@@ -7,6 +7,9 @@ Early days: a working proof of concept for text files, searched from the command
 ## Usage
 
 ```bash
+git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
+cargo install --path .                     # vinosearch into ~/.cargo/bin
+cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
 vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
@@ -26,15 +29,14 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 ## Runtime
 
-OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch), installed per user into `~/.local/lib/vinosearch/openvino`:
+OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch) (0.5.0 or newer), installed per user into `~/.local/lib/vinosearch/openvino`:
 
 ```bash
-scripts/install-runtime.sh             # compiles against the newest OpenVINO a recipe offers (~17 min)
-scripts/install-runtime.sh --prebuilt  # Intel's prebuilt wheel, older OpenVINO, no compile
-cargo run -- doctor                    # NPU, driver, runtime, then compiles and runs a probe model
+scripts/install-runtime.sh   # Intel's openvino wheel alone: 139 MB, ~17 s, no compile
+vinosearch doctor            # NPU, driver, runtime, then compiles and runs a probe model
 ```
 
-The default compiles because two programs on one NPU should run the same OpenVINO release: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
+vinoSearch calls OpenVINO directly, without ONNX Runtime, so it uses `ovfetch install --openvino-only`. That gets the newest OpenVINO the NPU driver supports (2026.4.1 here), the same release vinoAuthFace and vinoWhisper run, which matters: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
 
 ovfetch's runtime ships OpenVINO's ONNX frontend only, so models must be ONNX.
 
