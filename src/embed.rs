@@ -15,7 +15,8 @@ use tokenizers::{PostProcessor, Tokenizer, TruncationDirection};
 pub const DIM: usize = 768;
 /// Static on the NPU, so every query pays for the full length: 64 took ~20 ms
 /// a query, 32 takes ~12. 32 holds the task prefix plus ~22 tokens (about 15
-/// words), longer than a launcher query; the rest is truncated.
+/// words), longer than a launcher query. A longer one goes through the
+/// document shape instead (~35-50 ms; identical embeddings, cosine 0.999998).
 const QUERY_LEN: usize = 32;
 const DOC_LEN: usize = 256;
 /// Document requests queued on the device at once. 1 indexes at 27.3
@@ -48,6 +49,15 @@ pub struct Embedder {
     tok: Tokenizer,
     query: Stage,
     docs: Option<Stage>,
+}
+
+/// Whether `text` fits in `len` tokens with the special tokens added.
+fn fits(tok: &Tokenizer, text: &str, len: usize) -> Result<bool> {
+    let n = tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.len();
+    let added = tok
+        .get_post_processor()
+        .map_or(0, |p| p.added_tokens(false));
+    Ok(n + added <= len)
 }
 
 /// Token ids and attention mask, exactly `len` long: truncated before the
@@ -239,9 +249,15 @@ impl Embedder {
     }
 
     pub fn query(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut v = self
-            .query
-            .run(&self.tok, &[format!("{QUERY_PREFIX}{text}")])?;
+        let text = format!("{QUERY_PREFIX}{text}");
+        let mut v = if fits(&self.tok, &text, QUERY_LEN)? {
+            self.query.run(&self.tok, &[text])?
+        } else {
+            // Too long for the query shape: the document shape takes 256
+            // tokens, and is compiled already whenever the runner has indexed.
+            self.prepare_documents()?;
+            self.docs.as_mut().unwrap().run(&self.tok, &[text])?
+        };
         Ok(v.remove(0))
     }
 
@@ -339,6 +355,13 @@ mod tests {
         let (ids, mask) = encode_fixed(&tiny(), "a b a b a b a b", 5).unwrap();
         assert_eq!(ids, [2, 3, 4, 3, 1]);
         assert_eq!(mask, [1; 5]);
+    }
+
+    #[test]
+    fn fit_counts_the_special_tokens() {
+        // "a b a" is 3 tokens, 5 with <bos> and <eos>.
+        assert!(fits(&tiny(), "a b a", 5).unwrap());
+        assert!(!fits(&tiny(), "a b a", 4).unwrap());
     }
 
     #[test]
