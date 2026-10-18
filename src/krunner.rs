@@ -356,6 +356,51 @@ fn data_home() -> Result<PathBuf> {
 /// Register the runner with KRunner and let D-Bus start it on demand. Only
 /// flags given here are baked into the service; the rest come from the config
 /// file each time the runner starts.
+const UNIT: &str = "vinosearch.service";
+
+fn unit_path() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".config"),
+    };
+    Ok(base.join("systemd/user").join(UNIT))
+}
+
+/// `systemctl --user <args>`, reporting rather than failing: without systemd
+/// the runner still starts through D-Bus activation's Exec line.
+fn systemctl(args: &[&str]) -> bool {
+    match std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("systemctl --user {}: {s}", args.join(" "));
+            false
+        }
+        Err(e) => {
+            eprintln!("systemctl: {e}");
+            false
+        }
+    }
+}
+
+/// Whether something already owns the runner's bus name.
+fn runner_running() -> bool {
+    let owned = || -> Result<bool> {
+        let conn = zbus::blocking::Connection::session()?;
+        let bus = zbus::blocking::fdo::DBusProxy::new(&conn)?;
+        Ok(bus.name_has_owner(SERVICE.try_into()?)?)
+    };
+    owned().unwrap_or(false)
+}
+
+/// Register the runner with KRunner, and with systemd as a user service that
+/// starts at login, so the watcher keeps the index current from then on
+/// (D-Bus activation alone would start it only at the first query). Only
+/// flags given here are baked into the service; the rest come from the
+/// config file each time the runner starts.
 pub fn install(
     openvino_dir: Option<&Path>,
     device: Option<&str>,
@@ -391,22 +436,57 @@ pub fn install(
     )?;
     fs::write(
         &service,
-        format!("[D-BUS Service]\nName={SERVICE}\nExec={exec}\n"),
+        format!("[D-BUS Service]\nName={SERVICE}\nExec={exec}\nSystemdService={UNIT}\n"),
     )?;
-    println!("wrote {}\nwrote {}", plugin.display(), service.display());
+    let unit = unit_path()?;
+    fs::create_dir_all(unit.parent().unwrap())?;
+    fs::write(
+        &unit,
+        format!(
+            "[Unit]\nDescription=vinoSearch semantic file search (KRunner runner and index watcher)\n\
+             Documentation=https://github.com/karanshukla/vinoSearch\n\n\
+             [Service]\nType=dbus\nBusName={SERVICE}\nExecStart={exec}\n\
+             Restart=on-failure\nRestartSec=10\n\n\
+             [Install]\nWantedBy=default.target\n"
+        ),
+    )?;
+    println!(
+        "wrote {}\nwrote {}\nwrote {}",
+        plugin.display(),
+        service.display(),
+        unit.display()
+    );
+    if systemctl(&["daemon-reload"]) {
+        if runner_running() {
+            // Starting now would lose the bus name to it and fail; the unit
+            // takes over from the next login.
+            systemctl(&["enable", UNIT]);
+            println!(
+                "enabled {UNIT}; a runner is already running, so it starts from the next login"
+            );
+        } else if systemctl(&["enable", "--now", UNIT]) {
+            println!("enabled and started {UNIT}");
+        }
+    }
     Ok(())
 }
 
 pub fn uninstall() -> Result<()> {
     let data = data_home()?;
+    let unit = unit_path()?;
+    if unit.exists() {
+        systemctl(&["disable", "--now", UNIT]);
+    }
     for p in [
         data.join("krunner/dbusplugins/vinosearch.desktop"),
         data.join(format!("dbus-1/services/{SERVICE}.service")),
+        unit,
     ] {
         if p.exists() {
             fs::remove_file(&p)?;
             println!("removed {}", p.display());
         }
     }
+    systemctl(&["daemon-reload"]);
     Ok(())
 }
