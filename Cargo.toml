@@ -32,3 +32,11 @@ zbus = "5"
 toml = "1.1"
 futures-channel = "0.3"
 libc = "0.2"
+
+# Core::compile_model_from_file, until intel/openvino-rs#202 is released.
+# Pinned by commit; all three come from the same tree because openvino-sys
+# declares `links`, so a second copy from crates.io cannot coexist.
+[patch.crates-io]
+openvino = { git = "https://github.com/karanshukla/openvino-rs", rev = "f72cadbf98921fc463c9ec24cfdc0bdf6611563a" }
+openvino-sys = { git = "https://github.com/karanshukla/openvino-rs", rev = "f72cadbf98921fc463c9ec24cfdc0bdf6611563a" }
+openvino-finder = { git = "https://github.com/karanshukla/openvino-rs", rev = "f72cadbf98921fc463c9ec24cfdc0bdf6611563a" }

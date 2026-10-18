@@ -43,7 +43,7 @@ struct Stage {
 /// process that only answers queries never holds a second copy of the model.
 pub struct Embedder {
     core: Core,
-    onnx: PathBuf,
+    model_dir: PathBuf,
     device: String,
     cache: PathBuf,
     tok: Tokenizer,
@@ -141,7 +141,7 @@ fn blobs(dir: &Path) -> Vec<PathBuf> {
 impl Stage {
     fn new(
         core: &mut Core,
-        model_path: &Path,
+        model_dir: &Path,
         device: &str,
         cache_root: &Path,
         len: usize,
@@ -156,17 +156,29 @@ impl Stage {
         )
         .context("setting CACHE_DIR")?;
         let before = blobs(&cache);
-        let path = model_path.to_str().context("model path is not UTF-8")?;
-        let mut model = core
-            .read_model_from_file(path, "")
-            .context("reading model")?;
-        let tokens = PartialShape::new_static(2, &[1, len as i64])?;
-        model
-            .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
-            .context("reshaping to static shapes")?;
-        let mut compiled = core
-            .compile_model(&model, DeviceType::from(device))
-            .context("compiling")?;
+        let mut compiled = match crate::model::static_path(model_dir, len).filter(|p| p.is_file()) {
+            // Straight from the path: on a cache hit OpenVINO loads the blob
+            // without reading the model, 340 MB peak instead of 630 MB.
+            Some(path) => core
+                .compile_model_from_file(
+                    path.to_str().context("model path is not UTF-8")?,
+                    DeviceType::from(device),
+                )
+                .context("compiling")?,
+            // A model fetched before the static graphs were published.
+            None => {
+                let path = crate::model::onnx_path(model_dir);
+                let mut model = core
+                    .read_model_from_file(path.to_str().context("model path is not UTF-8")?, "")
+                    .context("reading model")?;
+                let tokens = PartialShape::new_static(2, &[1, len as i64])?;
+                model
+                    .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
+                    .context("reshaping to static shapes")?;
+                core.compile_model(&model, DeviceType::from(device))
+                    .context("compiling")?
+            }
+        };
         let requests = (0..in_flight)
             .map(|_| compiled.create_infer_request())
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -232,14 +244,13 @@ impl Embedder {
     pub fn new(mut core: Core, model_dir: &Path, device: &str, cache_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         prune_cache(cache_dir)?;
-        let onnx = crate::model::onnx_path(model_dir);
         let tok_path = crate::model::tokenizer_path(model_dir);
         let tok =
             Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{}: {e}", tok_path.display()))?;
-        let query = Stage::new(&mut core, &onnx, device, cache_dir, QUERY_LEN, 1)?;
+        let query = Stage::new(&mut core, model_dir, device, cache_dir, QUERY_LEN, 1)?;
         Ok(Self {
             core,
-            onnx,
+            model_dir: model_dir.to_owned(),
             device: device.to_owned(),
             cache: cache_dir.to_owned(),
             tok,
@@ -266,7 +277,7 @@ impl Embedder {
         if self.docs.is_none() {
             self.docs = Some(Stage::new(
                 &mut self.core,
-                &self.onnx,
+                &self.model_dir,
                 &self.device,
                 &self.cache,
                 DOC_LEN,
