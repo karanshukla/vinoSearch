@@ -95,9 +95,11 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
 /// Flags over the config file over defaults.
 struct Settings {
     path: PathBuf,
+    file: config::Config,
     device: String,
     idle_unload_minutes: f64,
     excludes: config::Excludes,
+    pinned: worker::Pinned,
 }
 
 fn settings(cli: &Cli) -> Result<Settings> {
@@ -109,31 +111,35 @@ fn settings(cli: &Cli) -> Result<Settings> {
     let idle_unload_minutes = cli
         .idle_unload_minutes
         .or(file.idle_unload_minutes)
-        .unwrap_or(5.0);
-    if !(idle_unload_minutes >= 0.0 && idle_unload_minutes.is_finite()) {
-        bail!("idle_unload_minutes must be 0 or more");
-    }
+        .unwrap_or(config::DEFAULT_IDLE_UNLOAD_MINUTES);
+    config::idle_unload(idle_unload_minutes)?;
     Ok(Settings {
         device: cli
             .device
             .clone()
             .or(file.device.clone())
-            .unwrap_or_else(|| "NPU".into()),
+            .unwrap_or_else(|| config::DEFAULT_DEVICE.into()),
         idle_unload_minutes,
         excludes: file.excludes()?,
+        pinned: worker::Pinned {
+            device: cli.device.is_some(),
+            idle_unload: cli.idle_unload_minutes.is_some(),
+        },
+        file,
         path,
     })
 }
 
 fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
-    let m = s.idle_unload_minutes;
     worker::Options {
         openvino_dir: cli.openvino_dir.clone(),
+        status: std::sync::Arc::new(worker::Status::new(&s.device)),
         device: s.device,
-        idle: (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0)),
+        idle: config::idle_unload(s.idle_unload_minutes).expect("checked in settings()"),
         excludes: s.excludes,
         config: s.path,
-        status: Default::default(),
+        file: s.file,
+        pinned: s.pinned,
     }
 }
 
@@ -224,7 +230,7 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
-            let _watcher = watch::spawn(tx, opts.config.clone(), opts.excludes.clone())?;
+            let _watcher = watch::spawn(tx, opts.config.clone(), opts.file.clone())?;
             worker::run(rx, opts)?;
             Ok(true)
         }

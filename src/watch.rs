@@ -26,7 +26,9 @@ const ROOTS_EVERY: Duration = Duration::from_secs(30);
 struct State {
     watcher: RecommendedWatcher,
     roots: Vec<PathBuf>,
-    watched: usize,
+    /// Directories with a watch. Ones deleted since lose theirs in the kernel
+    /// and stay listed until their root is forgotten, which is harmless.
+    watched: HashSet<PathBuf>,
     warned_limit: bool,
     excludes: Excludes,
 }
@@ -35,11 +37,16 @@ impl State {
     fn watch_tree(&mut self, dir: &Path) {
         let ex = self.excludes.clone();
         for entry in index::walk(dir, &ex).filter(|e| e.file_type().is_dir()) {
+            if self.watched.contains(entry.path()) {
+                continue;
+            }
             match self
                 .watcher
                 .watch(entry.path(), RecursiveMode::NonRecursive)
             {
-                Ok(()) => self.watched += 1,
+                Ok(()) => {
+                    self.watched.insert(entry.into_path());
+                }
                 Err(e) => {
                     // ENOSPC: out of inotify watches (fs.inotify.max_user_watches).
                     if !self.warned_limit {
@@ -51,22 +58,42 @@ impl State {
         }
     }
 
-    /// Follow roots added since the last look, and drop forgotten ones. A
-    /// forgotten root's inotify watches stay until restart, but its events no
-    /// longer match a root, so they are ignored.
+    /// Follow roots added since the last look, and drop forgotten ones with
+    /// their watches (except under a root still followed: roots can nest).
     fn sync_roots(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>) {
         let Ok(roots) = index::roots(conn) else {
             return;
         };
-        self.roots.retain(|r| roots.contains(r));
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.roots)
+            .into_iter()
+            .partition(|r| roots.contains(r));
+        self.roots = kept;
+        for root in gone {
+            let drop: Vec<PathBuf> = self
+                .watched
+                .iter()
+                .filter(|d| d.starts_with(&root) && self.root_of(d).is_none())
+                .cloned()
+                .collect();
+            for dir in &drop {
+                // Fails for directories deleted since; their watch is gone already.
+                let _ = self.watcher.unwatch(dir);
+                self.watched.remove(dir);
+            }
+            eprintln!(
+                "stopped watching {} ({} directories)",
+                root.display(),
+                drop.len()
+            );
+        }
         for root in roots {
             if !self.roots.contains(&root) && root.is_dir() && !self.excludes.contains(&root) {
-                let before = self.watched;
+                let before = self.watched.len();
                 self.watch_tree(&root);
                 eprintln!(
                     "watching {} ({} directories)",
                     root.display(),
-                    self.watched - before
+                    self.watched.len() - before
                 );
                 // Catch up on what changed while nothing was watching (before
                 // login, or with the runner stopped). Watches are already in
@@ -123,12 +150,14 @@ fn interesting(kind: &EventKind) -> bool {
     }
 }
 
-/// `config` is re-read every ROOTS_EVERY; changed exclusions go to the worker.
+/// `config` is re-read every ROOTS_EVERY; when it differs from `file` (what
+/// it held at startup), the new contents go to the worker.
 pub fn spawn(
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
-    excludes: Excludes,
+    mut file: Config,
 ) -> Result<std::thread::JoinHandle<()>> {
+    let excludes = file.excludes()?;
     let conn = index::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
@@ -136,7 +165,7 @@ pub fn spawn(
         let mut st = State {
             watcher,
             roots: Vec::new(),
-            watched: 0,
+            watched: HashSet::new(),
             warned_limit: false,
             excludes,
         };
@@ -175,16 +204,19 @@ pub fn spawn(
                 break;
             }
             if last_roots.elapsed() >= ROOTS_EVERY {
-                match Config::load(&config).and_then(|c| c.excludes()) {
-                    Ok(ex) if ex != st.excludes => {
-                        eprintln!("{}: exclusions changed", config.display());
-                        st.excludes = ex.clone();
-                        if jobs.send(Job::Excludes(ex)).is_err() {
+                // A file that fails to parse, or has a bad exclusion, changes
+                // nothing: better the last good exclusions than index what a
+                // typo un-excluded.
+                match Config::load(&config).and_then(|c| Ok((c.excludes()?, c))) {
+                    Ok((ex, c)) if c != file => {
+                        eprintln!("{}: changed", config.display());
+                        st.excludes = ex;
+                        file = c.clone();
+                        if jobs.send(Job::Config(c)).is_err() {
                             break;
                         }
                     }
                     Ok(_) => {}
-                    // Keep the last good exclusions rather than index what a typo un-excluded.
                     Err(e) => eprintln!("reading config: {e:#}"),
                 }
                 st.sync_roots(&conn, &jobs);

@@ -218,7 +218,6 @@ struct Control {
     status: Arc<Status>,
     db: Mutex<rusqlite::Connection>,
     config: PathBuf,
-    device: String,
 }
 
 fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
@@ -274,7 +273,10 @@ impl Control {
                     || self.status.queued_reindex.load(Ordering::Relaxed) > 0,
             )),
         );
-        out.insert(key::DEVICE.into(), owned(Value::from(self.device.clone())));
+        out.insert(
+            key::DEVICE.into(),
+            owned(Value::from(self.status.device.lock().unwrap().clone())),
+        );
         out.insert(key::FILES.into(), owned(Value::from(files)));
         out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
         out.insert(key::ROOTS.into(), owned(Value::from(roots)));
@@ -407,13 +409,12 @@ fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let _watcher = watch::spawn(tx.clone(), opts.config.clone(), opts.excludes.clone())?;
+    let _watcher = watch::spawn(tx.clone(), opts.config.clone(), opts.file.clone())?;
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
         db: Mutex::new(index::open(&index::default_db()?)?),
         config: opts.config.clone(),
-        device: opts.device.clone(),
     };
     let worker = std::thread::spawn(move || worker::run(rx, opts));
     let _conn = zbus::blocking::connection::Builder::session()?

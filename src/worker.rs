@@ -6,7 +6,7 @@
 //! after `idle` without a job, as the other vino projects do. What the worker
 //! is doing is published in `Status`, so status queries never wait behind it.
 
-use crate::config::Excludes;
+use crate::config::{self, Config, Excludes};
 use crate::embed::Embedder;
 use crate::index::{self, Hit, Outcome, Vectors};
 use crate::sched;
@@ -28,8 +28,9 @@ pub enum Job {
     },
     /// Paths created, modified, renamed or removed under a root.
     Changed(Vec<PathBuf>),
-    /// The config's exclusions changed: drop what is now excluded.
-    Excludes(Excludes),
+    /// The config file changed: apply its exclusions (dropping what is now
+    /// excluded), device and idle timeout, except where a flag overrides them.
+    Config(Config),
     /// Index a root (new or existing), as `vinosearch index` does.
     Reindex(PathBuf),
     /// Stop indexing and watching a root, and drop what was indexed under it.
@@ -59,6 +60,25 @@ pub struct Status {
     pub fetch_total: AtomicU64,
     /// Why the last model download failed, cleared when one starts.
     pub fetch_error: std::sync::Mutex<String>,
+    /// The device the model runs, or will next load, on.
+    pub device: std::sync::Mutex<String>,
+}
+
+impl Status {
+    pub fn new(device: &str) -> Self {
+        Self {
+            device: std::sync::Mutex::new(device.to_owned()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Settings given as flags or environment variables, which config file
+/// changes leave alone.
+#[derive(Clone, Copy, Default)]
+pub struct Pinned {
+    pub device: bool,
+    pub idle_unload: bool,
 }
 
 struct Loaded {
@@ -71,8 +91,11 @@ pub struct Options {
     pub device: String,
     pub idle: Option<Duration>,
     pub excludes: Excludes,
-    /// The config file the exclusions came from, which the watcher re-reads.
+    /// The config file the settings came from, which the watcher re-reads.
     pub config: PathBuf,
+    /// Its contents at startup.
+    pub file: Config,
+    pub pinned: Pinned,
     pub status: Arc<Status>,
 }
 
@@ -148,12 +171,14 @@ fn answer(
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut conn = index::open(&index::default_db()?)?;
     let mut excludes = opts.excludes.clone();
+    let mut device = opts.device.clone();
+    let mut idle = opts.idle;
     let purged = index::purge(&conn, &excludes)?;
     if purged > 0 {
         eprintln!("removed {purged} excluded files from the index");
     }
-    let load = |conn: &rusqlite::Connection| -> Result<Loaded> {
-        let emb = crate::embedder(opts.openvino_dir.clone(), &opts.device)?;
+    let load = |conn: &rusqlite::Connection, device: &str| -> Result<Loaded> {
+        let emb = crate::embedder(opts.openvino_dir.clone(), device)?;
         let vectors = Vectors::load(conn)?;
         eprintln!("serving {} chunks", vectors.len());
         Ok(Loaded { emb, vectors })
@@ -172,7 +197,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         let job = if let Some(job) = deferred.pop_front() {
             job
         } else {
-            match (opts.idle, loaded.is_some()) {
+            match (idle, loaded.is_some()) {
                 (Some(after), true) => match jobs.recv_timeout(after) {
                     Ok(job) => job,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -189,11 +214,40 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         };
         // Jobs that need no model.
         let job = match job {
-            Job::Excludes(ex) => {
-                excludes = ex;
-                match index::purge(&conn, &excludes) {
-                    Ok(n) => eprintln!("exclusions changed, {n} files removed"),
-                    Err(e) => eprintln!("applying exclusions: {e:#}"),
+            Job::Config(file) => {
+                match file.excludes() {
+                    Ok(ex) if ex != excludes => {
+                        excludes = ex;
+                        match index::purge(&conn, &excludes) {
+                            Ok(n) => eprintln!("exclusions changed, {n} files removed"),
+                            Err(e) => eprintln!("applying exclusions: {e:#}"),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("exclusions not applied: {e:#}"),
+                }
+                if !opts.pinned.device {
+                    let new = file.device.as_deref().unwrap_or(config::DEFAULT_DEVICE);
+                    if new != device {
+                        eprintln!("device changed to {new}");
+                        device = new.to_owned();
+                        *status.device.lock().unwrap() = device.clone();
+                        // Loaded again, on the new device, by the next job that needs it.
+                        unload(&mut loaded, "device changed");
+                    }
+                }
+                if !opts.pinned.idle_unload {
+                    let m = file
+                        .idle_unload_minutes
+                        .unwrap_or(config::DEFAULT_IDLE_UNLOAD_MINUTES);
+                    match config::idle_unload(m) {
+                        Ok(new) if new != idle => {
+                            eprintln!("idle unload changed to {m} minutes");
+                            idle = new;
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("idle_unload_minutes not applied: {e:#}"),
+                    }
                 }
                 continue;
             }
@@ -235,7 +289,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             status.indexing.store(true, Ordering::Relaxed);
         }
         if loaded.is_none() {
-            match load(&conn) {
+            match load(&conn, &device) {
                 Ok(l) => {
                     loaded = Some(l);
                     status.loaded.store(true, Ordering::Relaxed);
@@ -313,11 +367,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
                 status.indexing.store(false, Ordering::Relaxed);
             }
-            Job::Excludes(_)
-            | Job::Forget(_)
-            | Job::Unload
-            | Job::DeleteModel
-            | Job::ClearCache => {
+            Job::Config(_) | Job::Forget(_) | Job::Unload | Job::DeleteModel | Job::ClearCache => {
                 unreachable!("handled before loading")
             }
         }

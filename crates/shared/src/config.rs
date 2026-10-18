@@ -14,6 +14,18 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+pub const DEFAULT_DEVICE: &str = "NPU";
+pub const DEFAULT_IDLE_UNLOAD_MINUTES: f64 = 5.0;
+
+/// How long the model may sit idle before it is freed; None keeps it loaded.
+pub fn idle_unload(minutes: f64) -> Result<Option<Duration>> {
+    if !(minutes >= 0.0 && minutes.is_finite()) {
+        bail!("idle_unload_minutes must be 0 or more");
+    }
+    Ok((minutes > 0.0).then(|| Duration::from_secs_f64(minutes * 60.0)))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -135,6 +147,15 @@ mod tests {
         );
         assert_eq!(resolve("~", home).unwrap(), home);
         assert!(resolve("relative/dir", home).is_err());
+    }
+
+    #[test]
+    fn idle_unload_validates() {
+        assert_eq!(idle_unload(0.0).unwrap(), None);
+        assert_eq!(idle_unload(0.5).unwrap(), Some(Duration::from_secs(30)));
+        assert!(idle_unload(-1.0).is_err());
+        assert!(idle_unload(f64::NAN).is_err());
+        assert!(idle_unload(f64::INFINITY).is_err());
     }
 
     #[test]

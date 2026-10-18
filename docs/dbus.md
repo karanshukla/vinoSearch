@@ -67,7 +67,15 @@ device = "NPU"
 idle_unload_minutes = 5
 ```
 
-A running runner re-reads the file every 30 seconds and applies `exclude` changes, dropping anything newly excluded from the index. `device` and `idle_unload_minutes` take effect the next time the runner starts.
+A running runner re-reads the file every 30 seconds and applies what changed:
+
+| Key | Takes effect |
+|---|---|
+| `exclude` | at once: anything newly excluded is dropped from the index and no longer watched for new directories |
+| `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
+| `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
+
+A setting given as a flag or environment variable (`--device`, `--idle-unload-minutes`, `VINOSEARCH_IDLE_UNLOAD_MINUTES`, or baked into the service by `krunner --install --device ...`) wins over the file, so file changes to it are ignored until the runner restarts without the flag. A file that fails to parse, or has an invalid `exclude`, changes nothing; an invalid `idle_unload_minutes` keeps the current timeout.
 
 ## Trying it
 
