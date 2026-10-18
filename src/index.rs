@@ -25,14 +25,40 @@ const EXTENSIONS: &[&str] = &[
 ];
 // No config formats (toml, yaml, json, ini, conf, ...): they are where
 // credentials live, and the index is not encrypted yet (#4).
+/// Directories that are always build output, caches, generated reports or
+/// vendored dependencies. Generic names a person might use for their own
+/// files (`bin`, `out`, `lib`) are left out.
 const SKIP_DIRS: &[&str] = &[
+    // JavaScript
     "node_modules",
-    "target",
+    "bower_components",
     "dist",
+    // Rust, Java, Gradle, CMake, Elixir, Sphinx
+    "target",
     "build",
+    "_build",
+    // .NET intermediate output (generated .cs files)
+    "obj",
+    // Python
     "__pycache__",
     "venv",
+    "site-packages",
+    // Go, PHP, Ruby
+    "vendor",
+    // Apple
+    "Pods",
+    "DerivedData",
+    // Elm
+    "elm-stuff",
+    // Test coverage reports
+    "coverage",
+    "htmlcov",
 ];
+/// Directory name prefixes with the same meaning (`cmake-build-debug`, ...).
+const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
+/// Minified or bundled files: generated, one enormous line, never what a
+/// search is for.
+const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
 pub fn default_db() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
@@ -84,13 +110,21 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 pub(crate) fn wanted(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    !SKIP_FILE_SUFFIXES.iter().any(|s| name.ends_with(s))
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 pub(crate) fn skipped_dir(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
+    name.starts_with('.')
+        || SKIP_DIRS.contains(&name)
+        || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Line-aligned chunks of up to CHUNK_CHARS, with the line each starts on.
@@ -260,7 +294,23 @@ pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
     for p in ex.paths() {
         n += remove(conn, p)?;
     }
+    if n > 0 {
+        compact(conn)?;
+    }
     Ok(n)
+}
+
+/// Hand freed space back once over a quarter of the file is free pages.
+/// SQLite otherwise keeps a purged index's full size: excluding 80% of a
+/// 113k-chunk index left the file at 470 MB until a VACUUM took it to 92 MB
+/// (0.6 s).
+pub fn compact(conn: &Connection) -> Result<()> {
+    let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    if free * 4 > pages {
+        conn.execute_batch("VACUUM")?;
+    }
+    Ok(())
 }
 
 /// Index everything wanted under `root` and remember it as a root to watch.
@@ -279,7 +329,7 @@ pub fn index(
             root.display()
         );
     }
-    purge(conn, ex)?;
+    let purged = purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
         [root.to_string_lossy()],
@@ -337,7 +387,10 @@ pub fn index(
     for p in &gone {
         conn.execute("DELETE FROM files WHERE path = ?1", [p])?;
     }
-    stats.removed = gone.len();
+    stats.removed = gone.len() + purged;
+    if !gone.is_empty() {
+        compact(conn)?;
+    }
     Ok(stats)
 }
 
@@ -348,7 +401,11 @@ pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
         "DELETE FROM roots WHERE path = ?1",
         [root.to_string_lossy()],
     )?;
-    remove(conn, root)
+    let n = remove(conn, root)?;
+    if n > 0 {
+        compact(conn)?;
+    }
+    Ok(n)
 }
 
 /// Files and chunks in the index.
@@ -620,6 +677,46 @@ mod tests {
         let v: Vec<f32> = (0..DIM).map(|i| i as f32 / 7.0).collect();
         assert_eq!(from_blob(&to_blob(&v)).unwrap(), v);
         assert!(from_blob(&[0u8; 12]).is_none());
+    }
+
+    #[test]
+    fn generated_trees_and_files_are_skipped() {
+        for d in [
+            "coverage",
+            "obj",
+            "vendor",
+            "cmake-build-release",
+            ".git",
+            "node_modules",
+        ] {
+            assert!(skipped_dir(d), "{d}");
+        }
+        for d in ["src", "bin", "out", "docs", "covered"] {
+            assert!(!skipped_dir(d), "{d}");
+        }
+        assert!(!wanted(Path::new("app.min.js")));
+        assert!(!wanted(Path::new("vendor.bundle.js")));
+        assert!(wanted(Path::new("app.js")));
+        assert!(wanted(Path::new("README.md")));
+    }
+
+    #[test]
+    fn compact_returns_freed_pages() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (b BLOB); PRAGMA page_size = 4096;")
+            .unwrap();
+        for _ in 0..200 {
+            conn.execute("INSERT INTO t VALUES (zeroblob(4000))", [])
+                .unwrap();
+        }
+        conn.execute("DELETE FROM t", []).unwrap();
+        let free = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(free(&conn) > 100);
+        compact(&conn).unwrap();
+        assert_eq!(free(&conn), 0);
     }
 
     #[test]

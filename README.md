@@ -19,7 +19,7 @@ vinosearch krunner --install               # register with KRunner; D-Bus starts
 systemctl --user restart plasma-krunner.service
 ```
 
-Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28.6 chunks/s on the NPU (see [Performance](#performance)).
+Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories, build output, vendored dependencies and generated reports (`target`, `node_modules`, `vendor`, `obj`, `coverage`, ...) are skipped, as are minified `*.min.js`/`*.min.css` and `*.bundle.js` files. Indexing runs at ~28.6 chunks/s on the NPU (see [Performance](#performance)).
 
 Settings live in `~/.config/vinosearch/config.toml`; flags and environment variables override it:
 
