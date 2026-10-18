@@ -111,13 +111,12 @@ fn changed(
         if ex.contains(&path) {
             continue;
         }
-        if path.is_dir() {
-            // A new or renamed-in directory: index what is under it.
-            files.extend(
-                index::walk(&path, ex)
-                    .filter(|e| e.file_type().is_file())
-                    .map(|e| e.into_path()),
-            );
+        if index::is_real_dir(&path) {
+            // A new or renamed-in directory: what under it is new, changed or
+            // gone. Gone matters too: by the time a debounced batch runs, a
+            // directory renamed away may already have been recreated at the
+            // same path, and its old files must not stay indexed.
+            files.extend(index::stale(conn, &path, ex)?);
         } else {
             files.push(path);
         }
