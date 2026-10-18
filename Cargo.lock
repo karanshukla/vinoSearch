@@ -1208,9 +1208,9 @@ dependencies = [
 
 [[package]]
 name = "ovfetch"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d263ab3296f20da22de6717ba856ca8318039051592da3bd1258cfe034175b6"
+checksum = "a277f799dae5acbc333b863799eadbcb6a1ed393634d08b04ecbc62ada488854"
 dependencies = [
  "anyhow",
  "serde",
