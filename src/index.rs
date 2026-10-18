@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 /// About 250 tokens of English, inside the 256-token document shape.
@@ -288,6 +288,46 @@ pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Res
     Ok(Outcome::Embedded(chunks.len()))
 }
 
+/// (mtime, size) as the index records them.
+fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((mtime.as_secs() as i64, meta.len() as i64))
+}
+
+/// Paths under `root` the index is behind on: wanted files that are new or
+/// changed (by mtime and size), and indexed files that are gone. Needs no
+/// model, so a runner can check at start whether it has anything to do.
+pub fn stale(conn: &Connection, root: &Path, ex: &Excludes) -> Result<Vec<PathBuf>> {
+    let mut known: std::collections::HashMap<String, (i64, i64)> = {
+        let mut stmt =
+            conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
+        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = Vec::new();
+    for entry in walk(root, ex).filter(|e| e.file_type().is_file()) {
+        let path = entry.path();
+        let Some(key) = path.to_str() else { continue };
+        let was = known.remove(key);
+        let wanted_now = wanted(path) && entry.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES);
+        if !wanted_now {
+            // An indexed file that is no longer wanted (grew too big, say).
+            if was.is_some() {
+                out.push(path.to_path_buf());
+            }
+            continue;
+        }
+        if was != entry.metadata().ok().as_ref().and_then(stamp_of) {
+            out.push(path.to_path_buf());
+        }
+    }
+    // Indexed, but not found by the walk: deleted, or now excluded or skipped.
+    out.extend(known.into_keys().map(PathBuf::from));
+    Ok(out)
+}
+
 /// Drop everything indexed under an excluded path. Returns files removed.
 pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
     let mut n = 0;
@@ -315,12 +355,13 @@ pub fn compact(conn: &Connection) -> Result<()> {
 
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
-/// that are gone are removed.
+/// that are gone are removed. `progress` is called after each file embedded.
 pub fn index(
     conn: &mut Connection,
     emb: &mut Embedder,
     root: &Path,
     ex: &Excludes,
+    progress: &mut dyn FnMut(&Stats),
 ) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
     if ex.contains(&root) {
@@ -341,7 +382,6 @@ pub fn index(
         removed: 0,
     };
     let mut seen = HashSet::new();
-    let t0 = Instant::now();
     for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path()) {
             continue;
@@ -353,13 +393,7 @@ pub fn index(
             Outcome::Embedded(n) => {
                 stats.files_embedded += 1;
                 stats.chunks += n;
-                let secs = t0.elapsed().as_secs_f64();
-                eprint!(
-                    "\r{} files, {} chunks, {:.1} chunks/s   ",
-                    stats.files_embedded,
-                    stats.chunks,
-                    stats.chunks as f64 / secs
-                );
+                progress(&stats);
             }
             Outcome::Unchanged => {}
             Outcome::Skipped => {
@@ -370,9 +404,6 @@ pub fn index(
             }
         }
         stats.files_seen += 1;
-    }
-    if stats.files_embedded > 0 {
-        eprintln!();
     }
 
     let gone: Vec<String> = {
@@ -717,6 +748,39 @@ mod tests {
         assert!(free(&conn) > 100);
         compact(&conn).unwrap();
         assert_eq!(free(&conn), 0);
+    }
+
+    #[test]
+    fn stale_finds_new_changed_and_gone_files() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conn = open(&dir.join("db/index.sqlite")).unwrap();
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        for f in ["same.md", "edited.md", "new.md", "skip.toml"] {
+            fs::write(root.join(f), f).unwrap();
+        }
+        let record = |name: &str, stamp: (i64, i64)| {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
+                params![root.join(name).to_str().unwrap(), stamp.0, stamp.1],
+            )
+            .unwrap();
+        };
+        let real = |name: &str| stamp_of(&fs::metadata(root.join(name)).unwrap()).unwrap();
+        record("same.md", real("same.md"));
+        record("edited.md", (0, 0));
+        record("deleted.md", (0, 0));
+        record("skip.toml", real("skip.toml"));
+        let mut got: Vec<String> = stale(&conn, &root, &Excludes::default())
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        assert_eq!(got, ["deleted.md", "edited.md", "new.md", "skip.toml"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

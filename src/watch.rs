@@ -54,7 +54,7 @@ impl State {
     /// Follow roots added since the last look, and drop forgotten ones. A
     /// forgotten root's inotify watches stay until restart, but its events no
     /// longer match a root, so they are ignored.
-    fn sync_roots(&mut self, conn: &rusqlite::Connection) {
+    fn sync_roots(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>) {
         let Ok(roots) = index::roots(conn) else {
             return;
         };
@@ -68,6 +68,23 @@ impl State {
                     root.display(),
                     self.watched - before
                 );
+                // Catch up on what changed while nothing was watching (before
+                // login, or with the runner stopped). Watches are already in
+                // place, so nothing falls between this scan and them.
+                let t0 = Instant::now();
+                match index::stale(conn, &root, &self.excludes) {
+                    Ok(paths) if !paths.is_empty() => {
+                        eprintln!(
+                            "{}: {} paths changed while unwatched (checked in {:.1} s)",
+                            root.display(),
+                            paths.len(),
+                            t0.elapsed().as_secs_f64()
+                        );
+                        let _ = jobs.send(Job::Changed(paths));
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("checking {}: {e:#}", root.display()),
+                }
                 self.roots.push(root);
             }
         }
@@ -123,7 +140,7 @@ pub fn spawn(
             warned_limit: false,
             excludes,
         };
-        st.sync_roots(&conn);
+        st.sync_roots(&conn, &jobs);
         let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut last_event = Instant::now();
         let mut last_roots = Instant::now();
@@ -170,7 +187,7 @@ pub fn spawn(
                     // Keep the last good exclusions rather than index what a typo un-excluded.
                     Err(e) => eprintln!("reading config: {e:#}"),
                 }
-                st.sync_roots(&conn);
+                st.sync_roots(&conn, &jobs);
                 last_roots = Instant::now();
             }
         }
