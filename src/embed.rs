@@ -18,7 +18,11 @@ pub const DIM: usize = 768;
 /// words), longer than a launcher query; the rest is truncated.
 const QUERY_LEN: usize = 32;
 const DOC_LEN: usize = 256;
-const IN_FLIGHT: usize = 4;
+/// Document requests queued on the device at once. 1 indexes at 27.3
+/// chunks/s against 4's 28.0, with the NPU ~87% busy either way, and leaves
+/// another program's request (a face unlock, dictation) behind at most one
+/// document instead of four.
+const IN_FLIGHT: usize = 1;
 /// `wait` is `wait_for`, which refuses a negative (unbounded) timeout.
 const WAIT_MS: i64 = 120_000;
 
@@ -241,8 +245,8 @@ impl Embedder {
         Ok(v.remove(0))
     }
 
-    /// Embed documents already formatted with [`document_text`].
-    pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Compile the document stage now, if it is not already.
+    pub fn prepare_documents(&mut self) -> Result<()> {
         if self.docs.is_none() {
             self.docs = Some(Stage::new(
                 &mut self.core,
@@ -253,6 +257,12 @@ impl Embedder {
                 IN_FLIGHT,
             )?);
         }
+        Ok(())
+    }
+
+    /// Embed documents already formatted with [`document_text`].
+    pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.prepare_documents()?;
         self.docs.as_mut().unwrap().run(&self.tok, texts)
     }
 }
