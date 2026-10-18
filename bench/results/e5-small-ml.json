@@ -1,0 +1,23 @@
+{
+  "model": "e5-small-ml",
+  "repo": "intfloat/multilingual-e5-small",
+  "devices": {
+    "NPU": {
+      "compile_s": 2.49,
+      "query_ms_p50": 2.0,
+      "query_ms_p95": 2.19,
+      "docs_per_s": 152.0,
+      "battery_w": 11.2,
+      "corpus_s": 31.7,
+      "ndcg10": 0.6436,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.4,
+      "query_ms_p50": 5.78,
+      "query_ms_p95": 8.0,
+      "docs_per_s": 33.7,
+      "battery_w": 30.6
+    }
+  }
+}

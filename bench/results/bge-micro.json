@@ -1,0 +1,23 @@
+{
+  "model": "bge-micro",
+  "repo": "TaylorAI/bge-micro-v2",
+  "devices": {
+    "NPU": {
+      "compile_s": 0.04,
+      "query_ms_p50": 0.76,
+      "query_ms_p95": 1.16,
+      "docs_per_s": 475.8,
+      "battery_w": 6.2,
+      "corpus_s": 8.9,
+      "ndcg10": 0.6518,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.2,
+      "query_ms_p50": 2.66,
+      "query_ms_p95": 2.76,
+      "docs_per_s": 72.9,
+      "battery_w": 11.4
+    }
+  }
+}

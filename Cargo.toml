@@ -1,0 +1,19 @@
+[package]
+name = "vinosearch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Semantic file search for KDE and GNOME, run on Intel NPUs through OpenVINO"
+repository = "https://github.com/karanshukla/vinoSearch"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+# Loaded at runtime from ovfetch's prefix, so the build never links against a
+# directory that may be replaced and nothing needs an rpath.
+openvino = { version = "0.11", features = ["runtime-linking"] }
+openvino-sys = { version = "0.11", features = ["runtime-linking"] }
+ovfetch = { version = "0.4.1", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

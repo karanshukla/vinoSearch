@@ -1,0 +1,23 @@
+{
+  "model": "gemma-300m",
+  "repo": "onnx-community/embeddinggemma-300m-ONNX",
+  "devices": {
+    "NPU": {
+      "compile_s": 12.05,
+      "query_ms_p50": 7.25,
+      "query_ms_p95": 9.59,
+      "docs_per_s": 45.9,
+      "battery_w": 12.3,
+      "corpus_s": 112.4,
+      "ndcg10": 0.7658,
+      "cos_vs_cpu_min": 0.9904
+    },
+    "CPU": {
+      "compile_s": 2.53,
+      "query_ms_p50": 37.18,
+      "query_ms_p95": 39.23,
+      "docs_per_s": 5.4,
+      "battery_w": 27.6
+    }
+  }
+}
