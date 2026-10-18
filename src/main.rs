@@ -3,6 +3,7 @@ mod index;
 mod krunner;
 mod model;
 mod runtime;
+mod sched;
 mod watch;
 mod worker;
 
@@ -174,14 +175,24 @@ fn run(cli: Cli) -> Result<bool> {
             let mut conn = index::open(&index::default_db()?)?;
             for p in &paths {
                 let t0 = Instant::now();
-                let st = index::index(&mut conn, &mut emb, Path::new(p), &s.excludes, &mut |st| {
-                    eprint!(
-                        "\r{} files, {} chunks, {:.1} chunks/s   ",
-                        st.files_embedded,
-                        st.chunks,
-                        st.chunks as f64 / t0.elapsed().as_secs_f64()
-                    );
-                })?;
+                let mut shown = 0;
+                let st = index::index(
+                    &mut conn,
+                    &mut emb,
+                    Path::new(p),
+                    &s.excludes,
+                    &mut |st, _, _| {
+                        if st.files_embedded != shown {
+                            shown = st.files_embedded;
+                            eprint!(
+                                "\r{} files, {} chunks, {:.1} chunks/s   ",
+                                st.files_embedded,
+                                st.chunks,
+                                st.chunks as f64 / t0.elapsed().as_secs_f64()
+                            );
+                        }
+                    },
+                )?;
                 if st.files_embedded > 0 {
                     eprintln!();
                 }

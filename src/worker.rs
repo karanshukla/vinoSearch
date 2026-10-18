@@ -9,8 +9,10 @@
 use crate::config::Excludes;
 use crate::embed::Embedder;
 use crate::index::{self, Hit, Outcome, Vectors};
+use crate::sched;
 use anyhow::Result;
 use futures_channel::oneshot;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -79,40 +81,68 @@ fn changed(
     emb: &mut Embedder,
     paths: Vec<PathBuf>,
     ex: &Excludes,
-    status: &Status,
+    after: &mut index::AfterFile,
 ) -> Result<()> {
-    let (mut files, mut chunks, mut removed) = (0, 0, 0);
+    let mut files = Vec::new();
     for path in paths {
         if ex.contains(&path) {
             continue;
         }
         if path.is_dir() {
             // A new or renamed-in directory: index what is under it.
-            for entry in index::walk(&path, ex).filter(|e| e.file_type().is_file()) {
-                if let Outcome::Embedded(n) = index::index_file(conn, emb, entry.path())? {
-                    files += 1;
-                    chunks += n;
-                    status.indexed_files.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else if path.exists() {
-            match index::index_file(conn, emb, &path)? {
-                Outcome::Embedded(n) => {
-                    files += 1;
-                    chunks += n;
-                    status.indexed_files.fetch_add(1, Ordering::Relaxed);
-                }
-                Outcome::Unchanged => {}
-                Outcome::Skipped => {}
-            }
+            files.extend(
+                index::walk(&path, ex)
+                    .filter(|e| e.file_type().is_file())
+                    .map(|e| e.into_path()),
+            );
         } else {
-            removed += index::remove(conn, &path)?;
+            files.push(path);
         }
     }
-    if files + removed > 0 {
-        eprintln!("updated: {files} files embedded ({chunks} chunks), {removed} removed");
+    let mut st = index::Stats {
+        files_seen: 0,
+        files_embedded: 0,
+        chunks: 0,
+        removed: 0,
+    };
+    for path in files {
+        if path.exists() {
+            st.files_seen += 1;
+            if let Outcome::Embedded(n) =
+                index::index_file(conn, emb, &path, &mut |c, e| after(&st, c, e))?
+            {
+                st.files_embedded += 1;
+                st.chunks += n;
+            }
+        } else {
+            st.removed += index::remove(conn, &path)?;
+        }
+        after(&st, conn, emb);
+    }
+    if st.files_embedded + st.removed > 0 {
+        eprintln!(
+            "updated: {} files embedded ({} chunks), {} removed",
+            st.files_embedded, st.chunks, st.removed
+        );
     }
     Ok(())
+}
+
+fn answer(
+    conn: &rusqlite::Connection,
+    emb: &mut Embedder,
+    vectors: &Vectors,
+    query: &str,
+    k: usize,
+    reply: oneshot::Sender<Vec<Hit>>,
+) {
+    let hits = emb
+        .query(query)
+        .and_then(|q| index::search(conn, vectors, &q, k));
+    let _ = reply.send(hits.unwrap_or_else(|e| {
+        eprintln!("match {query:?}: {e:#}");
+        Vec::new()
+    }));
 }
 
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
@@ -130,6 +160,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     };
     let status = &opts.status;
     let mut loaded: Option<Loaded> = None;
+    // Jobs that arrived while indexing and were not queries, run after it.
+    let mut deferred: VecDeque<Job> = VecDeque::new();
     let unload = |loaded: &mut Option<Loaded>, why: &str| {
         if loaded.take().is_some() {
             status.loaded.store(false, Ordering::Relaxed);
@@ -137,19 +169,23 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         }
     };
     loop {
-        let job = match (opts.idle, loaded.is_some()) {
-            (Some(after), true) => match jobs.recv_timeout(after) {
-                Ok(job) => job,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    unload(&mut loaded, &format!("idle for {}s", after.as_secs()));
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
-            _ => match jobs.recv() {
-                Ok(job) => job,
-                Err(_) => break,
-            },
+        let job = if let Some(job) = deferred.pop_front() {
+            job
+        } else {
+            match (opts.idle, loaded.is_some()) {
+                (Some(after), true) => match jobs.recv_timeout(after) {
+                    Ok(job) => job,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        unload(&mut loaded, &format!("idle for {}s", after.as_secs()));
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                _ => match jobs.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                },
+            }
         };
         // Jobs that need no model.
         let job = match job {
@@ -220,32 +256,50 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }
             }
         }
-        let l = loaded.as_mut().unwrap();
+        let Loaded { emb, vectors } = loaded.as_mut().unwrap();
+        // Indexing runs at idle priority and stops between files for queries,
+        // which are answered at normal priority from the vectors as they were
+        // (a reload per file would cost more than the query). Anything else
+        // waits for the job to finish.
+        // Compile the document stage first: OpenVINO's threads created by the
+        // compile inherit the caller's priority, and at idle they would stay
+        // there.
+        if indexes && let Err(e) = emb.prepare_documents() {
+            eprintln!("compiling the document model: {e:#}");
+        }
+        let idle = indexes.then(sched::Idle::enter);
+        let mut after = |st: &index::Stats, conn: &rusqlite::Connection, emb: &mut Embedder| {
+            status
+                .indexed_files
+                .store(st.files_embedded as u64, Ordering::Relaxed);
+            while let Ok(job) = jobs.try_recv() {
+                match job {
+                    Job::Match { query, k, reply } => {
+                        let serve = || answer(conn, emb, vectors, &query, k, reply);
+                        match &idle {
+                            Some(idle) => idle.normal(serve),
+                            None => serve(),
+                        }
+                    }
+                    other => deferred.push_back(other),
+                }
+            }
+        };
         match job {
             Job::Match { query, k, reply } => {
-                let hits = (|| -> Result<Vec<Hit>> {
-                    l.vectors.refresh(&conn)?;
-                    let q = l.emb.query(&query)?;
-                    index::search(&conn, &l.vectors, &q, k)
-                })();
-                let _ = reply.send(hits.unwrap_or_else(|e| {
-                    eprintln!("match {query:?}: {e:#}");
-                    Vec::new()
-                }));
+                if let Err(e) = vectors.refresh(&conn) {
+                    eprintln!("reloading vectors: {e:#}");
+                }
+                answer(&conn, emb, vectors, &query, k, reply);
             }
             Job::Changed(paths) => {
-                if let Err(e) = changed(&mut conn, &mut l.emb, paths, &excludes, status) {
+                if let Err(e) = changed(&mut conn, emb, paths, &excludes, &mut after) {
                     eprintln!("updating index: {e:#}");
                 }
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Reindex(root) => {
-                let mut progress = |s: &index::Stats| {
-                    status
-                        .indexed_files
-                        .store(s.files_embedded as u64, Ordering::Relaxed);
-                };
-                match index::index(&mut conn, &mut l.emb, &root, &excludes, &mut progress) {
+                match index::index(&mut conn, emb, &root, &excludes, &mut after) {
                     Ok(s) => eprintln!(
                         "{}: {} files seen, {} embedded ({} chunks), {} removed",
                         root.display(),

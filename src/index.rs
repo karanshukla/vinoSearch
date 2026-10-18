@@ -233,7 +233,14 @@ pub enum Outcome {
 }
 
 /// Index one file if it is wanted and changed since it was last indexed.
-pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Result<Outcome> {
+/// `between` runs after each chunk is embedded, so a 1 MiB file (~1,100
+/// chunks, ~40 s) does not hold a waiting query for its whole length.
+pub fn index_file(
+    conn: &mut Connection,
+    emb: &mut Embedder,
+    path: &Path,
+    between: &mut dyn FnMut(&Connection, &mut Embedder),
+) -> Result<Outcome> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES && wanted(path) => m,
         _ => {
@@ -269,7 +276,11 @@ pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Res
         .iter()
         .map(|(_, c)| document_text(&title, c))
         .collect();
-    let vectors = emb.documents(&inputs)?;
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        vectors.extend(emb.documents(std::slice::from_ref(input))?);
+        between(conn, emb);
+    }
 
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
@@ -353,15 +364,19 @@ pub fn compact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Called after each file `index` looks at, with the connection and model
+/// lent back: for progress, and for the runner to answer queries mid-index.
+pub type AfterFile<'a> = dyn FnMut(&Stats, &Connection, &mut Embedder) + 'a;
+
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
-/// that are gone are removed. `progress` is called after each file embedded.
+/// that are gone are removed.
 pub fn index(
     conn: &mut Connection,
     emb: &mut Embedder,
     root: &Path,
     ex: &Excludes,
-    progress: &mut dyn FnMut(&Stats),
+    after: &mut AfterFile,
 ) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
     if ex.contains(&root) {
@@ -389,21 +404,20 @@ pub fn index(
         if let Some(p) = entry.path().to_str() {
             seen.insert(p.to_owned());
         }
-        match index_file(conn, emb, entry.path())? {
+        match index_file(conn, emb, entry.path(), &mut |c, e| after(&stats, c, e))? {
             Outcome::Embedded(n) => {
                 stats.files_embedded += 1;
                 stats.chunks += n;
-                progress(&stats);
+                stats.files_seen += 1;
             }
-            Outcome::Unchanged => {}
+            Outcome::Unchanged => stats.files_seen += 1,
             Outcome::Skipped => {
                 if let Some(p) = entry.path().to_str() {
                     seen.remove(p);
                 }
-                continue;
             }
         }
-        stats.files_seen += 1;
+        after(&stats, conn, emb);
     }
 
     let gone: Vec<String> = {
