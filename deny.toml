@@ -3,6 +3,13 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [advisories]
 yanked = "deny"
+# zbus 5.x still depends on the standalone crates; no upgrade path until zbus 6
+# is adopted by our dependency chain.
+ignore = [
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "Unicode-3.0", "ISC", "BSD-3-Clause", "CDLA-Permissive-2.0", "Zlib", "BSL-1.0", "CC0-1.0"]
