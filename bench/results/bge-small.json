@@ -1,0 +1,23 @@
+{
+  "model": "bge-small",
+  "repo": "BAAI/bge-small-en-v1.5",
+  "devices": {
+    "NPU": {
+      "compile_s": 3.28,
+      "query_ms_p50": 1.9,
+      "query_ms_p95": 1.93,
+      "docs_per_s": 157.5,
+      "battery_w": 9.7,
+      "corpus_s": 31.6,
+      "ndcg10": 0.6835,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.62,
+      "query_ms_p50": 8.27,
+      "query_ms_p95": 8.45,
+      "docs_per_s": 18.7,
+      "battery_w": 20.6
+    }
+  }
+}

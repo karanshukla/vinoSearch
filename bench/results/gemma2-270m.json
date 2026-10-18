@@ -1,0 +1,23 @@
+{
+  "model": "gemma2-270m",
+  "repo": "onnx-community/embeddinggemma-2-ONNX",
+  "devices": {
+    "NPU": {
+      "compile_s": 10.34,
+      "query_ms_p50": 10.06,
+      "query_ms_p95": 13.79,
+      "docs_per_s": 27.1,
+      "battery_w": 10.6,
+      "corpus_s": 190.6,
+      "ndcg10": 0.5823,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 2.86,
+      "query_ms_p50": 38.55,
+      "query_ms_p95": 53.81,
+      "docs_per_s": 2.7,
+      "battery_w": 20.9
+    }
+  }
+}

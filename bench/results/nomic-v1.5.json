@@ -1,0 +1,23 @@
+{
+  "model": "nomic-v1.5",
+  "repo": "nomic-ai/nomic-embed-text-v1.5",
+  "devices": {
+    "NPU": {
+      "compile_s": 0.15,
+      "query_ms_p50": 5.84,
+      "query_ms_p95": 8.72,
+      "docs_per_s": 54.7,
+      "battery_w": 8.7,
+      "corpus_s": 93.9,
+      "ndcg10": 0.6796,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.81,
+      "query_ms_p50": 27.02,
+      "query_ms_p95": 29.59,
+      "docs_per_s": 4.8,
+      "battery_w": 27.4
+    }
+  }
+}

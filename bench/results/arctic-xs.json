@@ -1,0 +1,23 @@
+{
+  "model": "arctic-xs",
+  "repo": "Snowflake/snowflake-arctic-embed-xs",
+  "devices": {
+    "NPU": {
+      "compile_s": 1.71,
+      "query_ms_p50": 1.12,
+      "query_ms_p95": 1.23,
+      "docs_per_s": 283.9,
+      "battery_w": 6.0,
+      "corpus_s": 16.2,
+      "ndcg10": 0.6118,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.31,
+      "query_ms_p50": 4.56,
+      "query_ms_p95": 4.71,
+      "docs_per_s": 37.1,
+      "battery_w": 11.8
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "model": "minilm-l6",
+  "repo": "sentence-transformers/all-MiniLM-L6-v2",
+  "devices": {
+    "NPU": {
+      "compile_s": 1.7,
+      "query_ms_p50": 1.08,
+      "query_ms_p95": 1.11,
+      "docs_per_s": 274.5,
+      "battery_w": 4.9,
+      "corpus_s": 16.6,
+      "ndcg10": 0.6402,
+      "cos_vs_cpu_min": 1.0
+    },
+    "CPU": {
+      "compile_s": 0.38,
+      "query_ms_p50": 4.63,
+      "query_ms_p95": 5.05,
+      "docs_per_s": 36.7,
+      "battery_w": 18.9
+    }
+  }
+}
