@@ -130,7 +130,7 @@ fn relevant(root: &Path, path: &Path, ex: &Excludes) -> bool {
     if ex.contains(path) || index::skipped_under(root, path) {
         return false;
     }
-    if path.is_dir() {
+    if index::is_real_dir(path) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy())
@@ -183,7 +183,7 @@ pub fn spawn(
                         if !relevant(&root, &path, &st.excludes) {
                             continue;
                         }
-                        if path.is_dir()
+                        if index::is_real_dir(&path)
                             && matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
                         {
                             st.watch_tree(&path);

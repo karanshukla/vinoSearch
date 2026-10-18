@@ -210,11 +210,19 @@ pub fn skipped_under(root: &Path, path: &Path) -> bool {
     })
 }
 
+/// A directory, and not a symlink to one. Following a link would index its
+/// target under the link's path, where exclusions (canonical paths) miss it.
+pub fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 /// Everything under `root` that indexing looks at, skipping hidden and build
 /// directories and anything excluded.
 pub fn walk<'a>(root: &Path, ex: &'a Excludes) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
+    // follow_links(false) alone still follows `root` itself when it is a link.
     WalkDir::new(root)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(move |e| {
             !ex.contains(e.path())
@@ -832,6 +840,29 @@ mod tests {
             assert!(!wanted(Path::new(f)), "{f}");
         }
         assert!(wanted(Path::new("notes.md")));
+    }
+
+    #[test]
+    fn walk_does_not_follow_symlinks() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("root/real")).unwrap();
+        fs::create_dir_all(dir.join("secret")).unwrap();
+        fs::write(dir.join("root/real/a.md"), "a").unwrap();
+        fs::write(dir.join("secret/tax.md"), "s").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("root/link")).unwrap();
+        let files = |p: &Path| -> Vec<PathBuf> {
+            walk(p, &Excludes::default())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.into_path())
+                .collect()
+        };
+        assert_eq!(files(&dir.join("root")), [dir.join("root/real/a.md")]);
+        // The watcher walks a created path directly, so the link is the root.
+        assert!(files(&dir.join("root/link")).is_empty());
+        assert!(!is_real_dir(&dir.join("root/link")));
+        assert!(is_real_dir(&dir.join("root/real")));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

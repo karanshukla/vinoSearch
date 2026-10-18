@@ -111,7 +111,7 @@ fn changed(
         if ex.contains(&path) {
             continue;
         }
-        if path.is_dir() {
+        if index::is_real_dir(&path) {
             // A new or renamed-in directory: index what is under it.
             files.extend(
                 index::walk(&path, ex)
