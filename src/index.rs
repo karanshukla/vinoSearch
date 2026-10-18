@@ -25,14 +25,40 @@ const EXTENSIONS: &[&str] = &[
 ];
 // No config formats (toml, yaml, json, ini, conf, ...): they are where
 // credentials live, and the index is not encrypted yet (#4).
+/// Directories that are always build output, caches, generated reports or
+/// vendored dependencies. Generic names a person might use for their own
+/// files (`bin`, `out`, `lib`) are left out.
 const SKIP_DIRS: &[&str] = &[
+    // JavaScript
     "node_modules",
-    "target",
+    "bower_components",
     "dist",
+    // Rust, Java, Gradle, CMake, Elixir, Sphinx
+    "target",
     "build",
+    "_build",
+    // .NET intermediate output (generated .cs files)
+    "obj",
+    // Python
     "__pycache__",
     "venv",
+    "site-packages",
+    // Go, PHP, Ruby
+    "vendor",
+    // Apple
+    "Pods",
+    "DerivedData",
+    // Elm
+    "elm-stuff",
+    // Test coverage reports
+    "coverage",
+    "htmlcov",
 ];
+/// Directory name prefixes with the same meaning (`cmake-build-debug`, ...).
+const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
+/// Minified or bundled files: generated, one enormous line, never what a
+/// search is for.
+const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
 pub fn default_db() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
@@ -84,13 +110,21 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 pub(crate) fn wanted(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    !SKIP_FILE_SUFFIXES.iter().any(|s| name.ends_with(s))
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 pub(crate) fn skipped_dir(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
+    name.starts_with('.')
+        || SKIP_DIRS.contains(&name)
+        || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Line-aligned chunks of up to CHUNK_CHARS, with the line each starts on.
@@ -620,6 +654,27 @@ mod tests {
         let v: Vec<f32> = (0..DIM).map(|i| i as f32 / 7.0).collect();
         assert_eq!(from_blob(&to_blob(&v)).unwrap(), v);
         assert!(from_blob(&[0u8; 12]).is_none());
+    }
+
+    #[test]
+    fn generated_trees_and_files_are_skipped() {
+        for d in [
+            "coverage",
+            "obj",
+            "vendor",
+            "cmake-build-release",
+            ".git",
+            "node_modules",
+        ] {
+            assert!(skipped_dir(d), "{d}");
+        }
+        for d in ["src", "bin", "out", "docs", "covered"] {
+            assert!(!skipped_dir(d), "{d}");
+        }
+        assert!(!wanted(Path::new("app.min.js")));
+        assert!(!wanted(Path::new("vendor.bundle.js")));
+        assert!(wanted(Path::new("app.js")));
+        assert!(wanted(Path::new("README.md")));
     }
 
     #[test]
