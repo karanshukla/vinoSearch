@@ -1,19 +1,28 @@
-//! KRunner D-Bus runner (org.kde.krunner1). Queries go to the worker
-//! thread, which owns the model; the watcher keeps the index current.
+//! The runner on the session bus: KRunner's org.kde.krunner1 at /runner, and
+//! dev.vinosearch.Control1 at /control for the settings app. Queries go to the
+//! worker thread, which owns the model; the watcher keeps the index current.
+//!
+//! Handlers never block the bus: Match awaits the worker's reply, and Control
+//! reads shared status and its own database connection, so a status query
+//! answers while the worker is busy indexing.
 
-use crate::index::Hit;
+use crate::config::Config;
+use crate::index::{self, Hit};
 use crate::watch;
-use crate::worker::{self, Job, Options};
+use crate::worker::{self, Job, Options, Status};
 use anyhow::{Context, Result};
+use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, mpsc};
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 
 const SERVICE: &str = "dev.vinosearch.Runner";
 const OBJECT: &str = "/runner";
+const CONTROL: &str = "/control";
 const RESULTS: usize = 5;
 /// Cosine below this is noise for this model: an off-topic query against a
 /// code index topped out at 0.60, real matches scored 0.72 to 0.83.
@@ -86,8 +95,8 @@ impl Runner {
     }
 
     #[zbus(name = "Match")]
-    fn find(&self, query: String) -> Vec<Match> {
-        let (tx, rx) = mpsc::channel();
+    async fn find(&self, query: String) -> Vec<Match> {
+        let (tx, rx) = oneshot::channel();
         let job = Job::Match {
             query,
             k: RESULTS * 8,
@@ -96,7 +105,7 @@ impl Runner {
         if self.jobs.lock().unwrap().send(job).is_err() {
             return Vec::new();
         }
-        per_file(rx.recv().unwrap_or_default())
+        per_file(rx.await.unwrap_or_default())
             .into_iter()
             .map(to_match)
             .collect()
@@ -115,6 +124,88 @@ impl Runner {
     fn teardown(&self) {}
 }
 
+struct Control {
+    jobs: Mutex<mpsc::Sender<Job>>,
+    status: Arc<Status>,
+    db: Mutex<rusqlite::Connection>,
+    config: PathBuf,
+    device: String,
+}
+
+fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed(e.to_string())
+}
+
+impl Control {
+    fn send(&self, job: Job) -> zbus::fdo::Result<()> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .send(job)
+            .map_err(|_| failed("the worker has stopped"))
+    }
+
+    /// An existing directory, canonical, not excluded.
+    fn root(&self, path: &str) -> zbus::fdo::Result<PathBuf> {
+        let p = fs::canonicalize(path).map_err(|e| failed(format!("{path}: {e}")))?;
+        if !p.is_dir() {
+            return Err(failed(format!("{path} is not a directory")));
+        }
+        let ex = Config::load(&self.config)
+            .and_then(|c| c.excludes())
+            .map_err(|e| failed(format!("{e:#}")))?;
+        if ex.contains(&p) {
+            return Err(failed(format!("{} is excluded", p.display())));
+        }
+        Ok(p)
+    }
+}
+
+#[interface(name = "dev.vinosearch.Control1")]
+impl Control {
+    /// model_loaded (b), indexing (b), device (s), files (x), chunks (x), roots (as).
+    fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+        let db = self.db.lock().unwrap();
+        let (files, chunks) = index::counts(&db).map_err(failed)?;
+        let roots: Vec<String> = index::roots(&db)
+            .map_err(failed)?
+            .into_iter()
+            .map(|r| r.display().to_string())
+            .collect();
+        let mut out = HashMap::new();
+        out.insert(
+            "model_loaded".into(),
+            owned(Value::from(self.status.loaded.load(Ordering::Relaxed))),
+        );
+        out.insert(
+            "indexing".into(),
+            owned(Value::from(self.status.indexing.load(Ordering::Relaxed))),
+        );
+        out.insert("device".into(), owned(Value::from(self.device.clone())));
+        out.insert("files".into(), owned(Value::from(files)));
+        out.insert("chunks".into(), owned(Value::from(chunks)));
+        out.insert("roots".into(), owned(Value::from(roots)));
+        Ok(out)
+    }
+
+    /// Index a directory and watch it from now on. Returns once queued.
+    fn reindex(&self, path: String) -> zbus::fdo::Result<()> {
+        let root = self.root(&path)?;
+        self.send(Job::Reindex(root))
+    }
+
+    /// Stop indexing a root and drop what was indexed under it.
+    fn forget(&self, path: String) -> zbus::fdo::Result<()> {
+        let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        self.send(Job::Forget(root))
+    }
+
+    /// Free the model now.
+    fn unload(&self) -> zbus::fdo::Result<()> {
+        self.send(Job::Unload)
+    }
+}
+
 /// Best chunk per file, files above MIN_SCORE, best RESULTS of them.
 fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
     let mut seen = HashSet::new();
@@ -126,7 +217,14 @@ fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let _watcher = watch::spawn(tx.clone())?;
+    let _watcher = watch::spawn(tx.clone(), opts.config.clone(), opts.excludes.clone())?;
+    let control = Control {
+        jobs: Mutex::new(tx.clone()),
+        status: opts.status.clone(),
+        db: Mutex::new(index::open(&index::default_db()?)?),
+        config: opts.config.clone(),
+        device: opts.device.clone(),
+    };
     let worker = std::thread::spawn(move || worker::run(rx, opts));
     let _conn = zbus::blocking::connection::Builder::session()?
         .name(SERVICE)?
@@ -136,6 +234,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 jobs: Mutex::new(tx),
             },
         )?
+        .serve_at(CONTROL, control)?
         .build()
         .context("registering on the session bus")?;
     eprintln!("{SERVICE} on {OBJECT}");
@@ -152,13 +251,22 @@ fn data_home() -> Result<PathBuf> {
     })
 }
 
-/// Register the runner with KRunner and let D-Bus start it on demand.
-pub fn install(openvino_dir: Option<&Path>, device: &str, idle_unload_minutes: f64) -> Result<()> {
+/// Register the runner with KRunner and let D-Bus start it on demand. Only
+/// flags given here are baked into the service; the rest come from the config
+/// file each time the runner starts.
+pub fn install(
+    openvino_dir: Option<&Path>,
+    device: Option<&str>,
+    idle_unload_minutes: Option<f64>,
+) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let mut exec = format!(
-        "{} --device {device} --idle-unload-minutes {idle_unload_minutes}",
-        exe.display()
-    );
+    let mut exec = exe.display().to_string();
+    if let Some(d) = device {
+        exec.push_str(&format!(" --device {d}"));
+    }
+    if let Some(m) = idle_unload_minutes {
+        exec.push_str(&format!(" --idle-unload-minutes {m}"));
+    }
     if let Some(d) = openvino_dir {
         exec.push_str(&format!(" --openvino-dir {}", d.display()));
     }

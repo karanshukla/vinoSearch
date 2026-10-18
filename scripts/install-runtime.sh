@@ -2,24 +2,20 @@
 # Install the OpenVINO runtime vinoSearch loads, through ovfetch, into a
 # per-user prefix. No root: the daemon runs as the user.
 #
-#   scripts/install-runtime.sh             # compile against the newest OpenVINO a recipe offers
-#   scripts/install-runtime.sh --prebuilt  # Intel's prebuilt wheel only (older OpenVINO, no compile)
+#   scripts/install-runtime.sh
 #
-# The default compiles (about 17 minutes) because Intel's prebuilt builds lag
-# OpenVINO, and two programs on one NPU should run the same release: an NPU
-# fault resets the device for every process using it. ovfetch only compiles
-# when a recipe beats every prebuilt that fits, and skips the work when the
-# prefix already holds the resolved build.
+# vinoSearch calls OpenVINO directly, so it takes Intel's openvino wheel alone
+# (`ovfetch install --openvino-only`): the newest OpenVINO the NPU driver
+# supports, hash-checked, in seconds, with no ONNX Runtime and no compile.
+# ovfetch skips the work when the prefix already holds the resolved build.
 set -euo pipefail
 
 PREFIX="${VINOSEARCH_OPENVINO_DIR:-$HOME/.local/lib/vinosearch/openvino}"
-OVFETCH_MIN="0.4.1"
-ARGS=(--build)
+OVFETCH_MIN="0.5.0"
 
 for arg in "$@"; do
     case "$arg" in
-        --prebuilt) ARGS=() ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -43,8 +39,8 @@ if ! OVFETCH="$(find_ovfetch)"; then
     exit 1
 fi
 
-"$OVFETCH" resolve "${ARGS[@]}"
+"$OVFETCH" resolve --openvino-only
 mkdir -p "$(dirname "$PREFIX")"
-"$OVFETCH" install "${ARGS[@]}" --prefix "$PREFIX"
+"$OVFETCH" install --openvino-only --prefix "$PREFIX"
 "$OVFETCH" verify --prefix "$PREFIX"
-echo "installed into $PREFIX; check it with: cargo run -- doctor"
+echo "installed into $PREFIX; check it with: vinosearch doctor"

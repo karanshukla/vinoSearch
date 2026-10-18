@@ -1,3 +1,4 @@
+mod config;
 mod embed;
 mod index;
 mod krunner;
@@ -19,17 +20,15 @@ struct Cli {
     /// ovfetch prefix holding the OpenVINO runtime [default: ~/.local/lib/vinosearch/openvino]
     #[arg(long, global = true, env = "VINOSEARCH_OPENVINO_DIR")]
     openvino_dir: Option<PathBuf>,
-    /// Device the model runs on.
-    #[arg(long, global = true, default_value = "NPU")]
-    device: String,
-    /// Free the model after this many minutes without a query; 0 keeps it loaded.
-    #[arg(
-        long,
-        global = true,
-        env = "VINOSEARCH_IDLE_UNLOAD_MINUTES",
-        default_value_t = 5.0
-    )]
-    idle_unload_minutes: f64,
+    /// Settings file [default: ~/.config/vinosearch/config.toml]
+    #[arg(long, global = true, env = "VINOSEARCH_CONFIG")]
+    config: Option<PathBuf>,
+    /// Device the model runs on [default: config, else NPU]
+    #[arg(long, global = true)]
+    device: Option<String>,
+    /// Free the model after this many minutes without a query; 0 keeps it loaded [default: config, else 5]
+    #[arg(long, global = true, env = "VINOSEARCH_IDLE_UNLOAD_MINUTES")]
+    idle_unload_minutes: Option<f64>,
     #[command(subcommand)]
     command: Command,
 }
@@ -83,17 +82,49 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     Ok(emb)
 }
 
-fn worker_options(cli: &Cli, preload: bool) -> Result<worker::Options> {
-    let m = cli.idle_unload_minutes;
-    if !(m >= 0.0 && m.is_finite()) {
-        bail!("--idle-unload-minutes must be 0 or more");
+/// Flags over the config file over defaults.
+struct Settings {
+    path: PathBuf,
+    device: String,
+    idle_unload_minutes: f64,
+    excludes: config::Excludes,
+}
+
+fn settings(cli: &Cli) -> Result<Settings> {
+    let path = match &cli.config {
+        Some(p) => p.clone(),
+        None => config::default_path()?,
+    };
+    let file = config::Config::load(&path)?;
+    let idle_unload_minutes = cli
+        .idle_unload_minutes
+        .or(file.idle_unload_minutes)
+        .unwrap_or(5.0);
+    if !(idle_unload_minutes >= 0.0 && idle_unload_minutes.is_finite()) {
+        bail!("idle_unload_minutes must be 0 or more");
     }
-    Ok(worker::Options {
-        openvino_dir: cli.openvino_dir.clone(),
-        device: cli.device.clone(),
-        idle: (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0)),
-        preload,
+    Ok(Settings {
+        device: cli
+            .device
+            .clone()
+            .or(file.device.clone())
+            .unwrap_or_else(|| "NPU".into()),
+        idle_unload_minutes,
+        excludes: file.excludes()?,
+        path,
     })
+}
+
+fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
+    let m = s.idle_unload_minutes;
+    worker::Options {
+        openvino_dir: cli.openvino_dir.clone(),
+        device: s.device,
+        idle: (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0)),
+        excludes: s.excludes,
+        config: s.path,
+        status: Default::default(),
+    }
 }
 
 pub(crate) fn snippet(text: &str) -> String {
@@ -105,10 +136,11 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 fn run(cli: Cli) -> Result<bool> {
+    let s = settings(&cli)?;
     match cli.command {
         Command::Doctor => {
             let prefix = runtime::default_prefix(cli.openvino_dir)?;
-            runtime::doctor(&prefix, &cli.device)
+            runtime::doctor(&prefix, &s.device)
         }
         Command::FetchModel => {
             model::fetch(&model::default_dir()?)?;
@@ -118,17 +150,17 @@ fn run(cli: Cli) -> Result<bool> {
             if paths.is_empty() {
                 bail!("give at least one path to index");
             }
-            let mut emb = embedder(cli.openvino_dir, &cli.device)?;
+            let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
             let mut conn = index::open(&index::default_db()?)?;
             for p in &paths {
-                let s = index::index(&mut conn, &mut emb, Path::new(p))?;
+                let st = index::index(&mut conn, &mut emb, Path::new(p), &s.excludes)?;
                 println!(
                     "{}: {} files seen, {} embedded ({} chunks), {} removed",
                     p.display(),
-                    s.files_seen,
-                    s.files_embedded,
-                    s.chunks,
-                    s.removed
+                    st.files_seen,
+                    st.files_embedded,
+                    st.chunks,
+                    st.removed
                 );
             }
             Ok(true)
@@ -137,25 +169,27 @@ fn run(cli: Cli) -> Result<bool> {
             if install {
                 krunner::install(
                     cli.openvino_dir.as_deref(),
-                    &cli.device,
+                    cli.device.as_deref(),
                     cli.idle_unload_minutes,
                 )?;
             } else if uninstall {
                 krunner::uninstall()?;
             } else {
-                krunner::serve(worker_options(&cli, true)?)?;
+                krunner::serve(worker_options(&cli, s))?;
             }
             Ok(true)
         }
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let _watcher = watch::spawn(tx)?;
-            worker::run(rx, worker_options(&cli, false)?)?;
+            let opts = worker_options(&cli, s);
+            let _watcher = watch::spawn(tx, opts.config.clone(), opts.excludes.clone())?;
+            worker::run(rx, opts)?;
             Ok(true)
         }
         Command::Search { query, n } => {
-            let mut emb = embedder(cli.openvino_dir, &cli.device)?;
+            let mut emb = embedder(cli.openvino_dir, &s.device)?;
             let conn = index::open(&index::default_db()?)?;
+            index::purge(&conn, &s.excludes)?;
             let t0 = Instant::now();
             let q = emb.query(&query)?;
             let t1 = Instant::now();

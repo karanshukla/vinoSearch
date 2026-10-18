@@ -4,8 +4,9 @@
 //! text, so this needs encrypting at rest (TPM-sealed key) before it holds
 //! anything a user would not leave readable.
 
+use crate::config::Excludes;
 use crate::embed::{DIM, Embedder, document_text};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fs;
@@ -128,6 +129,7 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+#[cfg(test)]
 fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     (b.len() == DIM * 4).then(|| {
         b.as_chunks::<4>()
@@ -156,14 +158,16 @@ pub fn skipped_under(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// Everything under `root` that indexing looks at, skipping hidden and build directories.
-pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+/// Everything under `root` that indexing looks at, skipping hidden and build
+/// directories and anything excluded.
+pub fn walk<'a>(root: &Path, ex: &'a Excludes) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy()))
+        .filter_entry(move |e| {
+            !ex.contains(e.path())
+                && (e.depth() == 0
+                    || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy())))
         })
         .filter_map(|e| e.map_err(|e| eprintln!("skip: {e}")).ok())
 }
@@ -250,11 +254,32 @@ pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Res
     Ok(Outcome::Embedded(chunks.len()))
 }
 
+/// Drop everything indexed under an excluded path. Returns files removed.
+pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
+    let mut n = 0;
+    for p in ex.paths() {
+        n += remove(conn, p)?;
+    }
+    Ok(n)
+}
+
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
 /// that are gone are removed.
-pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<Stats> {
+pub fn index(
+    conn: &mut Connection,
+    emb: &mut Embedder,
+    root: &Path,
+    ex: &Excludes,
+) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    if ex.contains(&root) {
+        bail!(
+            "{} is excluded; remove it from `exclude` in the config to index it",
+            root.display()
+        );
+    }
+    purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
         [root.to_string_lossy()],
@@ -267,7 +292,7 @@ pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<S
     };
     let mut seen = HashSet::new();
     let t0 = Instant::now();
-    for entry in walk(&root) {
+    for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path()) {
             continue;
         }
@@ -316,6 +341,24 @@ pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<S
     Ok(stats)
 }
 
+/// Stop treating `root` as a root and drop everything indexed under it.
+/// Returns files removed.
+pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM roots WHERE path = ?1",
+        [root.to_string_lossy()],
+    )?;
+    remove(conn, root)
+}
+
+/// Files and chunks in the index.
+pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
+    Ok((
+        conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?,
+        conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?,
+    ))
+}
+
 /// Roots `index` has been run on, which the watcher follows.
 pub fn roots(conn: &Connection) -> Result<Vec<PathBuf>> {
     let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;
@@ -330,40 +373,73 @@ pub struct Hit {
     pub text: String,
 }
 
-/// Every chunk's embedding, flattened, for searching without re-reading SQLite.
+/// Every chunk's embedding, held as int8 with a per-vector scale: a quarter
+/// of the memory, and a quarter of the bytes each query reads, which is what
+/// bounds brute-force search. On a 113k-chunk index the top result scored at
+/// most 0.001 below f32's (mean 0.00001), and 97% of the top 40 matched.
 pub struct Vectors {
     ids: Vec<i64>,
-    data: Vec<f32>,
-    /// (max chunk id, chunk count) when loaded, to notice the index changing.
-    stamp: (i64, i64),
+    data: Vec<i8>,
+    scales: Vec<f32>,
+    /// Database state when loaded, to notice the index changing.
+    stamp: (i64, u64),
 }
 
-fn stamp(conn: &Connection) -> Result<(i64, i64)> {
-    Ok(conn.query_row(
-        "SELECT COALESCE(MAX(id), 0), COUNT(*) FROM chunks",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
+/// Changes when anything is written: `data_version` for other connections'
+/// commits, `total_changes` for this one's. Both are O(1); counting chunks
+/// scanned the whole table on every query.
+fn stamp(conn: &Connection) -> Result<(i64, u64)> {
+    let version = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    Ok((version, conn.total_changes()))
 }
 
 impl Vectors {
-    pub fn load(conn: &Connection) -> Result<Self> {
-        let stamp = stamp(conn)?;
-        let mut stmt = conn.prepare("SELECT id, embedding FROM chunks")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
-        let (mut ids, mut data) = (Vec::new(), Vec::new());
-        for row in rows {
-            let (id, blob) = row?;
-            let Some(v) = from_blob(&blob) else { continue };
-            ids.push(id);
-            data.extend(v);
+    fn empty() -> Self {
+        Self {
+            ids: Vec::new(),
+            data: Vec::new(),
+            scales: Vec::new(),
+            stamp: (0, 0),
         }
-        Ok(Self { ids, data, stamp })
     }
 
-    /// Reload if chunks were added or removed since loading.
+    pub fn load(conn: &Connection) -> Result<Self> {
+        let stamp = stamp(conn)?;
+        let n: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+        let n = n as usize;
+        let mut out = Self {
+            ids: Vec::with_capacity(n),
+            data: Vec::with_capacity(n * DIM),
+            scales: Vec::with_capacity(n),
+            stamp,
+        };
+        let mut v = [0f32; DIM];
+        let mut stmt = conn.prepare("SELECT id, embedding FROM chunks")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            // Borrowed, so no copy of each blob is made on the way in.
+            let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? else {
+                continue;
+            };
+            if blob.len() != DIM * 4 {
+                continue;
+            }
+            for (x, c) in v.iter_mut().zip(blob.as_chunks::<4>().0) {
+                *x = f32::from_le_bytes(*c);
+            }
+            let (q, scale) = quantize(&v);
+            out.ids.push(row.get(0)?);
+            out.data.extend_from_slice(&q);
+            out.scales.push(scale);
+        }
+        Ok(out)
+    }
+
+    /// Reload if the index changed since loading. The old copy is dropped
+    /// first, so a reload never holds two.
     pub fn refresh(&mut self, conn: &Connection) -> Result<()> {
         if stamp(conn)? != self.stamp {
+            *self = Self::empty();
             *self = Self::load(conn)?;
         }
         Ok(())
@@ -374,17 +450,53 @@ impl Vectors {
     }
 }
 
+/// Symmetric int8: `v ≈ q * scale`, with the largest component at ±127.
+fn quantize(v: &[f32; DIM]) -> ([i8; DIM], f32) {
+    let max = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+    if max == 0.0 {
+        return ([0; DIM], 0.0);
+    }
+    let scale = max / 127.0;
+    (std::array::from_fn(|i| (v[i] / scale).round() as i8), scale)
+}
+
+/// Lanes summed independently, so the compiler can use SIMD.
+const LANES: usize = 16;
+
+fn dot(a: &[i8; DIM], b: &[i8; DIM]) -> i32 {
+    let mut acc = [0i32; LANES];
+    for (x, y) in a
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<LANES>().0)
+    {
+        for i in 0..LANES {
+            acc[i] += i32::from(x[i]) * i32::from(y[i]);
+        }
+    }
+    acc.iter().sum()
+}
+
 /// Cosine against every chunk (embeddings are unit length), best `k`.
 pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+    let query: &[f32; DIM] = query.try_into().context("query is not DIM long")?;
+    let (q, qs) = quantize(query);
     let mut scored: Vec<(f32, i64)> = vectors
         .data
         .as_chunks::<DIM>()
         .0
         .iter()
+        .zip(&vectors.scales)
         .zip(&vectors.ids)
-        .map(|(v, id)| (v.iter().zip(query).map(|(a, b)| a * b).sum(), *id))
+        .map(|((v, s), id)| (dot(v, &q) as f32 * s * qs, *id))
         .collect();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let by_score = |a: &(f32, i64), b: &(f32, i64)| b.0.total_cmp(&a.0);
+    if scored.len() > k && k > 0 {
+        scored.select_nth_unstable_by(k - 1, by_score);
+        scored.truncate(k);
+    }
+    scored.sort_by(by_score);
     scored.truncate(k);
     let mut stmt = conn.prepare(
         "SELECT f.path, c.start_line, c.text FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
@@ -508,5 +620,49 @@ mod tests {
         let v: Vec<f32> = (0..DIM).map(|i| i as f32 / 7.0).collect();
         assert_eq!(from_blob(&to_blob(&v)).unwrap(), v);
         assert!(from_blob(&[0u8; 12]).is_none());
+    }
+
+    #[test]
+    fn int8_scores_track_f32() {
+        let a: [f32; DIM] = std::array::from_fn(|i| ((i * 7) % 13) as f32 / 13.0 - 0.5);
+        let b: [f32; DIM] = std::array::from_fn(|i| ((i * 5) % 11) as f32 / 11.0 - 0.5);
+        let exact: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        let ((qa, sa), (qb, sb)) = (quantize(&a), quantize(&b));
+        let approx = dot(&qa, &qb) as f32 * sa * sb;
+        assert!(
+            (approx - exact).abs() < 0.01 * exact.abs().max(1.0),
+            "{approx} vs {exact}"
+        );
+        assert_eq!(quantize(&[0.0; DIM]), ([0; DIM], 0.0));
+    }
+
+    #[test]
+    fn search_returns_the_best_k_in_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, mtime INTEGER, size INTEGER);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY, file_id INTEGER, start_line INTEGER, text TEXT, embedding BLOB);
+             INSERT INTO files VALUES (1, '/f', 0, 0);",
+        )
+        .unwrap();
+        // Chunk i points along axis 0 with weight i/10, so higher i scores higher.
+        for i in 0..10 {
+            let mut v = vec![0f32; DIM];
+            v[0] = i as f32 / 10.0;
+            conn.execute(
+                "INSERT INTO chunks VALUES (?1, 1, ?1, '', ?2)",
+                params![i + 1, to_blob(&v)],
+            )
+            .unwrap();
+        }
+        let vectors = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let lines: Vec<i64> = search(&conn, &vectors, &q, 3)
+            .unwrap()
+            .iter()
+            .map(|h| h.line)
+            .collect();
+        assert_eq!(lines, [10, 9, 8]);
     }
 }

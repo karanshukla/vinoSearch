@@ -16,7 +16,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # directory that may be replaced and nothing needs an rpath.
 openvino = { version = "0.11", features = ["runtime-linking"] }
 openvino-sys = { version = "0.11", features = ["runtime-linking"] }
-ovfetch = { version = "0.4.1", default-features = false }
+ovfetch = { version = "0.5.0", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,3 +25,5 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ureq = "3"
 walkdir = "2.5"
 zbus = "5"
+toml = "1.1"
+futures-channel = "0.3"

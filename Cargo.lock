@@ -713,6 +713,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,9 +1217,9 @@ dependencies = [
 
 [[package]]
 name = "ovfetch"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d263ab3296f20da22de6717ba856ca8318039051592da3bd1258cfe034175b6"
+checksum = "a277f799dae5acbc333b863799eadbcb6a1ed393634d08b04ecbc62ada488854"
 dependencies = [
  "anyhow",
  "serde",
@@ -1972,6 +1981,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-channel",
  "hex",
  "notify",
  "openvino",
@@ -1982,6 +1992,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokenizers",
+ "toml",
  "ureq",
  "walkdir",
  "zbus",

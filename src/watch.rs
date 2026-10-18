@@ -5,6 +5,7 @@
 //! watch would add one for every directory under `target/` and
 //! `node_modules/`). Events are debounced and handed to the worker as paths.
 
+use crate::config::{Config, Excludes};
 use crate::index;
 use crate::worker::Job;
 use anyhow::Result;
@@ -18,7 +19,8 @@ use std::time::{Duration, Instant};
 /// Quiet period before a batch of changes is indexed: editors write a file in
 /// several steps, and builds touch many at once.
 const DEBOUNCE: Duration = Duration::from_secs(2);
-/// How often to look for roots added by `vinosearch index` while running.
+/// How often to look for roots added by `vinosearch index`, and re-read the
+/// config, while running.
 const ROOTS_EVERY: Duration = Duration::from_secs(30);
 
 struct State {
@@ -26,11 +28,13 @@ struct State {
     roots: Vec<PathBuf>,
     watched: usize,
     warned_limit: bool,
+    excludes: Excludes,
 }
 
 impl State {
     fn watch_tree(&mut self, dir: &Path) {
-        for entry in index::walk(dir).filter(|e| e.file_type().is_dir()) {
+        let ex = self.excludes.clone();
+        for entry in index::walk(dir, &ex).filter(|e| e.file_type().is_dir()) {
             match self
                 .watcher
                 .watch(entry.path(), RecursiveMode::NonRecursive)
@@ -47,12 +51,16 @@ impl State {
         }
     }
 
-    fn add_new_roots(&mut self, conn: &rusqlite::Connection) {
+    /// Follow roots added since the last look, and drop forgotten ones. A
+    /// forgotten root's inotify watches stay until restart, but its events no
+    /// longer match a root, so they are ignored.
+    fn sync_roots(&mut self, conn: &rusqlite::Connection) {
         let Ok(roots) = index::roots(conn) else {
             return;
         };
+        self.roots.retain(|r| roots.contains(r));
         for root in roots {
-            if !self.roots.contains(&root) && root.is_dir() {
+            if !self.roots.contains(&root) && root.is_dir() && !self.excludes.contains(&root) {
                 let before = self.watched;
                 self.watch_tree(&root);
                 eprintln!(
@@ -74,8 +82,8 @@ impl State {
 }
 
 /// Whether a change to `path` could alter the index.
-fn relevant(root: &Path, path: &Path) -> bool {
-    if index::skipped_under(root, path) {
+fn relevant(root: &Path, path: &Path, ex: &Excludes) -> bool {
+    if ex.contains(path) || index::skipped_under(root, path) {
         return false;
     }
     if path.is_dir() {
@@ -98,7 +106,12 @@ fn interesting(kind: &EventKind) -> bool {
     }
 }
 
-pub fn spawn(jobs: mpsc::Sender<Job>) -> Result<std::thread::JoinHandle<()>> {
+/// `config` is re-read every ROOTS_EVERY; changed exclusions go to the worker.
+pub fn spawn(
+    jobs: mpsc::Sender<Job>,
+    config: PathBuf,
+    excludes: Excludes,
+) -> Result<std::thread::JoinHandle<()>> {
     let conn = index::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
@@ -108,8 +121,9 @@ pub fn spawn(jobs: mpsc::Sender<Job>) -> Result<std::thread::JoinHandle<()>> {
             roots: Vec::new(),
             watched: 0,
             warned_limit: false,
+            excludes,
         };
-        st.add_new_roots(&conn);
+        st.sync_roots(&conn);
         let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut last_event = Instant::now();
         let mut last_roots = Instant::now();
@@ -120,7 +134,7 @@ pub fn spawn(jobs: mpsc::Sender<Job>) -> Result<std::thread::JoinHandle<()>> {
                         let Some(root) = st.root_of(&path).map(Path::to_path_buf) else {
                             continue;
                         };
-                        if !relevant(&root, &path) {
+                        if !relevant(&root, &path, &st.excludes) {
                             continue;
                         }
                         if path.is_dir()
@@ -144,7 +158,19 @@ pub fn spawn(jobs: mpsc::Sender<Job>) -> Result<std::thread::JoinHandle<()>> {
                 break;
             }
             if last_roots.elapsed() >= ROOTS_EVERY {
-                st.add_new_roots(&conn);
+                match Config::load(&config).and_then(|c| c.excludes()) {
+                    Ok(ex) if ex != st.excludes => {
+                        eprintln!("{}: exclusions changed", config.display());
+                        st.excludes = ex.clone();
+                        if jobs.send(Job::Excludes(ex)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    // Keep the last good exclusions rather than index what a typo un-excluded.
+                    Err(e) => eprintln!("reading config: {e:#}"),
+                }
+                st.sync_roots(&conn);
                 last_roots = Instant::now();
             }
         }

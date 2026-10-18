@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use tokenizers::{PostProcessor, Tokenizer, TruncationDirection};
 
 pub const DIM: usize = 768;
-const QUERY_LEN: usize = 64;
+/// Static on the NPU, so every query pays for the full length: 64 took ~20 ms
+/// a query, 32 takes ~12. 32 holds the task prefix plus ~22 tokens (about 15
+/// words), longer than a launcher query; the rest is truncated.
+const QUERY_LEN: usize = 32;
 const DOC_LEN: usize = 256;
 const IN_FLIGHT: usize = 4;
 /// `wait` is `wait_for`, which refuses a negative (unbounded) timeout.

@@ -7,6 +7,9 @@ Early days: a working proof of concept for text files, searched from the command
 ## Usage
 
 ```bash
+git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
+cargo install --path .                     # vinosearch into ~/.cargo/bin
+cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
 vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
@@ -16,25 +19,52 @@ vinosearch krunner --install               # register with KRunner; D-Bus starts
 systemctl --user restart plasma-krunner.service
 ```
 
-Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28 chunks/s on the NPU.
+Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28.6 chunks/s on the NPU (see [Performance](#performance)).
+
+Settings live in `~/.config/vinosearch/config.toml`; flags and environment variables override it:
+
+```toml
+exclude = ["~/Downloads"]   # never indexed or watched, even under an indexed root
+device = "NPU"
+idle_unload_minutes = 5
+```
+
+Adding an exclusion drops anything already indexed under it, and a running runner picks the change up within 30 seconds. `vinosearch index` refuses an excluded path.
 
 Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds.
 
-The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 1042 MB loaded, 40 MB unloaded, ~2 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
+The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 645 MB loaded with a 113k-chunk index, 40 MB unloaded, ~1.7 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
+
+The runner also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index).
 
 The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat it like the files it indexes; encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
 
+## Performance
+
+`~/Development` on a Dell XPS 13 (Core 5 320, Wildcat Lake NPU, driver 1.35.0, OpenVINO 2026.4.1), on battery, 2026-10-18. A deliberately messy tree: two copies of a kernel driver, the KWin source and generated coverage reports are 80% of it.
+
+| | |
+|---|---|
+| Index | 9,763 files, 113,341 chunks, 470 MB on disk |
+| Indexing | 66 min, 28.6 chunks/s, 3% of one core (137 s CPU), peak RSS 1.07 GB |
+| Indexing power | ~9.2 W system vs 4.5 W idle: ~5.2 Wh for the whole index, about 10% of the battery |
+| First model compile | 4.5 s with an empty cache; cached after |
+| Cold query (D-Bus activation, model, vectors, query) | 1.7 s |
+| Warm query through KRunner's D-Bus call | p50 26 ms, p95 46 ms (query embedding ~12 ms, search ~11 ms) |
+| Runner memory, model loaded | 645 MB |
+
+Warm queries started at p50 85 ms on this index. Fixed, in order of what they saved: an O(n) `COUNT(*)` on every query, a dot product that did not vectorize, a full sort for the top 40, f32 vectors (now int8 in memory: the top result scores at most 0.001 below f32's), and a 64-token query shape (now 32). `bench/query_latency.sh` measures through the installed runner.
+
 ## Runtime
 
-OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch), installed per user into `~/.local/lib/vinosearch/openvino`:
+OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch) (0.5.0 or newer), installed per user into `~/.local/lib/vinosearch/openvino`:
 
 ```bash
-scripts/install-runtime.sh             # compiles against the newest OpenVINO a recipe offers (~17 min)
-scripts/install-runtime.sh --prebuilt  # Intel's prebuilt wheel, older OpenVINO, no compile
-cargo run -- doctor                    # NPU, driver, runtime, then compiles and runs a probe model
+scripts/install-runtime.sh   # Intel's openvino wheel alone: 139 MB, ~17 s, no compile
+vinosearch doctor            # NPU, driver, runtime, then compiles and runs a probe model
 ```
 
-The default compiles because two programs on one NPU should run the same OpenVINO release: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
+vinoSearch calls OpenVINO directly, without ONNX Runtime, so it uses `ovfetch install --openvino-only`. That gets the newest OpenVINO the NPU driver supports (2026.4.1 here), the same release vinoAuthFace and vinoWhisper run, which matters: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
 
 ovfetch's runtime ships OpenVINO's ONNX frontend only, so models must be ONNX.
 
