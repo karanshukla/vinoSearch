@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -18,9 +19,11 @@ const CHUNK_CHARS: usize = 900;
 const MAX_FILE_BYTES: u64 = 1 << 20;
 const EXTENSIONS: &[&str] = &[
     "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
-    "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "toml", "yaml", "yml", "json",
-    "ini", "conf", "cfg", "html", "css", "scss", "sql", "lua", "zig", "nix", "cs", "php",
+    "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "css", "scss", "sql",
+    "lua", "zig", "nix", "cs", "php",
 ];
+// No config formats (toml, yaml, json, ini, conf, ...): they are where
+// credentials live, and the index is not encrypted yet (#4).
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -38,10 +41,24 @@ pub fn default_db() -> Result<PathBuf> {
     Ok(base.join("vinosearch/index.sqlite"))
 }
 
+/// The index holds copies of file contents, so only the user may read it:
+/// the directory 0700, the database 0600 (SQLite gives its -wal and -shm
+/// files the database's mode).
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| path.display().to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -357,6 +374,29 @@ mod tests {
     #[test]
     fn blank_text_has_no_chunks() {
         assert!(chunk("\n\n  \n").is_empty());
+    }
+
+    #[test]
+    fn index_is_private_to_the_user() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-test-{}", std::process::id()));
+        let db = dir.join("sub/index.sqlite");
+        open(&db).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(db.parent().unwrap()), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        // An existing, looser database is tightened on open.
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        open(&db).unwrap();
+        assert_eq!(mode(&db), 0o600);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_files_are_not_indexed() {
+        for f in ["a.toml", "b.yaml", "c.json", "d.ini", "e.conf", ".env"] {
+            assert!(!wanted(Path::new(f)), "{f}");
+        }
+        assert!(wanted(Path::new("notes.md")));
     }
 
     #[test]

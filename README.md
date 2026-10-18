@@ -15,11 +15,11 @@ vinosearch krunner --install               # register with KRunner; D-Bus starts
 systemctl --user restart plasma-krunner.service
 ```
 
-Text files only for now (Markdown, plain text, source code, config), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28 chunks/s on the NPU.
+Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28 chunks/s on the NPU.
 
 The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 1042 MB loaded, 40 MB unloaded, ~2 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
 
-The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`. Embeddings can be partly inverted back to their text, so treat it like the files it indexes.
+The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat it like the files it indexes; encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
 
 ## Runtime
 
