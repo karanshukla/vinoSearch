@@ -2,7 +2,24 @@
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
 
-Early days: what's here is the runtime setup and the model evaluation.
+Early days: a working proof of concept for text files, searched from the command line or KRunner.
+
+## Usage
+
+```bash
+scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
+vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
+vinosearch index ~/Documents ~/Development # re-run to pick up changes; unchanged files are skipped
+vinosearch search "how do I rotate the signing key"
+vinosearch krunner --install               # register with KRunner; D-Bus starts the runner on first use
+systemctl --user restart plasma-krunner.service
+```
+
+Text files only for now (Markdown, plain text, source code, config), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28 chunks/s on the NPU.
+
+The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 1042 MB loaded, 40 MB unloaded, ~2 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
+
+The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`. Embeddings can be partly inverted back to their text, so treat it like the files it indexes.
 
 ## Runtime
 
