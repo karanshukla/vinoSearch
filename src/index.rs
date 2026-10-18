@@ -7,8 +7,8 @@
 use crate::config::Excludes;
 use crate::embed::{DIM, Embedder, document_text};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
-use std::collections::HashSet;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,10 @@ const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
 /// search is for.
 const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
+/// Log entries kept. A Vectors further behind than this reloads in full,
+/// which at that many changes is no slower than applying them.
+const CHUNK_LOG_KEEP: i64 = 100_000;
+
 pub fn default_db() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
@@ -87,7 +91,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         .with_context(|| path.display().to_string())?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let conn = Connection::open(path)?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS files (
@@ -104,8 +108,22 @@ pub fn open(path: &Path) -> Result<Connection> {
              embedding BLOB NOT NULL
          );
          CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
-         CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);",
-    )?;
+         CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);
+         -- Every chunk id inserted or deleted, in commit order, so a loaded
+         -- Vectors can catch up without rereading the table. AUTOINCREMENT
+         -- because seq must never be reused; chunks.id can be (#27). The
+         -- triggers also see deletes cascaded from files.
+         CREATE TABLE IF NOT EXISTS chunk_log (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             chunk_id INTEGER NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS chunk_log_insert AFTER INSERT ON chunks
+         BEGIN INSERT INTO chunk_log (chunk_id) VALUES (NEW.id); END;
+         CREATE TRIGGER IF NOT EXISTS chunk_log_delete AFTER DELETE ON chunks
+         BEGIN INSERT INTO chunk_log (chunk_id) VALUES (OLD.id); END;
+         CREATE TRIGGER IF NOT EXISTS chunk_log_prune AFTER INSERT ON chunk_log
+         BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;"
+    ))?;
     Ok(conn)
 }
 
@@ -483,8 +501,12 @@ pub struct Vectors {
     ids: Vec<i64>,
     data: Vec<i8>,
     scales: Vec<f32>,
+    /// Where each id is in `ids`, for removing it.
+    pos: HashMap<i64, usize>,
     /// Database state when loaded, to notice the index changing.
     stamp: (i64, u64),
+    /// The last `chunk_log` entry these vectors include.
+    seq: i64,
 }
 
 /// Changes when anything is written: `data_version` for other connections'
@@ -495,56 +517,151 @@ fn stamp(conn: &Connection) -> Result<(i64, u64)> {
     Ok((version, conn.total_changes()))
 }
 
+/// The newest `chunk_log` seq ever assigned (0 for none), from
+/// sqlite_sequence so it survives the log being pruned empty.
+fn log_end(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'chunk_log'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
 impl Vectors {
     fn empty() -> Self {
         Self {
             ids: Vec::new(),
             data: Vec::new(),
             scales: Vec::new(),
+            pos: HashMap::new(),
             stamp: (0, 0),
+            seq: 0,
         }
     }
 
+    /// Append one chunk's embedding, if the blob is a DIM-long f32 vector.
+    fn push(&mut self, id: i64, blob: &[u8]) {
+        if blob.len() != DIM * 4 {
+            return;
+        }
+        let mut v = [0f32; DIM];
+        for (x, c) in v.iter_mut().zip(blob.as_chunks::<4>().0) {
+            *x = f32::from_le_bytes(*c);
+        }
+        let (q, scale) = quantize(&v);
+        self.pos.insert(id, self.ids.len());
+        self.ids.push(id);
+        self.data.extend_from_slice(&q);
+        self.scales.push(scale);
+    }
+
+    /// Drop `id` by moving the last vector into its slot.
+    fn remove(&mut self, id: i64) {
+        let Some(p) = self.pos.remove(&id) else {
+            return;
+        };
+        let last = self.ids.len() - 1;
+        if p != last {
+            self.data.copy_within(last * DIM..(last + 1) * DIM, p * DIM);
+            self.ids[p] = self.ids[last];
+            self.scales[p] = self.scales[last];
+            self.pos.insert(self.ids[p], p);
+        }
+        self.ids.truncate(last);
+        self.data.truncate(last * DIM);
+        self.scales.truncate(last);
+    }
+
     pub fn load(conn: &Connection) -> Result<Self> {
-        let stamp = stamp(conn)?;
-        let n: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+        // One read transaction, so the log position matches the rows read.
+        let tx = conn.unchecked_transaction()?;
+        let n: i64 = tx.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
         let n = n as usize;
         let mut out = Self {
             ids: Vec::with_capacity(n),
             data: Vec::with_capacity(n * DIM),
             scales: Vec::with_capacity(n),
-            stamp,
+            pos: HashMap::with_capacity(n),
+            stamp: stamp(&tx)?,
+            seq: log_end(&tx)?,
         };
-        let mut v = [0f32; DIM];
-        let mut stmt = conn.prepare("SELECT id, embedding FROM chunks")?;
+        let mut stmt = tx.prepare("SELECT id, embedding FROM chunks")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             // Borrowed, so no copy of each blob is made on the way in.
-            let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? else {
-                continue;
-            };
-            if blob.len() != DIM * 4 {
-                continue;
+            if let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? {
+                out.push(row.get(0)?, blob);
             }
-            for (x, c) in v.iter_mut().zip(blob.as_chunks::<4>().0) {
-                *x = f32::from_le_bytes(*c);
-            }
-            let (q, scale) = quantize(&v);
-            out.ids.push(row.get(0)?);
-            out.data.extend_from_slice(&q);
-            out.scales.push(scale);
         }
         Ok(out)
     }
 
-    /// Reload if the index changed since loading. The old copy is dropped
-    /// first, so a reload never holds two.
+    /// Catch up with the index if it changed since loading: only the chunks
+    /// inserted or deleted since, from `chunk_log`. A full reload when the
+    /// log no longer reaches back far enough, or when most of the index
+    /// changed; the old copy is dropped first, so a reload never holds two.
     pub fn refresh(&mut self, conn: &Connection) -> Result<()> {
-        if stamp(conn)? != self.stamp {
+        if stamp(conn)? == self.stamp {
+            return Ok(());
+        }
+        if !self.catch_up(conn)? {
             *self = Self::empty();
             *self = Self::load(conn)?;
         }
         Ok(())
+    }
+
+    /// Ok(false) when a full reload is needed instead.
+    fn catch_up(&mut self, conn: &Connection) -> Result<bool> {
+        let tx = conn.unchecked_transaction()?;
+        let end = log_end(&tx)?;
+        if end == self.seq {
+            self.stamp = stamp(&tx)?;
+            return Ok(true);
+        }
+        let first: Option<i64> = tx.query_row(
+            "SELECT min(seq) FROM chunk_log WHERE seq > ?1",
+            [self.seq],
+            |r| r.get(0),
+        )?;
+        // Pruned past us (or a database from before the log, or rebuilt).
+        if end < self.seq || first != Some(self.seq + 1) {
+            return Ok(false);
+        }
+        let touched: HashSet<i64> = {
+            let mut stmt = tx.prepare("SELECT chunk_id FROM chunk_log WHERE seq > ?1")?;
+            stmt.query_map([self.seq], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if touched.len() > self.ids.len() / 2 {
+            return Ok(false);
+        }
+        // Whatever happened to an id in between, its row now (or its
+        // absence) is what counts: drop the old vector, read the current one.
+        for id in &touched {
+            self.remove(*id);
+        }
+        let mut stmt = tx.prepare("SELECT embedding FROM chunks WHERE id = ?1")?;
+        let mut added = Vec::new();
+        for id in &touched {
+            let mut rows = stmt.query([id])?;
+            if let Some(row) = rows.next()? {
+                added.push((*id, row.get::<_, Vec<u8>>(0)?));
+            }
+        }
+        // Exact, so a few new chunks do not double a 100 MB buffer.
+        self.ids.reserve_exact(added.len());
+        self.scales.reserve_exact(added.len());
+        self.data.reserve_exact(added.len() * DIM);
+        for (id, blob) in &added {
+            self.push(*id, blob);
+        }
+        self.seq = end;
+        self.stamp = stamp(&tx)?;
+        Ok(true)
     }
 
     pub fn len(&self) -> usize {
@@ -813,13 +930,10 @@ mod tests {
 
     #[test]
     fn search_returns_the_best_k_in_order() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, mtime INTEGER, size INTEGER);
-             CREATE TABLE chunks (id INTEGER PRIMARY KEY, file_id INTEGER, start_line INTEGER, text TEXT, embedding BLOB);
-             INSERT INTO files VALUES (1, '/f', 0, 0);",
-        )
-        .unwrap();
+        let dir = std::env::temp_dir().join(format!("vinosearch-search-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute("INSERT INTO files VALUES (1, '/f', 0, 0)", [])
+            .unwrap();
         // Chunk i points along axis 0 with weight i/10, so higher i scores higher.
         for i in 0..10 {
             let mut v = vec![0f32; DIM];
@@ -839,5 +953,89 @@ mod tests {
             .map(|h| h.line)
             .collect();
         assert_eq!(lines, [10, 9, 8]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A unit vector along `axis`, as an embedding blob.
+    fn axis(axis: usize) -> Vec<u8> {
+        let mut v = vec![0f32; DIM];
+        v[axis] = 1.0;
+        to_blob(&v)
+    }
+
+    fn add_file(conn: &Connection, path: &str, axes: &[usize]) -> Vec<i64> {
+        conn.execute(
+            "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+            [path],
+        )
+        .unwrap();
+        let file = conn.last_insert_rowid();
+        axes.iter()
+            .map(|a| {
+                conn.execute(
+                    "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, 1, '', ?2)",
+                    params![file, axis(*a)],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            })
+            .collect()
+    }
+
+    /// What refresh produced, compared with a fresh load: (id, best axis) pairs.
+    fn contents(v: &Vectors) -> Vec<(i64, usize)> {
+        let mut out: Vec<_> = v
+            .ids
+            .iter()
+            .zip(v.data.as_chunks::<DIM>().0)
+            .map(|(id, d)| (*id, d.iter().position(|x| *x == 127).unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn refresh_applies_only_what_changed() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-refresh-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        // A second connection writes, as `vinosearch index` or the watcher would.
+        let writer = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&writer, "/base.md", &(0..20).collect::<Vec<_>>());
+        add_file(&writer, "/a.md", &[20, 21, 22]);
+        let mut v = Vectors::load(&conn).unwrap();
+        assert_eq!(v.len(), 23);
+
+        // Incremental, and the same as loading from scratch.
+        let caught_up = |v: &mut Vectors| {
+            assert!(v.catch_up(&conn).unwrap(), "fell back to a full reload");
+            assert_eq!(contents(v), contents(&Vectors::load(&conn).unwrap()));
+        };
+        // New chunks, and a file replaced (delete cascades to its chunks).
+        add_file(&writer, "/c.md", &[23]);
+        remove(&writer, Path::new("/a.md")).unwrap();
+        add_file(&writer, "/a.md", &[24, 25]);
+        caught_up(&mut v);
+        assert_eq!(v.len(), 23);
+        // The highest id deleted, then reused for a different vector: SQLite
+        // hands out max(id) + 1, so the new chunk gets the old one's id.
+        let max: i64 = writer
+            .query_row("SELECT max(id) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        remove(&writer, Path::new("/a.md")).unwrap();
+        assert_eq!(add_file(&writer, "/d.md", &[26, 27]).last(), Some(&max));
+        caught_up(&mut v);
+        // Nothing changed.
+        caught_up(&mut v);
+
+        // The log pruned past this copy: refresh reloads in full.
+        add_file(&writer, "/e.md", &[28]);
+        writer.execute("DELETE FROM chunk_log", []).unwrap();
+        assert!(!v.catch_up(&conn).unwrap());
+        v.refresh(&conn).unwrap();
+        assert_eq!(contents(&v), contents(&Vectors::load(&conn).unwrap()));
+        // Most of the index changed: also a full reload.
+        remove(&writer, Path::new("/base.md")).unwrap();
+        assert!(!v.catch_up(&conn).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
