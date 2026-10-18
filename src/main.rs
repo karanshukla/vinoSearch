@@ -70,9 +70,8 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     }
     let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
         .join(".cache/vinosearch/ov-cache");
-    let mut core = openvino::Core::new()?;
     let t0 = Instant::now();
-    let emb = embed::Embedder::new(&mut core, &dir, device, &cache)?;
+    let emb = embed::Embedder::new(openvino::Core::new()?, &dir, device, &cache)?;
     eprintln!(
         "model ready on {device} in {:.1} s",
         t0.elapsed().as_secs_f64()

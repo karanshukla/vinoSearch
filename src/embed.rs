@@ -9,8 +9,8 @@ use openvino::{
     CompiledModel, Core, DeviceType, ElementType, InferRequest, PartialShape, RwPropertyKey, Shape,
     Tensor,
 };
-use std::path::Path;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use std::path::{Path, PathBuf};
+use tokenizers::{PostProcessor, Tokenizer, TruncationDirection};
 
 pub const DIM: usize = 768;
 const QUERY_LEN: usize = 64;
@@ -26,36 +26,54 @@ pub fn document_text(title: &str, text: &str) -> String {
 }
 
 struct Stage {
-    tok: Tokenizer,
     len: usize,
     _compiled: CompiledModel,
     requests: Vec<InferRequest>,
 }
 
+/// Query stage up front; the document stage compiles on first use, so a
+/// process that only answers queries never holds a second copy of the model.
 pub struct Embedder {
+    core: Core,
+    onnx: PathBuf,
+    device: String,
+    tok: Tokenizer,
     query: Stage,
-    docs: Stage,
+    docs: Option<Stage>,
 }
 
-fn tokenizer(path: &Path, len: usize) -> Result<Tokenizer> {
-    let mut tok = Tokenizer::from_file(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    tok.with_truncation(Some(TruncationParams {
-        max_length: len,
-        ..Default::default()
-    }))
-    .map_err(|e| anyhow!("{e}"))?;
-    tok.with_padding(Some(PaddingParams {
-        strategy: PaddingStrategy::Fixed(len),
-        ..Default::default()
-    }));
-    Ok(tok)
+/// Token ids and attention mask, exactly `len` long: truncated before the
+/// special tokens are added so they survive (as `TokenizerImpl::post_process`
+/// does with truncation set), then padded with mask 0.
+fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Vec<i64>)> {
+    let mut enc = tok.encode(text, false).map_err(|e| anyhow!("{e}"))?;
+    let added = tok
+        .get_post_processor()
+        .map_or(0, |p| p.added_tokens(false));
+    ensure!(
+        len > added,
+        "length {len} leaves no room past {added} special tokens"
+    );
+    enc.truncate(len - added, 0, TruncationDirection::Right);
+    let enc = tok
+        .post_process(enc, None, true)
+        .map_err(|e| anyhow!("{e}"))?;
+    let pad = tok.get_padding().map_or(0, |p| p.pad_id);
+    let mut ids: Vec<i64> = enc.get_ids().iter().map(|&i| i64::from(i)).collect();
+    let mut mask: Vec<i64> = enc
+        .get_attention_mask()
+        .iter()
+        .map(|&m| i64::from(m))
+        .collect();
+    ids.resize(len, i64::from(pad));
+    mask.resize(len, 0);
+    Ok((ids, mask))
 }
 
 impl Stage {
     fn new(
         core: &mut Core,
         model_path: &Path,
-        tok_path: &Path,
         device: &str,
         len: usize,
         in_flight: usize,
@@ -75,7 +93,6 @@ impl Stage {
             .map(|_| compiled.create_infer_request())
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
-            tok: tokenizer(tok_path, len)?,
             len,
             _compiled: compiled,
             requests,
@@ -83,22 +100,14 @@ impl Stage {
     }
 
     fn feed(tok: &Tokenizer, len: usize, req: &mut InferRequest, text: &str) -> Result<()> {
-        let enc = tok.encode(text, true).map_err(|e| anyhow!("{e}"))?;
+        let (ids, mask) = encode_fixed(tok, text, len)?;
         let shape = Shape::new(&[1, len as i64])?;
-        let mut ids = Tensor::new(ElementType::I64, &shape)?;
-        for (d, s) in ids.get_data_mut::<i64>()?.iter_mut().zip(enc.get_ids()) {
-            *d = i64::from(*s);
-        }
-        let mut mask = Tensor::new(ElementType::I64, &shape)?;
-        for (d, s) in mask
-            .get_data_mut::<i64>()?
-            .iter_mut()
-            .zip(enc.get_attention_mask())
-        {
-            *d = i64::from(*s);
-        }
-        req.set_tensor("input_ids", &ids)?;
-        req.set_tensor("attention_mask", &mask)?;
+        let mut t_ids = Tensor::new(ElementType::I64, &shape)?;
+        t_ids.get_data_mut::<i64>()?.copy_from_slice(&ids);
+        let mut t_mask = Tensor::new(ElementType::I64, &shape)?;
+        t_mask.get_data_mut::<i64>()?.copy_from_slice(&mask);
+        req.set_tensor("input_ids", &t_ids)?;
+        req.set_tensor("attention_mask", &t_mask)?;
         Ok(())
     }
 
@@ -118,11 +127,11 @@ impl Stage {
         Ok(v.iter().map(|x| x / norm).collect())
     }
 
-    fn run(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn run(&mut self, tok: &Tokenizer, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for window in texts.chunks(self.requests.len()) {
             for (req, text) in self.requests.iter_mut().zip(window) {
-                Self::feed(&self.tok, self.len, req, text)?;
+                Self::feed(tok, self.len, req, text)?;
                 req.infer_async()?;
             }
             for req in self.requests.iter_mut().take(window.len()) {
@@ -135,26 +144,96 @@ impl Stage {
 }
 
 impl Embedder {
-    pub fn new(core: &mut Core, model_dir: &Path, device: &str, cache_dir: &Path) -> Result<Self> {
+    pub fn new(mut core: Core, model_dir: &Path, device: &str, cache_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         let cache = cache_dir.to_str().context("cache path is not UTF-8")?;
         core.set_property(&DeviceType::from(device), &RwPropertyKey::CacheDir, cache)
             .context("setting CACHE_DIR")?;
         let onnx = crate::model::onnx_path(model_dir);
-        let tok = crate::model::tokenizer_path(model_dir);
+        let tok_path = crate::model::tokenizer_path(model_dir);
+        let tok =
+            Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{}: {e}", tok_path.display()))?;
+        let query = Stage::new(&mut core, &onnx, device, QUERY_LEN, 1)?;
         Ok(Self {
-            query: Stage::new(core, &onnx, &tok, device, QUERY_LEN, 1)?,
-            docs: Stage::new(core, &onnx, &tok, device, DOC_LEN, IN_FLIGHT)?,
+            core,
+            onnx,
+            device: device.to_owned(),
+            tok,
+            query,
+            docs: None,
         })
     }
 
     pub fn query(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut v = self.query.run(&[format!("{QUERY_PREFIX}{text}")])?;
+        let mut v = self
+            .query
+            .run(&self.tok, &[format!("{QUERY_PREFIX}{text}")])?;
         Ok(v.remove(0))
     }
 
     /// Embed documents already formatted with [`document_text`].
     pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.docs.run(texts)
+        if self.docs.is_none() {
+            self.docs = Some(Stage::new(
+                &mut self.core,
+                &self.onnx,
+                &self.device,
+                DOC_LEN,
+                IN_FLIGHT,
+            )?);
+        }
+        self.docs.as_mut().unwrap().run(&self.tok, texts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::processors::template::TemplateProcessing;
+
+    fn tiny() -> Tokenizer {
+        let vocab = [
+            ("<pad>", 0),
+            ("<bos>", 2),
+            ("<eos>", 1),
+            ("a", 3),
+            ("b", 4),
+            ("<unk>", 5),
+        ]
+        .into_iter()
+        .map(|(t, i)| (t.to_string(), i))
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace {}));
+        tok.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<bos> $A <eos>")
+                .unwrap()
+                .special_tokens(vec![("<bos>", 2), ("<eos>", 1)])
+                .build()
+                .unwrap(),
+        ));
+        tok
+    }
+
+    #[test]
+    fn truncation_keeps_the_special_tokens() {
+        let (ids, mask) = encode_fixed(&tiny(), "a b a b a b a b", 5).unwrap();
+        assert_eq!(ids, [2, 3, 4, 3, 1]);
+        assert_eq!(mask, [1; 5]);
+    }
+
+    #[test]
+    fn short_text_pads_with_mask_zero() {
+        let (ids, mask) = encode_fixed(&tiny(), "a b", 6).unwrap();
+        assert_eq!(ids, [2, 3, 4, 1, 0, 0]);
+        assert_eq!(mask, [1, 1, 1, 1, 0, 0]);
     }
 }
