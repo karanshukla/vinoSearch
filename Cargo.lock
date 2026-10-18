@@ -1994,8 +1994,18 @@ dependencies = [
  "tokenizers",
  "toml",
  "ureq",
+ "vinosearch-shared",
  "walkdir",
  "zbus",
+]
+
+[[package]]
+name = "vinosearch-shared"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
 ]
 
 [[package]]

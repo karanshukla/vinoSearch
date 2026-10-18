@@ -1,4 +1,3 @@
-mod config;
 mod embed;
 mod index;
 mod krunner;
@@ -12,6 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
+use vinosearch_shared::config;
 
 /// Semantic file search, run on the NPU.
 #[derive(Parser)]

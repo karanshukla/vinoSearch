@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 
-const SERVICE: &str = "dev.vinosearch.Runner";
-const OBJECT: &str = "/runner";
-const CONTROL: &str = "/control";
+use vinosearch_shared::dbus::{
+    CONTROL_PATH as CONTROL, RUNNER_PATH as OBJECT, SERVICE, status as key,
+};
 const RESULTS: usize = 5;
 /// Cosine below this is noise for this model: an off-topic query against a
 /// code index topped out at 0.60, real matches scored 0.72 to 0.83.
@@ -174,17 +174,17 @@ impl Control {
             .collect();
         let mut out = HashMap::new();
         out.insert(
-            "model_loaded".into(),
+            key::MODEL_LOADED.into(),
             owned(Value::from(self.status.loaded.load(Ordering::Relaxed))),
         );
         out.insert(
-            "indexing".into(),
+            key::INDEXING.into(),
             owned(Value::from(self.status.indexing.load(Ordering::Relaxed))),
         );
-        out.insert("device".into(), owned(Value::from(self.device.clone())));
-        out.insert("files".into(), owned(Value::from(files)));
-        out.insert("chunks".into(), owned(Value::from(chunks)));
-        out.insert("roots".into(), owned(Value::from(roots)));
+        out.insert(key::DEVICE.into(), owned(Value::from(self.device.clone())));
+        out.insert(key::FILES.into(), owned(Value::from(files)));
+        out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
+        out.insert(key::ROOTS.into(), owned(Value::from(roots)));
         Ok(out)
     }
 

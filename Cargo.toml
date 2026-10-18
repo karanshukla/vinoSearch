@@ -7,7 +7,11 @@ description = "Semantic file search for KDE and GNOME, run on Intel NPUs through
 repository = "https://github.com/karanshukla/vinoSearch"
 publish = false
 
+[workspace]
+members = [".", "crates/shared"]
+
 [dependencies]
+vinosearch-shared = { path = "crates/shared" }
 anyhow = "1.0"
 hex = "0.4"
 notify = "8"
