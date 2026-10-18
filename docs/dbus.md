@@ -7,7 +7,22 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 | Object | Interface | For |
 |---|---|---|
 | `/runner` | `org.kde.krunner1` | KRunner (`Match`, `Actions`, `Run`, `Teardown`) |
+| `/gnome` | `org.gnome.Shell.SearchProvider2` | GNOME Shell's overview search |
 | `/control` | `dev.vinosearch.Control1` | the settings app |
+
+## `org.gnome.Shell.SearchProvider2`
+
+The same search KRunner's `Match` runs: the best chunk per file, files scoring at least 0.65, top 5. Result ids are file paths.
+
+| Method | What it does |
+|---|---|
+| `GetInitialResultSet(as terms)` | Joins the terms with spaces and searches. Under 3 characters returns nothing, as KRunner's plugin waits for 3 letters. |
+| `GetSubsearchResultSet(as previous, as terms)` | Searches afresh: a semantic match does not narrow as the query grows. |
+| `GetResultMetas(as ids)` | `id`, `name` (file name), `description` (directory, line and snippet), `gicon` (`text-x-generic`). Ids from an older search get the path as description. |
+| `ActivateResult(s id, as terms, u timestamp)` | `xdg-open` the file. |
+| `LaunchSearch(as terms, u timestamp)` | Nothing yet; the settings app (#5) will be the target. |
+
+GNOME Shell only reads search providers from the system data dirs, never `~/.local/share`, so `krunner --install` writes the provider file to `~/.local/share/vinosearch/xdg/gnome-shell/search-providers/` and appends that directory to `XDG_DATA_DIRS` in `~/.config/environment.d/60-vinosearch.conf`, the way Flatpak exports per-user apps. It also writes `~/.local/share/applications/dev.vinosearch.desktop`, which GNOME Shell needs to show the provider (a hidden entry disables it). Results appear from the next login; `--uninstall` removes all three.
 
 ## `dev.vinosearch.Control1`
 

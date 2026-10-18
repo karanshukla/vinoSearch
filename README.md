@@ -2,7 +2,7 @@
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
 
-Early days: a working proof of concept for text files, searched from the command line or KRunner.
+Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell.
 
 ## Usage
 
@@ -15,7 +15,7 @@ vinosearch fetch-model                     # 274 MB, every file checked against 
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch watch                           # keep indexed roots current (the KRunner runner also does this)
 vinosearch search "how do I rotate the signing key"
-vinosearch krunner --install               # register with KRunner, and as a systemd user service started at login
+vinosearch krunner --install               # register with KRunner and GNOME Shell search, and as a systemd user service started at login
 systemctl --user restart plasma-krunner.service
 ```
 

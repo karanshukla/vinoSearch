@@ -4,6 +4,10 @@
 pub const SERVICE: &str = "dev.vinosearch.Runner";
 /// KRunner's interface (`org.kde.krunner1`) lives here.
 pub const RUNNER_PATH: &str = "/runner";
+/// GNOME Shell's org.gnome.Shell.SearchProvider2 lives here.
+pub const GNOME_PATH: &str = "/gnome";
+/// The desktop entry GNOME Shell shows the provider's results under.
+pub const DESKTOP_ID: &str = "dev.vinosearch.desktop";
 /// The settings app's interface lives here.
 pub const CONTROL_PATH: &str = "/control";
 pub const CONTROL_INTERFACE: &str = "dev.vinosearch.Control1";
