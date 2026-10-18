@@ -76,18 +76,19 @@ pub fn open(path: &Path) -> Result<Connection> {
              text TEXT NOT NULL,
              embedding BLOB NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);",
+         CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
+         CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);",
     )?;
     Ok(conn)
 }
 
-fn wanted(path: &Path) -> bool {
+pub(crate) fn wanted(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-fn skipped_dir(name: &str) -> bool {
+pub(crate) fn skipped_dir(name: &str) -> bool {
     name.starts_with('.') || SKIP_DIRS.contains(&name)
 }
 
@@ -144,10 +145,120 @@ pub struct Stats {
     pub removed: usize,
 }
 
-/// Index everything wanted under `root`. Unchanged files (same mtime and size)
-/// are skipped; files under `root` that are gone are removed.
+/// Hidden directories and build output under `root` (not `root` itself).
+pub fn skipped_under(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| {
+        let mut parts: Vec<_> = rel.components().collect();
+        parts.pop(); // the file or directory itself is judged by `wanted` / its own walk
+        parts
+            .iter()
+            .any(|c| skipped_dir(&c.as_os_str().to_string_lossy()))
+    })
+}
+
+/// Everything under `root` that indexing looks at, skipping hidden and build directories.
+pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy()))
+        })
+        .filter_map(|e| e.map_err(|e| eprintln!("skip: {e}")).ok())
+}
+
+fn like_under(dir: &str) -> String {
+    format!(
+        "{}/%",
+        dir.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
+/// Drop `path` and, if it was a directory, everything under it. Returns files removed.
+pub fn remove(conn: &Connection, path: &Path) -> Result<usize> {
+    let p = path.to_string_lossy();
+    let n = conn.execute(
+        "DELETE FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+        params![p, like_under(&p)],
+    )?;
+    Ok(n)
+}
+
+pub enum Outcome {
+    Embedded(usize),
+    Unchanged,
+    /// Not a wanted file (type, size, encoding); any old entry for it is dropped.
+    Skipped,
+}
+
+/// Index one file if it is wanted and changed since it was last indexed.
+pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Result<Outcome> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES && wanted(path) => m,
+        _ => {
+            remove(conn, path)?;
+            return Ok(Outcome::Skipped);
+        }
+    };
+    let Some(key) = path.to_str() else {
+        return Ok(Outcome::Skipped);
+    };
+    let mtime = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let size = meta.len() as i64;
+    let known: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT mtime, size FROM files WHERE path = ?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    if known == Some((mtime, size)) {
+        return Ok(Outcome::Unchanged);
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        remove(conn, path)?;
+        return Ok(Outcome::Skipped);
+    };
+    let chunks = chunk(&text);
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let inputs: Vec<String> = chunks
+        .iter()
+        .map(|(_, c)| document_text(&title, c))
+        .collect();
+    let vectors = emb.documents(&inputs)?;
+
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
+    tx.execute(
+        "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
+        params![key, mtime, size],
+    )?;
+    let file_id = tx.last_insert_rowid();
+    for ((line, text), v) in chunks.iter().zip(&vectors) {
+        tx.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, ?2, ?3, ?4)",
+            params![file_id, *line as i64, text, to_blob(v)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(Outcome::Embedded(chunks.len()))
+}
+
+/// Index everything wanted under `root` and remember it as a root to watch.
+/// Unchanged files (same mtime and size) are skipped; files under `root`
+/// that are gone are removed.
 pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
+        [root.to_string_lossy()],
+    )?;
     let mut stats = Stats {
         files_seen: 0,
         files_embedded: 0,
@@ -156,95 +267,44 @@ pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<S
     };
     let mut seen = HashSet::new();
     let t0 = Instant::now();
-    let walker = WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy()))
-        });
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skip: {e}");
-                continue;
-            }
-        };
+    for entry in walk(&root) {
         if !entry.file_type().is_file() || !wanted(entry.path()) {
             continue;
         }
-        let meta = entry.metadata()?;
-        if meta.len() > MAX_FILE_BYTES {
-            continue;
+        if let Some(p) = entry.path().to_str() {
+            seen.insert(p.to_owned());
         }
-        let Some(path) = entry.path().to_str().map(str::to_owned) else {
-            continue;
-        };
+        match index_file(conn, emb, entry.path())? {
+            Outcome::Embedded(n) => {
+                stats.files_embedded += 1;
+                stats.chunks += n;
+                let secs = t0.elapsed().as_secs_f64();
+                eprint!(
+                    "\r{} files, {} chunks, {:.1} chunks/s   ",
+                    stats.files_embedded,
+                    stats.chunks,
+                    stats.chunks as f64 / secs
+                );
+            }
+            Outcome::Unchanged => {}
+            Outcome::Skipped => {
+                if let Some(p) = entry.path().to_str() {
+                    seen.remove(p);
+                }
+                continue;
+            }
+        }
         stats.files_seen += 1;
-        seen.insert(path.clone());
-        let mtime = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        let size = meta.len() as i64;
-        let known: Option<(i64, i64)> = conn
-            .query_row(
-                "SELECT mtime, size FROM files WHERE path = ?1",
-                [&path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        if known == Some((mtime, size)) {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let chunks = chunk(&text);
-        let title = entry.file_name().to_string_lossy();
-        let inputs: Vec<String> = chunks
-            .iter()
-            .map(|(_, c)| document_text(&title, c))
-            .collect();
-        let vectors = emb.documents(&inputs)?;
-
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM files WHERE path = ?1", [&path])?;
-        tx.execute(
-            "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
-            params![path, mtime, size],
-        )?;
-        let file_id = tx.last_insert_rowid();
-        for ((line, text), v) in chunks.iter().zip(&vectors) {
-            tx.execute(
-                "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, ?2, ?3, ?4)",
-                params![file_id, *line as i64, text, to_blob(v)],
-            )?;
-        }
-        tx.commit()?;
-        stats.files_embedded += 1;
-        stats.chunks += chunks.len();
-        let secs = t0.elapsed().as_secs_f64();
-        eprint!(
-            "\r{} files, {} chunks, {:.1} chunks/s   ",
-            stats.files_embedded,
-            stats.chunks,
-            stats.chunks as f64 / secs
-        );
     }
     if stats.files_embedded > 0 {
         eprintln!();
     }
 
-    let prefix = format!("{}/", root.display());
     let gone: Vec<String> = {
         let mut stmt = conn.prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let pattern = format!(
-            "{}%",
-            prefix
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let rows = stmt.query_map([pattern], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
+            r.get::<_, String>(0)
+        })?;
         rows.filter_map(Result::ok)
             .filter(|p| !seen.contains(p))
             .collect()
@@ -254,6 +314,13 @@ pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<S
     }
     stats.removed = gone.len();
     Ok(stats)
+}
+
+/// Roots `index` has been run on, which the watcher follows.
+pub fn roots(conn: &Connection) -> Result<Vec<PathBuf>> {
+    let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).map(PathBuf::from).collect())
 }
 
 pub struct Hit {
@@ -388,6 +455,43 @@ mod tests {
         fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
         open(&db).unwrap();
         assert_eq!(mode(&db), 0o600);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn skipped_under_judges_parent_directories_only() {
+        let root = Path::new("/r");
+        assert!(skipped_under(root, Path::new("/r/.git/HEAD")));
+        assert!(skipped_under(root, Path::new("/r/a/target/x.rs")));
+        assert!(!skipped_under(root, Path::new("/r/a/b.rs")));
+        assert!(!skipped_under(root, Path::new("/r/target")));
+        assert!(!skipped_under(
+            Path::new("/home/u/.notes"),
+            Path::new("/home/u/.notes/a.md")
+        ));
+    }
+
+    #[test]
+    fn remove_drops_a_file_or_a_whole_directory() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-rm-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        for p in ["/a/x.md", "/a/b/y.md", "/a_b/z.md", "/c.md"] {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+                [p],
+            )
+            .unwrap();
+        }
+        assert_eq!(remove(&conn, Path::new("/a")).unwrap(), 2);
+        assert_eq!(remove(&conn, Path::new("/c.md")).unwrap(), 1);
+        let left: Vec<String> = conn
+            .prepare("SELECT path FROM files")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(left, ["/a_b/z.md"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

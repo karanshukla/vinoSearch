@@ -9,13 +9,16 @@ Early days: a working proof of concept for text files, searched from the command
 ```bash
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
 vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
-vinosearch index ~/Documents ~/Development # re-run to pick up changes; unchanged files are skipped
+vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
+vinosearch watch                           # keep indexed roots current (the KRunner runner also does this)
 vinosearch search "how do I rotate the signing key"
 vinosearch krunner --install               # register with KRunner; D-Bus starts the runner on first use
 systemctl --user restart plasma-krunner.service
 ```
 
 Text files only for now (Markdown, plain text, source code; not config formats like TOML, YAML or JSON, where credentials live), up to 1 MiB each, split into ~900-character chunks. Hidden directories and build output (`target`, `node_modules`, ...) are skipped. Indexing runs at ~28 chunks/s on the NPU.
+
+Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds.
 
 The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 1042 MB loaded, 40 MB unloaded, ~2 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
 
