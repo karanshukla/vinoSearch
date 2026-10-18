@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const REPO: &str = "arankays/embeddinggemma-2-text-int8-cw-onnx";
-pub(crate) const REVISION: &str = "99f038330ae02144b23b8768506dafd511344fa4";
+pub(crate) const REVISION: &str = "864906084df3372041155c0364612132256f7d77";
 
 /// (path in the repo, sha256, size in bytes)
 const FILES: &[(&str, &str, u64)] = &[
@@ -23,6 +23,19 @@ const FILES: &[(&str, &str, u64)] = &[
         "onnx/model.onnx_data",
         "5fa7999279f92b8e97dd74dee5478b58b58c2c28bfdcfd343c7e4e4cb4103dd7",
         273_296_384,
+    ),
+    // model_text.onnx with its inputs fixed at [1, 32] and [1, 256]
+    // (bench/static_shapes.py), so the runner can compile straight from the
+    // path and a cache hit never reads the weights.
+    (
+        "onnx/model_text_q32.onnx",
+        "8ecbd32473fce1d7805ab4ef8ab9be69d12b3b95639231001cd30054096245bc",
+        713_465,
+    ),
+    (
+        "onnx/model_text_d256.onnx",
+        "65e91c59827cfa791f090dab4b9091ff5a37e5393adb1fd77d6289ef89985049",
+        713_467,
     ),
     (
         "tokenizer.json",
@@ -46,6 +59,16 @@ pub fn default_dir() -> Result<PathBuf> {
 
 pub fn onnx_path(dir: &Path) -> PathBuf {
     dir.join("onnx/model_text.onnx")
+}
+
+/// The graph with inputs fixed at `[1, len]`, if one was published for `len`.
+pub fn static_path(dir: &Path, len: usize) -> Option<PathBuf> {
+    let tag = match len {
+        32 => "q32",
+        256 => "d256",
+        _ => return None,
+    };
+    Some(dir.join(format!("onnx/model_text_{tag}.onnx")))
 }
 
 pub fn tokenizer_path(dir: &Path) -> PathBuf {
@@ -119,9 +142,14 @@ pub fn fetch(dir: &Path, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<()>
     Ok(())
 }
 
-/// Every pinned file is present. Hashes are checked by `fetch`, not on every load.
+/// The files a load needs are present. Hashes are checked by `fetch`, not on
+/// every load. The static-shape graphs are optional: a model fetched before
+/// they were published loads through the reshape path instead.
 pub fn present(dir: &Path) -> bool {
-    FILES.iter().all(|(name, _, _)| dir.join(name).is_file())
+    FILES
+        .iter()
+        .filter(|(name, _, _)| !name.contains("model_text_"))
+        .all(|(name, _, _)| dir.join(name).is_file())
 }
 
 /// Remove the model's files. The caller makes sure nothing has it loaded.
