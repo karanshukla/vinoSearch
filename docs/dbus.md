@@ -11,7 +11,7 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 
 ## `dev.vinosearch.Control1`
 
-Every method returns promptly, including while the runner is indexing: `Status` reads state the worker publishes, and the others only queue work. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
+Every method returns promptly, including while the runner is indexing or downloading: `Status` reads state the worker publishes, and the others only queue work. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
 
 | Method | Signature | What it does |
 |---|---|---|
@@ -19,17 +19,28 @@ Every method returns promptly, including while the runner is indexing: `Status` 
 | `Reindex` | `(s path) → ()` | Index a directory and watch it from now on. Fails if the path is missing, not a directory, or excluded. Queued; watch `indexing` in `Status` for it to finish. |
 | `Forget` | `(s path) → ()` | Stop indexing and watching a root, and drop what was indexed under it. |
 | `Unload` | `() → ()` | Free the model now instead of after the idle timeout. |
+| `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (306 MB, every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
+| `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
+| `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 
 ### `Status` keys
 
 | Key | Type | Meaning |
 |---|---|---|
 | `model_loaded` | `b` | The model is in memory. |
-| `indexing` | `b` | The worker is embedding files (a `Reindex`, or changes the watcher found). |
+| `indexing` | `b` | A `Reindex` is queued or running, or the worker is embedding changes the watcher found. True from the moment `Reindex` returns. |
+| `indexed_files` | `t` | Files embedded so far by the current indexing job. |
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
 | `chunks` | `x` | Chunks in the index. |
 | `roots` | `as` | Indexed roots, canonical paths. |
+| `model_present` | `b` | Every model file is on disk. |
+| `fetching` | `b` | A `FetchModel` download is running. |
+| `fetch_done`, `fetch_total` | `t` | Bytes of the model in place so far, and in total, for a progress bar. |
+| `fetch_error` | `s` | Why the last download failed; empty when it did not, cleared when one starts. |
+| `index_bytes` | `t` | The index database on disk, WAL included. |
+| `model_bytes` | `t` | The model on disk. |
+| `cache_bytes` | `t` | OpenVINO's compiled-model cache on disk (one blob per stage, ~270 MB each on the NPU). |
 
 ## Settings
 

@@ -8,6 +8,7 @@
 
 use crate::config::Config;
 use crate::index::{self, Hit};
+use crate::model;
 use crate::watch;
 use crate::worker::{self, Job, Options, Status};
 use anyhow::{Context, Result};
@@ -163,7 +164,8 @@ impl Control {
 
 #[interface(name = "dev.vinosearch.Control1")]
 impl Control {
-    /// model_loaded (b), indexing (b), device (s), files (x), chunks (x), roots (as).
+    /// State, storage and progress; keys in vinosearch_shared::dbus::status,
+    /// described in docs/dbus.md.
     fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
         let db = self.db.lock().unwrap();
         let (files, chunks) = index::counts(&db).map_err(failed)?;
@@ -179,19 +181,67 @@ impl Control {
         );
         out.insert(
             key::INDEXING.into(),
-            owned(Value::from(self.status.indexing.load(Ordering::Relaxed))),
+            owned(Value::from(
+                self.status.indexing.load(Ordering::Relaxed)
+                    || self.status.queued_reindex.load(Ordering::Relaxed) > 0,
+            )),
         );
         out.insert(key::DEVICE.into(), owned(Value::from(self.device.clone())));
         out.insert(key::FILES.into(), owned(Value::from(files)));
         out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
         out.insert(key::ROOTS.into(), owned(Value::from(roots)));
+        let st = &self.status;
+        let u64_of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        out.insert(
+            key::INDEXED_FILES.into(),
+            owned(Value::from(u64_of(&st.indexed_files))),
+        );
+        out.insert(
+            key::FETCHING.into(),
+            owned(Value::from(st.fetching.load(Ordering::Relaxed))),
+        );
+        out.insert(
+            key::FETCH_DONE.into(),
+            owned(Value::from(u64_of(&st.fetch_done))),
+        );
+        out.insert(
+            key::FETCH_TOTAL.into(),
+            owned(Value::from(u64_of(&st.fetch_total))),
+        );
+        out.insert(
+            key::FETCH_ERROR.into(),
+            owned(Value::from(st.fetch_error.lock().unwrap().clone())),
+        );
+        let model_dir = model::default_dir().map_err(failed)?;
+        out.insert(
+            key::MODEL_PRESENT.into(),
+            owned(Value::from(model::present(&model_dir))),
+        );
+        let db_path = index::default_db().map_err(failed)?;
+        let index_bytes: u64 = ["", "-wal", "-shm"]
+            .iter()
+            .map(|ext| disk_bytes(Path::new(&format!("{}{ext}", db_path.display()))))
+            .sum();
+        out.insert(key::INDEX_BYTES.into(), owned(Value::from(index_bytes)));
+        out.insert(
+            key::MODEL_BYTES.into(),
+            owned(Value::from(disk_bytes(&model_dir))),
+        );
+        let cache = crate::cache_dir().map_err(failed)?;
+        out.insert(
+            key::CACHE_BYTES.into(),
+            owned(Value::from(disk_bytes(&cache))),
+        );
         Ok(out)
     }
 
     /// Index a directory and watch it from now on. Returns once queued.
     fn reindex(&self, path: String) -> zbus::fdo::Result<()> {
         let root = self.root(&path)?;
-        self.send(Job::Reindex(root))
+        self.status.queued_reindex.fetch_add(1, Ordering::Relaxed);
+        self.send(Job::Reindex(root)).inspect_err(|_| {
+            self.status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
+        })
     }
 
     /// Stop indexing a root and drop what was indexed under it.
@@ -204,6 +254,58 @@ impl Control {
     fn unload(&self) -> zbus::fdo::Result<()> {
         self.send(Job::Unload)
     }
+
+    /// Download the model (or whatever of it is missing or corrupt) in the
+    /// background. Progress is in Status: fetching, fetch_done, fetch_total,
+    /// fetch_error.
+    fn fetch_model(&self) -> zbus::fdo::Result<()> {
+        if self.status.fetching.swap(true, Ordering::SeqCst) {
+            return Err(failed("a download is already running"));
+        }
+        let status = self.status.clone();
+        *status.fetch_error.lock().unwrap() = String::new();
+        status.fetch_done.store(0, Ordering::Relaxed);
+        status
+            .fetch_total
+            .store(model::total_bytes(), Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let result = model::default_dir().and_then(|dir| {
+                model::fetch(&dir, &mut |_, done, _| {
+                    status.fetch_done.store(done, Ordering::Relaxed);
+                })
+            });
+            if let Err(e) = result {
+                eprintln!("fetching the model: {e:#}");
+                *status.fetch_error.lock().unwrap() = format!("{e:#}");
+            }
+            status.fetching.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+
+    /// Unload and delete the model's files.
+    fn delete_model(&self) -> zbus::fdo::Result<()> {
+        if self.status.fetching.load(Ordering::SeqCst) {
+            return Err(failed("a download is running"));
+        }
+        self.send(Job::DeleteModel)
+    }
+
+    /// Delete the compiled-model cache; the next model load recompiles (seconds).
+    fn clear_cache(&self) -> zbus::fdo::Result<()> {
+        self.send(Job::ClearCache)
+    }
+}
+
+/// Bytes under `path`, a file or a directory; 0 if it is missing.
+fn disk_bytes(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// Best chunk per file, files above MIN_SCORE, best RESULTS of them.

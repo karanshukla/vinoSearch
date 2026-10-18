@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 /// About 250 tokens of English, inside the 256-token document shape.
@@ -315,12 +315,13 @@ pub fn compact(conn: &Connection) -> Result<()> {
 
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
-/// that are gone are removed.
+/// that are gone are removed. `progress` is called after each file embedded.
 pub fn index(
     conn: &mut Connection,
     emb: &mut Embedder,
     root: &Path,
     ex: &Excludes,
+    progress: &mut dyn FnMut(&Stats),
 ) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
     if ex.contains(&root) {
@@ -341,7 +342,6 @@ pub fn index(
         removed: 0,
     };
     let mut seen = HashSet::new();
-    let t0 = Instant::now();
     for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path()) {
             continue;
@@ -353,13 +353,7 @@ pub fn index(
             Outcome::Embedded(n) => {
                 stats.files_embedded += 1;
                 stats.chunks += n;
-                let secs = t0.elapsed().as_secs_f64();
-                eprint!(
-                    "\r{} files, {} chunks, {:.1} chunks/s   ",
-                    stats.files_embedded,
-                    stats.chunks,
-                    stats.chunks as f64 / secs
-                );
+                progress(&stats);
             }
             Outcome::Unchanged => {}
             Outcome::Skipped => {
@@ -370,9 +364,6 @@ pub fn index(
             }
         }
         stats.files_seen += 1;
-    }
-    if stats.files_embedded > 0 {
-        eprintln!();
     }
 
     let gone: Vec<String> = {

@@ -13,7 +13,7 @@ use anyhow::Result;
 use futures_channel::oneshot;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -34,13 +34,29 @@ pub enum Job {
     Forget(PathBuf),
     /// Free the model now instead of waiting for the idle timeout.
     Unload,
+    /// Unload and delete the model's files.
+    DeleteModel,
+    /// Delete OpenVINO's compiled-model cache (the next load recompiles).
+    ClearCache,
 }
 
-/// What the worker is doing, for status queries.
+/// What the runner is doing, for status queries. The worker owns the model
+/// and indexing fields; the model download runs on its own thread.
 #[derive(Default)]
 pub struct Status {
     pub loaded: AtomicBool,
+    /// The worker is on an indexing job, model load included.
     pub indexing: AtomicBool,
+    /// Reindex jobs queued and not yet finished; Control counts them in as it
+    /// sends, so Status says indexing from the moment Reindex returns.
+    pub queued_reindex: AtomicUsize,
+    /// Files embedded so far by the current indexing job.
+    pub indexed_files: AtomicU64,
+    pub fetching: AtomicBool,
+    pub fetch_done: AtomicU64,
+    pub fetch_total: AtomicU64,
+    /// Why the last model download failed, cleared when one starts.
+    pub fetch_error: std::sync::Mutex<String>,
 }
 
 struct Loaded {
@@ -63,6 +79,7 @@ fn changed(
     emb: &mut Embedder,
     paths: Vec<PathBuf>,
     ex: &Excludes,
+    status: &Status,
 ) -> Result<()> {
     let (mut files, mut chunks, mut removed) = (0, 0, 0);
     for path in paths {
@@ -75,6 +92,7 @@ fn changed(
                 if let Outcome::Embedded(n) = index::index_file(conn, emb, entry.path())? {
                     files += 1;
                     chunks += n;
+                    status.indexed_files.fetch_add(1, Ordering::Relaxed);
                 }
             }
         } else if path.exists() {
@@ -82,6 +100,7 @@ fn changed(
                 Outcome::Embedded(n) => {
                     files += 1;
                     chunks += n;
+                    status.indexed_files.fetch_add(1, Ordering::Relaxed);
                 }
                 Outcome::Unchanged => {}
                 Outcome::Skipped => {}
@@ -153,8 +172,32 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 unload(&mut loaded, "asked to");
                 continue;
             }
+            Job::DeleteModel => {
+                unload(&mut loaded, "deleting the model");
+                match crate::model::default_dir().and_then(|d| crate::model::delete(&d)) {
+                    Ok(()) => eprintln!("model deleted"),
+                    Err(e) => eprintln!("deleting the model: {e:#}"),
+                }
+                continue;
+            }
+            Job::ClearCache => {
+                // Loaded stages are compiled already; only the next load reads the cache.
+                match crate::cache_dir().and_then(|d| match std::fs::remove_dir_all(&d) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                    _ => Ok(()),
+                }) {
+                    Ok(()) => eprintln!("compiled-model cache cleared"),
+                    Err(e) => eprintln!("clearing the cache: {e:#}"),
+                }
+                continue;
+            }
             job => job,
         };
+        let indexes = matches!(job, Job::Changed(_) | Job::Reindex(_));
+        if indexes {
+            status.indexed_files.store(0, Ordering::Relaxed);
+            status.indexing.store(true, Ordering::Relaxed);
+        }
         if loaded.is_none() {
             match load(&conn) {
                 Ok(l) => {
@@ -163,9 +206,16 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("loading model: {e:#}");
-                    if let Job::Match { reply, .. } = job {
-                        let _ = reply.send(Vec::new());
+                    match job {
+                        Job::Match { reply, .. } => {
+                            let _ = reply.send(Vec::new());
+                        }
+                        Job::Reindex(_) => {
+                            status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        _ => {}
                     }
+                    status.indexing.store(false, Ordering::Relaxed);
                     continue;
                 }
             }
@@ -184,15 +234,18 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }));
             }
             Job::Changed(paths) => {
-                status.indexing.store(true, Ordering::Relaxed);
-                if let Err(e) = changed(&mut conn, &mut l.emb, paths, &excludes) {
+                if let Err(e) = changed(&mut conn, &mut l.emb, paths, &excludes, status) {
                     eprintln!("updating index: {e:#}");
                 }
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Reindex(root) => {
-                status.indexing.store(true, Ordering::Relaxed);
-                match index::index(&mut conn, &mut l.emb, &root, &excludes) {
+                let mut progress = |s: &index::Stats| {
+                    status
+                        .indexed_files
+                        .store(s.files_embedded as u64, Ordering::Relaxed);
+                };
+                match index::index(&mut conn, &mut l.emb, &root, &excludes, &mut progress) {
                     Ok(s) => eprintln!(
                         "{}: {} files seen, {} embedded ({} chunks), {} removed",
                         root.display(),
@@ -203,9 +256,14 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     ),
                     Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
                 }
+                status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
                 status.indexing.store(false, Ordering::Relaxed);
             }
-            Job::Excludes(_) | Job::Forget(_) | Job::Unload => {
+            Job::Excludes(_)
+            | Job::Forget(_)
+            | Job::Unload
+            | Job::DeleteModel
+            | Job::ClearCache => {
                 unreachable!("handled before loading")
             }
         }

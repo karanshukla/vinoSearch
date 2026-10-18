@@ -40,6 +40,7 @@ pub struct Embedder {
     core: Core,
     onnx: PathBuf,
     device: String,
+    cache: PathBuf,
     tok: Tokenizer,
     query: Stage,
     docs: Option<Stage>,
@@ -73,14 +74,74 @@ fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Ve
     Ok((ids, mask))
 }
 
+/// Compiled blobs for one stage live in their own directory, named for what
+/// decides their contents, so blobs for an old model revision or shape are
+/// recognisably stale. OpenVINO names blobs by an opaque hash, and nothing
+/// evicts them: one day of changing shapes left 1.4 GB, five ~280 MB blobs,
+/// for two in use.
+fn cache_key(device: &str, len: usize) -> String {
+    let dev: String = device
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{}-{dev}-{len}", &crate::model::REVISION[..12])
+}
+
+/// Drop everything under `root` but this revision's stage directories (for
+/// any device, so a one-off run on another device does not cost the NPU a
+/// recompile).
+fn prune_cache(root: &Path) -> Result<()> {
+    let rev = &crate::model::REVISION[..12];
+    for e in std::fs::read_dir(root)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let current = e.path().is_dir()
+            && name.strip_prefix(rev).is_some_and(|rest| {
+                [QUERY_LEN, DOC_LEN]
+                    .iter()
+                    .any(|len| rest.starts_with('-') && rest.ends_with(&format!("-{len}")))
+            });
+        if !current {
+            let removed = if e.path().is_dir() {
+                std::fs::remove_dir_all(e.path())
+            } else {
+                std::fs::remove_file(e.path())
+            };
+            if let Err(err) = removed {
+                eprintln!("pruning {}: {err}", e.path().display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn blobs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "blob"))
+        .collect()
+}
+
 impl Stage {
     fn new(
         core: &mut Core,
         model_path: &Path,
         device: &str,
+        cache_root: &Path,
         len: usize,
         in_flight: usize,
     ) -> Result<Self> {
+        let cache = cache_root.join(cache_key(device, len));
+        std::fs::create_dir_all(&cache)?;
+        core.set_property(
+            &DeviceType::from(device),
+            &RwPropertyKey::CacheDir,
+            cache.to_str().context("cache path is not UTF-8")?,
+        )
+        .context("setting CACHE_DIR")?;
+        let before = blobs(&cache);
         let path = model_path.to_str().context("model path is not UTF-8")?;
         let mut model = core
             .read_model_from_file(path, "")
@@ -95,6 +156,13 @@ impl Stage {
         let requests = (0..in_flight)
             .map(|_| compiled.create_infer_request())
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A new blob means a cache miss (a new OpenVINO, say), so the older
+        // ones in this directory are for a build that no longer loads them.
+        if blobs(&cache).iter().any(|b| !before.contains(b)) {
+            for old in before {
+                let _ = std::fs::remove_file(old);
+            }
+        }
         Ok(Self {
             len,
             _compiled: compiled,
@@ -149,18 +217,17 @@ impl Stage {
 impl Embedder {
     pub fn new(mut core: Core, model_dir: &Path, device: &str, cache_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
-        let cache = cache_dir.to_str().context("cache path is not UTF-8")?;
-        core.set_property(&DeviceType::from(device), &RwPropertyKey::CacheDir, cache)
-            .context("setting CACHE_DIR")?;
+        prune_cache(cache_dir)?;
         let onnx = crate::model::onnx_path(model_dir);
         let tok_path = crate::model::tokenizer_path(model_dir);
         let tok =
             Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{}: {e}", tok_path.display()))?;
-        let query = Stage::new(&mut core, &onnx, device, QUERY_LEN, 1)?;
+        let query = Stage::new(&mut core, &onnx, device, cache_dir, QUERY_LEN, 1)?;
         Ok(Self {
             core,
             onnx,
             device: device.to_owned(),
+            cache: cache_dir.to_owned(),
             tok,
             query,
             docs: None,
@@ -181,6 +248,7 @@ impl Embedder {
                 &mut self.core,
                 &self.onnx,
                 &self.device,
+                &self.cache,
                 DOC_LEN,
                 IN_FLIGHT,
             )?);
@@ -192,6 +260,36 @@ impl Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_keeps_only_this_revisions_stage_directories() {
+        let root = std::env::temp_dir().join(format!("vinosearch-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let keep = [
+            cache_key("NPU", QUERY_LEN),
+            cache_key("NPU", DOC_LEN),
+            cache_key("CPU", DOC_LEN),
+        ];
+        let drop = [
+            cache_key("NPU", 64),
+            format!("0123456789ab-NPU-{QUERY_LEN}"),
+        ];
+        for d in keep.iter().chain(&drop) {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("123.blob"), b"legacy").unwrap();
+        prune_cache(&root).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = keep.to_vec();
+        want.sort();
+        assert_eq!(left, want);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
     use tokenizers::processors::template::TemplateProcessing;

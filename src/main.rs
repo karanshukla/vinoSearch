@@ -61,6 +61,16 @@ enum Command {
     },
 }
 
+/// OpenVINO's compiled-model cache.
+pub(crate) fn cache_dir() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("no HOME"))?)
+            .join(".cache"),
+    };
+    Ok(base.join("vinosearch/ov-cache"))
+}
+
 pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<embed::Embedder> {
     let prefix = runtime::default_prefix(openvino_dir)?;
     runtime::load(&prefix)?;
@@ -71,8 +81,7 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
             dir.display()
         );
     }
-    let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-        .join(".cache/vinosearch/ov-cache");
+    let cache = cache_dir()?;
     let t0 = Instant::now();
     let emb = embed::Embedder::new(openvino::Core::new()?, &dir, device, &cache)?;
     eprintln!(
@@ -143,7 +152,18 @@ fn run(cli: Cli) -> Result<bool> {
             runtime::doctor(&prefix, &s.device)
         }
         Command::FetchModel => {
-            model::fetch(&model::default_dir()?)?;
+            let mut last = String::new();
+            let mut shown = 0;
+            model::fetch(&model::default_dir()?, &mut |name, done, total| {
+                // A line per file, then a percentage every 10%.
+                let pct = done * 100 / total.max(1);
+                if name != last || pct >= shown + 10 {
+                    eprintln!("{pct:3}%  {name}");
+                    last = name.to_owned();
+                    shown = pct - pct % 10;
+                }
+            })?;
+            eprintln!("model ready: {}", model::default_dir()?.display());
             Ok(true)
         }
         Command::Index { paths } => {
@@ -153,7 +173,18 @@ fn run(cli: Cli) -> Result<bool> {
             let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
             let mut conn = index::open(&index::default_db()?)?;
             for p in &paths {
-                let st = index::index(&mut conn, &mut emb, Path::new(p), &s.excludes)?;
+                let t0 = Instant::now();
+                let st = index::index(&mut conn, &mut emb, Path::new(p), &s.excludes, &mut |st| {
+                    eprint!(
+                        "\r{} files, {} chunks, {:.1} chunks/s   ",
+                        st.files_embedded,
+                        st.chunks,
+                        st.chunks as f64 / t0.elapsed().as_secs_f64()
+                    );
+                })?;
+                if st.files_embedded > 0 {
+                    eprintln!();
+                }
                 println!(
                     "{}: {} files seen, {} embedded ({} chunks), {} removed",
                     p.display(),
