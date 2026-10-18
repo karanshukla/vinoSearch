@@ -9,6 +9,9 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # paste is unmaintained but only pulled in transitively by tokenizers;
+    # no safe upgrade is available.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
