@@ -25,3 +25,4 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ureq = "3"
 walkdir = "2.5"
 zbus = "5"
+toml = "1.1"

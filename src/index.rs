@@ -4,8 +4,9 @@
 //! text, so this needs encrypting at rest (TPM-sealed key) before it holds
 //! anything a user would not leave readable.
 
+use crate::config::Excludes;
 use crate::embed::{DIM, Embedder, document_text};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fs;
@@ -156,14 +157,16 @@ pub fn skipped_under(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// Everything under `root` that indexing looks at, skipping hidden and build directories.
-pub fn walk(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+/// Everything under `root` that indexing looks at, skipping hidden and build
+/// directories and anything excluded.
+pub fn walk<'a>(root: &Path, ex: &'a Excludes) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy()))
+        .filter_entry(move |e| {
+            !ex.contains(e.path())
+                && (e.depth() == 0
+                    || !(e.file_type().is_dir() && skipped_dir(&e.file_name().to_string_lossy())))
         })
         .filter_map(|e| e.map_err(|e| eprintln!("skip: {e}")).ok())
 }
@@ -250,11 +253,32 @@ pub fn index_file(conn: &mut Connection, emb: &mut Embedder, path: &Path) -> Res
     Ok(Outcome::Embedded(chunks.len()))
 }
 
+/// Drop everything indexed under an excluded path. Returns files removed.
+pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
+    let mut n = 0;
+    for p in ex.paths() {
+        n += remove(conn, p)?;
+    }
+    Ok(n)
+}
+
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
 /// that are gone are removed.
-pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<Stats> {
+pub fn index(
+    conn: &mut Connection,
+    emb: &mut Embedder,
+    root: &Path,
+    ex: &Excludes,
+) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    if ex.contains(&root) {
+        bail!(
+            "{} is excluded; remove it from `exclude` in the config to index it",
+            root.display()
+        );
+    }
+    purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
         [root.to_string_lossy()],
@@ -267,7 +291,7 @@ pub fn index(conn: &mut Connection, emb: &mut Embedder, root: &Path) -> Result<S
     };
     let mut seen = HashSet::new();
     let t0 = Instant::now();
-    for entry in walk(&root) {
+    for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path()) {
             continue;
         }

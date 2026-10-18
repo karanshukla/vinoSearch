@@ -5,6 +5,7 @@
 //! loaded on demand and dropped, with the vector cache, after `idle` without a
 //! job, as the other vino projects do.
 
+use crate::config::Excludes;
 use crate::embed::Embedder;
 use crate::index::{self, Hit, Outcome, Vectors};
 use anyhow::Result;
@@ -21,6 +22,8 @@ pub enum Job {
     },
     /// Paths created, modified, renamed or removed under a root.
     Changed(Vec<PathBuf>),
+    /// The config's exclusions changed: drop what is now excluded.
+    Excludes(Excludes),
 }
 
 struct Loaded {
@@ -34,14 +37,25 @@ pub struct Options {
     pub idle: Option<Duration>,
     /// Load the model before the first job (the KRunner runner is started by its first query).
     pub preload: bool,
+    pub excludes: Excludes,
+    /// The config file the exclusions came from, which the watcher re-reads.
+    pub config: PathBuf,
 }
 
-fn changed(conn: &mut rusqlite::Connection, emb: &mut Embedder, paths: Vec<PathBuf>) -> Result<()> {
+fn changed(
+    conn: &mut rusqlite::Connection,
+    emb: &mut Embedder,
+    paths: Vec<PathBuf>,
+    ex: &Excludes,
+) -> Result<()> {
     let (mut files, mut chunks, mut removed) = (0, 0, 0);
     for path in paths {
+        if ex.contains(&path) {
+            continue;
+        }
         if path.is_dir() {
             // A new or renamed-in directory: index what is under it.
-            for entry in index::walk(&path).filter(|e| e.file_type().is_file()) {
+            for entry in index::walk(&path, ex).filter(|e| e.file_type().is_file()) {
                 if let Outcome::Embedded(n) = index::index_file(conn, emb, entry.path())? {
                     files += 1;
                     chunks += n;
@@ -68,6 +82,11 @@ fn changed(conn: &mut rusqlite::Connection, emb: &mut Embedder, paths: Vec<PathB
 
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut conn = index::open(&index::default_db()?)?;
+    let mut excludes = opts.excludes.clone();
+    let purged = index::purge(&conn, &excludes)?;
+    if purged > 0 {
+        eprintln!("removed {purged} excluded files from the index");
+    }
     let load = |conn: &rusqlite::Connection| -> Result<Loaded> {
         let emb = crate::embedder(opts.openvino_dir.clone(), &opts.device)?;
         let vectors = Vectors::load(conn)?;
@@ -95,6 +114,18 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 Err(_) => break,
             },
         };
+        // Exclusions need no model.
+        let job = match job {
+            Job::Excludes(ex) => {
+                excludes = ex;
+                match index::purge(&conn, &excludes) {
+                    Ok(n) => eprintln!("exclusions changed, {n} files removed"),
+                    Err(e) => eprintln!("applying exclusions: {e:#}"),
+                }
+                continue;
+            }
+            job => job,
+        };
         if loaded.is_none() {
             match load(&conn) {
                 Ok(l) => loaded = Some(l),
@@ -121,10 +152,11 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }));
             }
             Job::Changed(paths) => {
-                if let Err(e) = changed(&mut conn, &mut l.emb, paths) {
+                if let Err(e) = changed(&mut conn, &mut l.emb, paths, &excludes) {
                     eprintln!("updating index: {e:#}");
                 }
             }
+            Job::Excludes(_) => unreachable!("handled before loading"),
         }
     }
     Ok(())

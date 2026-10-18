@@ -126,7 +126,7 @@ fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let _watcher = watch::spawn(tx.clone())?;
+    let _watcher = watch::spawn(tx.clone(), opts.config.clone(), opts.excludes.clone())?;
     let worker = std::thread::spawn(move || worker::run(rx, opts));
     let _conn = zbus::blocking::connection::Builder::session()?
         .name(SERVICE)?
@@ -152,13 +152,22 @@ fn data_home() -> Result<PathBuf> {
     })
 }
 
-/// Register the runner with KRunner and let D-Bus start it on demand.
-pub fn install(openvino_dir: Option<&Path>, device: &str, idle_unload_minutes: f64) -> Result<()> {
+/// Register the runner with KRunner and let D-Bus start it on demand. Only
+/// flags given here are baked into the service; the rest come from the config
+/// file each time the runner starts.
+pub fn install(
+    openvino_dir: Option<&Path>,
+    device: Option<&str>,
+    idle_unload_minutes: Option<f64>,
+) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let mut exec = format!(
-        "{} --device {device} --idle-unload-minutes {idle_unload_minutes}",
-        exe.display()
-    );
+    let mut exec = exe.display().to_string();
+    if let Some(d) = device {
+        exec.push_str(&format!(" --device {d}"));
+    }
+    if let Some(m) = idle_unload_minutes {
+        exec.push_str(&format!(" --idle-unload-minutes {m}"));
+    }
     if let Some(d) = openvino_dir {
         exec.push_str(&format!(" --openvino-dir {}", d.display()));
     }
