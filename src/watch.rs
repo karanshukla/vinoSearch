@@ -51,10 +51,14 @@ impl State {
         }
     }
 
-    fn add_new_roots(&mut self, conn: &rusqlite::Connection) {
+    /// Follow roots added since the last look, and drop forgotten ones. A
+    /// forgotten root's inotify watches stay until restart, but its events no
+    /// longer match a root, so they are ignored.
+    fn sync_roots(&mut self, conn: &rusqlite::Connection) {
         let Ok(roots) = index::roots(conn) else {
             return;
         };
+        self.roots.retain(|r| roots.contains(r));
         for root in roots {
             if !self.roots.contains(&root) && root.is_dir() && !self.excludes.contains(&root) {
                 let before = self.watched;
@@ -119,7 +123,7 @@ pub fn spawn(
             warned_limit: false,
             excludes,
         };
-        st.add_new_roots(&conn);
+        st.sync_roots(&conn);
         let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut last_event = Instant::now();
         let mut last_roots = Instant::now();
@@ -166,7 +170,7 @@ pub fn spawn(
                     // Keep the last good exclusions rather than index what a typo un-excluded.
                     Err(e) => eprintln!("reading config: {e:#}"),
                 }
-                st.add_new_roots(&conn);
+                st.sync_roots(&conn);
                 last_roots = Instant::now();
             }
         }

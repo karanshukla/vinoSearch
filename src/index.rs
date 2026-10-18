@@ -340,6 +340,24 @@ pub fn index(
     Ok(stats)
 }
 
+/// Stop treating `root` as a root and drop everything indexed under it.
+/// Returns files removed.
+pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM roots WHERE path = ?1",
+        [root.to_string_lossy()],
+    )?;
+    remove(conn, root)
+}
+
+/// Files and chunks in the index.
+pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
+    Ok((
+        conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?,
+        conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?,
+    ))
+}
+
 /// Roots `index` has been run on, which the watcher follows.
 pub fn roots(conn: &Connection) -> Result<Vec<PathBuf>> {
     let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;

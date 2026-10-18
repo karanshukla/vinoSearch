@@ -1,15 +1,19 @@
 //! The one thread that owns the model and the index.
 //!
-//! OpenVINO's handles are not Send, so queries (from the KRunner interface)
-//! and changed paths (from the watcher) come here over a channel. The model is
-//! loaded on demand and dropped, with the vector cache, after `idle` without a
-//! job, as the other vino projects do.
+//! OpenVINO's handles are not Send, so queries (from the KRunner interface),
+//! changed paths (from the watcher) and control requests come here over a
+//! channel. The model is loaded on demand and dropped, with the vector cache,
+//! after `idle` without a job, as the other vino projects do. What the worker
+//! is doing is published in `Status`, so status queries never wait behind it.
 
 use crate::config::Excludes;
 use crate::embed::Embedder;
 use crate::index::{self, Hit, Outcome, Vectors};
 use anyhow::Result;
+use futures_channel::oneshot;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -18,12 +22,25 @@ pub enum Job {
     Match {
         query: String,
         k: usize,
-        reply: mpsc::Sender<Vec<Hit>>,
+        reply: oneshot::Sender<Vec<Hit>>,
     },
     /// Paths created, modified, renamed or removed under a root.
     Changed(Vec<PathBuf>),
     /// The config's exclusions changed: drop what is now excluded.
     Excludes(Excludes),
+    /// Index a root (new or existing), as `vinosearch index` does.
+    Reindex(PathBuf),
+    /// Stop indexing and watching a root, and drop what was indexed under it.
+    Forget(PathBuf),
+    /// Free the model now instead of waiting for the idle timeout.
+    Unload,
+}
+
+/// What the worker is doing, for status queries.
+#[derive(Default)]
+pub struct Status {
+    pub loaded: AtomicBool,
+    pub indexing: AtomicBool,
 }
 
 struct Loaded {
@@ -35,11 +52,10 @@ pub struct Options {
     pub openvino_dir: Option<PathBuf>,
     pub device: String,
     pub idle: Option<Duration>,
-    /// Load the model before the first job (the KRunner runner is started by its first query).
-    pub preload: bool,
     pub excludes: Excludes,
     /// The config file the exclusions came from, which the watcher re-reads.
     pub config: PathBuf,
+    pub status: Arc<Status>,
 }
 
 fn changed(
@@ -93,18 +109,20 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         eprintln!("serving {} chunks", vectors.len());
         Ok(Loaded { emb, vectors })
     };
-    let mut loaded = if opts.preload {
-        Some(load(&conn)?)
-    } else {
-        None
+    let status = &opts.status;
+    let mut loaded: Option<Loaded> = None;
+    let unload = |loaded: &mut Option<Loaded>, why: &str| {
+        if loaded.take().is_some() {
+            status.loaded.store(false, Ordering::Relaxed);
+            eprintln!("model unloaded ({why})");
+        }
     };
     loop {
         let job = match (opts.idle, loaded.is_some()) {
             (Some(after), true) => match jobs.recv_timeout(after) {
                 Ok(job) => job,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    loaded = None;
-                    eprintln!("idle for {}s, model unloaded", after.as_secs());
+                    unload(&mut loaded, &format!("idle for {}s", after.as_secs()));
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -114,7 +132,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 Err(_) => break,
             },
         };
-        // Exclusions need no model.
+        // Jobs that need no model.
         let job = match job {
             Job::Excludes(ex) => {
                 excludes = ex;
@@ -124,11 +142,25 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }
                 continue;
             }
+            Job::Forget(root) => {
+                match index::forget(&conn, &root) {
+                    Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
+                    Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
+                }
+                continue;
+            }
+            Job::Unload => {
+                unload(&mut loaded, "asked to");
+                continue;
+            }
             job => job,
         };
         if loaded.is_none() {
             match load(&conn) {
-                Ok(l) => loaded = Some(l),
+                Ok(l) => {
+                    loaded = Some(l);
+                    status.loaded.store(true, Ordering::Relaxed);
+                }
                 Err(e) => {
                     eprintln!("loading model: {e:#}");
                     if let Job::Match { reply, .. } = job {
@@ -152,11 +184,30 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }));
             }
             Job::Changed(paths) => {
+                status.indexing.store(true, Ordering::Relaxed);
                 if let Err(e) = changed(&mut conn, &mut l.emb, paths, &excludes) {
                     eprintln!("updating index: {e:#}");
                 }
+                status.indexing.store(false, Ordering::Relaxed);
             }
-            Job::Excludes(_) => unreachable!("handled before loading"),
+            Job::Reindex(root) => {
+                status.indexing.store(true, Ordering::Relaxed);
+                match index::index(&mut conn, &mut l.emb, &root, &excludes) {
+                    Ok(s) => eprintln!(
+                        "{}: {} files seen, {} embedded ({} chunks), {} removed",
+                        root.display(),
+                        s.files_seen,
+                        s.files_embedded,
+                        s.chunks,
+                        s.removed
+                    ),
+                    Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
+                }
+                status.indexing.store(false, Ordering::Relaxed);
+            }
+            Job::Excludes(_) | Job::Forget(_) | Job::Unload => {
+                unreachable!("handled before loading")
+            }
         }
     }
     Ok(())

@@ -115,15 +115,15 @@ fn settings(cli: &Cli) -> Result<Settings> {
     })
 }
 
-fn worker_options(cli: &Cli, s: Settings, preload: bool) -> worker::Options {
+fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
     let m = s.idle_unload_minutes;
     worker::Options {
         openvino_dir: cli.openvino_dir.clone(),
         device: s.device,
         idle: (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0)),
-        preload,
         excludes: s.excludes,
         config: s.path,
+        status: Default::default(),
     }
 }
 
@@ -175,13 +175,13 @@ fn run(cli: Cli) -> Result<bool> {
             } else if uninstall {
                 krunner::uninstall()?;
             } else {
-                krunner::serve(worker_options(&cli, s, true))?;
+                krunner::serve(worker_options(&cli, s))?;
             }
             Ok(true)
         }
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let opts = worker_options(&cli, s, false);
+            let opts = worker_options(&cli, s);
             let _watcher = watch::spawn(tx, opts.config.clone(), opts.excludes.clone())?;
             worker::run(rx, opts)?;
             Ok(true)

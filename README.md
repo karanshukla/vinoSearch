@@ -35,6 +35,8 @@ Indexed roots are watched with inotify, one non-recursive watch per directory in
 
 The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 1042 MB loaded, 40 MB unloaded, ~2 s to reload. `vinosearch krunner --uninstall` removes the KRunner and D-Bus files.
 
+The runner also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index).
+
 The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat it like the files it indexes; encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
 
 ## Runtime
