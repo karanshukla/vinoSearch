@@ -31,7 +31,8 @@ now() { date +%s%N; }
 
 stats() {
     sort -n | awk '{a[NR]=$1; s+=$1} END {
-        printf "n=%d  mean=%.1f  p50=%d  p95=%d  max=%d ms\n", NR, s/NR, a[int((NR+1)/2)], a[int(NR*0.95+0.5)>NR?NR:int(NR*0.95+0.5)], a[NR]}'
+        p95 = int(NR * 0.95 + 0.5); if (p95 > NR) p95 = NR; if (p95 < 1) p95 = 1
+        printf "n=%d  mean=%.1f  p50=%d  p95=%d  max=%d ms\n", NR, s/NR, a[int((NR+1)/2)], a[p95], a[NR]}'
 }
 
 if busctl --user status "$DEST" >/dev/null 2>&1; then

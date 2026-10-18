@@ -129,6 +129,7 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+#[cfg(test)]
 fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     (b.len() == DIM * 4).then(|| {
         b.as_chunks::<4>()
@@ -376,36 +377,54 @@ pub struct Hit {
 pub struct Vectors {
     ids: Vec<i64>,
     data: Vec<f32>,
-    /// (max chunk id, chunk count) when loaded, to notice the index changing.
-    stamp: (i64, i64),
+    /// Database state when loaded, to notice the index changing.
+    stamp: (i64, u64),
 }
 
-fn stamp(conn: &Connection) -> Result<(i64, i64)> {
-    Ok(conn.query_row(
-        "SELECT COALESCE(MAX(id), 0), COUNT(*) FROM chunks",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
+/// Changes when anything is written: `data_version` for other connections'
+/// commits, `total_changes` for this one's. Both are O(1); counting chunks
+/// scanned the whole table on every query.
+fn stamp(conn: &Connection) -> Result<(i64, u64)> {
+    let version = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    Ok((version, conn.total_changes()))
 }
 
 impl Vectors {
     pub fn load(conn: &Connection) -> Result<Self> {
         let stamp = stamp(conn)?;
+        let n: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+        let n = n as usize;
+        let (mut ids, mut data) = (Vec::with_capacity(n), Vec::with_capacity(n * DIM));
         let mut stmt = conn.prepare("SELECT id, embedding FROM chunks")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
-        let (mut ids, mut data) = (Vec::new(), Vec::new());
-        for row in rows {
-            let (id, blob) = row?;
-            let Some(v) = from_blob(&blob) else { continue };
-            ids.push(id);
-            data.extend(v);
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            // Borrowed, so no copy of each blob is made on the way in.
+            let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? else {
+                continue;
+            };
+            if blob.len() != DIM * 4 {
+                continue;
+            }
+            ids.push(row.get(0)?);
+            data.extend(
+                blob.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
         }
         Ok(Self { ids, data, stamp })
     }
 
-    /// Reload if chunks were added or removed since loading.
+    /// Reload if the index changed since loading. The old copy is dropped
+    /// first, so a reload never holds two.
     pub fn refresh(&mut self, conn: &Connection) -> Result<()> {
         if stamp(conn)? != self.stamp {
+            *self = Self {
+                ids: Vec::new(),
+                data: Vec::new(),
+                stamp: (0, 0),
+            };
             *self = Self::load(conn)?;
         }
         Ok(())
@@ -416,17 +435,42 @@ impl Vectors {
     }
 }
 
+/// Lanes summed independently: one running total forces the additions into
+/// order, which stops the compiler using SIMD.
+const LANES: usize = 16;
+
+fn dot(a: &[f32; DIM], b: &[f32; DIM]) -> f32 {
+    let mut acc = [0f32; LANES];
+    for (x, y) in a
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<LANES>().0)
+    {
+        for i in 0..LANES {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    acc.iter().sum()
+}
+
 /// Cosine against every chunk (embeddings are unit length), best `k`.
 pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+    let query: &[f32; DIM] = query.try_into().context("query is not DIM long")?;
     let mut scored: Vec<(f32, i64)> = vectors
         .data
         .as_chunks::<DIM>()
         .0
         .iter()
         .zip(&vectors.ids)
-        .map(|(v, id)| (v.iter().zip(query).map(|(a, b)| a * b).sum(), *id))
+        .map(|(v, id)| (dot(v, query), *id))
         .collect();
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let by_score = |a: &(f32, i64), b: &(f32, i64)| b.0.total_cmp(&a.0);
+    if scored.len() > k && k > 0 {
+        scored.select_nth_unstable_by(k - 1, by_score);
+        scored.truncate(k);
+    }
+    scored.sort_by(by_score);
     scored.truncate(k);
     let mut stmt = conn.prepare(
         "SELECT f.path, c.start_line, c.text FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
@@ -550,5 +594,43 @@ mod tests {
         let v: Vec<f32> = (0..DIM).map(|i| i as f32 / 7.0).collect();
         assert_eq!(from_blob(&to_blob(&v)).unwrap(), v);
         assert!(from_blob(&[0u8; 12]).is_none());
+    }
+
+    #[test]
+    fn lane_dot_matches_the_naive_one() {
+        let a: [f32; DIM] = std::array::from_fn(|i| ((i * 7) % 13) as f32 / 13.0 - 0.5);
+        let b: [f32; DIM] = std::array::from_fn(|i| ((i * 5) % 11) as f32 / 11.0 - 0.5);
+        let naive: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        assert!((dot(&a, &b) - naive).abs() < 1e-4);
+    }
+
+    #[test]
+    fn search_returns_the_best_k_in_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, mtime INTEGER, size INTEGER);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY, file_id INTEGER, start_line INTEGER, text TEXT, embedding BLOB);
+             INSERT INTO files VALUES (1, '/f', 0, 0);",
+        )
+        .unwrap();
+        // Chunk i points along axis 0 with weight i/10, so higher i scores higher.
+        for i in 0..10 {
+            let mut v = vec![0f32; DIM];
+            v[0] = i as f32 / 10.0;
+            conn.execute(
+                "INSERT INTO chunks VALUES (?1, 1, ?1, '', ?2)",
+                params![i + 1, to_blob(&v)],
+            )
+            .unwrap();
+        }
+        let vectors = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let lines: Vec<i64> = search(&conn, &vectors, &q, 3)
+            .unwrap()
+            .iter()
+            .map(|h| h.line)
+            .collect();
+        assert_eq!(lines, [10, 9, 8]);
     }
 }
