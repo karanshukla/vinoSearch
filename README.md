@@ -29,7 +29,7 @@ device = "NPU"
 idle_unload_minutes = 5
 ```
 
-Adding an exclusion drops anything already indexed under it, and a running runner picks the change up within 30 seconds. `vinosearch index` refuses an excluded path.
+Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
 
 Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds.
 
