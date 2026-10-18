@@ -1,16 +1,14 @@
-//! KRunner D-Bus runner (org.kde.krunner1).
-//!
-//! OpenVINO's handles are not Send, and zbus serves interfaces from its own
-//! threads, so one worker thread owns the model and the index and the
-//! interface hands it queries over a channel.
+//! KRunner D-Bus runner (org.kde.krunner1). Queries go to the worker
+//! thread, which owns the model; the watcher keeps the index current.
 
-use crate::index::{self, Hit, Vectors};
+use crate::index::Hit;
+use crate::watch;
+use crate::worker::{self, Job, Options};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
-use std::time::Duration;
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -31,11 +29,6 @@ type Match = (
     f64,
     HashMap<String, OwnedValue>,
 );
-
-struct Job {
-    query: String,
-    reply: mpsc::Sender<Vec<Hit>>,
-}
 
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
@@ -95,17 +88,15 @@ impl Runner {
     #[zbus(name = "Match")]
     fn find(&self, query: String) -> Vec<Match> {
         let (tx, rx) = mpsc::channel();
-        if self
-            .jobs
-            .lock()
-            .unwrap()
-            .send(Job { query, reply: tx })
-            .is_err()
-        {
+        let job = Job::Match {
+            query,
+            k: RESULTS * 8,
+            reply: tx,
+        };
+        if self.jobs.lock().unwrap().send(job).is_err() {
             return Vec::new();
         }
-        rx.recv()
-            .unwrap_or_default()
+        per_file(rx.recv().unwrap_or_default())
             .into_iter()
             .map(to_match)
             .collect()
@@ -133,64 +124,10 @@ fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
         .collect()
 }
 
-struct Loaded {
-    emb: crate::embed::Embedder,
-    vectors: Vectors,
-}
-
-/// Serve jobs, loading the model on demand and dropping it (and the vector
-/// cache) after `idle` without a query, as the other vino projects do.
-fn worker(
-    jobs: mpsc::Receiver<Job>,
-    openvino_dir: Option<PathBuf>,
-    device: String,
-    idle: Option<Duration>,
-) -> Result<()> {
-    let conn = index::open(&index::default_db()?)?;
-    let load = || -> Result<Loaded> {
-        let emb = crate::embedder(openvino_dir.clone(), &device)?;
-        let vectors = Vectors::load(&conn)?;
-        eprintln!("serving {} chunks", vectors.len());
-        Ok(Loaded { emb, vectors })
-    };
-    // Loaded up front: D-Bus starts this on the first query anyway.
-    let mut loaded = Some(load()?);
-    loop {
-        let job = match (idle, loaded.is_some()) {
-            (Some(after), true) => match jobs.recv_timeout(after) {
-                Ok(job) => job,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    loaded = None;
-                    eprintln!("idle for {}s, model unloaded", after.as_secs());
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
-            _ => match jobs.recv() {
-                Ok(job) => job,
-                Err(_) => break,
-            },
-        };
-        let hits = (|| -> Result<Vec<Hit>> {
-            if loaded.is_none() {
-                loaded = Some(load()?);
-            }
-            let l = loaded.as_mut().unwrap();
-            l.vectors.refresh(&conn)?;
-            let q = l.emb.query(&job.query)?;
-            Ok(per_file(index::search(&conn, &l.vectors, &q, RESULTS * 8)?))
-        })();
-        let _ = job.reply.send(hits.unwrap_or_else(|e| {
-            eprintln!("match {:?}: {e:#}", job.query);
-            Vec::new()
-        }));
-    }
-    Ok(())
-}
-
-pub fn serve(openvino_dir: Option<PathBuf>, device: String, idle: Option<Duration>) -> Result<()> {
+pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || worker(rx, openvino_dir, device, idle));
+    let _watcher = watch::spawn(tx.clone())?;
+    let worker = std::thread::spawn(move || worker::run(rx, opts));
     let _conn = zbus::blocking::connection::Builder::session()?
         .name(SERVICE)?
         .serve_at(
@@ -203,7 +140,7 @@ pub fn serve(openvino_dir: Option<PathBuf>, device: String, idle: Option<Duratio
         .context("registering on the session bus")?;
     eprintln!("{SERVICE} on {OBJECT}");
     // The worker only returns on a startup error or when the channel closes.
-    handle
+    worker
         .join()
         .map_err(|_| anyhow::anyhow!("worker panicked"))?
 }

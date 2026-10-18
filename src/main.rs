@@ -3,6 +3,8 @@ mod index;
 mod krunner;
 mod model;
 mod runtime;
+mod watch;
+mod worker;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -49,6 +51,8 @@ enum Command {
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
     },
+    /// Keep the index current: watch every indexed root and re-index changes.
+    Watch,
     /// Search the index.
     Search {
         query: String,
@@ -70,14 +74,26 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     }
     let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
         .join(".cache/vinosearch/ov-cache");
-    let mut core = openvino::Core::new()?;
     let t0 = Instant::now();
-    let emb = embed::Embedder::new(&mut core, &dir, device, &cache)?;
+    let emb = embed::Embedder::new(openvino::Core::new()?, &dir, device, &cache)?;
     eprintln!(
         "model ready on {device} in {:.1} s",
         t0.elapsed().as_secs_f64()
     );
     Ok(emb)
+}
+
+fn worker_options(cli: &Cli, preload: bool) -> Result<worker::Options> {
+    let m = cli.idle_unload_minutes;
+    if !(m >= 0.0 && m.is_finite()) {
+        bail!("--idle-unload-minutes must be 0 or more");
+    }
+    Ok(worker::Options {
+        openvino_dir: cli.openvino_dir.clone(),
+        device: cli.device.clone(),
+        idle: (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0)),
+        preload,
+    })
 }
 
 pub(crate) fn snippet(text: &str) -> String {
@@ -127,13 +143,14 @@ fn run(cli: Cli) -> Result<bool> {
             } else if uninstall {
                 krunner::uninstall()?;
             } else {
-                if !(cli.idle_unload_minutes >= 0.0 && cli.idle_unload_minutes.is_finite()) {
-                    bail!("--idle-unload-minutes must be 0 or more");
-                }
-                let idle = (cli.idle_unload_minutes > 0.0)
-                    .then(|| std::time::Duration::from_secs_f64(cli.idle_unload_minutes * 60.0));
-                krunner::serve(cli.openvino_dir, cli.device, idle)?;
+                krunner::serve(worker_options(&cli, true)?)?;
             }
+            Ok(true)
+        }
+        Command::Watch => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _watcher = watch::spawn(tx)?;
+            worker::run(rx, worker_options(&cli, false)?)?;
             Ok(true)
         }
         Command::Search { query, n } => {
