@@ -9,7 +9,7 @@ use crate::config::{Config, Excludes};
 use crate::index;
 use crate::worker::Job;
 use anyhow::Result;
-use notify::event::{EventKind, ModifyKind};
+use notify::event::{Event, EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,8 +26,8 @@ const ROOTS_EVERY: Duration = Duration::from_secs(30);
 struct State {
     watcher: RecommendedWatcher,
     roots: Vec<PathBuf>,
-    /// Directories with a watch. Ones deleted since lose theirs in the kernel
-    /// and stay listed until their root is forgotten, which is harmless.
+    /// Directories with a watch. Dropped when the directory is removed or
+    /// renamed away, so one recreated at the same path is watched again.
     watched: HashSet<PathBuf>,
     warned_limit: bool,
     excludes: Excludes,
@@ -58,6 +58,23 @@ impl State {
         }
     }
 
+    /// Drop the watches on `dir` and everything under it that `keep` rejects.
+    /// Returns how many were dropped.
+    fn unwatch_tree(&mut self, dir: &Path, keep: impl Fn(&Self, &Path) -> bool) -> usize {
+        let drop: Vec<PathBuf> = self
+            .watched
+            .iter()
+            .filter(|d| d.starts_with(dir) && !keep(self, d))
+            .cloned()
+            .collect();
+        for d in &drop {
+            // Fails for directories already deleted; the kernel dropped those.
+            let _ = self.watcher.unwatch(d);
+            self.watched.remove(d);
+        }
+        drop.len()
+    }
+
     /// Follow roots added since the last look, and drop forgotten ones with
     /// their watches (except under a root still followed: roots can nest).
     fn sync_roots(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>) {
@@ -69,22 +86,8 @@ impl State {
             .partition(|r| roots.contains(r));
         self.roots = kept;
         for root in gone {
-            let drop: Vec<PathBuf> = self
-                .watched
-                .iter()
-                .filter(|d| d.starts_with(&root) && self.root_of(d).is_none())
-                .cloned()
-                .collect();
-            for dir in &drop {
-                // Fails for directories deleted since; their watch is gone already.
-                let _ = self.watcher.unwatch(dir);
-                self.watched.remove(dir);
-            }
-            eprintln!(
-                "stopped watching {} ({} directories)",
-                root.display(),
-                drop.len()
-            );
+            let n = self.unwatch_tree(&root, |st, d| st.root_of(d).is_some());
+            eprintln!("stopped watching {} ({n} directories)", root.display());
         }
         for root in roots {
             if !self.roots.contains(&root) && root.is_dir() && !self.excludes.contains(&root) {
@@ -141,6 +144,20 @@ fn relevant(root: &Path, path: &Path, ex: &Excludes) -> bool {
     !path.exists() || index::wanted(path)
 }
 
+/// Paths an event says are no longer there: removed, or renamed away.
+fn gone(event: &Event) -> &[PathBuf] {
+    match event.kind {
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            &event.paths
+        }
+        // [from, to]
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            &event.paths[..event.paths.len().min(1)]
+        }
+        _ => &[],
+    }
+}
+
 fn interesting(kind: &EventKind) -> bool {
     match kind {
         EventKind::Create(_) | EventKind::Remove(_) => true,
@@ -176,6 +193,10 @@ pub fn spawn(
         loop {
             match events.recv_timeout(Duration::from_millis(500)) {
                 Ok(Ok(event)) if interesting(&event.kind) => {
+                    // Before anything below re-adds the destination of a rename.
+                    for path in gone(&event) {
+                        st.unwatch_tree(path, |_, _| false);
+                    }
                     for path in event.paths {
                         let Some(root) = st.root_of(&path).map(Path::to_path_buf) else {
                             continue;
