@@ -375,7 +375,8 @@ impl SettingsWindow {
         help_line(
             ui,
             "Never indexed or watched, even inside an included folder. Adding one drops what is \
-             already indexed under it within 30 seconds.",
+             already indexed under it within 30 seconds. The list starts with folders of \
+             installed packages and games, which take long to index and are rarely searched for.",
         );
         if let Some(why) = &self.config_broken {
             ui.label(

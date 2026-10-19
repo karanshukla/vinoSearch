@@ -44,6 +44,11 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
     "venv",
     "site-packages",
+    // Conda installs, wherever they are
+    "miniconda3",
+    "anaconda3",
+    "miniforge3",
+    "mambaforge",
     // Go, PHP, Ruby
     "vendor",
     // Apple
@@ -1247,6 +1252,7 @@ mod tests {
             "cmake-build-release",
             ".git",
             "node_modules",
+            "miniconda3",
         ] {
             assert!(skipped_dir(d), "{d}");
         }

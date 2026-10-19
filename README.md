@@ -40,7 +40,7 @@ device = "NPU"
 idle_unload_minutes = 5
 ```
 
-Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
+Without an `exclude` line, the default list applies: `~/snap`, `~/go/pkg`, `~/sdk`, `~/Android/Sdk`, `~/R`, `~/perl5` and `~/Games`, trees of installed packages that take long to index and are rarely searched. Conda installs (`miniconda3`, `anaconda3`, ...) are skipped wherever they are. Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
 
 Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds. inotify can still miss changes (the kernel drops events when its queue overflows, and directories past the watch limit go unwatched), so every root is also compared with the index by mtime and size once an hour, after the machine wakes from sleep, right after dropped events, and on demand from the settings window. That reads no file contents: 0.5 s for 45,418 paths under a home directory here.
 
