@@ -231,7 +231,16 @@ pub fn spawn(
                 match Config::load(&config).and_then(|c| Ok((c.excludes()?, c))) {
                     Ok((ex, c)) if c != file => {
                         eprintln!("{}: changed", config.display());
-                        st.excludes = ex;
+                        let old = std::mem::replace(&mut st.excludes, ex);
+                        // Directories no longer excluded need watches now.
+                        for dir in old.paths() {
+                            if !st.excludes.contains(dir)
+                                && index::is_real_dir(dir)
+                                && st.root_of(dir).is_some()
+                            {
+                                st.watch_tree(dir);
+                            }
+                        }
                         file = c.clone();
                         if jobs.send(Job::Config(c)).is_err() {
                             break;

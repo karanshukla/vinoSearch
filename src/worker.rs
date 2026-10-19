@@ -12,7 +12,7 @@ use crate::index::{self, Hit, Outcome, Vectors};
 use crate::sched;
 use anyhow::Result;
 use futures_channel::oneshot;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -41,6 +41,9 @@ pub enum Job {
     DeleteModel,
     /// Delete OpenVINO's compiled-model cache (the next load recompiles).
     ClearCache,
+    /// The model may load now (a download finished): run the indexing that
+    /// waited for it.
+    Retry,
 }
 
 /// What the runner is doing, for status queries. The worker owns the model
@@ -106,9 +109,16 @@ fn changed(
     ex: &Excludes,
     after: &mut index::AfterFile,
 ) -> Result<()> {
+    let roots = index::roots(conn)?;
     let mut files = Vec::new();
     for path in paths {
         if ex.contains(&path) {
+            continue;
+        }
+        // Under a root no longer followed (Forget, with this batch already
+        // queued): indexing it would leave rows nothing ever removes. Removal
+        // still goes ahead.
+        if path.exists() && !roots.iter().any(|r| path.starts_with(r)) {
             continue;
         }
         if index::is_real_dir(&path) {
@@ -186,6 +196,21 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut loaded: Option<Loaded> = None;
     // Jobs that arrived while indexing and were not queries, run after it.
     let mut deferred: VecDeque<Job> = VecDeque::new();
+    // Indexing that could not run because the model failed to load (not
+    // fetched yet, or the device failed), run after the next load succeeds.
+    let mut waiting: HashSet<PathBuf> = HashSet::new();
+    let mut waiting_roots: Vec<PathBuf> = Vec::new();
+    let replay = |waiting: &mut HashSet<PathBuf>,
+                  waiting_roots: &mut Vec<PathBuf>,
+                  deferred: &mut VecDeque<Job>| {
+        if !waiting.is_empty() {
+            deferred.push_back(Job::Changed(waiting.drain().collect()));
+        }
+        for root in waiting_roots.drain(..) {
+            status.queued_reindex.fetch_add(1, Ordering::Relaxed);
+            deferred.push_back(Job::Reindex(root));
+        }
+    };
     let unload = |loaded: &mut Option<Loaded>, why: &str| {
         if loaded.take().is_some() {
             status.loaded.store(false, Ordering::Relaxed);
@@ -213,13 +238,28 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         };
         // Jobs that need no model.
         let job = match job {
+            Job::Retry => {
+                replay(&mut waiting, &mut waiting_roots, &mut deferred);
+                continue;
+            }
             Job::Config(file) => {
                 match file.excludes() {
                     Ok(ex) if ex != excludes => {
+                        // What is no longer excluded: index it (its files are
+                        // new to the index, and changed() finds them).
+                        let allowed: Vec<PathBuf> = excludes
+                            .paths()
+                            .iter()
+                            .filter(|p| !ex.contains(p) && index::is_real_dir(p))
+                            .cloned()
+                            .collect();
                         excludes = ex;
                         match index::purge(&conn, &excludes) {
                             Ok(n) => eprintln!("exclusions changed, {n} files removed"),
                             Err(e) => eprintln!("applying exclusions: {e:#}"),
+                        }
+                        if !allowed.is_empty() {
+                            deferred.push_back(Job::Changed(allowed));
                         }
                     }
                     Ok(_) => {}
@@ -262,6 +302,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 continue;
             }
             Job::DeleteModel => {
+                // Checked again here: this may have waited behind indexing
+                // while a FetchModel started.
+                if status.fetching.load(Ordering::SeqCst) {
+                    eprintln!("not deleting the model: a download started since it was asked");
+                    continue;
+                }
                 unload(&mut loaded, "deleting the model");
                 match crate::model::default_dir().and_then(|d| crate::model::delete(&d)) {
                     Ok(()) => eprintln!("model deleted"),
@@ -292,6 +338,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 Ok(l) => {
                     loaded = Some(l);
                     status.loaded.store(true, Ordering::Relaxed);
+                    replay(&mut waiting, &mut waiting_roots, &mut deferred);
                 }
                 Err(e) => {
                     eprintln!("loading model: {e:#}");
@@ -299,9 +346,11 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                         Job::Match { reply, .. } => {
                             let _ = reply.send(Vec::new());
                         }
-                        Job::Reindex(_) => {
+                        Job::Reindex(root) => {
                             status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
+                            waiting_roots.push(root);
                         }
+                        Job::Changed(paths) => waiting.extend(paths),
                         _ => {}
                     }
                     status.indexing.store(false, Ordering::Relaxed);
@@ -366,7 +415,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
                 status.indexing.store(false, Ordering::Relaxed);
             }
-            Job::Config(_) | Job::Forget(_) | Job::Unload | Job::DeleteModel | Job::ClearCache => {
+            Job::Config(_)
+            | Job::Forget(_)
+            | Job::Unload
+            | Job::DeleteModel
+            | Job::ClearCache
+            | Job::Retry => {
                 unreachable!("handled before loading")
             }
         }
