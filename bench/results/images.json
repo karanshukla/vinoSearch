@@ -1,0 +1,13 @@
+{
+  "machine": "Core 5 320 (Wildcat Lake NPU), NPU driver 1.35.0, OpenVINO 2026.4.1, 2026-10-19",
+  "dataset": "Flickr30k 1k test (nlphuji/flickr_1k_test_image_text_retrieval), 1000 images, 5000 captions",
+  "pipeline": "vision_encoder_static_<k> fp32 + model_image_<k> INT8, both on the NPU; idle 1.65 W package, 6.3 W psys",
+  "results": [
+    {"tokens": 280, "text_to_image": {"R@1": 86.3, "R@5": 97.5, "R@10": 98.7}, "image_to_text": {"R@1": 96.5, "R@5": 99.8, "R@10": 100.0},
+     "ms_per_image": 2767, "pkg_J": 9.4, "pkg_above_idle_J": 4.85, "psys_J": 25.5, "psys_above_idle_J": 7.31, "cos_to_reference_min": 0.9997},
+    {"tokens": 140, "text_to_image": {"R@1": 84.5, "R@5": 96.9, "R@10": 98.6}, "image_to_text": {"R@1": 95.7, "R@5": 99.7, "R@10": 100.0},
+     "ms_per_image": 1311, "pkg_J": 4.36, "pkg_above_idle_J": 2.2, "psys_J": 11.95, "psys_above_idle_J": 3.33, "cos_to_reference_min": 0.9996},
+    {"tokens": 70, "text_to_image": {"R@1": 81.1, "R@5": 95.4, "R@10": 97.9}, "image_to_text": {"R@1": 91.8, "R@5": 98.9, "R@10": 99.7},
+     "ms_per_image": 653, "pkg_J": 2.16, "pkg_above_idle_J": 1.09, "psys_J": 5.41, "psys_above_idle_J": 1.12, "cos_to_reference_min": 0.9994}
+  ]
+}
