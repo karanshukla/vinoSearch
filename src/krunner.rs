@@ -510,7 +510,11 @@ fn install_gnome() -> Result<()> {
     // window when that is installed beside us, else the documentation.
     let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
     let exec = if settings.is_file() {
-        settings.display().to_string()
+        let s = utf8(&settings)?;
+        if s.chars().any(char::is_control) {
+            anyhow::bail!("{s:?}: cannot go in a desktop entry");
+        }
+        desktop_quote(s)
     } else {
         "xdg-open https://github.com/karanshukla/vinoSearch#readme".to_owned()
     };
@@ -609,18 +613,22 @@ pub fn install(
     device: Option<&str>,
     idle_unload_minutes: Option<f64>,
 ) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut exec = exe.display().to_string();
+    let mut args = vec![utf8(&std::env::current_exe()?)?.to_owned()];
     if let Some(d) = device {
-        exec.push_str(&format!(" --device {d}"));
+        args.extend(["--device".into(), d.to_owned()]);
     }
     if let Some(m) = idle_unload_minutes {
-        exec.push_str(&format!(" --idle-unload-minutes {m}"));
+        args.extend(["--idle-unload-minutes".into(), m.to_string()]);
     }
     if let Some(d) = openvino_dir {
-        exec.push_str(&format!(" --openvino-dir {}", d.display()));
+        args.extend(["--openvino-dir".into(), utf8(d)?.to_owned()]);
     }
-    exec.push_str(" krunner");
+    args.push("krunner".into());
+    for a in &args {
+        if a.chars().any(char::is_control) {
+            anyhow::bail!("{a:?}: cannot go in a service's command line");
+        }
+    }
     let data = data_home()?;
     let plugin = data.join(KRUNNER_PLUGIN);
     let service = data.join(format!("dbus-1/services/{SERVICE}.service"));
@@ -642,7 +650,10 @@ pub fn install(
     )?;
     fs::write(
         &service,
-        format!("[D-BUS Service]\nName={SERVICE}\nExec={exec}\nSystemdService={UNIT}\n"),
+        format!(
+            "[D-BUS Service]\nName={SERVICE}\nExec={}\nSystemdService={UNIT}\n",
+            command_line(&args, dbus_quote)
+        ),
     )?;
     let unit = unit_path()?;
     fs::create_dir_all(unit.parent().unwrap())?;
@@ -651,9 +662,10 @@ pub fn install(
         format!(
             "[Unit]\nDescription=vinoSearch semantic file search (KRunner runner and index watcher)\n\
              Documentation=https://github.com/karanshukla/vinoSearch\n\n\
-             [Service]\nType=dbus\nBusName={SERVICE}\nExecStart={exec}\n\
+             [Service]\nType=dbus\nBusName={SERVICE}\nExecStart={}\n\
              Restart=on-failure\nRestartSec=10\n\n\
-             [Install]\nWantedBy=default.target\n"
+             [Install]\nWantedBy=default.target\n",
+            command_line(&args, systemd_quote)
         ),
     )?;
     println!(
@@ -679,6 +691,58 @@ pub fn install(
     Ok(())
 }
 
+fn utf8(p: &Path) -> Result<&str> {
+    p.to_str()
+        .with_context(|| format!("{}: not UTF-8", p.display()))
+}
+
+/// `args` as one command line, each quoted by `quote`, so a path with a
+/// space stays one argument.
+fn command_line(args: &[String], quote: fn(&str) -> String) -> String {
+    args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// A double-quoted word in a D-Bus service file's Exec (dbus-daemon's and
+/// dbus-broker's shell-like parsing: inside double quotes a backslash
+/// escapes `\`, `"`, `$` and `` ` ``).
+fn dbus_quote(arg: &str) -> String {
+    let mut q = String::from('"');
+    for c in arg.chars() {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    q
+}
+
+/// A double-quoted word in a systemd ExecStart: C-style backslash escapes,
+/// `%%` for a literal `%` (specifiers) and `$$` for `$` (variables).
+fn systemd_quote(arg: &str) -> String {
+    let mut q = String::from('"');
+    for c in arg.chars() {
+        match c {
+            '\\' | '"' => {
+                q.push('\\');
+                q.push(c);
+            }
+            '%' => q.push_str("%%"),
+            '$' => q.push_str("$$"),
+            _ => q.push(c),
+        }
+    }
+    q.push('"');
+    q
+}
+
+/// A quoted argument in a desktop entry's Exec: the D-Bus quoting, which
+/// matches the Exec key's, then `%%` for `%` (field codes) and every
+/// backslash doubled again for the string value's own escaping.
+fn desktop_quote(arg: &str) -> String {
+    dbus_quote(arg).replace('\\', "\\\\").replace('%', "%%")
+}
+
 pub fn uninstall() -> Result<()> {
     let data = data_home()?;
     let unit = unit_path()?;
@@ -702,4 +766,29 @@ pub fn uninstall() -> Result<()> {
     }
     systemctl(&["daemon-reload"]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_lines_quote_every_argument() {
+        let args = ["/opt/my apps/vinosearch".to_owned(), "krunner".to_owned()];
+        assert_eq!(
+            command_line(&args, dbus_quote),
+            r#""/opt/my apps/vinosearch" "krunner""#
+        );
+        assert_eq!(
+            command_line(&args, systemd_quote),
+            r#""/opt/my apps/vinosearch" "krunner""#
+        );
+        let odd = r#"/a "b" \c $d `e` 100%"#;
+        assert_eq!(dbus_quote(odd), r#""/a \"b\" \\c \$d \`e\` 100%""#);
+        assert_eq!(systemd_quote(odd), r#""/a \"b\" \\c $$d `e` 100%%""#);
+        assert_eq!(
+            desktop_quote(odd),
+            r#""/a \\"b\\" \\\\c \\$d \\`e\\` 100%%""#
+        );
+    }
 }
