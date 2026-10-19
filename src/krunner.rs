@@ -353,6 +353,7 @@ impl Control {
             return Err(failed("a download is already running"));
         }
         let status = self.status.clone();
+        let jobs = self.jobs.lock().unwrap().clone();
         *status.fetch_error.lock().unwrap() = String::new();
         status.fetch_done.store(0, Ordering::Relaxed);
         status
@@ -364,9 +365,15 @@ impl Control {
                     status.fetch_done.store(done, Ordering::Relaxed);
                 })
             });
-            if let Err(e) = result {
-                eprintln!("fetching the model: {e:#}");
-                *status.fetch_error.lock().unwrap() = format!("{e:#}");
+            match result {
+                // Indexing that found no model can run now.
+                Ok(()) => {
+                    let _ = jobs.send(Job::Retry);
+                }
+                Err(e) => {
+                    eprintln!("fetching the model: {e:#}");
+                    *status.fetch_error.lock().unwrap() = format!("{e:#}");
+                }
             }
             status.fetching.store(false, Ordering::SeqCst);
         });
