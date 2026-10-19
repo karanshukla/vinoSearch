@@ -42,8 +42,12 @@ type Match = (
     HashMap<String, OwnedValue>,
 );
 
+/// One connection for the handlers that read the index; queries are short.
+type Db = Arc<Mutex<rusqlite::Connection>>;
+
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
+    db: Db,
 }
 
 /// The best chunk of each of the best files for `query`, as KRunner and GNOME
@@ -90,10 +94,7 @@ fn to_match(h: Hit) -> Match {
     let (name, subtext) = describe(&h);
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Value::from(subtext)));
-    props.insert(
-        "urls".into(),
-        owned(Value::from(vec![format!("file://{}", h.path)])),
-    );
+    props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
     let relevance = f64::from(((h.score - MIN_SCORE) / (1.0 - MIN_SCORE)).clamp(0.0, 1.0));
     (
         h.path,
@@ -105,7 +106,40 @@ fn to_match(h: Hit) -> Match {
     )
 }
 
-fn open(target: &Path) {
+/// `path` as a file:// URL, percent-encoded so `#`, `%`, `?` and spaces
+/// survive (RFC 8089; `/` stays as the separator).
+fn file_url(path: &str) -> String {
+    let mut url = String::from("file://");
+    for &b in path.as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// Open the indexed file `id`, or its folder. Ids come from callers on the
+/// session bus, so anything this runner could not have returned is refused.
+fn open(db: &Db, id: &str, folder: bool) {
+    match index::is_indexed(&db.lock().unwrap(), id) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("not opening {id}: not an indexed file");
+            return;
+        }
+        Err(e) => {
+            eprintln!("not opening {id}: {e:#}");
+            return;
+        }
+    }
+    let path = Path::new(id);
+    let target = if folder {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
     if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
         eprintln!("xdg-open {}: {e}", target.display());
     }
@@ -133,11 +167,7 @@ impl Runner {
 
     #[zbus(name = "Run")]
     fn run(&self, match_id: String, action_id: String) {
-        let path = PathBuf::from(&match_id);
-        match action_id.as_str() {
-            "open-folder" => open(path.parent().unwrap_or(&path)),
-            _ => open(&path),
-        }
+        open(&self.db, &match_id, action_id == "open-folder");
     }
 
     #[zbus(name = "Teardown")]
@@ -148,6 +178,7 @@ impl Runner {
 /// last search's hits are kept to describe them without searching again.
 struct Gnome {
     jobs: Mutex<mpsc::Sender<Job>>,
+    db: Db,
     last: Mutex<HashMap<String, Hit>>,
 }
 
@@ -209,7 +240,7 @@ impl Gnome {
 
     #[zbus(name = "ActivateResult")]
     fn activate(&self, id: String, _terms: Vec<String>, _timestamp: u32) {
-        open(Path::new(&id));
+        open(&self.db, &id, false);
     }
 
     /// Clicking the provider's icon. Nothing to show yet; the settings app
@@ -221,7 +252,7 @@ impl Gnome {
 struct Control {
     jobs: Mutex<mpsc::Sender<Job>>,
     status: Arc<Status>,
-    db: Mutex<rusqlite::Connection>,
+    db: Db,
     config: PathBuf,
 }
 
@@ -440,10 +471,11 @@ pub fn serve(opts: Options) -> Result<()> {
         opts.file.clone(),
         opts.status.clone(),
     )?;
+    let db: Db = Arc::new(Mutex::new(index::open(&index::default_db()?)?));
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
-        db: Mutex::new(index::open(&index::default_db()?)?),
+        db: db.clone(),
         config: opts.config.clone(),
     };
     let worker = std::thread::spawn(move || worker::run(rx, opts));
@@ -453,12 +485,14 @@ pub fn serve(opts: Options) -> Result<()> {
             OBJECT,
             Runner {
                 jobs: Mutex::new(tx.clone()),
+                db: db.clone(),
             },
         )?
         .serve_at(
             GNOME,
             Gnome {
                 jobs: Mutex::new(tx),
+                db,
                 last: Mutex::default(),
             },
         )?
@@ -707,4 +741,19 @@ pub fn uninstall() -> Result<()> {
     }
     systemctl(&["daemon-reload"]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_urls_are_percent_encoded() {
+        assert_eq!(file_url("/home/u/a.md"), "file:///home/u/a.md");
+        assert_eq!(
+            file_url("/home/u/My Notes/#1 50%?.md"),
+            "file:///home/u/My%20Notes/%231%2050%25%3F.md"
+        );
+        assert_eq!(file_url("/tmp/é.txt"), "file:///tmp/%C3%A9.txt");
+    }
 }
