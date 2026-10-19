@@ -100,4 +100,4 @@ Found along the way, on OpenVINO 2026.4.1 and NPU driver 1.35.0:
 
 ## Demos
 
-The animations in the README are drawn, not recorded: `python3 docs/media/demos.py` writes `docs/media/krunner.svg` and `settings.svg`. File names, snippets and counts in them are made up. The photo is from [Unsplash](https://unsplash.com/license), downscaled to `docs/media/dog-sunset.webp`.
+The animations in the README (`docs/media/krunner.svg`, `settings.svg`) are drawn, not recorded. File names, snippets and counts in them are made up. The photo is from [Unsplash](https://unsplash.com/license).
