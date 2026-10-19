@@ -197,6 +197,7 @@ fn run(cli: Cli) -> Result<bool> {
                                 st.chunks as f64 / t0.elapsed().as_secs_f64()
                             );
                         }
+                        Ok(())
                     },
                 )?;
                 if st.files_embedded > 0 {

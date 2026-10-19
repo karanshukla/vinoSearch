@@ -320,6 +320,10 @@ impl Control {
             )),
         );
         out.insert(
+            key::PAUSED.into(),
+            owned(Value::from(self.status.paused.load(Ordering::Relaxed))),
+        );
+        out.insert(
             key::DEVICE.into(),
             owned(Value::from(self.status.device.lock().unwrap().clone())),
         );
@@ -408,6 +412,20 @@ impl Control {
     fn check_now(&self) -> zbus::fdo::Result<()> {
         self.status.check_now.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Stop indexing within a chunk and hold new indexing until
+    /// ResumeIndexing. Files already indexed stay; queries still work.
+    fn pause_indexing(&self) -> zbus::fdo::Result<()> {
+        self.status.paused.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Run the indexing held since PauseIndexing. Unchanged files are
+    /// skipped, so it carries on where it stopped.
+    fn resume_indexing(&self) -> zbus::fdo::Result<()> {
+        self.status.paused.store(false, Ordering::Relaxed);
+        self.send(Job::Retry)
     }
 
     /// Free the model now.

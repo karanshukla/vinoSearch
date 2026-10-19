@@ -231,12 +231,20 @@ impl SettingsWindow {
             row(ui, "Now:", "", |ui| {
                 ui.horizontal(|ui| {
                     ui.set_min_height(ui.spacing().interact_size.y);
-                    if s.indexing {
+                    if s.paused {
+                        ui.label("Indexing stopped. What's indexed so far is kept.");
+                        if ui.button("Resume").clicked() {
+                            self.link.send(Request::ResumeIndexing);
+                        }
+                    } else if s.indexing {
                         spinner(ui);
                         ui.label(format!(
                             "Indexing, {} files so far",
                             count(s.indexed_files as i64)
                         ));
+                        if ui.button("Stop").clicked() {
+                            self.link.send(Request::PauseIndexing);
+                        }
                     } else {
                         ui.label("Up to date");
                     }

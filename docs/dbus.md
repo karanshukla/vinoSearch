@@ -34,6 +34,8 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `Reindex` | `(s path) → ()` | Index a directory and watch it from now on. Fails if the path is missing, not a directory, or excluded. Queued; watch `indexing` in `Status` for it to finish. |
 | `Forget` | `(s path) → ()` | Stop indexing and watching a root, and drop what was indexed under it. |
 | `CheckNow` | `() → ()` | Compare every root with the index by mtime and size, as the watcher does hourly, and index what differs. Runs once any indexing job has finished; `last_checked` in `Status` moves when it has. |
+| `PauseIndexing` | `() → ()` | Stop indexing after the chunk in progress (~35 ms on the NPU) and hold new indexing work until `ResumeIndexing`. Every file finished so far stays in the index; queries keep working. Not kept across a runner restart, which indexes as usual. |
+| `ResumeIndexing` | `() → ()` | Run the indexing held since `PauseIndexing`. Unchanged files are skipped by mtime and size, so it carries on where it stopped. |
 | `Unload` | `() → ()` | Free the model now instead of after the idle timeout. |
 | `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (308 MB, every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
@@ -46,6 +48,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 |---|---|---|
 | `model_loaded` | `b` | The model is in memory. |
 | `indexing` | `b` | A `Reindex` is queued or running, or the worker is embedding changes the watcher found. True from the moment `Reindex` returns. |
+| `paused` | `b` | `PauseIndexing` was called and `ResumeIndexing` not since. `indexing` is false while paused. |
 | `indexed_files` | `t` | Files embedded so far by the current indexing job. |
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
@@ -76,7 +79,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 
 | Key | Takes effect |
 |---|---|
-| `exclude` | at once: anything newly excluded is dropped from the index and no longer watched for new directories |
+| `exclude` | at once, stopping an indexing job to apply it (the job runs again after): anything newly excluded is dropped from the index and no longer watched for new directories |
 | `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
 | `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
 | `index_busy_percent` | at once, mid-index included: most of the device's time background indexing takes, 1 to 100, default 50, half that on battery |
