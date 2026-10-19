@@ -9,7 +9,8 @@
 //! index_busy_percent = 50
 //! ```
 //!
-//! A missing file is the defaults. Flags and environment variables override it.
+//! A missing file is the defaults, and a missing `exclude` is
+//! [`DEFAULT_EXCLUDE`]. Flags and environment variables override it.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,21 @@ use std::time::Duration;
 pub const DEFAULT_DEVICE: &str = "NPU";
 pub const DEFAULT_IDLE_UNLOAD_MINUTES: f64 = 5.0;
 pub const DEFAULT_INDEX_BUSY_PERCENT: u8 = 50;
+/// Big trees of downloaded or installed files that live in the home folder
+/// under names too common to skip everywhere (`pkg`, `sdk`, `Games`).
+pub const DEFAULT_EXCLUDE: &[&str] = &[
+    // Snap packages' data and revisions
+    "~/snap",
+    // Go's module and build cache, and the Go SDKs `go install` fetches
+    "~/go/pkg",
+    "~/sdk",
+    "~/Android/Sdk",
+    // R and Perl libraries installed per user
+    "~/R",
+    "~/perl5",
+    // Heroic, Lutris and others install games here
+    "~/Games",
+];
 
 /// `index_busy_percent` as a share of the device's time, in (0, 1].
 pub fn index_share(percent: u8) -> Result<f64> {
@@ -37,7 +53,7 @@ pub fn idle_unload(minutes: f64) -> Result<Option<Duration>> {
     Ok((minutes > 0.0).then(|| Duration::from_secs_f64(minutes * 60.0)))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Directories never indexed or watched, even under an indexed root. A
@@ -53,6 +69,17 @@ pub struct Config {
     /// half that on battery [default: 50].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_busy_percent: Option<u8>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            exclude: DEFAULT_EXCLUDE.iter().map(|&e| e.to_owned()).collect(),
+            device: None,
+            idle_unload_minutes: None,
+            index_busy_percent: None,
+        }
+    }
 }
 
 fn home() -> Result<PathBuf> {
@@ -103,6 +130,8 @@ impl Config {
                 *v = exclude.into();
                 *v.decor_mut() = decor;
             }
+            // Left unwritten while it is the defaults, so a later release's defaults reach it.
+            None if self.exclude == Config::default().exclude => {}
             None => doc["exclude"] = toml_edit::value(exclude),
         }
         match &self.device {
@@ -301,6 +330,27 @@ mod tests {
             exclude: vec!["~/Downloads".into()],
             ..Config::default()
         };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_exclude_is_the_default_list_until_changed() {
+        let c: Config = toml::from_str("device = \"CPU\"\n").unwrap();
+        assert_eq!(c.exclude, DEFAULT_EXCLUDE);
+        let c: Config = toml::from_str("exclude = []\n").unwrap();
+        assert!(c.exclude.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("vinosearch-dflt-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut c = Config {
+            device: Some("CPU".into()),
+            ..Config::default()
+        };
+        c.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("exclude"));
+        c.exclude.retain(|e| e != "~/Games");
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
         fs::remove_dir_all(&dir).unwrap();

@@ -79,7 +79,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 
 | Key | Takes effect |
 |---|---|
-| `exclude` | at once, stopping an indexing job to apply it (the job runs again after): anything newly excluded is dropped from the index and no longer watched for new directories |
+| `exclude` (missing: `config::DEFAULT_EXCLUDE`, and not written back while unchanged) | at once, stopping an indexing job to apply it (the job runs again after): anything newly excluded is dropped from the index and no longer watched for new directories |
 | `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
 | `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
 | `index_busy_percent` | at once, mid-index included: most of the device's time background indexing takes, 1 to 100, default 50, half that on battery |
