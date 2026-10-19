@@ -54,12 +54,14 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 ## Settings
 
-`vinosearch-settings` is the settings window: egui, in the same style as vinoWhisper's settings (Inter, flat surfaces, the vino green), with the icon above. Install it with `cargo install --path crates/settings`, then run `vinosearch krunner --install` once more so the **vinoSearch** entry in the app menu opens it. Or run `vinosearch-settings` directly; `--page index|model|integration` opens a given page.
+`vinosearch-settings` is the settings window: egui, in the same style as vinoWhisper's settings (Inter, flat surfaces, the vino green), with the icon above. Install it with `cargo install --path crates/settings`, then run `vinosearch krunner --install` once more so the **vinoSearch** entry in the app menu opens it. Or run `vinosearch-settings` directly; `--page index|folders|model|hardware|integration` opens a given page.
 
 | Page | Shows | Lets you |
 |---|---|---|
-| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes, the largest folders inside the indexed ones and their share of the index | Check now, add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, exclude one of the largest folders in one click, add or remove exclusions |
-| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size, and what `vinosearch doctor` reports (NPU, driver, OpenVINO, devices, a probe run on the chosen device) | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
+| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes, the largest folders inside the indexed ones and their share of the index | Check now, exclude one of the largest folders in one click |
+| Folders | The included (indexed) folders and the excluded ones | Add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
+| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
+| Hardware | What `vinosearch doctor` reports: NPU, driver, NPU compiler, OpenVINO, devices, and a probe run on the device picked on the Model page | Check again |
 | Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 
 How it behaves:

@@ -11,12 +11,20 @@ use crate::{doctor, integration, portal, theme};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Index,
+    Folders,
     Model,
+    Hardware,
     Integration,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::Index, Page::Model, Page::Integration];
+    const ALL: [Page; 5] = [
+        Page::Index,
+        Page::Folders,
+        Page::Model,
+        Page::Hardware,
+        Page::Integration,
+    ];
 
     fn parse(name: &str) -> Option<Page> {
         Page::ALL
@@ -27,7 +35,9 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::Index => "Index",
+            Page::Folders => "Folders",
             Page::Model => "Model",
+            Page::Hardware => "Hardware",
             Page::Integration => "Integration",
         }
     }
@@ -286,8 +296,24 @@ impl SettingsWindow {
                 },
             );
         }
+        if let Some(s) = reachable.filter(|s| s.chunks > 0) {
+            self.largest(ui, s, largest);
+        }
+    }
 
-        section(ui, "Folders");
+    /// What is indexed and what never is.
+    fn folders(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        let p = theme::palette(ui.ctx());
+        let reachable = match status {
+            Some(Ok(s)) => Some(s),
+            Some(Err(why)) => {
+                ui.add_space(10.0);
+                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                None
+            }
+            None => None,
+        };
+        section(ui, "Included");
         help_line(
             ui,
             "Indexed, then watched for changes. Hidden folders, build output and dependencies \
@@ -328,14 +354,10 @@ impl SettingsWindow {
             self.adder(ui, Target::Root);
         });
 
-        if let Some(s) = reachable.filter(|s| s.chunks > 0) {
-            self.largest(ui, s, largest);
-        }
-
         section(ui, "Excluded");
         help_line(
             ui,
-            "Never indexed or watched, even inside a folder above. Adding one drops what is \
+            "Never indexed or watched, even inside an included folder. Adding one drops what is \
              already indexed under it within 30 seconds.",
         );
         if let Some(why) = &self.config_broken {
@@ -370,8 +392,9 @@ impl SettingsWindow {
     /// trees are often most of it, which nobody would guess without seeing it.
     fn largest(&mut self, ui: &mut egui::Ui, s: &Status, largest: Option<&Vec<(String, u64)>>) {
         let p = theme::palette(ui.ctx());
-        // Asked again once the index has changed and settled.
-        if !s.indexing && self.largest_for != Some(s.chunks) {
+        // Asked at once, then again whenever the index has changed and indexing
+        // has settled: a first index can run for hours.
+        if (self.largest_for.is_none() || !s.indexing) && self.largest_for != Some(s.chunks) {
             self.largest_for = Some(s.chunks);
             self.link.send(Request::LargestFolders(LARGEST));
         }
@@ -559,11 +582,9 @@ impl SettingsWindow {
             );
         }
 
-        self.hardware(ui);
-
         section(ui, "Running");
         if self.config_broken.is_some() {
-            help_line(ui, "The settings file doesn't parse; see the Index page.");
+            help_line(ui, "The settings file doesn't parse; see the Folders page.");
             return;
         }
         let mut changed = false;
@@ -631,12 +652,13 @@ impl SettingsWindow {
     }
 
     /// What `vinosearch doctor` reports, run the first time the page shows.
+    /// The device it probes is the one picked on the Model page.
     fn hardware(&mut self, ui: &mut egui::Ui) {
         let state = self.doctor.lock().unwrap().clone();
         if state.report.is_none() && !state.running {
             doctor::run(Arc::clone(&self.doctor), ui.ctx());
         }
-        section(ui, "Hardware");
+        section(ui, "This machine");
         if let Some(report) = &state.report {
             for (label, text) in &report.lines {
                 let failed = label == "Probe:" && !report.ok;
@@ -664,8 +686,8 @@ impl SettingsWindow {
         row(
             ui,
             "",
-            "Runs a tiny model on the device below, in a separate process, as \
-             vinosearch doctor does.",
+            "Runs a tiny model on the device picked on the Model page, in a separate \
+             process, as vinosearch doctor does.",
             |ui| {
                 ui.horizontal(|ui| {
                     ui.set_min_height(ui.spacing().interact_size.y);
@@ -1025,10 +1047,13 @@ impl eframe::App for SettingsWindow {
                                 .color(header.text),
                         );
                     } else {
-                        ui.spacing_mut().item_spacing.x = 18.0;
-                        for page in Page::ALL {
-                            tab_item(ui, page, &mut self.page, header);
-                        }
+                        // Five tabs: wrap rather than clip at the narrowest widths.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(18.0, 6.0);
+                            for page in Page::ALL {
+                                tab_item(ui, page, &mut self.page, header);
+                            }
+                        });
                     }
                 });
             });
@@ -1087,7 +1112,9 @@ impl eframe::App for SettingsWindow {
                         let status = shared.status.as_ref();
                         match self.page {
                             Page::Index => self.index(ui, status, shared.largest.as_ref()),
+                            Page::Folders => self.folders(ui, status),
                             Page::Model => self.model(ui, status),
+                            Page::Hardware => self.hardware(ui),
                             Page::Integration => self.integration(ui),
                         }
                         ui.add_space(12.0);
@@ -1185,6 +1212,8 @@ mod tests {
     #[test]
     fn pages_parse_by_title() {
         assert!(Page::parse("model") == Some(Page::Model));
+        assert!(Page::parse("Hardware") == Some(Page::Hardware));
+        assert!(Page::parse("folders") == Some(Page::Folders));
         assert!(Page::parse("nope").is_none());
     }
 }

@@ -13,7 +13,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 vinosearch-settings: the vinoSearch settings window
 
-Usage: vinosearch-settings [--page index|model|integration]
+Usage: vinosearch-settings [--page index|folders|model|hardware|integration]
 ";
 
 fn main() -> ExitCode {
