@@ -479,6 +479,14 @@ pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// Whether `path` is an indexed file.
+pub fn is_indexed(conn: &Connection, path: &str) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM files WHERE path = ?1", [path], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Files and chunks in the index.
 pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
     Ok((
@@ -831,6 +839,9 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(left, ["/a_b/z.md"]);
+        assert!(is_indexed(&conn, "/a_b/z.md").unwrap());
+        assert!(!is_indexed(&conn, "/a_b").unwrap());
+        assert!(!is_indexed(&conn, "/c.md").unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 
