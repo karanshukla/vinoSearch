@@ -120,9 +120,10 @@ impl Config {
     }
 }
 
-/// `~/x` against `home`, made absolute and free of `.`/`..`, then
-/// canonicalized when it exists, so it compares equal to the canonical paths
-/// indexing records.
+/// `~/x` against `home`, made absolute and free of `.`/`..`, then its
+/// longest existing ancestor canonicalized, so it compares equal to the
+/// canonical paths indexing records, including once a folder that is missing
+/// now is created (on Silverblue, `/home` is a symlink to `/var/home`).
 fn resolve(entry: &str, home: &Path) -> Result<PathBuf> {
     let raw = match entry.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -142,7 +143,23 @@ fn resolve(entry: &str, home: &Path) -> Result<PathBuf> {
             c => clean.push(c),
         }
     }
-    Ok(fs::canonicalize(&clean).unwrap_or(clean))
+    Ok(canonical_prefix(&clean))
+}
+
+/// `path` with its longest existing ancestor canonicalized and the rest
+/// appended as written.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    for base in path.ancestors() {
+        if let Ok(canon) = fs::canonicalize(base) {
+            let rest = path.strip_prefix(base).expect("an ancestor is a prefix");
+            return if rest.as_os_str().is_empty() {
+                canon
+            } else {
+                canon.join(rest)
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Resolved exclusions. Matching is by whole path components, so excluding
@@ -194,6 +211,23 @@ mod tests {
         );
         assert_eq!(resolve("~", home).unwrap(), home);
         assert!(resolve("relative/dir", home).is_err());
+    }
+
+    #[test]
+    fn a_missing_exclusion_resolves_through_a_symlinked_home() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-cfg-{}", std::process::id()));
+        let real = dir.join("var/home/u");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.join("home");
+        std::os::unix::fs::symlink(dir.join("var/home"), &link).unwrap();
+        let real = fs::canonicalize(&real).unwrap();
+        // Written before Documents/tax exists, through the symlink.
+        let ex = resolve("~/Documents/tax", &link.join("u")).unwrap();
+        assert_eq!(ex, real.join("Documents/tax"));
+        fs::create_dir_all(real.join("Documents/tax")).unwrap();
+        let indexed = fs::canonicalize(link.join("u/Documents/tax")).unwrap();
+        assert!(Excludes(vec![ex]).contains(&indexed.join("2025.md")));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
