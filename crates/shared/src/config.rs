@@ -6,6 +6,7 @@
 //! exclude = ["~/Downloads", "~/Documents/tax"]
 //! device = "NPU"
 //! idle_unload_minutes = 5
+//! index_busy_percent = 50
 //! ```
 //!
 //! A missing file is the defaults. Flags and environment variables override it.
@@ -18,6 +19,15 @@ use std::time::Duration;
 
 pub const DEFAULT_DEVICE: &str = "NPU";
 pub const DEFAULT_IDLE_UNLOAD_MINUTES: f64 = 5.0;
+pub const DEFAULT_INDEX_BUSY_PERCENT: u8 = 50;
+
+/// `index_busy_percent` as a share of the device's time, in (0, 1].
+pub fn index_share(percent: u8) -> Result<f64> {
+    if !(1..=100).contains(&percent) {
+        bail!("index_busy_percent must be 1 to 100");
+    }
+    Ok(f64::from(percent) / 100.0)
+}
 
 /// How long the model may sit idle before it is freed; None keeps it loaded.
 pub fn idle_unload(minutes: f64) -> Result<Option<Duration>> {
@@ -39,6 +49,10 @@ pub struct Config {
     /// Free the model after this many idle minutes; 0 keeps it loaded [default: 5].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_unload_minutes: Option<f64>,
+    /// Most of the device's time background indexing may take, in percent;
+    /// half that on battery [default: 50].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_busy_percent: Option<u8>,
 }
 
 fn home() -> Result<PathBuf> {
@@ -102,6 +116,10 @@ impl Config {
             }
             Some(m) => doc["idle_unload_minutes"] = toml_edit::value(m),
             None => drop(doc.remove("idle_unload_minutes")),
+        }
+        match self.index_busy_percent {
+            Some(p) => doc["index_busy_percent"] = toml_edit::value(i64::from(p)),
+            None => drop(doc.remove("index_busy_percent")),
         }
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
@@ -188,6 +206,11 @@ mod tests {
         assert_eq!(c.exclude, ["~/Downloads"]);
         assert_eq!(c.idle_unload_minutes, Some(0.0));
         assert_eq!(c.device, None);
+        assert_eq!(c.index_busy_percent, None);
+        let c: Config = toml::from_str("index_busy_percent = 25\n").unwrap();
+        assert_eq!(index_share(c.index_busy_percent.unwrap()).unwrap(), 0.25);
+        assert!(index_share(0).is_err());
+        assert!(index_share(101).is_err());
         assert_eq!(toml::from_str::<Config>("").unwrap(), Config::default());
         assert!(toml::from_str::<Config>("exclud = []").is_err());
     }

@@ -10,6 +10,7 @@ use openvino::{
     Tensor,
 };
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::{PostProcessor, Tokenizer, TruncationDirection};
 
 pub const DIM: usize = 768;
@@ -49,6 +50,7 @@ pub struct Embedder {
     tok: Tokenizer,
     query: Stage,
     docs: Option<Stage>,
+    docs_share: f64,
 }
 
 /// Whether `text` fits in `len` tokens with the special tokens added.
@@ -224,9 +226,12 @@ impl Stage {
         Ok(v.iter().map(|x| x / norm).collect())
     }
 
-    fn run(&mut self, tok: &Tokenizer, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// `share` of the device's time, in (0, 1]: after each request, wait
+    /// `busy * (1 - share) / share`, leaving the device to other programs.
+    fn run(&mut self, tok: &Tokenizer, texts: &[String], share: f64) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for window in texts.chunks(self.requests.len()) {
+            let t0 = Instant::now();
             for (req, text) in self.requests.iter_mut().zip(window) {
                 Self::feed(tok, self.len, req, text)?;
                 req.infer_async()?;
@@ -234,6 +239,9 @@ impl Stage {
             for req in self.requests.iter_mut().take(window.len()) {
                 req.wait(WAIT_MS)?;
                 out.push(Self::read(req)?);
+            }
+            if share < 1.0 {
+                std::thread::sleep(t0.elapsed().mul_f64((1.0 - share) / share));
             }
         }
         Ok(out)
@@ -256,18 +264,19 @@ impl Embedder {
             tok,
             query,
             docs: None,
+            docs_share: 1.0,
         })
     }
 
     pub fn query(&mut self, text: &str) -> Result<Vec<f32>> {
         let text = format!("{QUERY_PREFIX}{text}");
         let mut v = if fits(&self.tok, &text, QUERY_LEN)? {
-            self.query.run(&self.tok, &[text])?
+            self.query.run(&self.tok, &[text], 1.0)?
         } else {
             // Too long for the query shape: the document shape takes 256
             // tokens, and is compiled already whenever the runner has indexed.
             self.prepare_documents()?;
-            self.docs.as_mut().unwrap().run(&self.tok, &[text])?
+            self.docs.as_mut().unwrap().run(&self.tok, &[text], 1.0)?
         };
         Ok(v.remove(0))
     }
@@ -287,6 +296,12 @@ impl Embedder {
         Ok(())
     }
 
+    /// Cap document embedding at `share` of the device's time, in (0, 1].
+    /// Queries always run at full speed.
+    pub fn set_document_share(&mut self, share: f64) {
+        self.docs_share = share.clamp(0.01, 1.0);
+    }
+
     /// Free the document stage; the next document (or long query) compiles it
     /// again, from the cache.
     pub fn release_documents(&mut self) -> bool {
@@ -300,7 +315,8 @@ impl Embedder {
     /// Embed documents already formatted with [`document_text`].
     pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.prepare_documents()?;
-        self.docs.as_mut().unwrap().run(&self.tok, texts)
+        let share = self.docs_share;
+        self.docs.as_mut().unwrap().run(&self.tok, texts, share)
     }
 }
 

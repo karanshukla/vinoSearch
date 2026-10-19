@@ -69,6 +69,7 @@ Settings are not on D-Bus. They live in `~/.config/vinosearch/config.toml` (`vin
 exclude = ["~/Downloads"]
 device = "NPU"
 idle_unload_minutes = 5
+index_busy_percent = 50
 ```
 
 A running runner re-reads the file every 30 seconds and applies what changed:
@@ -78,6 +79,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `exclude` | at once: anything newly excluded is dropped from the index and no longer watched for new directories |
 | `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
 | `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
+| `index_busy_percent` | at once, mid-index included: most of the device's time background indexing takes, 1 to 100, default 50, half that on battery |
 
 A setting given as a flag or environment variable (`--device`, `--idle-unload-minutes`, `VINOSEARCH_IDLE_UNLOAD_MINUTES`, or baked into the service by `krunner --install --device ...`) wins over the file, so file changes to it are ignored until the runner restarts without the flag. A file that fails to parse, or has an invalid `exclude`, changes nothing; an invalid `idle_unload_minutes` keeps the current timeout.
 

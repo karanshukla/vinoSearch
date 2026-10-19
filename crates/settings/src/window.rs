@@ -3,7 +3,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke};
-use vinosearch_shared::config::{self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES};
+use vinosearch_shared::config::{
+    self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES, DEFAULT_INDEX_BUSY_PERCENT,
+};
 
 use crate::control::{Link, Request, Status};
 use crate::{doctor, integration, portal, theme};
@@ -642,6 +644,23 @@ impl SettingsWindow {
                     .on_hover_cursor(egui::CursorIcon::Text);
                 if response.changed() {
                     self.config.idle_unload_minutes = Some(minutes);
+                    self.idle_dirty = true;
+                }
+            },
+        );
+        row(
+            ui,
+            "Indexing share:",
+            "Most of the device's time background indexing may take, half that on battery. \
+             Lower leaves more room for face unlock and dictation; indexing takes longer.",
+            |ui| {
+                let mut percent = self
+                    .config
+                    .index_busy_percent
+                    .unwrap_or(DEFAULT_INDEX_BUSY_PERCENT);
+                let response = ui.add(egui::Slider::new(&mut percent, 10..=100).suffix(" %"));
+                if response.changed() {
+                    self.config.index_busy_percent = Some(percent);
                     self.idle_dirty = true;
                 }
             },

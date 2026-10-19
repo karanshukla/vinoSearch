@@ -1,4 +1,4 @@
-//! Idle priority for background indexing, per thread.
+//! Idle priority and pacing for background indexing.
 //!
 //! The worker thread both indexes and answers queries, so it drops to idle
 //! CPU scheduling and idle I/O priority for an indexing job and returns to
@@ -43,6 +43,62 @@ fn set_cpu(policy: libc::c_int) -> bool {
 fn set_io(prio: libc::c_int) -> bool {
     // SAFETY: ioprio_set takes three integers; 0 is the calling thread.
     unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, prio) == 0 }
+}
+
+/// On battery: a battery is present and no charger (mains or USB-C) is
+/// online. A machine with no battery is never on it.
+pub fn on_battery() -> bool {
+    on_battery_in(std::path::Path::new("/sys/class/power_supply"))
+}
+
+fn on_battery_in(dir: &std::path::Path) -> bool {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    let mut battery = false;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        match read(e.path().join("type")).trim() {
+            "Battery" => battery = true,
+            "Mains" | "USB" if read(e.path().join("online")).trim() == "1" => return false,
+            _ => {}
+        }
+    }
+    battery
+}
+
+/// Share of the device's time background indexing may take: `share`, or
+/// half of it on battery. Rechecks the power supply every 10 s.
+pub struct Pace {
+    share: f64,
+    battery: bool,
+    checked: Option<std::time::Instant>,
+}
+
+impl Pace {
+    pub fn new(share: f64) -> Self {
+        Self {
+            share,
+            battery: false,
+            checked: None,
+        }
+    }
+
+    pub fn set(&mut self, share: f64) {
+        self.share = share;
+    }
+
+    pub fn share(&mut self) -> f64 {
+        if self
+            .checked
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+        {
+            self.battery = on_battery();
+            self.checked = Some(std::time::Instant::now());
+        }
+        if self.battery {
+            self.share / 2.0
+        } else {
+            self.share
+        }
+    }
 }
 
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +157,29 @@ mod tests {
     fn policy() -> libc::c_int {
         // SAFETY: pid 0 is the calling thread.
         unsafe { libc::sched_getscheduler(0) }
+    }
+
+    #[test]
+    fn battery_only_without_a_charger_online() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-psy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let supply = |name: &str, kind: &str, online: Option<&str>| {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("type"), format!("{kind}\n")).unwrap();
+            if let Some(o) = online {
+                std::fs::write(d.join("online"), format!("{o}\n")).unwrap();
+            }
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!on_battery_in(&dir));
+        supply("BAT0", "Battery", None);
+        supply("ADP1", "Mains", Some("0"));
+        supply("ucsi", "USB", Some("0"));
+        assert!(on_battery_in(&dir));
+        supply("ucsi", "USB", Some("1"));
+        assert!(!on_battery_in(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
