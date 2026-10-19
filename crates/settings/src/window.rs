@@ -207,7 +207,7 @@ impl SettingsWindow {
                 ui.horizontal(|ui| {
                     ui.set_min_height(ui.spacing().interact_size.y);
                     if s.indexing {
-                        ui.add(egui::Spinner::new().size(14.0));
+                        spinner(ui);
                         ui.label(format!(
                             "Indexing, {} files so far",
                             count(s.indexed_files as i64)
@@ -579,7 +579,7 @@ impl SettingsWindow {
             |ui| {
                 ui.horizontal(|ui| {
                     if state.running {
-                        ui.add(egui::Spinner::new().size(14.0));
+                        spinner(ui);
                         ui.label("Working…");
                     } else if state.registered {
                         ui.label("On");
@@ -687,6 +687,27 @@ fn size(bytes: u64) -> String {
     } else {
         format!("{value:.0} {unit}")
     }
+}
+
+/// egui's Spinner asks for a repaint every frame, and with vsync off that is
+/// as fast as the GPU goes: 71% of a core here (2026-10-18), taken from
+/// indexing, which runs at idle priority. This one draws at 10 fps.
+fn spinner(ui: &mut egui::Ui) {
+    let size = 14.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    let t = ui.input(|i| i.time);
+    let start = (t * 6.0) % std::f64::consts::TAU;
+    let points: Vec<egui::Pos2> = (0..=16)
+        .map(|i| {
+            let a = start + i as f64 / 16.0 * std::f64::consts::PI * 1.5;
+            rect.center() + egui::vec2(a.cos() as f32, a.sin() as f32) * (size / 2.0 - 1.5)
+        })
+        .collect();
+    let color = ui.visuals().strong_text_color();
+    ui.painter()
+        .add(egui::Shape::line(points, Stroke::new(2.0_f32, color)));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 fn command(ui: &mut egui::Ui, text: &str) {
