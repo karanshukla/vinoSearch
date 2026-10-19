@@ -17,7 +17,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long the document stage stays compiled after its last use. It holds
+/// ~430 MB on top of the query stage and reloads from the cache in ~0.1 s,
+/// so it goes long before the model's idle unload, which queries keep
+/// putting off. Long enough to cover a run of saves a few seconds apart.
+const DOCS_HOLD: Duration = Duration::from_secs(60);
 
 pub enum Job {
     /// Best `k` chunks for a query.
@@ -269,20 +275,38 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             eprintln!("model unloaded ({why})");
         }
     };
+    // When the last job finished, and when to free the document stage.
+    let mut last_job = Instant::now();
+    let mut free_docs: Option<Instant> = None;
+    let mut timed_out = false;
     loop {
+        if !std::mem::take(&mut timed_out) {
+            last_job = Instant::now();
+        }
         let job = if let Some(job) = deferred.pop_front() {
             job
         } else {
-            match (idle, loaded.is_some()) {
-                (Some(after), true) => match jobs.recv_timeout(after) {
+            let unload_at = idle.filter(|_| loaded.is_some()).map(|d| last_job + d);
+            let free_at = free_docs.filter(|_| loaded.is_some());
+            match unload_at.into_iter().chain(free_at).min() {
+                Some(at) => match jobs.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(job) => job,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        unload(&mut loaded, &format!("idle for {}s", after.as_secs()));
+                        timed_out = true;
+                        free_docs = None;
+                        if Some(at) == unload_at {
+                            let after = idle.unwrap_or_default().as_secs();
+                            unload(&mut loaded, &format!("idle for {after}s"));
+                        } else if let Some(l) = loaded.as_mut()
+                            && l.emb.release_documents()
+                        {
+                            eprintln!("document model freed");
+                        }
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 },
-                _ => match jobs.recv() {
+                None => match jobs.recv() {
                     Ok(job) => job,
                     Err(_) => break,
                 },
@@ -440,6 +464,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         // Compile the document stage first: OpenVINO's threads created by the
         // compile inherit the caller's priority, and at idle they would stay
         // there.
+        let had_docs = emb.has_documents();
         if indexes && let Err(e) = emb.prepare_documents() {
             eprintln!("compiling the document model: {e:#}");
         }
@@ -535,6 +560,11 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             | Job::Retry => {
                 unreachable!("handled before loading")
             }
+        }
+        // Used by this job: indexing, or a query too long for the query stage
+        // that compiled it. Short queries leave the timer alone.
+        if emb.has_documents() && (indexes || !had_docs) {
+            free_docs = Some(Instant::now() + DOCS_HOLD);
         }
     }
     Ok(())
