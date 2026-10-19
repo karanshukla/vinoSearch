@@ -1,6 +1,6 @@
 //! `~/.config/vinosearch/config.toml`: settings shared by the CLI, the runner
 //! and (later) the settings app, which edits this file rather than keeping
-//! state of its own.
+//! state of its own, through [`Config::save`].
 //!
 //! ```toml
 //! exclude = ["~/Downloads", "~/Documents/tax"]
@@ -61,6 +61,53 @@ impl Config {
             Err(e) => return Err(e).with_context(|| path.display().to_string()),
         };
         toml::from_str(&text).with_context(|| path.display().to_string())
+    }
+
+    /// Write these settings to `path`, keeping the comments and layout of what
+    /// is already there. Written whole and renamed into place, so a runner
+    /// re-reading the file never sees half of it.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| path.display().to_string()),
+        };
+        let mut doc: toml_edit::DocumentMut =
+            text.parse().with_context(|| path.display().to_string())?;
+        let mut exclude: toml_edit::Array = self.exclude.iter().map(String::as_str).collect();
+        if !exclude.is_empty() {
+            for e in exclude.iter_mut() {
+                e.decor_mut().set_prefix("\n    ");
+            }
+            exclude.set_trailing_comma(true);
+            exclude.set_trailing("\n");
+        }
+        match doc.get_mut("exclude").and_then(|i| i.as_value_mut()) {
+            // Assigning the value alone keeps the comments around the key.
+            Some(v) => {
+                let decor = v.decor().clone();
+                *v = exclude.into();
+                *v.decor_mut() = decor;
+            }
+            None => doc["exclude"] = toml_edit::value(exclude),
+        }
+        match &self.device {
+            Some(d) => doc["device"] = toml_edit::value(d.as_str()),
+            None => drop(doc.remove("device")),
+        }
+        match self.idle_unload_minutes {
+            // Whole minutes stay integers, as people write them.
+            Some(m) if m.fract() == 0.0 && m.abs() < i64::MAX as f64 => {
+                doc["idle_unload_minutes"] = toml_edit::value(m as i64)
+            }
+            Some(m) => doc["idle_unload_minutes"] = toml_edit::value(m),
+            None => drop(doc.remove("idle_unload_minutes")),
+        }
+        let dir = path.parent().context("config path has no directory")?;
+        fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, doc.to_string()).with_context(|| tmp.display().to_string())?;
+        fs::rename(&tmp, path).with_context(|| path.display().to_string())
     }
 
     pub fn excludes(&self) -> Result<Excludes> {
@@ -156,6 +203,50 @@ mod tests {
         assert!(idle_unload(-1.0).is_err());
         assert!(idle_unload(f64::NAN).is_err());
         assert!(idle_unload(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn saving_keeps_comments_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-config-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            "# Never indexed or watched.\nexclude = [\"~/a\"]\ndevice = \"CPU\" # for now\n",
+        )
+        .unwrap();
+        let mut c = Config::load(&path).unwrap();
+        c.exclude.push("~/b".into());
+        c.device = None;
+        c.idle_unload_minutes = Some(0.0);
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# Never indexed or watched.\nexclude = [\n"),
+            "{text}"
+        );
+        assert!(!text.contains("device"), "{text}");
+        assert!(text.contains("idle_unload_minutes = 0\n"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+
+        c.exclude.clear();
+        c.idle_unload_minutes = Some(2.5);
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_creates_the_file() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-new-{}", std::process::id()));
+        let path = dir.join("sub/config.toml");
+        let c = Config {
+            exclude: vec!["~/Downloads".into()],
+            ..Config::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

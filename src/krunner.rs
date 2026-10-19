@@ -23,8 +23,8 @@ use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 
 use vinosearch_shared::dbus::{
-    CONTROL_PATH as CONTROL, DESKTOP_ID, GNOME_PATH as GNOME, RUNNER_PATH as OBJECT, SERVICE,
-    status as key,
+    CONTROL_PATH as CONTROL, DESKTOP_ID, GNOME_PATH as GNOME, ICON, KRUNNER_PLUGIN,
+    RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, status as key,
 };
 const RESULTS: usize = 5;
 /// Cosine below this is noise for this model: an off-topic query against a
@@ -488,14 +488,21 @@ fn install_gnome() -> Result<()> {
         ),
     )?;
     // GNOME Shell skips a provider whose desktop entry is hidden
-    // (NoDisplay), so this one shows in the app grid. Until the settings app
-    // (#5) exists, launching it opens the documentation.
+    // (NoDisplay), so this one shows in the app grid. It opens the settings
+    // window when that is installed beside us, else the documentation.
+    let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
+    let exec = if settings.is_file() {
+        settings.display().to_string()
+    } else {
+        "xdg-open https://github.com/karanshukla/vinoSearch#readme".to_owned()
+    };
     fs::write(
         &g.desktop,
-        "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
-         Comment=Semantic file search on the NPU\nIcon=system-search\n\
-         Exec=xdg-open https://github.com/karanshukla/vinoSearch#readme\n\
-         Categories=Utility;\nTerminal=false\n",
+        format!(
+            "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
+             Comment=Semantic file search on the NPU\nIcon={ICON}\nExec={exec}\n\
+             StartupWMClass={SETTINGS_APP_ID}\nCategories=Utility;Settings;\nTerminal=false\n"
+        ),
     )?;
     // Appended, so it never shadows anything the system provides. The
     // default is the XDG spec's, for sessions that leave the variable unset.
@@ -517,6 +524,13 @@ fn config_home() -> Result<PathBuf> {
         Some(d) if !d.is_empty() => PathBuf::from(d),
         _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".config"),
     })
+}
+
+/// The vinoPilot landing page's vinoSearch mark.
+const ICON_SVG: &str = include_str!("../data/dev.vinosearch.svg");
+
+fn icon_path() -> Result<PathBuf> {
+    Ok(data_home()?.join(format!("icons/hicolor/scalable/apps/{ICON}.svg")))
 }
 
 fn data_home() -> Result<PathBuf> {
@@ -588,15 +602,18 @@ pub fn install(
     }
     exec.push_str(" krunner");
     let data = data_home()?;
-    let plugin = data.join("krunner/dbusplugins/vinosearch.desktop");
+    let plugin = data.join(KRUNNER_PLUGIN);
     let service = data.join(format!("dbus-1/services/{SERVICE}.service"));
-    fs::create_dir_all(plugin.parent().unwrap())?;
-    fs::create_dir_all(service.parent().unwrap())?;
+    let icon = icon_path()?;
+    for p in [&plugin, &service, &icon] {
+        fs::create_dir_all(p.parent().unwrap())?;
+    }
+    fs::write(&icon, ICON_SVG)?;
     fs::write(
         &plugin,
         format!(
             "[Desktop Entry]\nName=vinoSearch\nComment=Semantic file search on the NPU\n\
-             X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon=system-search\n\
+             X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon={ICON}\n\
              X-KDE-PluginInfo-Name=vinosearch\nX-KDE-PluginInfo-EnabledByDefault=true\n\
              X-Plasma-API=DBus\nX-Plasma-DBusRunner-Service={SERVICE}\nX-Plasma-DBusRunner-Path={OBJECT}\n\
              X-Plasma-Request-Actions-Once=true\nX-Plasma-Runner-Min-Letter-Count=3\n\
@@ -620,10 +637,11 @@ pub fn install(
         ),
     )?;
     println!(
-        "wrote {}\nwrote {}\nwrote {}",
+        "wrote {}\nwrote {}\nwrote {}\nwrote {}",
         plugin.display(),
         service.display(),
-        unit.display()
+        unit.display(),
+        icon.display()
     );
     install_gnome()?;
     if systemctl(&["daemon-reload"]) {
@@ -649,12 +667,13 @@ pub fn uninstall() -> Result<()> {
         systemctl(&["disable", "--now", UNIT]);
     }
     for p in [
-        data.join("krunner/dbusplugins/vinosearch.desktop"),
+        data.join(KRUNNER_PLUGIN),
         data.join(format!("dbus-1/services/{SERVICE}.service")),
         unit,
         gnome.provider,
         gnome.desktop,
         gnome.environment,
+        icon_path()?,
     ] {
         if p.exists() {
             fs::remove_file(&p)?;

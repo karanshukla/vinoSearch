@@ -1,0 +1,16 @@
+[package]
+name = "vinosearch-settings"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Settings window for vinoSearch"
+repository = "https://github.com/karanshukla/vinoSearch"
+publish = false
+
+# Talks to the runner over D-Bus and edits config.toml; never loads OpenVINO.
+[dependencies]
+vinosearch-shared = { path = "../shared" }
+anyhow = "1.0"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+zbus = "5"
+

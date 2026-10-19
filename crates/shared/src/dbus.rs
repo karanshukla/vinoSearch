@@ -6,8 +6,15 @@ pub const SERVICE: &str = "dev.vinosearch.Runner";
 pub const RUNNER_PATH: &str = "/runner";
 /// GNOME Shell's org.gnome.Shell.SearchProvider2 lives here.
 pub const GNOME_PATH: &str = "/gnome";
-/// The desktop entry GNOME Shell shows the provider's results under.
+/// The desktop entry GNOME Shell shows the provider's results under. It also
+/// launches the settings window, whose Wayland app id is the same name, so
+/// the window gets the entry's icon.
 pub const DESKTOP_ID: &str = "dev.vinosearch.desktop";
+pub const SETTINGS_APP_ID: &str = "dev.vinosearch";
+/// Icon name, installed under hicolor/scalable/apps.
+pub const ICON: &str = "dev.vinosearch";
+/// KRunner's plugin file, under the XDG data directory.
+pub const KRUNNER_PLUGIN: &str = "krunner/dbusplugins/vinosearch.desktop";
 /// The settings app's interface lives here.
 pub const CONTROL_PATH: &str = "/control";
 pub const CONTROL_INTERFACE: &str = "dev.vinosearch.Control1";

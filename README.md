@@ -2,20 +2,21 @@
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
 
-Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell.
+Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell, with a settings window for the rest.
 
 ## Usage
 
 ```bash
 git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
 cargo install --path .                     # vinosearch into ~/.cargo/bin
+cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
 cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
 vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch watch                           # keep indexed roots current (the KRunner runner also does this)
 vinosearch search "how do I rotate the signing key"
-vinosearch krunner --install               # register with KRunner and GNOME Shell search, and as a systemd user service started at login
+vinosearch krunner --install               # register with KRunner and GNOME Shell search, as a systemd user service started at login, and in the app menu
 systemctl --user restart plasma-krunner.service
 ```
 
@@ -40,6 +41,16 @@ The runner runs as `vinosearch.service` (logs: `journalctl --user -u vinosearch`
 The runner also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index).
 
 The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat it like the files it indexes; encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
+
+## Settings
+
+`vinosearch-settings` is an egui window in the style of vinoWhisper's settings, with three pages:
+
+- **Index**: progress while indexing, file and chunk counts, the indexed folders (add, re-index, remove) and the exclude list.
+- **Model**: download, verify or delete the model, unload it, clear the compiled-model cache, pick the device and the idle unload time.
+- **Integration**: KRunner and GNOME search on or off, which runs `vinosearch krunner --install` or `--uninstall`.
+
+It reads the runner's state over `dev.vinosearch.Control1` once a second and edits `config.toml` directly, keeping your comments, so the runner picks changes up within 30 seconds. It never loads OpenVINO. Folders are picked through the desktop's own file chooser (xdg-desktop-portal), or typed. `krunner --install` makes the vinoSearch app-menu entry open it when it is installed next to `vinosearch`; `--page model` opens a given page.
 
 ## Performance
 
