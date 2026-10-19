@@ -10,6 +10,14 @@ Early days: a working proof of concept for text files, searched from the command
 
 ```bash
 git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
+scripts/install.sh --index ~/Documents
+```
+
+`scripts/install.sh` does all of the below, skipping what's already done, so re-running it after a `git pull` upgrades in place. It needs Rust and a C compiler, and stops with one line at the first thing missing (including the NPU driver; `--device CPU` runs without an NPU). It indexes only the folders you name with `--index` (repeatable) or type when it asks. `scripts/install.sh --uninstall` removes the service, KRunner / GNOME files and binaries; add `--purge` to also delete the index, model, compiled cache and runtime.
+
+Or step by step:
+
+```bash
 cargo install --path .                     # vinosearch into ~/.cargo/bin
 cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
 cargo install ovfetch                      # 0.5.0 or newer
