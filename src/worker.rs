@@ -8,7 +8,7 @@
 
 use crate::config::{self, Config, Excludes};
 use crate::embed::Embedder;
-use crate::index::{self, Hit, Outcome, Vectors};
+use crate::index::{self, FileTypes, Hit, Kind, Outcome, Vectors};
 use crate::sched;
 use anyhow::Result;
 use futures_channel::oneshot;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 const DOCS_HOLD: Duration = Duration::from_secs(60);
 
 pub enum Job {
-    /// Best `k` chunks for a query.
+    /// Best `k` chunks of each kind for a query, text first.
     Match {
         query: String,
         k: usize,
@@ -34,8 +34,9 @@ pub enum Job {
     },
     /// Paths created, modified, renamed or removed under a root.
     Changed(Vec<PathBuf>),
-    /// The config file changed: apply its exclusions (dropping what is now
-    /// excluded), device and idle timeout, except where a flag overrides them.
+    /// The config file changed: apply its exclusions and file types (dropping
+    /// what is now excluded or turned off), device and idle timeout, except
+    /// where a flag overrides them.
     Config(Config),
     /// Index a root (new or existing), as `vinosearch index` does.
     Reindex(PathBuf),
@@ -132,6 +133,7 @@ pub struct Options {
     pub device: String,
     pub idle: Option<Duration>,
     pub excludes: Excludes,
+    pub types: FileTypes,
     /// The config file the settings came from, which the watcher re-reads.
     pub config: PathBuf,
     /// Its contents at startup.
@@ -145,6 +147,7 @@ fn changed(
     emb: &mut Embedder,
     paths: Vec<PathBuf>,
     ex: &Excludes,
+    types: &FileTypes,
     after: &mut index::AfterFile,
 ) -> Result<index::Stats> {
     let roots = index::roots(conn)?;
@@ -164,7 +167,7 @@ fn changed(
             // gone. Gone matters too: by the time a debounced batch runs, a
             // directory renamed away may already have been recreated at the
             // same path, and its old files must not stay indexed.
-            files.extend(index::stale(conn, &path, ex)?);
+            files.extend(index::stale(conn, &path, ex, types)?);
         } else {
             files.push(path);
         }
@@ -179,7 +182,7 @@ fn changed(
     for path in files {
         if path.exists() {
             st.files_seen += 1;
-            match index::index_file(conn, emb, &path, &mut |c, e| after(&st, c, e))? {
+            match index::index_file(conn, emb, &path, types, &mut |c, e| after(&st, c, e))? {
                 Outcome::Embedded(n) => {
                     st.files_embedded += 1;
                     st.chunks += n;
@@ -216,9 +219,11 @@ fn answer(
     k: usize,
     reply: oneshot::Sender<Vec<Hit>>,
 ) {
-    let hits = emb
-        .query(query)
-        .and_then(|q| index::search(conn, vectors, &q, k));
+    let hits = emb.query(query).and_then(|q| {
+        let mut hits = index::search(conn, vectors, &q, Kind::Text, k)?;
+        hits.extend(index::search(conn, vectors, &q, Kind::Image, k)?);
+        Ok(hits)
+    });
     let _ = reply.send(hits.unwrap_or_else(|e| {
         eprintln!("match {query:?}: {e:#}");
         Vec::new()
@@ -228,6 +233,7 @@ fn answer(
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut conn = index::open(&index::default_db()?)?;
     let mut excludes = opts.excludes.clone();
+    let mut types = opts.types.clone();
     let mut device = opts.device.clone();
     let mut idle = opts.idle;
     let share = |file: &Config| {
@@ -240,7 +246,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         eprintln!("{e:#}");
         config::index_share(config::DEFAULT_INDEX_BUSY_PERCENT).unwrap()
     }));
-    let purged = index::purge(&conn, &excludes)?;
+    let purged = index::purge(&conn, &excludes)? + index::purge_types(&conn, &types)?;
     if purged > 0 {
         eprintln!("removed {purged} excluded files from the index");
     }
@@ -341,6 +347,18 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     Ok(_) => {}
                     Err(e) => eprintln!("exclusions not applied: {e:#}"),
                 }
+                // Turned on, the watcher checks every root for what is wanted now.
+                match FileTypes::new(&file.formats) {
+                    Ok(new) if new != types => {
+                        types = new;
+                        match index::purge_types(&conn, &types) {
+                            Ok(n) => eprintln!("file types changed, {n} files removed"),
+                            Err(e) => eprintln!("applying file types: {e:#}"),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("file types not applied: {e:#}"),
+                }
                 if !opts.pinned.device {
                     let new = file.device.as_deref().unwrap_or(config::DEFAULT_DEVICE);
                     if new != device {
@@ -407,7 +425,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     continue;
                 }
                 unload(&mut loaded, "deleting the model");
-                match crate::model::default_dir().and_then(|d| crate::model::delete(&d)) {
+                match crate::model::delete() {
                     Ok(()) => eprintln!("model deleted"),
                     Err(e) => eprintln!("deleting the model: {e:#}"),
                 }
@@ -498,7 +516,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                         if let Ok(new) = share(&file) {
                             pace.set(new);
                         }
-                        restart |= file.excludes().is_ok_and(|ex| ex != excludes);
+                        restart |= file.excludes().is_ok_and(|ex| ex != excludes)
+                            || FileTypes::new(&file.formats).is_ok_and(|t| t != types);
                         deferred.push_back(Job::Config(file));
                     }
                     Job::Forget(root) => {
@@ -518,7 +537,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 answer(&conn, emb, vectors, &query, k, reply);
             }
             Job::Changed(paths) => {
-                let r = changed(&mut conn, emb, paths.clone(), &excludes, &mut after);
+                let r = changed(&mut conn, emb, paths.clone(), &excludes, &types, &mut after);
                 match r {
                     Ok(s) => touched(status, &s),
                     // Jobs held while paused go back through the main loop.
@@ -528,7 +547,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Reindex(root) => {
-                let r = index::index(&mut conn, emb, &root, &excludes, &mut after);
+                let r = index::index(&mut conn, emb, &root, &excludes, &types, &mut after);
                 if interrupted(&r) {
                     eprintln!("indexing {} stopped", root.display());
                     status.queued_reindex.fetch_add(1, Ordering::Relaxed);

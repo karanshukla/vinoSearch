@@ -7,6 +7,14 @@
 //! device = "NPU"
 //! idle_unload_minutes = 5
 //! index_busy_percent = 50
+//!
+//! [formats.text]
+//! min_score = 0.65
+//!
+//! [formats.images]
+//! enabled = true
+//! extensions = ["jpg", "jpeg", "png", "heic"]
+//! min_score = 0.6
 //! ```
 //!
 //! A missing file is the defaults, and a missing `exclude` is
@@ -36,6 +44,15 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
     // Heroic, Lutris and others install games here
     "~/Games",
 ];
+
+/// Text results scoring below this are left out. An off-topic query against a
+/// code index topped out at 0.60; real matches scored 0.72 to 0.83.
+pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
+/// Images score lower against a text query than text does: on ~/Pictures,
+/// right matches scored 0.61 to 0.69 and the rest 0.57 to 0.60.
+pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.6;
+pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] =
+    &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
 
 /// `index_busy_percent` as a share of the device's time, in (0, 1].
 pub fn index_share(percent: u8) -> Result<f64> {
@@ -69,6 +86,34 @@ pub struct Config {
     /// half that on battery [default: 50].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_busy_percent: Option<u8>,
+    /// What kinds of file are indexed, and how close a result must be (#73).
+    pub formats: Formats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Formats {
+    pub text: TextFormat,
+    pub images: ImageFormat,
+}
+
+/// Text is always indexed for now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextFormat {
+    /// Results scoring below this are left out [default: 0.65].
+    pub min_score: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageFormat {
+    /// Index images. Needs the vision encoder, a 671 MB download [default: false].
+    pub enabled: Option<bool>,
+    /// File extensions taken for images [default: DEFAULT_IMAGE_EXTENSIONS].
+    pub extensions: Option<Vec<String>>,
+    /// Results scoring below this are left out [default: 0.6].
+    pub min_score: Option<f32>,
 }
 
 impl Default for Config {
@@ -78,7 +123,55 @@ impl Default for Config {
             device: None,
             idle_unload_minutes: None,
             index_busy_percent: None,
+            formats: Formats::default(),
         }
+    }
+}
+
+/// A `min_score`, checked: a cosine, so -1 to 1.
+pub fn min_score(score: Option<f32>, default: f32) -> Result<f32> {
+    let s = score.unwrap_or(default);
+    if !(-1.0..=1.0).contains(&s) {
+        bail!("min_score must be -1 to 1");
+    }
+    Ok(s)
+}
+
+impl Formats {
+    pub fn images_enabled(&self) -> bool {
+        self.images.enabled.unwrap_or(false)
+    }
+
+    pub fn text_min_score(&self) -> Result<f32> {
+        min_score(self.text.min_score, DEFAULT_TEXT_MIN_SCORE)
+    }
+
+    pub fn image_min_score(&self) -> Result<f32> {
+        min_score(self.images.min_score, DEFAULT_IMAGE_MIN_SCORE)
+    }
+
+    /// The extensions images are indexed by, lower case and without a dot;
+    /// empty while images are off.
+    pub fn image_extensions(&self) -> Result<Vec<String>> {
+        if !self.images_enabled() {
+            return Ok(Vec::new());
+        }
+        let list = match &self.images.extensions {
+            Some(l) => l.clone(),
+            None => DEFAULT_IMAGE_EXTENSIONS
+                .iter()
+                .map(|&e| e.to_owned())
+                .collect(),
+        };
+        list.iter()
+            .map(|e| {
+                let e = e.trim().trim_start_matches('.').to_ascii_lowercase();
+                if e.is_empty() || !e.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    bail!("image extension {e:?}: use letters and digits, like \"jpg\"");
+                }
+                Ok(e)
+            })
+            .collect()
     }
 }
 
@@ -150,6 +243,30 @@ impl Config {
             Some(p) => doc["index_busy_percent"] = toml_edit::value(i64::from(p)),
             None => drop(doc.remove("index_busy_percent")),
         }
+        let f = &self.formats;
+        // Through its shortest decimal, so 0.7 is written as 0.7, not 0.699999988.
+        let score = |s: f32| toml_edit::value(s.to_string().parse::<f64>().unwrap_or(f64::from(s)));
+        set(&mut doc, "text", "min_score", f.text.min_score.map(score));
+        set(
+            &mut doc,
+            "images",
+            "enabled",
+            f.images.enabled.map(toml_edit::value),
+        );
+        set(
+            &mut doc,
+            "images",
+            "extensions",
+            f.images.extensions.as_ref().map(|l| {
+                toml_edit::value(l.iter().map(String::as_str).collect::<toml_edit::Array>())
+            }),
+        );
+        set(
+            &mut doc,
+            "images",
+            "min_score",
+            f.images.min_score.map(score),
+        );
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
         let tmp = path.with_extension("toml.tmp");
@@ -164,6 +281,49 @@ impl Config {
             .map(|e| resolve(e, &home))
             .collect::<Result<_>>()
             .map(Excludes)
+    }
+}
+
+/// Set or remove `formats.<format>.<key>`, dropping tables left empty.
+fn set(doc: &mut toml_edit::DocumentMut, format: &str, key: &str, value: Option<toml_edit::Item>) {
+    let Some(value) = value else {
+        if let Some(formats) = doc.get_mut("formats").and_then(|i| i.as_table_like_mut()) {
+            if let Some(t) = formats.get_mut(format).and_then(|i| i.as_table_like_mut()) {
+                t.remove(key);
+                if t.is_empty() {
+                    formats.remove(format);
+                }
+            }
+            if formats.is_empty() {
+                doc.remove("formats");
+            }
+        }
+        return;
+    };
+    let formats = doc.entry("formats").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        toml_edit::Item::Table(t)
+    });
+    let t = formats
+        .as_table_like_mut()
+        .expect("formats is a table")
+        .entry(format)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    // A whole value, keeping any comment beside it.
+    match t
+        .as_table_like_mut()
+        .expect("a format is a table")
+        .get_mut(key)
+    {
+        Some(old) if old.is_value() => {
+            let decor = old.as_value().unwrap().decor().clone();
+            *old = value;
+            *old.as_value_mut().unwrap().decor_mut() = decor;
+        }
+        _ => {
+            t.as_table_like_mut().unwrap().insert(key, value);
+        }
     }
 }
 
@@ -352,6 +512,55 @@ mod tests {
         assert!(!fs::read_to_string(&path).unwrap().contains("exclude"));
         c.exclude.retain(|e| e != "~/Games");
         c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn formats_default_to_text_only() {
+        let c = Config::default();
+        assert!(c.formats.image_extensions().unwrap().is_empty());
+        assert_eq!(c.formats.text_min_score().unwrap(), DEFAULT_TEXT_MIN_SCORE);
+        let c: Config = toml::from_str("[formats.images]\nenabled = true\n").unwrap();
+        assert_eq!(
+            c.formats.image_extensions().unwrap(),
+            DEFAULT_IMAGE_EXTENSIONS
+        );
+        let c: Config =
+            toml::from_str("[formats.images]\nenabled = true\nextensions = [\".HEIC\", \"jpg\"]\n")
+                .unwrap();
+        assert_eq!(c.formats.image_extensions().unwrap(), ["heic", "jpg"]);
+        let c: Config =
+            toml::from_str("[formats.images]\nenabled = true\nextensions = [\"a/b\"]\n").unwrap();
+        assert!(c.formats.image_extensions().is_err());
+        let c: Config = toml::from_str("[formats.text]\nmin_score = 2\n").unwrap();
+        assert!(c.formats.text_min_score().is_err());
+        // Text can't be turned off yet.
+        assert!(toml::from_str::<Config>("[formats.text]\nenabled = false\n").is_err());
+    }
+
+    #[test]
+    fn saving_formats_keeps_comments_and_drops_empty_tables() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-fmt-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            "device = \"NPU\"\n\n[formats.images]\nenabled = false # big download\n",
+        )
+        .unwrap();
+        let mut c = Config::load(&path).unwrap();
+        c.formats.images.enabled = Some(true);
+        c.formats.text.min_score = Some(0.7);
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enabled = true # big download"), "{text}");
+        assert!(text.contains("min_score = 0.7\n"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+        c.formats = Formats::default();
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("formats"), "{text}");
         assert_eq!(Config::load(&path).unwrap(), c);
         fs::remove_dir_all(&dir).unwrap();
     }

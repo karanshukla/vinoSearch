@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke};
 use vinosearch_shared::config::{
-    self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES, DEFAULT_INDEX_BUSY_PERCENT,
+    self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES, DEFAULT_IMAGE_EXTENSIONS,
+    DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT, DEFAULT_TEXT_MIN_SCORE,
 };
 
 use crate::control::{Link, Request, Status};
@@ -15,15 +16,17 @@ use crate::{doctor, integration, portal, theme};
 enum Page {
     Index,
     Folders,
+    Search,
     Model,
     Hardware,
     Integration,
 }
 
 impl Page {
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::Index,
         Page::Folders,
+        Page::Search,
         Page::Model,
         Page::Hardware,
         Page::Integration,
@@ -39,6 +42,7 @@ impl Page {
         match self {
             Page::Index => "Index",
             Page::Folders => "Folders",
+            Page::Search => "Search",
             Page::Model => "Model",
             Page::Hardware => "Hardware",
             Page::Integration => "Integration",
@@ -94,6 +98,8 @@ struct SettingsWindow {
     idle_dirty: bool,
     new_root: String,
     new_exclude: String,
+    /// The image extensions as typed, until Enter or leaving the field.
+    image_extensions: Option<String>,
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
@@ -122,6 +128,7 @@ impl SettingsWindow {
             idle_dirty: false,
             new_root: String::new(),
             new_exclude: String::new(),
+            image_extensions: None,
             picked: Arc::new(Mutex::new(None)),
             picking: false,
             confirm: None,
@@ -686,6 +693,142 @@ impl SettingsWindow {
         }
     }
 
+    /// What gets indexed, and how close a result must be to show.
+    fn search(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        if let Some(why) = &self.config_broken {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} doesn't parse, so it isn't changed from here: {why}",
+                    self.config_path.display()
+                ))
+                .color(ui.visuals().error_fg_color),
+            );
+            return;
+        }
+        let mut changed = false;
+        section(ui, "What to index");
+        row(
+            ui,
+            "Text:",
+            "Notes, documents and source code. Always on.",
+            |ui| value(ui, "On"),
+        );
+        row(
+            ui,
+            "Images:",
+            "Found by what is in them, from a text search: \"a cat\", \"a receipt\". Each \
+             takes about 1.3 s on the NPU to index. Needs the vision model, a 671 MB download. \
+             Turning them off drops them from the index.",
+            |ui| {
+                let mut on = self.config.formats.images_enabled();
+                if ui.checkbox(&mut on, "Index images").changed() {
+                    self.config.formats.images.enabled = on.then_some(true);
+                    changed = true;
+                }
+                if on
+                    && let Some(Ok(s)) = status
+                    && !s.model_present
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        let color = ui.visuals().warn_fg_color;
+                        ui.label(
+                            RichText::new("The vision model isn't downloaded yet.").color(color),
+                        );
+                        if ui
+                            .add_enabled(!s.fetching, egui::Button::new("Download"))
+                            .clicked()
+                        {
+                            self.link.send(Request::FetchModel);
+                        }
+                    });
+                }
+            },
+        );
+        if self.config.formats.images_enabled() {
+            row(
+                ui,
+                "Image types:",
+                "File extensions taken as images, separated by commas. Empty restores the \
+                 default list. Applies on Enter.",
+                |ui| {
+                    let current = self
+                        .config
+                        .formats
+                        .images
+                        .extensions
+                        .clone()
+                        .unwrap_or_else(|| {
+                            DEFAULT_IMAGE_EXTENSIONS
+                                .iter()
+                                .map(|&e| e.to_owned())
+                                .collect()
+                        })
+                        .join(", ");
+                    let text = self.image_extensions.get_or_insert(current);
+                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(320.0));
+                    if response.lost_focus() {
+                        let typed: Vec<String> = text
+                            .split([',', ' '])
+                            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        let mut next = self.config.formats.clone();
+                        next.images.extensions = (!typed.is_empty()
+                            && typed != DEFAULT_IMAGE_EXTENSIONS)
+                            .then_some(typed);
+                        match next.image_extensions() {
+                            Ok(_) => {
+                                if next != self.config.formats {
+                                    self.config.formats = next;
+                                    changed = true;
+                                }
+                                self.image_extensions = None;
+                            }
+                            Err(e) => self.notice = Some(format!("{e:#}")),
+                        }
+                    }
+                },
+            );
+        }
+
+        section(ui, "How close results must be");
+        help_line(
+            ui,
+            "Results scoring below the line are left out. Slide right for more, looser \
+             results; left for fewer, closer ones. Applies from the next search.",
+        );
+        let text = self.config.formats.text.min_score;
+        if let Some(v) = score_row(
+            ui,
+            "Text:",
+            "A query unrelated to anything indexed tops out around 0.60; real matches score \
+             0.70 and up.",
+            text,
+            DEFAULT_TEXT_MIN_SCORE,
+            0.85..=0.45,
+        ) {
+            self.config.formats.text.min_score = v;
+            self.idle_dirty = true;
+        }
+        let image = self.config.formats.images.min_score;
+        if let Some(v) = score_row(
+            ui,
+            "Images:",
+            "Images score lower against a query than text does: right matches about 0.61 to \
+             0.69, the rest 0.57 to 0.60.",
+            image,
+            DEFAULT_IMAGE_MIN_SCORE,
+            0.75..=0.45,
+        ) {
+            self.config.formats.images.min_score = v;
+            self.idle_dirty = true;
+        }
+        if changed {
+            self.save_config();
+        }
+    }
+
     /// What `vinosearch doctor` reports, run the first time the page shows.
     /// The device it probes is the one picked on the Model page.
     fn hardware(&mut self, ui: &mut egui::Ui) {
@@ -924,6 +1067,42 @@ fn listed(ui: &mut egui::Ui, path: &str, buttons: impl FnOnce(&mut egui::Ui)) {
             });
         });
     ui.add_space(2.0);
+}
+
+/// A minimum score as a slider, strict on the left and loose on the right,
+/// with a way back to the default. Some(new value) when it changed, None
+/// meaning the default.
+fn score_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    help: &str,
+    current: Option<f32>,
+    default: f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<Option<f32>> {
+    let mut out = None;
+    row(ui, label, help, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let p = theme::palette(ui.ctx());
+            ui.label(RichText::new("Fewer").color(p.muted));
+            let mut v = current.unwrap_or(default);
+            let response = ui.add(
+                egui::Slider::new(&mut v, range)
+                    .step_by(0.01)
+                    .fixed_decimals(2),
+            );
+            ui.label(RichText::new("More").color(p.muted));
+            if response.changed() {
+                // Stored rounded, as the slider shows it; the default is left unwritten.
+                let v = (v * 100.0).round() / 100.0;
+                out = Some(((v - default).abs() > 0.001).then_some(v));
+            }
+            if current.is_some() && ui.button("Default").clicked() {
+                out = Some(None);
+            }
+        });
+    });
+    out
 }
 
 // Like a Kirigami FormLayout: right-aligned labels beside their controls, or above them
@@ -1200,6 +1379,7 @@ impl eframe::App for SettingsWindow {
                         match self.page {
                             Page::Index => self.index(ui, status, shared.largest.as_ref()),
                             Page::Folders => self.folders(ui, status),
+                            Page::Search => self.search(ui, status),
                             Page::Model => self.model(ui, status),
                             Page::Hardware => self.hardware(ui),
                             Page::Integration => self.integration(ui),
@@ -1301,6 +1481,7 @@ mod tests {
         assert!(Page::parse("model") == Some(Page::Model));
         assert!(Page::parse("Hardware") == Some(Page::Hardware));
         assert!(Page::parse("folders") == Some(Page::Folders));
+        assert!(Page::parse("search") == Some(Page::Search));
         assert!(Page::parse("nope").is_none());
     }
 }

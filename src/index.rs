@@ -1,10 +1,11 @@
 //! Files -> chunks -> embeddings in SQLite, and brute-force search over them.
+//! A text file is many chunks; an image is one, embedded from its pixels.
 //!
 //! Plaintext on disk for now. Embeddings can be partly inverted back to their
 //! text, so this needs encrypting at rest (TPM-sealed key) before it holds
 //! anything a user would not leave readable.
 
-use crate::config::Excludes;
+use crate::config::{Excludes, Formats};
 use crate::embed::{DIM, Embedder, document_text};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -65,6 +66,57 @@ const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
 /// Minified or bundled files: generated, one enormous line, never what a
 /// search is for.
 const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
+
+/// Images past this are skipped: decoding takes several times the file in memory.
+const MAX_IMAGE_BYTES: u64 = 64 << 20;
+
+/// What a chunk was embedded from, stored in `chunks.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Text = 0,
+    Image = 1,
+}
+
+impl Kind {
+    fn from_db(v: i64) -> Self {
+        if v == Kind::Image as i64 {
+            Kind::Image
+        } else {
+            Kind::Text
+        }
+    }
+
+    fn max_bytes(self) -> u64 {
+        match self {
+            Kind::Text => MAX_FILE_BYTES,
+            Kind::Image => MAX_IMAGE_BYTES,
+        }
+    }
+}
+
+/// The file types indexed: text always, images by extension while they are
+/// on (#73).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileTypes {
+    images: Vec<String>,
+}
+
+impl FileTypes {
+    pub fn new(formats: &Formats) -> Result<Self> {
+        Ok(Self {
+            images: formats.image_extensions()?,
+        })
+    }
+
+    /// The kind `path` is indexed as, by its name; None if it is not.
+    pub fn kind(&self, path: &Path) -> Option<Kind> {
+        if text_file(path) {
+            return Some(Kind::Text);
+        }
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        self.images.contains(&ext).then_some(Kind::Image)
+    }
+}
 
 /// Log entries kept. A Vectors further behind than this reloads in full,
 /// which at that many changes is no slower than applying them.
@@ -140,6 +192,16 @@ pub fn open(path: &Path) -> Result<Connection> {
     if !has_hash {
         conn.execute_batch("ALTER TABLE files ADD COLUMN sha256 BLOB")?;
     }
+    // What each chunk was embedded from (#73), added to databases from before
+    // images: everything in those is text.
+    let has_kind: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'kind'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_kind {
+        conn.execute_batch("ALTER TABLE chunks ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")?;
+    }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256);
          -- A file whose content another file already has keeps no chunks of
@@ -158,7 +220,12 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-pub(crate) fn wanted(path: &Path) -> bool {
+/// Whether `path` is indexed, as `types` takes it.
+pub(crate) fn wanted(path: &Path, types: &FileTypes) -> bool {
+    types.kind(path).is_some()
+}
+
+fn text_file(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
@@ -301,10 +368,12 @@ pub fn index_file(
     conn: &mut Connection,
     emb: &mut Embedder,
     path: &Path,
+    types: &FileTypes,
     between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
 ) -> Result<Outcome> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES && wanted(path) => m,
+    let kind = types.kind(path);
+    let (meta, kind) = match (fs::symlink_metadata(path), kind) {
+        (Ok(m), Some(kind)) if m.is_file() && m.len() <= kind.max_bytes() => (m, kind),
         _ => {
             remove(conn, path)?;
             return Ok(Outcome::Skipped);
@@ -326,11 +395,15 @@ pub fn index_file(
     if unchanged && known.as_ref().is_some_and(|k| k.3.is_some()) {
         return Ok(Outcome::Unchanged);
     }
-    let Ok(text) = fs::read_to_string(path) else {
+    let read = match kind {
+        Kind::Text => fs::read_to_string(path).map(String::into_bytes),
+        Kind::Image => fs::read(path),
+    };
+    let Ok(bytes) = read else {
         remove(conn, path)?;
         return Ok(Outcome::Skipped);
     };
-    let hash = Sha256::digest(text.as_bytes()).to_vec();
+    let hash = Sha256::digest(&bytes).to_vec();
     let holder = holder_of(conn, &hash, key)?;
     if let Some((id, _, _, old_hash)) = known {
         if old_hash.as_ref() == Some(&hash) {
@@ -365,20 +438,38 @@ pub fn index_file(
         tx.commit()?;
         return Ok(Outcome::Duplicate);
     }
-    let chunks = chunk(&text);
-    let title = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    let inputs: Vec<String> = chunks
-        .iter()
-        .map(|(_, c)| document_text(&title, c))
-        .collect();
-    let mut vectors = Vec::with_capacity(inputs.len());
-    for input in &inputs {
-        vectors.extend(emb.documents(std::slice::from_ref(input))?);
-        between(conn, emb)?;
-    }
+    let (chunks, vectors) = match kind {
+        Kind::Text => {
+            let text = String::from_utf8(bytes).expect("read as a string");
+            let chunks = chunk(&text);
+            let title = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            let mut vectors = Vec::with_capacity(chunks.len());
+            for (_, c) in &chunks {
+                vectors.extend(emb.documents(&[document_text(&title, c)])?);
+                between(conn, emb)?;
+            }
+            (chunks, vectors)
+        }
+        // One chunk, with no text and line 0, from the pixels alone.
+        Kind::Image => {
+            let pixels =
+                // From the bytes hashed, so the file can't change in between.
+                match crate::vision::load(&bytes).and_then(|img| crate::vision::prepare(&img)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("skip {}: {e:#}", path.display());
+                        remove(conn, path)?;
+                        return Ok(Outcome::Skipped);
+                    }
+                };
+            let v = emb.image(&pixels)?;
+            between(conn, emb)?;
+            (vec![(0, String::new())], vec![v])
+        }
+    };
 
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
@@ -389,8 +480,8 @@ pub fn index_file(
     let file_id = tx.last_insert_rowid();
     for ((line, text), v) in chunks.iter().zip(&vectors) {
         tx.execute(
-            "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, ?2, ?3, ?4)",
-            params![file_id, *line as i64, text, to_blob(v)],
+            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, *line as i64, text, to_blob(v), kind as i64],
         )?;
     }
     tx.commit()?;
@@ -418,7 +509,12 @@ fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
 /// Paths under `root` the index is behind on: wanted files that are new or
 /// changed (by mtime and size), and indexed files that are gone. Needs no
 /// model, so a runner can check at start whether it has anything to do.
-pub fn stale(conn: &Connection, root: &Path, ex: &Excludes) -> Result<Vec<PathBuf>> {
+pub fn stale(
+    conn: &Connection,
+    root: &Path,
+    ex: &Excludes,
+    types: &FileTypes,
+) -> Result<Vec<PathBuf>> {
     let mut known: std::collections::HashMap<String, (i64, i64)> = {
         let mut stmt =
             conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
@@ -432,7 +528,9 @@ pub fn stale(conn: &Connection, root: &Path, ex: &Excludes) -> Result<Vec<PathBu
         let path = entry.path();
         let Some(key) = path.to_str() else { continue };
         let was = known.remove(key);
-        let wanted_now = wanted(path) && entry.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES);
+        let wanted_now = types
+            .kind(path)
+            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes()));
         if !wanted_now {
             // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
@@ -455,6 +553,25 @@ pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
     for p in ex.paths() {
         n += remove(conn, p)?;
     }
+    if n > 0 {
+        compact(conn)?;
+    }
+    Ok(n)
+}
+
+/// Drop every indexed file `types` no longer takes (images, once turned
+/// off). Returns files removed.
+pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
+    let paths: Vec<String> = conn
+        .prepare("SELECT path FROM files")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let tx = conn.unchecked_transaction()?;
+    let mut n = 0;
+    for p in paths.iter().filter(|p| !wanted(Path::new(p), types)) {
+        n += tx.execute("DELETE FROM files WHERE path = ?1", [p])?;
+    }
+    tx.commit()?;
     if n > 0 {
         compact(conn)?;
     }
@@ -487,6 +604,7 @@ pub fn index(
     emb: &mut Embedder,
     root: &Path,
     ex: &Excludes,
+    types: &FileTypes,
     after: &mut AfterFile,
 ) -> Result<Stats> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
@@ -510,13 +628,15 @@ pub fn index(
     };
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {
-        if !entry.file_type().is_file() || !wanted(entry.path()) {
+        if !entry.file_type().is_file() || !wanted(entry.path(), types) {
             continue;
         }
         if let Some(p) = entry.path().to_str() {
             seen.insert(p.to_owned());
         }
-        match index_file(conn, emb, entry.path(), &mut |c, e| after(&stats, c, e))? {
+        match index_file(conn, emb, entry.path(), types, &mut |c, e| {
+            after(&stats, c, e)
+        })? {
             Outcome::Embedded(n) => {
                 stats.files_embedded += 1;
                 stats.chunks += n;
@@ -671,6 +791,7 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
 }
 
 pub struct Hit {
+    pub kind: Kind,
     pub score: f32,
     pub path: String,
     pub line: i64,
@@ -687,6 +808,7 @@ pub struct Vectors {
     ids: Vec<i64>,
     data: Vec<i8>,
     scales: Vec<f32>,
+    kinds: Vec<Kind>,
     /// Where each id is in `ids`, for removing it.
     pos: HashMap<i64, usize>,
     /// Database state when loaded, to notice the index changing.
@@ -722,6 +844,7 @@ impl Vectors {
             ids: Vec::new(),
             data: Vec::new(),
             scales: Vec::new(),
+            kinds: Vec::new(),
             pos: HashMap::new(),
             stamp: (0, 0),
             seq: 0,
@@ -729,7 +852,7 @@ impl Vectors {
     }
 
     /// Append one chunk's embedding, if the blob is a DIM-long f32 vector.
-    fn push(&mut self, id: i64, blob: &[u8]) {
+    fn push(&mut self, id: i64, blob: &[u8], kind: Kind) {
         if blob.len() != DIM * 4 {
             return;
         }
@@ -742,6 +865,7 @@ impl Vectors {
         self.ids.push(id);
         self.data.extend_from_slice(&q);
         self.scales.push(scale);
+        self.kinds.push(kind);
     }
 
     /// Drop `id` by moving the last vector into its slot.
@@ -754,11 +878,13 @@ impl Vectors {
             self.data.copy_within(last * DIM..(last + 1) * DIM, p * DIM);
             self.ids[p] = self.ids[last];
             self.scales[p] = self.scales[last];
+            self.kinds[p] = self.kinds[last];
             self.pos.insert(self.ids[p], p);
         }
         self.ids.truncate(last);
         self.data.truncate(last * DIM);
         self.scales.truncate(last);
+        self.kinds.truncate(last);
     }
 
     pub fn load(conn: &Connection) -> Result<Self> {
@@ -770,16 +896,17 @@ impl Vectors {
             ids: Vec::with_capacity(n),
             data: Vec::with_capacity(n * DIM),
             scales: Vec::with_capacity(n),
+            kinds: Vec::with_capacity(n),
             pos: HashMap::with_capacity(n),
             stamp: stamp(&tx)?,
             seq: log_end(&tx)?,
         };
-        let mut stmt = tx.prepare("SELECT id, embedding FROM chunks")?;
+        let mut stmt = tx.prepare("SELECT id, embedding, kind FROM chunks")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             // Borrowed, so no copy of each blob is made on the way in.
             if let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? {
-                out.push(row.get(0)?, blob);
+                out.push(row.get(0)?, blob, Kind::from_db(row.get(2)?));
             }
         }
         Ok(out)
@@ -830,20 +957,21 @@ impl Vectors {
         for id in &touched {
             self.remove(*id);
         }
-        let mut stmt = tx.prepare("SELECT embedding FROM chunks WHERE id = ?1")?;
+        let mut stmt = tx.prepare("SELECT embedding, kind FROM chunks WHERE id = ?1")?;
         let mut added = Vec::new();
         for id in &touched {
             let mut rows = stmt.query([id])?;
             if let Some(row) = rows.next()? {
-                added.push((*id, row.get::<_, Vec<u8>>(0)?));
+                added.push((*id, row.get::<_, Vec<u8>>(0)?, Kind::from_db(row.get(1)?)));
             }
         }
         // Exact, so a few new chunks do not double a 100 MB buffer.
         self.ids.reserve_exact(added.len());
         self.scales.reserve_exact(added.len());
+        self.kinds.reserve_exact(added.len());
         self.data.reserve_exact(added.len() * DIM);
-        for (id, blob) in &added {
-            self.push(*id, blob);
+        for (id, blob, kind) in &added {
+            self.push(*id, blob, *kind);
         }
         self.seq = end;
         self.stamp = stamp(&tx)?;
@@ -883,8 +1011,14 @@ fn dot(a: &[i8; DIM], b: &[i8; DIM]) -> i32 {
     acc.iter().sum()
 }
 
-/// Cosine against every chunk (embeddings are unit length), best `k`.
-pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+/// Cosine against every chunk of `kind` (embeddings are unit length), best `k`.
+pub fn search(
+    conn: &Connection,
+    vectors: &Vectors,
+    query: &[f32],
+    kind: Kind,
+    k: usize,
+) -> Result<Vec<Hit>> {
     let query: &[f32; DIM] = query.try_into().context("query is not DIM long")?;
     let (q, qs) = quantize(query);
     let mut scored: Vec<(f32, i64)> = vectors
@@ -894,7 +1028,9 @@ pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> 
         .iter()
         .zip(&vectors.scales)
         .zip(&vectors.ids)
-        .map(|((v, s), id)| (dot(v, &q) as f32 * s * qs, *id))
+        .zip(&vectors.kinds)
+        .filter(|(_, k)| **k == kind)
+        .map(|(((v, s), id), _)| (dot(v, &q) as f32 * s * qs, *id))
         .collect();
     let by_score = |a: &(f32, i64), b: &(f32, i64)| b.0.total_cmp(&a.0);
     if scored.len() > k && k > 0 {
@@ -930,6 +1066,7 @@ pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> 
             None => Vec::new(),
         };
         hits.push(Hit {
+            kind,
             score,
             path,
             line,
@@ -1057,7 +1194,7 @@ mod tests {
         assert_eq!(holder_of(&conn, b"same", "/a/x.md").unwrap(), None);
 
         // One hit for the content, naming the copy.
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, 5).unwrap();
+        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/a/x.md");
         assert_eq!(hits[0].copies, ["/b/x.md"]);
@@ -1068,7 +1205,7 @@ mod tests {
             .query_row("SELECT file_id FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(owner, b);
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, 5).unwrap();
+        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
         assert_eq!(
             (hits[0].path.as_str(), hits[0].copies.len()),
             ("/b/x.md", 0)
@@ -1081,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_index_gains_the_hash_column() {
+    fn an_old_index_gains_the_hash_and_kind_columns() {
         let dir = std::env::temp_dir().join(format!("vinosearch-mig-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("i.sqlite");
@@ -1090,7 +1227,10 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
                  mtime INTEGER NOT NULL, size INTEGER NOT NULL);
-                 INSERT INTO files (path, mtime, size) VALUES ('/old.md', 1, 2);",
+                 INSERT INTO files (path, mtime, size) VALUES ('/old.md', 1, 2);
+                 CREATE TABLE chunks (id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
+                 start_line INTEGER NOT NULL, text TEXT NOT NULL, embedding BLOB NOT NULL);
+                 INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, 'x', x'');",
             )
             .unwrap();
         let conn = open(&db).unwrap();
@@ -1100,6 +1240,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hash, None);
+        let kind: i64 = conn
+            .query_row("SELECT kind FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, Kind::Text as i64);
         drop(conn);
         open(&db).unwrap(); // and opening it again is a no-op
         fs::remove_dir_all(&dir).unwrap();
@@ -1208,9 +1352,9 @@ mod tests {
     #[test]
     fn config_files_are_not_indexed() {
         for f in ["a.toml", "b.yaml", "c.json", "d.ini", "e.conf", ".env"] {
-            assert!(!wanted(Path::new(f)), "{f}");
+            assert!(!text_file(Path::new(f)), "{f}");
         }
-        assert!(wanted(Path::new("notes.md")));
+        assert!(text_file(Path::new("notes.md")));
     }
 
     #[test]
@@ -1259,10 +1403,10 @@ mod tests {
         for d in ["src", "bin", "out", "docs", "covered"] {
             assert!(!skipped_dir(d), "{d}");
         }
-        assert!(!wanted(Path::new("app.min.js")));
-        assert!(!wanted(Path::new("vendor.bundle.js")));
-        assert!(wanted(Path::new("app.js")));
-        assert!(wanted(Path::new("README.md")));
+        assert!(!text_file(Path::new("app.min.js")));
+        assert!(!text_file(Path::new("vendor.bundle.js")));
+        assert!(text_file(Path::new("app.js")));
+        assert!(text_file(Path::new("README.md")));
     }
 
     #[test]
@@ -1307,7 +1451,7 @@ mod tests {
         record("edited.md", (0, 0));
         record("deleted.md", (0, 0));
         record("skip.toml", real("skip.toml"));
-        let mut got: Vec<String> = stale(&conn, &root, &Excludes::default())
+        let mut got: Vec<String> = stale(&conn, &root, &Excludes::default(), &FileTypes::default())
             .unwrap()
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -1345,7 +1489,7 @@ mod tests {
             let mut v = vec![0f32; DIM];
             v[0] = i as f32 / 10.0;
             conn.execute(
-                "INSERT INTO chunks VALUES (?1, 1, ?1, '', ?2)",
+                "INSERT INTO chunks (id, file_id, start_line, text, embedding) VALUES (?1, 1, ?1, '', ?2)",
                 params![i + 1, to_blob(&v)],
             )
             .unwrap();
@@ -1353,12 +1497,63 @@ mod tests {
         let vectors = Vectors::load(&conn).unwrap();
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
-        let lines: Vec<i64> = search(&conn, &vectors, &q, 3)
+        let lines: Vec<i64> = search(&conn, &vectors, &q, Kind::Text, 3)
             .unwrap()
             .iter()
             .map(|h| h.line)
             .collect();
         assert_eq!(lines, [10, 9, 8]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn images_on() -> FileTypes {
+        let mut f = Formats::default();
+        f.images.enabled = Some(true);
+        FileTypes::new(&f).unwrap()
+    }
+
+    #[test]
+    fn images_are_wanted_only_while_on() {
+        let off = FileTypes::default();
+        assert_eq!(off.kind(Path::new("/p/a.JPG")), None);
+        assert_eq!(off.kind(Path::new("/p/a.md")), Some(Kind::Text));
+        let on = images_on();
+        assert_eq!(on.kind(Path::new("/p/a.JPG")), Some(Kind::Image));
+        assert_eq!(on.kind(Path::new("/p/a.webp")), Some(Kind::Image));
+        assert_eq!(on.kind(Path::new("/p/a.md")), Some(Kind::Text));
+        assert_eq!(on.kind(Path::new("/p/a.xcf")), None);
+    }
+
+    #[test]
+    fn kinds_are_searched_apart_and_purged_when_turned_off() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-kinds-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes.md", &[0, 1]);
+        add_file(&conn, "/cat.png", &[0]);
+        conn.execute("UPDATE chunks SET kind = 1, start_line = 0 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
+        let mut v = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let paths = |v: &Vectors, kind| -> Vec<String> {
+            search(&conn, v, &q, kind, 5)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(paths(&v, Kind::Image), ["/cat.png"]);
+        assert_eq!(paths(&v, Kind::Text), ["/notes.md", "/notes.md"]);
+        // Kinds stay with their vectors as rows are swapped out on removal.
+        remove(&conn, Path::new("/notes.md")).unwrap();
+        add_file(&conn, "/b.md", &[0]);
+        v.refresh(&conn).unwrap();
+        assert_eq!(paths(&v, Kind::Image), ["/cat.png"]);
+        assert_eq!(paths(&v, Kind::Text), ["/b.md"]);
+
+        assert_eq!(purge_types(&conn, &images_on()).unwrap(), 0);
+        assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
+        v.refresh(&conn).unwrap();
+        assert!(paths(&v, Kind::Image).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
