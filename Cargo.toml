@@ -32,6 +32,7 @@ zbus = "5"
 toml = "1.1"
 futures-channel = "0.3"
 libc = "0.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 
 # Core::compile_model_from_file, until intel/openvino-rs#202 is released.
 # Pinned by commit; all three come from the same tree because openvino-sys

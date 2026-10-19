@@ -12,7 +12,7 @@
 //! CATCH_UP_EVERY, after a resume, and when asked (`Control1.CheckNow`).
 
 use crate::config::{Config, Excludes};
-use crate::index;
+use crate::index::{self, FileTypes};
 use crate::worker::{Job, Status, unix_now};
 use anyhow::Result;
 use notify::event::{Event, EventKind, ModifyKind, RenameMode};
@@ -43,6 +43,7 @@ struct State {
     watched: HashSet<PathBuf>,
     warned_limit: bool,
     excludes: Excludes,
+    types: FileTypes,
 }
 
 impl State {
@@ -122,7 +123,7 @@ impl State {
     /// Queue whatever under `root` differs from the index.
     fn check(&self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: &Path) {
         let t0 = Instant::now();
-        match index::stale(conn, root, &self.excludes) {
+        match index::stale(conn, root, &self.excludes, &self.types) {
             Ok(paths) if !paths.is_empty() => {
                 eprintln!(
                     "{}: {} paths changed while unwatched (checked in {:.1} s)",
@@ -159,7 +160,7 @@ impl State {
 }
 
 /// Whether a change to `path` could alter the index.
-fn relevant(root: &Path, path: &Path, ex: &Excludes) -> bool {
+fn relevant(root: &Path, path: &Path, ex: &Excludes, types: &FileTypes) -> bool {
     if ex.contains(path) || index::skipped_under(root, path) {
         return false;
     }
@@ -171,7 +172,7 @@ fn relevant(root: &Path, path: &Path, ex: &Excludes) -> bool {
         return !index::skipped_dir(&name);
     }
     // Gone paths may have been indexed files or directories; removal sorts it out.
-    !path.exists() || index::wanted(path)
+    !path.exists() || index::wanted(path, types)
 }
 
 /// Paths an event says are no longer there: removed, or renamed away.
@@ -238,6 +239,7 @@ pub fn spawn(
     status: Arc<Status>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let excludes = file.excludes()?;
+    let types = FileTypes::new(&file.formats)?;
     let conn = index::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
@@ -248,6 +250,7 @@ pub fn spawn(
             watched: HashSet::new(),
             warned_limit: false,
             excludes,
+            types,
         };
         st.sync_roots(&conn, &jobs);
         status.last_checked.store(unix_now(), Ordering::Relaxed);
@@ -274,7 +277,7 @@ pub fn spawn(
                         let Some(root) = st.root_of(&path).map(Path::to_path_buf) else {
                             continue;
                         };
-                        if !relevant(&root, &path, &st.excludes) {
+                        if !relevant(&root, &path, &st.excludes, &st.types) {
                             continue;
                         }
                         if index::is_real_dir(&path)
@@ -298,11 +301,13 @@ pub fn spawn(
                 break;
             }
             if last_roots.elapsed() >= ROOTS_EVERY {
-                // A file that fails to parse, or has a bad exclusion, changes
-                // nothing: better the last good exclusions than index what a
-                // typo un-excluded.
-                match Config::load(&config).and_then(|c| Ok((c.excludes()?, c))) {
-                    Ok((ex, c)) if c != file => {
+                // A file that fails to parse, or has a bad exclusion or file
+                // type, changes nothing: better the last good exclusions than
+                // index what a typo un-excluded.
+                match Config::load(&config)
+                    .and_then(|c| Ok((c.excludes()?, FileTypes::new(&c.formats)?, c)))
+                {
+                    Ok((ex, types, c)) if c != file => {
                         eprintln!("{}: changed", config.display());
                         let old = std::mem::replace(&mut st.excludes, ex);
                         // Directories no longer excluded need watches now.
@@ -313,6 +318,11 @@ pub fn spawn(
                             {
                                 st.watch_tree(dir);
                             }
+                        }
+                        // A type turned on: what of it is already there.
+                        if types != st.types {
+                            st.types = types;
+                            due.get_or_insert("file types changed");
                         }
                         file = c.clone();
                         if jobs.send(Job::Config(c)).is_err() {

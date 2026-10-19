@@ -8,7 +8,7 @@
 //! answers while the worker is busy indexing.
 
 use crate::config::Config;
-use crate::index::{self, Hit};
+use crate::index::{self, Hit, Kind};
 use crate::model;
 use crate::watch;
 use crate::worker::{self, Job, Options, Status};
@@ -26,10 +26,8 @@ use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DESKTOP_ID, GNOME_PATH as GNOME, ICON, KRUNNER_PLUGIN,
     RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, status as key,
 };
+/// Files of each kind shown.
 const RESULTS: usize = 5;
-/// Cosine below this is noise for this model: an off-topic query against a
-/// code index topped out at 0.60, real matches scored 0.72 to 0.83.
-const MIN_SCORE: f32 = 0.65;
 /// QueryMatch::CategoryRelevance::Moderate
 const RELEVANCE_MODERATE: i32 = 50;
 
@@ -48,11 +46,43 @@ type Db = Arc<Mutex<rusqlite::Connection>>;
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
+    config: PathBuf,
 }
 
-/// The best chunk of each of the best files for `query`, as KRunner and GNOME
-/// Shell both show them. Empty if the worker has stopped.
-async fn search(jobs: &Mutex<mpsc::Sender<Job>>, query: String) -> Vec<Hit> {
+/// How close a result must be, per kind (`formats.*.min_score`).
+#[derive(Clone, Copy)]
+struct Floors {
+    text: f32,
+    image: f32,
+}
+
+impl Floors {
+    /// From the config file as it is now, so a change in the settings window
+    /// shows from the next keystroke; the defaults if it doesn't parse.
+    fn load(config: &Path) -> Self {
+        let formats = Config::load(config).map(|c| c.formats).unwrap_or_default();
+        Self {
+            text: formats
+                .text_min_score()
+                .unwrap_or(crate::config::DEFAULT_TEXT_MIN_SCORE),
+            image: formats
+                .image_min_score()
+                .unwrap_or(crate::config::DEFAULT_IMAGE_MIN_SCORE),
+        }
+    }
+
+    fn of(&self, kind: Kind) -> f32 {
+        match kind {
+            Kind::Text => self.text,
+            Kind::Image => self.image,
+        }
+    }
+}
+
+/// The best chunk of each of the best files for `query`, text first, then
+/// images, as KRunner and GNOME Shell both show them. Empty if the worker
+/// has stopped.
+async fn search(jobs: &Mutex<mpsc::Sender<Job>>, floors: Floors, query: String) -> Vec<Hit> {
     let (tx, rx) = oneshot::channel();
     let job = Job::Match {
         query,
@@ -62,7 +92,7 @@ async fn search(jobs: &Mutex<mpsc::Sender<Job>>, query: String) -> Vec<Hit> {
     if jobs.lock().unwrap().send(job).is_err() {
         return Vec::new();
     }
-    per_file(rx.await.unwrap_or_default())
+    per_file(rx.await.unwrap_or_default(), floors)
 }
 
 /// `path`'s file name, and its directory with the hit's line and a snippet.
@@ -80,26 +110,39 @@ fn describe(h: &Hit) -> (String, String) {
         1 => "  (+1 copy)".to_owned(),
         n => format!("  (+{n} copies)"),
     };
-    (
-        name,
-        format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
-    )
+    let description = match h.kind {
+        Kind::Text => format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
+        Kind::Image => format!("{dir}{copies}"),
+    };
+    (name, description)
+}
+
+fn icon(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Text => "text-x-generic",
+        Kind::Image => "image-x-generic",
+    }
 }
 
 fn owned(v: Value<'_>) -> OwnedValue {
     v.try_into().expect("string values have no fds")
 }
 
-fn to_match(h: Hit) -> Match {
+fn to_match(h: Hit, floors: Floors) -> Match {
     let (name, subtext) = describe(&h);
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Value::from(subtext)));
     props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
-    let relevance = f64::from(((h.score - MIN_SCORE) / (1.0 - MIN_SCORE)).clamp(0.0, 1.0));
+    // Images in a group of their own (#73); text stays under the runner's name.
+    if h.kind == Kind::Image {
+        props.insert("category".into(), owned(Value::from("Images")));
+    }
+    let floor = floors.of(h.kind);
+    let relevance = f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0));
     (
         h.path,
         name,
-        "text-x-generic".into(),
+        icon(h.kind).into(),
         RELEVANCE_MODERATE,
         relevance,
         props,
@@ -158,10 +201,11 @@ impl Runner {
 
     #[zbus(name = "Match")]
     async fn find(&self, query: String) -> Vec<Match> {
-        search(&self.jobs, query)
+        let floors = Floors::load(&self.config);
+        search(&self.jobs, floors, query)
             .await
             .into_iter()
-            .map(to_match)
+            .map(|h| to_match(h, floors))
             .collect()
     }
 
@@ -179,6 +223,7 @@ impl Runner {
 struct Gnome {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
+    config: PathBuf,
     last: Mutex<HashMap<String, Hit>>,
 }
 
@@ -192,7 +237,7 @@ impl Gnome {
         if query.trim().chars().count() < MIN_QUERY_CHARS {
             return Vec::new();
         }
-        let hits = search(&self.jobs, query).await;
+        let hits = search(&self.jobs, Floors::load(&self.config), query).await;
         let ids = hits.iter().map(|h| h.path.clone()).collect();
         *self.last.lock().unwrap() = hits.into_iter().map(|h| (h.path.clone(), h)).collect();
         ids
@@ -218,20 +263,24 @@ impl Gnome {
         let last = self.last.lock().unwrap();
         ids.into_iter()
             .map(|id| {
-                let (name, description) = match last.get(&id) {
-                    Some(h) => describe(h),
+                let (name, description, kind) = match last.get(&id) {
+                    Some(h) => {
+                        let (name, description) = describe(h);
+                        (name, description, h.kind)
+                    }
                     // From an earlier search: the path alone.
                     None => (
                         Path::new(&id)
                             .file_name()
                             .map_or(id.clone(), |n| n.to_string_lossy().into_owned()),
                         id.clone(),
+                        Kind::Text,
                     ),
                 };
                 let mut meta = HashMap::new();
                 meta.insert("name".into(), owned(Value::from(name)));
                 meta.insert("description".into(), owned(Value::from(description)));
-                meta.insert("gicon".into(), owned(Value::from("text-x-generic")));
+                meta.insert("gicon".into(), owned(Value::from(icon(kind))));
                 meta.insert("id".into(), owned(Value::from(id)));
                 meta
             })
@@ -271,6 +320,11 @@ fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
 }
 
 impl Control {
+    /// Images are on in the config file as it is now; off if it doesn't parse.
+    fn images_enabled(&self) -> bool {
+        Config::load(&self.config).is_ok_and(|c| c.formats.images_enabled())
+    }
+
     fn send(&self, job: Job) -> zbus::fdo::Result<()> {
         self.jobs
             .lock()
@@ -353,10 +407,11 @@ impl Control {
             owned(Value::from(st.fetch_error.lock().unwrap().clone())),
         );
         let model_dir = model::default_dir().map_err(failed)?;
-        out.insert(
-            key::MODEL_PRESENT.into(),
-            owned(Value::from(model::present(&model_dir))),
-        );
+        let vision_dir = model::vision_dir().map_err(failed)?;
+        // The vision encoder counts while images are on.
+        let present = model::present(&model_dir)
+            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir));
+        out.insert(key::MODEL_PRESENT.into(), owned(Value::from(present)));
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
             .iter()
@@ -365,7 +420,9 @@ impl Control {
         out.insert(key::INDEX_BYTES.into(), owned(Value::from(index_bytes)));
         out.insert(
             key::MODEL_BYTES.into(),
-            owned(Value::from(disk_bytes(&model_dir))),
+            owned(Value::from(
+                disk_bytes(&model_dir) + disk_bytes(&vision_dir),
+            )),
         );
         for (k, at) in [
             (key::LAST_CHECKED, &st.last_checked),
@@ -444,14 +501,13 @@ impl Control {
         let jobs = self.jobs.lock().unwrap().clone();
         *status.fetch_error.lock().unwrap() = String::new();
         status.fetch_done.store(0, Ordering::Relaxed);
+        let images = self.images_enabled();
         status
             .fetch_total
-            .store(model::total_bytes(), Ordering::Relaxed);
+            .store(model::total_bytes(images), Ordering::Relaxed);
         std::thread::spawn(move || {
-            let result = model::default_dir().and_then(|dir| {
-                model::fetch(&dir, &mut |_, done, _| {
-                    status.fetch_done.store(done, Ordering::Relaxed);
-                })
+            let result = model::fetch(images, &mut |_, done, _| {
+                status.fetch_done.store(done, Ordering::Relaxed);
             });
             match result {
                 // Indexing that found no model can run now.
@@ -493,12 +549,17 @@ fn disk_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-/// Best chunk per file, files above MIN_SCORE, best RESULTS of them.
-fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
+/// Best chunk per file, files at or above their kind's floor, best RESULTS
+/// of each kind: text, then images.
+fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    hits.into_iter()
-        .filter(|h| h.score >= MIN_SCORE && seen.insert(h.path.clone()))
+    let (text, images): (Vec<Hit>, Vec<Hit>) = hits
+        .into_iter()
+        .filter(|h| h.score >= floors.of(h.kind) && seen.insert(h.path.clone()))
+        .partition(|h| h.kind == Kind::Text);
+    text.into_iter()
         .take(RESULTS)
+        .chain(images.into_iter().take(RESULTS))
         .collect()
 }
 
@@ -517,6 +578,7 @@ pub fn serve(opts: Options) -> Result<()> {
         db: db.clone(),
         config: opts.config.clone(),
     };
+    let config = opts.config.clone();
     let worker = std::thread::spawn(move || worker::run(rx, opts));
     let _conn = zbus::blocking::connection::Builder::session()?
         .name(SERVICE)?
@@ -525,6 +587,7 @@ pub fn serve(opts: Options) -> Result<()> {
             Runner {
                 jobs: Mutex::new(tx.clone()),
                 db: db.clone(),
+                config: config.clone(),
             },
         )?
         .serve_at(
@@ -532,6 +595,7 @@ pub fn serve(opts: Options) -> Result<()> {
             Gnome {
                 jobs: Mutex::new(tx),
                 db,
+                config,
                 last: Mutex::default(),
             },
         )?

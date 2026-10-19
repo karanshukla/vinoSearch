@@ -1,4 +1,4 @@
-//! Text embeddings on the NPU.
+//! Text and image embeddings on the NPU.
 //!
 //! Every shape is static, as the NPU needs. Batch is 1: as of OpenVINO 2026.4.1
 //! a static batch above 1 mixes rows across the batch on the NPU. Throughput
@@ -29,6 +29,9 @@ const IN_FLIGHT: usize = 1;
 const WAIT_MS: i64 = 120_000;
 
 const QUERY_PREFIX: &str = "task: search result | query: ";
+/// An image's prompt, `<bos> <|image> <|image|> x tokens <image|> <eos>`,
+/// padded to this: SOFT_TOKENS + 4 rounded up to 16, model_image_140's shape.
+const IMAGE_LEN: usize = 144;
 
 pub fn document_text(title: &str, text: &str) -> String {
     format!("title: {title} | text: {text}")
@@ -40,16 +43,29 @@ struct Stage {
     requests: Vec<InferRequest>,
 }
 
-/// Query stage up front; the document stage compiles on first use, so a
-/// process that only answers queries never holds a second copy of the model.
+/// The vision encoder and the text model taking its output.
+struct ImageStage {
+    _vision: CompiledModel,
+    vision: InferRequest,
+    _text: CompiledModel,
+    text: InferRequest,
+    /// `<bos>`, `<|image>`, `<|image|>`, `<image|>`, `<eos>`.
+    ids: [i64; 5],
+}
+
+/// Query stage up front; the document and image stages compile on first
+/// use, so a process that only answers queries never holds a second copy of
+/// the model.
 pub struct Embedder {
     core: Core,
     model_dir: PathBuf,
+    vision_dir: PathBuf,
     device: String,
     cache: PathBuf,
     tok: Tokenizer,
     query: Stage,
     docs: Option<Stage>,
+    images: Option<ImageStage>,
     docs_share: f64,
 }
 
@@ -96,25 +112,40 @@ fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Ve
 /// evicts them: one day of changing shapes left 1.4 GB, five ~280 MB blobs,
 /// for two in use.
 fn cache_key(device: &str, len: usize) -> String {
+    stage_key(crate::model::REVISION, device, &len.to_string())
+}
+
+fn stage_key(revision: &str, device: &str, stage: &str) -> String {
     let dev: String = device
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    format!("{}-{dev}-{len}", &crate::model::REVISION[..12])
+    format!("{}-{dev}-{stage}", &revision[..12])
 }
 
-/// Drop everything under `root` but this revision's stage directories (for
+/// The stages this build compiles, as (model revision, stage).
+fn stages() -> [(&'static str, String); 4] {
+    let tokens = crate::vision::SOFT_TOKENS;
+    [
+        (crate::model::REVISION, QUERY_LEN.to_string()),
+        (crate::model::REVISION, DOC_LEN.to_string()),
+        (crate::model::REVISION, format!("image{tokens}")),
+        (crate::model::VISION_REVISION, format!("vision{tokens}")),
+    ]
+}
+
+/// Drop everything under `root` but this build's stage directories (for
 /// any device, so a one-off run on another device does not cost the NPU a
 /// recompile).
 fn prune_cache(root: &Path) -> Result<()> {
-    let rev = &crate::model::REVISION[..12];
+    let stages = stages();
     for e in std::fs::read_dir(root)?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let current = e.path().is_dir()
-            && name.strip_prefix(rev).is_some_and(|rest| {
-                [QUERY_LEN, DOC_LEN]
-                    .iter()
-                    .any(|len| rest.starts_with('-') && rest.ends_with(&format!("-{len}")))
+            && stages.iter().any(|(rev, stage)| {
+                name.strip_prefix(&rev[..12]).is_some_and(|rest| {
+                    rest.starts_with('-') && rest.ends_with(&format!("-{stage}"))
+                })
             });
         if !current {
             let removed = if e.path().is_dir() {
@@ -140,6 +171,43 @@ fn blobs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Compile with this stage's cache directory, then drop the blobs a cache
+/// miss left stale.
+fn compile_cached(
+    core: &mut Core,
+    device: &str,
+    cache: &Path,
+    compile: impl FnOnce(&mut Core) -> Result<CompiledModel>,
+) -> Result<CompiledModel> {
+    std::fs::create_dir_all(cache)?;
+    core.set_property(
+        &DeviceType::from(device),
+        &RwPropertyKey::CacheDir,
+        cache.to_str().context("cache path is not UTF-8")?,
+    )
+    .context("setting CACHE_DIR")?;
+    let before = blobs(cache);
+    let compiled = compile(core)?;
+    // A new blob means a cache miss (a new OpenVINO, say), so the older
+    // ones in this directory are for a build that no longer loads them.
+    if blobs(cache).iter().any(|b| !before.contains(b)) {
+        for old in before {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(compiled)
+}
+
+/// Straight from the path: on a cache hit OpenVINO loads the blob without
+/// reading the model, 340 MB peak instead of 630 MB for the text model.
+fn compile_file(core: &mut Core, path: &Path, device: &str) -> Result<CompiledModel> {
+    core.compile_model_from_file(
+        path.to_str().context("model path is not UTF-8")?,
+        DeviceType::from(device),
+    )
+    .with_context(|| format!("compiling {}", path.display()))
+}
+
 impl Stage {
     fn new(
         core: &mut Core,
@@ -150,47 +218,35 @@ impl Stage {
         in_flight: usize,
     ) -> Result<Self> {
         let cache = cache_root.join(cache_key(device, len));
-        std::fs::create_dir_all(&cache)?;
-        core.set_property(
-            &DeviceType::from(device),
-            &RwPropertyKey::CacheDir,
-            cache.to_str().context("cache path is not UTF-8")?,
-        )
-        .context("setting CACHE_DIR")?;
-        let before = blobs(&cache);
-        let mut compiled = match crate::model::static_path(model_dir, len).filter(|p| p.is_file()) {
-            // Straight from the path: on a cache hit OpenVINO loads the blob
-            // without reading the model, 340 MB peak instead of 630 MB.
-            Some(path) => core
-                .compile_model_from_file(
-                    path.to_str().context("model path is not UTF-8")?,
-                    DeviceType::from(device),
-                )
-                .context("compiling")?,
-            // A model fetched before the static graphs were published.
-            None => {
-                let path = crate::model::onnx_path(model_dir);
-                let mut model = core
-                    .read_model_from_file(path.to_str().context("model path is not UTF-8")?, "")
-                    .context("reading model")?;
-                let tokens = PartialShape::new_static(2, &[1, len as i64])?;
-                model
-                    .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
-                    .context("reshaping to static shapes")?;
-                core.compile_model(&model, DeviceType::from(device))
-                    .context("compiling")?
-            }
-        };
+        let mut compiled =
+            compile_cached(
+                core,
+                device,
+                &cache,
+                |core| match crate::model::static_path(model_dir, len).filter(|p| p.is_file()) {
+                    Some(path) => compile_file(core, &path, device),
+                    // A model fetched before the static graphs were published.
+                    None => {
+                        let path = crate::model::onnx_path(model_dir);
+                        let mut model = core
+                            .read_model_from_file(
+                                path.to_str().context("model path is not UTF-8")?,
+                                "",
+                            )
+                            .context("reading model")?;
+                        let tokens = PartialShape::new_static(2, &[1, len as i64])?;
+                        model
+                            .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
+                            .context("reshaping to static shapes")?;
+                        Ok(core
+                            .compile_model(&model, DeviceType::from(device))
+                            .context("compiling")?)
+                    }
+                },
+            )?;
         let requests = (0..in_flight)
             .map(|_| compiled.create_infer_request())
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        // A new blob means a cache miss (a new OpenVINO, say), so the older
-        // ones in this directory are for a build that no longer loads them.
-        if blobs(&cache).iter().any(|b| !before.contains(b)) {
-            for old in before {
-                let _ = std::fs::remove_file(old);
-            }
-        }
         Ok(Self {
             len,
             _compiled: compiled,
@@ -210,6 +266,7 @@ impl Stage {
         Ok(())
     }
 
+    /// One request's `sentence_embedding`, L2-normalised.
     fn read(req: &InferRequest) -> Result<Vec<f32>> {
         let out = req.get_tensor("sentence_embedding")?;
         let v = out.get_data::<f32>()?;
@@ -240,16 +297,128 @@ impl Stage {
                 req.wait(WAIT_MS)?;
                 out.push(Self::read(req)?);
             }
-            if share < 1.0 {
-                std::thread::sleep(t0.elapsed().mul_f64((1.0 - share) / share));
-            }
+            yield_device(t0, share);
         }
         Ok(out)
     }
 }
 
+/// After work that started at `t0`, leave the device to other programs for
+/// long enough that this work takes `share` of its time.
+fn yield_device(t0: Instant, share: f64) {
+    if share < 1.0 {
+        std::thread::sleep(t0.elapsed().mul_f64((1.0 - share) / share));
+    }
+}
+
+fn i64_tensor(dims: &[i64], data: &[i64]) -> Result<Tensor> {
+    let mut t = Tensor::new(ElementType::I64, &Shape::new(dims)?)?;
+    t.get_data_mut::<i64>()?.copy_from_slice(data);
+    Ok(t)
+}
+
+impl ImageStage {
+    fn new(
+        core: &mut Core,
+        model_dir: &Path,
+        vision_dir: &Path,
+        device: &str,
+        cache_root: &Path,
+        tok: &Tokenizer,
+    ) -> Result<Self> {
+        ensure!(
+            crate::model::images_present(model_dir, vision_dir),
+            "the vision encoder is not in {}; run: vinosearch fetch-model",
+            vision_dir.display()
+        );
+        let tokens = crate::vision::SOFT_TOKENS;
+        let cache = cache_root.join(stage_key(
+            crate::model::VISION_REVISION,
+            device,
+            &format!("vision{tokens}"),
+        ));
+        let path = crate::model::vision_path(vision_dir);
+        let mut vision = compile_cached(core, device, &cache, |core| {
+            compile_file(core, &path, device)
+        })?;
+        let cache = cache_root.join(stage_key(
+            crate::model::REVISION,
+            device,
+            &format!("image{tokens}"),
+        ));
+        let path = crate::model::image_text_path(model_dir);
+        let mut text = compile_cached(core, device, &cache, |core| {
+            compile_file(core, &path, device)
+        })?;
+        let id = |t: &str| {
+            tok.token_to_id(t)
+                .map(i64::from)
+                .with_context(|| format!("{t} is not in the tokenizer"))
+        };
+        Ok(Self {
+            vision: vision.create_infer_request()?,
+            _vision: vision,
+            text: text.create_infer_request()?,
+            _text: text,
+            ids: [
+                id("<bos>")?,
+                id("<|image>")?,
+                id("<|image|>")?,
+                id("<image|>")?,
+                id("<eos>")?,
+            ],
+        })
+    }
+
+    fn run(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+        use crate::vision::{PATCH_DIM, PATCHES, SOFT_TOKENS};
+        ensure!(
+            (1..=SOFT_TOKENS).contains(&px.tokens),
+            "{} soft tokens, expected 1 to {SOFT_TOKENS}",
+            px.tokens
+        );
+        let mut values = Tensor::new(
+            ElementType::F32,
+            &Shape::new(&[1, PATCHES as i64, PATCH_DIM as i64])?,
+        )?;
+        values.get_data_mut::<f32>()?.copy_from_slice(&px.values);
+        self.vision.set_tensor("pixel_values", &values)?;
+        self.vision.set_tensor(
+            "pixel_position_ids",
+            &i64_tensor(&[1, PATCHES as i64, 2], &px.positions)?,
+        )?;
+        self.vision.infer()?;
+        // Every soft token's row; the text model merges the first `tokens`
+        // (one per image token in the prompt) and ignores the rest.
+        let features = self.vision.get_tensor("image_features")?;
+        let [bos, boi, image, eoi, eos] = self.ids;
+        let mut ids = vec![bos, boi];
+        ids.extend(std::iter::repeat_n(image, px.tokens));
+        ids.extend([eoi, eos]);
+        let mut mask = vec![1; ids.len()];
+        // Padded at the end with id 0 and mask 0. More image tokens instead
+        // would not be neutral: they are attended even when masked.
+        ids.resize(IMAGE_LEN, 0);
+        mask.resize(IMAGE_LEN, 0);
+        let dims = [1, IMAGE_LEN as i64];
+        self.text
+            .set_tensor("input_ids", &i64_tensor(&dims, &ids)?)?;
+        self.text
+            .set_tensor("attention_mask", &i64_tensor(&dims, &mask)?)?;
+        self.text.set_tensor("image_features", &features)?;
+        self.text.infer()?;
+        Stage::read(&self.text)
+    }
+}
+
 impl Embedder {
-    pub fn new(mut core: Core, model_dir: &Path, device: &str, cache_dir: &Path) -> Result<Self> {
+    pub fn new(
+        mut core: Core,
+        model_dir: &Path,
+        vision_dir: &Path,
+        device: &str,
+        cache_dir: &Path,
+    ) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         prune_cache(cache_dir)?;
         let tok_path = crate::model::tokenizer_path(model_dir);
@@ -259,11 +428,13 @@ impl Embedder {
         Ok(Self {
             core,
             model_dir: model_dir.to_owned(),
+            vision_dir: vision_dir.to_owned(),
             device: device.to_owned(),
             cache: cache_dir.to_owned(),
             tok,
             query,
             docs: None,
+            images: None,
             docs_share: 1.0,
         })
     }
@@ -296,20 +467,40 @@ impl Embedder {
         Ok(())
     }
 
-    /// Cap document embedding at `share` of the device's time, in (0, 1].
-    /// Queries always run at full speed.
+    /// Cap document and image embedding at `share` of the device's time, in
+    /// (0, 1]. Queries always run at full speed.
     pub fn set_document_share(&mut self, share: f64) {
         self.docs_share = share.clamp(0.01, 1.0);
     }
 
-    /// Free the document stage; the next document (or long query) compiles it
-    /// again, from the cache.
+    /// Free the document and image stages; the next document (or long
+    /// query) or image compiles them again, from the cache.
     pub fn release_documents(&mut self) -> bool {
-        self.docs.take().is_some()
+        let images = self.images.take().is_some();
+        self.docs.take().is_some() || images
     }
 
+    /// The document or image stage is compiled.
     pub fn has_documents(&self) -> bool {
-        self.docs.is_some()
+        self.docs.is_some() || self.images.is_some()
+    }
+
+    /// Embed an image, prepared by [`crate::vision::prepare`].
+    pub fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+        if self.images.is_none() {
+            self.images = Some(ImageStage::new(
+                &mut self.core,
+                &self.model_dir,
+                &self.vision_dir,
+                &self.device,
+                &self.cache,
+                &self.tok,
+            )?);
+        }
+        let t0 = Instant::now();
+        let v = self.images.as_mut().unwrap().run(px)?;
+        yield_device(t0, self.docs_share);
+        Ok(v)
     }
 
     /// Embed documents already formatted with [`document_text`].
@@ -333,10 +524,13 @@ mod tests {
             cache_key("NPU", QUERY_LEN),
             cache_key("NPU", DOC_LEN),
             cache_key("CPU", DOC_LEN),
+            stage_key(crate::model::REVISION, "NPU", "image140"),
+            stage_key(crate::model::VISION_REVISION, "NPU", "vision140"),
         ];
         let drop = [
             cache_key("NPU", 64),
             format!("0123456789ab-NPU-{QUERY_LEN}"),
+            stage_key(crate::model::VISION_REVISION, "NPU", "vision280"),
         ];
         for d in keep.iter().chain(&drop) {
             std::fs::create_dir_all(root.join(d)).unwrap();

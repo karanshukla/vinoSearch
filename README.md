@@ -4,7 +4,7 @@
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
 
-Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell, with a settings window for the rest.
+Early days: a working proof of concept for text files and images, searched from the command line, KRunner or GNOME Shell, with a settings window for the rest.
 
 ## Usage
 
@@ -38,9 +38,19 @@ Settings live in `~/.config/vinosearch/config.toml`; flags and environment varia
 exclude = ["~/Downloads"]   # never indexed or watched, even under an indexed root
 device = "NPU"
 idle_unload_minutes = 5
+
+[formats.text]
+min_score = 0.65            # results scoring lower are left out; lower it for more results
+
+[formats.images]
+enabled = true              # off by default: the vision encoder is a 671 MB download
+extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"]   # the default list
+min_score = 0.6
 ```
 
-Without an `exclude` line, the default list applies: `~/snap`, `~/go/pkg`, `~/sdk`, `~/Android/Sdk`, `~/R`, `~/perl5` and `~/Games`, trees of installed packages that take long to index and are rarely searched. Conda installs (`miniconda3`, `anaconda3`, ...) are skipped wherever they are. Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
+Without an `exclude` line, the default list applies: `~/snap`, `~/go/pkg`, `~/sdk`, `~/Android/Sdk`, `~/R`, `~/perl5` and `~/Games`, trees of installed packages that take long to index and are rarely searched. Conda installs (`miniconda3`, `anaconda3`, ...) are skipped wherever they are. **Images** are embedded from their pixels with EmbeddingGemma 2's vision encoder, both stages on the NPU: 1.3 s an image, about 4.4 J on the package, up to 64 MiB a file, with no CPU time beyond decoding. Text queries search them directly. KRunner shows them in their own **Images** group; GNOME lists them after the text results. Turning images on queues a check of every root for the images already there (run `vinosearch fetch-model` first, or Download on the Model page), and turning them off drops them from the index. Images score lower against a query than text does, hence the separate `min_score`. See [Model](#model) for accuracy.
+
+Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
 
 Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds. inotify can still miss changes (the kernel drops events when its queue overflows, and directories past the watch limit go unwatched), so every root is also compared with the index by mtime and size once an hour, after the machine wakes from sleep, right after dropped events, and on demand from the settings window. That reads no file contents: 0.5 s for 45,418 paths under a home directory here.
 
@@ -107,7 +117,15 @@ ovfetch's runtime ships OpenVINO's ONNX frontend only, so models must be ONNX.
 
 ## Model
 
-[EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), text model, as [arankays/embeddinggemma-2-text-int8-cw-onnx](https://huggingface.co/arankays/embeddinggemma-2-text-int8-cw-onnx): INT8, 274 MB, with a fix for an OpenVINO conversion bug ([#1](https://github.com/karanshukla/vinoSearch/issues/1)).
+[EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2), text model, as [arankays/embeddinggemma-2-text-int8-cw-onnx](https://huggingface.co/arankays/embeddinggemma-2-text-int8-cw-onnx): INT8, 274 MB, with a fix for an OpenVINO conversion bug ([#1](https://github.com/karanshukla/vinoSearch/issues/1)). For images, its vision encoder with static shapes, as [arankays/embeddinggemma-2-vision-static-onnx](https://huggingface.co/arankays/embeddinggemma-2-vision-static-onnx): fp32, 671 MB, fetched only while images are on ([#2](https://github.com/karanshukla/vinoSearch/issues/2)).
+
+Images, on Flickr30k's 1k test split (1,000 images, 5,000 captions), both stages on the NPU, 2026-10-19 (`bench/image_retrieval.py`, `bench/image_energy.py`):
+
+| Soft tokens | Text→image R@1 / R@5 / R@10 | ms/image | Package J/image |
+|---|---|---|---|
+| 280 | 86.3 / 97.5 / 98.7 | 2767 | 9.4 |
+| **140 (used)** | **84.5 / 96.9 / 98.6** | **1311** | **4.4** |
+| 70 | 81.1 / 95.4 / 97.9 | 653 | 2.2 |
 
 From `bench/`, on BEIR SciFact (nDCG@10, documents truncated to 256 tokens), Core 5 320 NPU, OpenVINO 2026.4.1, 2026-10-18:
 

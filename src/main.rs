@@ -4,6 +4,7 @@ mod krunner;
 mod model;
 mod runtime;
 mod sched;
+mod vision;
 mod watch;
 mod worker;
 
@@ -84,7 +85,13 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     }
     let cache = cache_dir()?;
     let t0 = Instant::now();
-    let emb = embed::Embedder::new(openvino::Core::new()?, &dir, device, &cache)?;
+    let emb = embed::Embedder::new(
+        openvino::Core::new()?,
+        &dir,
+        &model::vision_dir()?,
+        device,
+        &cache,
+    )?;
     eprintln!(
         "model ready on {device} in {:.1} s",
         t0.elapsed().as_secs_f64()
@@ -99,6 +106,7 @@ struct Settings {
     device: String,
     idle_unload_minutes: f64,
     excludes: config::Excludes,
+    types: index::FileTypes,
     pinned: worker::Pinned,
 }
 
@@ -121,6 +129,7 @@ fn settings(cli: &Cli) -> Result<Settings> {
             .unwrap_or_else(|| config::DEFAULT_DEVICE.into()),
         idle_unload_minutes,
         excludes: file.excludes()?,
+        types: index::FileTypes::new(&file.formats)?,
         pinned: worker::Pinned {
             device: cli.device.is_some(),
             idle_unload: cli.idle_unload_minutes.is_some(),
@@ -137,6 +146,7 @@ fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
         device: s.device,
         idle: config::idle_unload(s.idle_unload_minutes).expect("checked in settings()"),
         excludes: s.excludes,
+        types: s.types,
         config: s.path,
         file: s.file,
         pinned: s.pinned,
@@ -161,7 +171,7 @@ fn run(cli: Cli) -> Result<bool> {
         Command::FetchModel => {
             let mut last = String::new();
             let mut shown = 0;
-            model::fetch(&model::default_dir()?, &mut |name, done, total| {
+            model::fetch(s.file.formats.images_enabled(), &mut |name, done, total| {
                 // A line per file, then a percentage every 10%.
                 let pct = done * 100 / total.max(1);
                 if name != last || pct >= shown + 10 {
@@ -187,6 +197,7 @@ fn run(cli: Cli) -> Result<bool> {
                     &mut emb,
                     Path::new(p),
                     &s.excludes,
+                    &s.types,
                     &mut |st, _, _| {
                         if st.files_embedded != shown {
                             shown = st.files_embedded;
@@ -245,17 +256,23 @@ fn run(cli: Cli) -> Result<bool> {
             let mut emb = embedder(cli.openvino_dir, &s.device)?;
             let conn = index::open(&index::default_db()?)?;
             index::purge(&conn, &s.excludes)?;
+            index::purge_types(&conn, &s.types)?;
             let t0 = Instant::now();
             let q = emb.query(&query)?;
             let t1 = Instant::now();
             let vectors = index::Vectors::load(&conn)?;
-            let hits = index::search(&conn, &vectors, &q, n)?;
+            let mut hits = index::search(&conn, &vectors, &q, index::Kind::Text, n)?;
+            hits.extend(index::search(&conn, &vectors, &q, index::Kind::Image, n)?);
             eprintln!(
                 "query {:.1} ms, search {:.1} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
                 t1.elapsed().as_secs_f64() * 1e3
             );
             for h in hits {
+                if h.kind == index::Kind::Image {
+                    println!("{:.3}  {}  (image)", h.score, h.path);
+                    continue;
+                }
                 println!(
                     "{:.3}  {}:{}\n       {}",
                     h.score,
