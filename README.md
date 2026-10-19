@@ -14,7 +14,7 @@ cargo install --path .                     # vinosearch into ~/.cargo/bin
 cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
 cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
-vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
+vinosearch fetch-model                     # 308 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch watch                           # keep indexed roots current (the KRunner runner also does this)
 vinosearch search "how do I rotate the signing key"
