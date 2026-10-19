@@ -58,8 +58,8 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 | Page | Shows | Lets you |
 |---|---|---|
-| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes | Check now, add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
-| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
+| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes, the largest folders inside the indexed ones and their share of the index | Check now, add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, exclude one of the largest folders in one click, add or remove exclusions |
+| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size, and what `vinosearch doctor` reports (NPU, driver, OpenVINO, devices, a probe run on the chosen device) | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
 | Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 
 How it behaves:
@@ -70,7 +70,9 @@ How it behaves:
 - **Fits the desktop.** It follows the light or dark preference from the desktop portal, and on Plasma its header takes the colour scheme's header colours, so it runs into the title bar like Dolphin's toolbar. Below 620 px wide the sidebar folds into tabs.
 - **Light.** It never loads OpenVINO or the model: it only depends on `vinosearch-shared`, eframe and zbus.
 
-It is Wayland only for now, as vinoWhisper's window is. Not there yet (#5): chunks per directory with a one-click exclude, and what `vinosearch doctor` reports.
+**Largest folders** lists up to 8 folders inside the indexed ones, biggest first, none inside another. A folder gives way to a subfolder holding three quarters of it, so a copied source tree shows as the part that is its bulk. It refreshes once the index changes and indexing settles.
+
+It is Wayland only for now, as vinoWhisper's window is. Clicking vinoSearch's icon in GNOME Shell's search results opens it.
 
 ## Performance
 

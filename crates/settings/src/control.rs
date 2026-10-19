@@ -92,6 +92,8 @@ pub enum Request {
     DeleteModel,
     ClearCache,
     CheckNow,
+    /// Answered in `Shared::largest`.
+    LargestFolders(u32),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +102,8 @@ pub struct Shared {
     pub status: Option<Result<Status, String>>,
     /// Why the last request failed, until the window clears it.
     pub refused: Option<String>,
+    /// The last `LargestFolders` answer: (path, chunks), biggest first.
+    pub largest: Option<Vec<(String, u64)>>,
 }
 
 pub struct Link {
@@ -121,10 +125,24 @@ impl Link {
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
-                if let Some(request) = request
-                    && let Err(e) = call(&mut conn, &request)
-                {
-                    out.lock().unwrap().refused = Some(e);
+                match request {
+                    Some(Request::LargestFolders(limit)) => {
+                        let answer = proxy(&mut conn)
+                            .and_then(|p| p.call("LargestFolders", &(limit,)))
+                            .map_err(|e| explain(&mut conn, e));
+                        let mut shared = out.lock().unwrap();
+                        match answer {
+                            Ok(folders) => shared.largest = Some(folders),
+                            Err(e) => shared.refused = Some(e),
+                        }
+                        ctx.request_repaint();
+                    }
+                    Some(request) => {
+                        if let Err(e) = call(&mut conn, &request) {
+                            out.lock().unwrap().refused = Some(e);
+                        }
+                    }
+                    None => {}
                 }
                 let answer = status_of(&mut conn);
                 let mut shared = out.lock().unwrap();
@@ -176,6 +194,7 @@ fn call(conn: &mut Option<zbus::blocking::Connection>, request: &Request) -> Res
         Request::DeleteModel => p.call("DeleteModel", &()),
         Request::ClearCache => p.call("ClearCache", &()),
         Request::CheckNow => p.call("CheckNow", &()),
+        Request::LargestFolders(_) => unreachable!("answered in the loop"),
     });
     result.map_err(|e| explain(conn, e))
 }

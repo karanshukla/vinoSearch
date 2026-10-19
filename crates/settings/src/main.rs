@@ -2,6 +2,7 @@
 //! `dev.vinosearch.Control1` and edits `config.toml`, which the runner re-reads.
 
 mod control;
+mod doctor;
 mod integration;
 mod portal;
 mod theme;

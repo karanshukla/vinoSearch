@@ -34,7 +34,7 @@ fn data_home() -> Option<PathBuf> {
 
 /// The `vinosearch` installed beside this binary, as `cargo install` puts
 /// them; else whichever is first on PATH.
-fn vinosearch() -> PathBuf {
+pub fn vinosearch() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|exe| Some(exe.parent()?.join("vinosearch")))
