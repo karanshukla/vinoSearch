@@ -71,9 +71,14 @@ fn describe(h: &Hit) -> (String, String) {
         .parent()
         .map(|d| d.display().to_string())
         .unwrap_or_default();
+    let copies = match h.copies.len() {
+        0 => String::new(),
+        1 => "  (+1 copy)".to_owned(),
+        n => format!("  (+{n} copies)"),
+    };
     (
         name,
-        format!("{dir}:{}  {}", h.line, crate::snippet(&h.text)),
+        format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
     )
 }
 

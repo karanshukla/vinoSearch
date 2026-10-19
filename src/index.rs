@@ -8,6 +8,7 @@ use crate::config::Excludes;
 use crate::embed::{DIM, Embedder, document_text};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -124,6 +125,31 @@ pub fn open(path: &Path) -> Result<Connection> {
          CREATE TRIGGER IF NOT EXISTS chunk_log_prune AFTER INSERT ON chunk_log
          BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;"
     ))?;
+    // Content hashes (#28), added to databases from before them. Their rows
+    // stay NULL until `index` next sees the file.
+    let has_hash: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('files') WHERE name = 'sha256'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_hash {
+        conn.execute_batch("ALTER TABLE files ADD COLUMN sha256 BLOB")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256);
+         -- A file whose content another file already has keeps no chunks of
+         -- its own. When the one holding them goes (deleted, changed,
+         -- forgotten), they pass to a copy instead of being dropped. Chunk
+         -- ids don't change, so loaded Vectors stay valid.
+         CREATE TRIGGER IF NOT EXISTS files_hand_over BEFORE DELETE ON files
+         WHEN OLD.sha256 IS NOT NULL
+         BEGIN
+             UPDATE chunks
+             SET file_id = (SELECT id FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id LIMIT 1)
+             WHERE file_id = OLD.id
+               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
+         END;",
+    )?;
     Ok(conn)
 }
 
@@ -197,6 +223,8 @@ pub struct Stats {
     pub files_embedded: usize,
     pub chunks: usize,
     pub removed: usize,
+    /// Files whose content was already indexed, so nothing was embedded.
+    pub duplicates: usize,
 }
 
 /// Hidden directories and build output under `root` (not `root` itself).
@@ -254,6 +282,8 @@ pub fn remove(conn: &Connection, path: &Path) -> Result<usize> {
 pub enum Outcome {
     Embedded(usize),
     Unchanged,
+    /// Same content as a file already indexed, whose chunks it shares.
+    Duplicate,
     /// Not a wanted file (type, size, encoding); any old entry for it is dropped.
     Skipped,
 }
@@ -279,20 +309,56 @@ pub fn index_file(
     };
     let mtime = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let size = meta.len() as i64;
-    let known: Option<(i64, i64)> = conn
+    let known: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
         .query_row(
-            "SELECT mtime, size FROM files WHERE path = ?1",
+            "SELECT id, mtime, size, sha256 FROM files WHERE path = ?1",
             [key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .ok();
-    if known == Some((mtime, size)) {
+        .optional()?;
+    let unchanged = known.as_ref().is_some_and(|k| (k.1, k.2) == (mtime, size));
+    if unchanged && known.as_ref().is_some_and(|k| k.3.is_some()) {
         return Ok(Outcome::Unchanged);
     }
     let Ok(text) = fs::read_to_string(path) else {
         remove(conn, path)?;
         return Ok(Outcome::Skipped);
     };
+    let hash = Sha256::digest(text.as_bytes()).to_vec();
+    let holder = holder_of(conn, &hash, key)?;
+    if let Some((id, _, _, old_hash)) = known {
+        if old_hash.as_ref() == Some(&hash) {
+            // Touched, not changed.
+            conn.execute(
+                "UPDATE files SET mtime = ?1, size = ?2 WHERE id = ?3",
+                params![mtime, size, id],
+            )?;
+            return Ok(Outcome::Unchanged);
+        }
+        if unchanged {
+            // Indexed before content hashes: record this one, and if another
+            // file already holds the same chunks, drop this file's copy.
+            conn.execute(
+                "UPDATE files SET sha256 = ?1 WHERE id = ?2",
+                params![hash, id],
+            )?;
+            if holder.is_some() && conn.execute("DELETE FROM chunks WHERE file_id = ?1", [id])? > 0
+            {
+                return Ok(Outcome::Duplicate);
+            }
+            return Ok(Outcome::Unchanged);
+        }
+    }
+    if holder.is_some() {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
+        tx.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
+            params![key, mtime, size, hash],
+        )?;
+        tx.commit()?;
+        return Ok(Outcome::Duplicate);
+    }
     let chunks = chunk(&text);
     let title = path
         .file_name()
@@ -311,8 +377,8 @@ pub fn index_file(
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
     tx.execute(
-        "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
-        params![key, mtime, size],
+        "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
+        params![key, mtime, size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
     for ((line, text), v) in chunks.iter().zip(&vectors) {
@@ -323,6 +389,18 @@ pub fn index_file(
     }
     tx.commit()?;
     Ok(Outcome::Embedded(chunks.len()))
+}
+
+/// Another file with content `hash` that holds its chunks, if there is one.
+fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT f.id FROM files f WHERE f.sha256 = ?1 AND f.path != ?2
+             AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id) LIMIT 1",
+            params![hash, except],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// (mtime, size) as the index records them.
@@ -421,6 +499,7 @@ pub fn index(
         files_embedded: 0,
         chunks: 0,
         removed: 0,
+        duplicates: 0,
     };
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {
@@ -437,6 +516,10 @@ pub fn index(
                 stats.files_seen += 1;
             }
             Outcome::Unchanged => stats.files_seen += 1,
+            Outcome::Duplicate => {
+                stats.duplicates += 1;
+                stats.files_seen += 1;
+            }
             Outcome::Skipped => {
                 if let Some(p) = entry.path().to_str() {
                     seen.remove(p);
@@ -499,6 +582,8 @@ pub struct Hit {
     pub path: String,
     pub line: i64,
     pub text: String,
+    /// Other indexed files with the same content.
+    pub copies: Vec<String>,
 }
 
 /// Every chunk's embedding, held as int8 with a per-vector scale: a quarter
@@ -726,21 +811,37 @@ pub fn search(conn: &Connection, vectors: &Vectors, query: &[f32], k: usize) -> 
     scored.sort_by(by_score);
     scored.truncate(k);
     let mut stmt = conn.prepare(
-        "SELECT f.path, c.start_line, c.text FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
+        "SELECT f.id, f.path, f.sha256, c.start_line, c.text
+         FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
     )?;
+    let mut copies =
+        conn.prepare("SELECT path FROM files WHERE sha256 = ?1 AND id != ?2 ORDER BY path")?;
     let mut hits = Vec::with_capacity(scored.len());
     for (score, id) in scored {
         // Gone since the vectors were loaded.
-        let Ok((path, line, text)) =
-            stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        else {
+        let Ok((file, path, hash, line, text)) = stmt.query_row([id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        }) else {
             continue;
+        };
+        let copies = match hash {
+            Some(h) => copies
+                .query_map(params![h, file], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+            None => Vec::new(),
         };
         hits.push(Hit {
             score,
             path,
             line,
             text,
+            copies,
         });
     }
     Ok(hits)
@@ -831,6 +932,80 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(left, ["/a_b/z.md"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copies_share_chunks_and_inherit_them() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-dup-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let file = |path: &str, hash: &[u8]| {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?2)",
+                params![path, hash],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let a = file("/a/x.md", b"same");
+        let mut v = vec![0f32; DIM];
+        v[0] = 1.0;
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, 1, 'hi', ?2)",
+            params![a, to_blob(&v)],
+        )
+        .unwrap();
+        let b = file("/b/x.md", b"same");
+        file("/c/y.md", b"other");
+        assert_eq!(holder_of(&conn, b"same", "/b/x.md").unwrap(), Some(a));
+        assert_eq!(holder_of(&conn, b"same", "/a/x.md").unwrap(), None);
+
+        // One hit for the content, naming the copy.
+        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/a/x.md");
+        assert_eq!(hits[0].copies, ["/b/x.md"]);
+
+        // The holder goes: the copy takes its chunks, same ids.
+        remove(&conn, Path::new("/a")).unwrap();
+        let owner: i64 = conn
+            .query_row("SELECT file_id FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner, b);
+        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, 5).unwrap();
+        assert_eq!(
+            (hits[0].path.as_str(), hits[0].copies.len()),
+            ("/b/x.md", 0)
+        );
+
+        // The last copy goes: so do the chunks.
+        remove(&conn, Path::new("/b/x.md")).unwrap();
+        assert_eq!(counts(&conn).unwrap(), (1, 0));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_old_index_gains_the_hash_column() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-mig-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("i.sqlite");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                 mtime INTEGER NOT NULL, size INTEGER NOT NULL);
+                 INSERT INTO files (path, mtime, size) VALUES ('/old.md', 1, 2);",
+            )
+            .unwrap();
+        let conn = open(&db).unwrap();
+        let hash: Option<Vec<u8>> = conn
+            .query_row("SELECT sha256 FROM files WHERE path = '/old.md'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(hash, None);
+        drop(conn);
+        open(&db).unwrap(); // and opening it again is a no-op
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -963,8 +1138,11 @@ mod tests {
     fn search_returns_the_best_k_in_order() {
         let dir = std::env::temp_dir().join(format!("vinosearch-search-{}", std::process::id()));
         let conn = open(&dir.join("i.sqlite")).unwrap();
-        conn.execute("INSERT INTO files VALUES (1, '/f', 0, 0)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, mtime, size) VALUES (1, '/f', 0, 0)",
+            [],
+        )
+        .unwrap();
         // Chunk i points along axis 0 with weight i/10, so higher i scores higher.
         for i in 0..10 {
             let mut v = vec![0f32; DIM];
