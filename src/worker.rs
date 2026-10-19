@@ -357,6 +357,14 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 continue;
             }
             Job::Forget(root) => {
+                // A Reindex of it still queued (one this Forget interrupted,
+                // say) would make it a root again.
+                let before = deferred.len();
+                deferred.retain(|j| !matches!(j, Job::Reindex(r) if *r == root));
+                status
+                    .queued_reindex
+                    .fetch_sub(before - deferred.len(), Ordering::Relaxed);
+                waiting_roots.retain(|r| *r != root);
                 match index::forget(&conn, &root) {
                     Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
                     Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
@@ -437,11 +445,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         }
         emb.set_document_share(pace.share());
         let idle = indexes.then(sched::Idle::enter);
-        // Set when a config change drops files this job may be indexing: the
-        // job stops, the change applies, and the job runs again after it.
-        let mut excluded = false;
+        // Set when a change drops files this job may be indexing (new
+        // exclusions, a forgotten root): the job stops, the change applies,
+        // and the job runs again after it.
+        let mut restart = false;
         let mut after = |st: &index::Stats, conn: &rusqlite::Connection, emb: &mut Embedder| {
-            if status.paused.load(Ordering::Relaxed) || excluded {
+            if status.paused.load(Ordering::Relaxed) || restart {
                 return Err(Interrupted.into());
             }
             // Plugged in or unplugged mid-job, or the setting changed.
@@ -459,13 +468,17 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                         }
                     }
                     // The pace applies now; new exclusions stop the job so
-                    // they apply before it runs again; anything else waits.
+                    // they apply before it runs again.
                     Job::Config(file) => {
                         if let Ok(new) = share(&file) {
                             pace.set(new);
                         }
-                        excluded |= file.excludes().is_ok_and(|ex| ex != excludes);
+                        restart |= file.excludes().is_ok_and(|ex| ex != excludes);
                         deferred.push_back(Job::Config(file));
+                    }
+                    Job::Forget(root) => {
+                        restart = true;
+                        deferred.push_back(Job::Forget(root));
                     }
                     other => deferred.push_back(other),
                 }
