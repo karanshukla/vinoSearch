@@ -548,14 +548,39 @@ pub fn index(
     Ok(stats)
 }
 
-/// Stop treating `root` as a root and drop everything indexed under it.
-/// Returns files removed.
+/// Stop treating `root` as a root and drop what was indexed under it, except
+/// files another root still covers (with roots `~/Dev` and `~/Dev/proj`,
+/// forgetting either keeps the files `~/Dev` still walks). Returns files
+/// removed.
 pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
     conn.execute(
         "DELETE FROM roots WHERE path = ?1",
         [root.to_string_lossy()],
     )?;
-    let n = remove(conn, root)?;
+    let others: Vec<PathBuf> = roots(conn)?
+        .into_iter()
+        .filter(|r| r.starts_with(root) || root.starts_with(r))
+        .collect();
+    let n = if others.is_empty() {
+        remove(conn, root)?
+    } else {
+        let covered = |p: &Path| {
+            others
+                .iter()
+                .any(|r| p.starts_with(r) && !skipped_under(r, p))
+        };
+        let under: Vec<String> = conn
+            .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?
+            .query_map([like_under(&root.to_string_lossy())], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut n = 0;
+        for p in under.iter().filter(|p| !covered(Path::new(p))) {
+            n += tx.execute("DELETE FROM files WHERE path = ?1", [p])?;
+        }
+        tx.commit()?;
+        n
+    };
     if n > 0 {
         compact(conn)?;
     }
@@ -1017,6 +1042,59 @@ mod tests {
         assert_eq!(hash, None);
         drop(conn);
         open(&db).unwrap(); // and opening it again is a no-op
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forget_keeps_files_another_root_covers() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-forget-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let files = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT path FROM files ORDER BY path")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let setup = |conn: &Connection| {
+            conn.execute_batch("DELETE FROM files; DELETE FROM roots;")
+                .unwrap();
+            for r in ["/dev", "/dev/proj", "/dev/.hidden/p2"] {
+                conn.execute("INSERT INTO roots (path) VALUES (?1)", [r])
+                    .unwrap();
+            }
+            for p in ["/dev/a.md", "/dev/proj/b.md", "/dev/.hidden/p2/c.md"] {
+                conn.execute(
+                    "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+                    [p],
+                )
+                .unwrap();
+            }
+        };
+
+        // The inner root: /dev still walks proj/b.md.
+        setup(&conn);
+        assert_eq!(forget(&conn, Path::new("/dev/proj")).unwrap(), 0);
+        assert_eq!(
+            files(&conn),
+            ["/dev/.hidden/p2/c.md", "/dev/a.md", "/dev/proj/b.md"]
+        );
+
+        // The outer root: proj and the hidden root stay, as their own roots.
+        setup(&conn);
+        assert_eq!(forget(&conn, Path::new("/dev")).unwrap(), 1);
+        assert_eq!(files(&conn), ["/dev/.hidden/p2/c.md", "/dev/proj/b.md"]);
+
+        // A root under a hidden directory, which /dev's walk skips: all of it goes.
+        setup(&conn);
+        assert_eq!(forget(&conn, Path::new("/dev/.hidden/p2")).unwrap(), 1);
+        assert_eq!(files(&conn), ["/dev/a.md", "/dev/proj/b.md"]);
+
+        // No other root overlaps: everything under it goes.
+        conn.execute_batch("DELETE FROM roots WHERE path != '/dev/proj'")
+            .unwrap();
+        assert_eq!(forget(&conn, Path::new("/dev/proj")).unwrap(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
