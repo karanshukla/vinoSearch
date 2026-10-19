@@ -34,7 +34,7 @@ idle_unload_minutes = 5
 
 Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
 
-Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds.
+Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds. inotify can still miss changes (the kernel drops events when its queue overflows, and directories past the watch limit go unwatched), so every root is also compared with the index by mtime and size once an hour, after the machine wakes from sleep, right after dropped events, and on demand from the settings window. That reads no file contents: 0.5 s for 45,418 paths under a home directory here.
 
 The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 553 MB loaded with a 23k-chunk index and no load spike (it compiles from a static-shape graph, so a cached model is loaded without reading the weights), 12 MB unloaded, ~1 s to reload. `vinosearch krunner --uninstall` stops the service and removes the KRunner, D-Bus and systemd files.
 
@@ -50,7 +50,7 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 | Page | Shows | Lets you |
 |---|---|---|
-| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk | Add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
+| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes | Check now, add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
 | Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
 | Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 

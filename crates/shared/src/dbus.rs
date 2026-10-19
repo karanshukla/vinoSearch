@@ -38,4 +38,8 @@ pub mod status {
     pub const INDEX_BYTES: &str = "index_bytes";
     pub const MODEL_BYTES: &str = "model_bytes";
     pub const CACHE_BYTES: &str = "cache_bytes";
+    /// Unix seconds: the last check of every root against the index, and the
+    /// last indexing job that changed it. 0 for not since the runner started.
+    pub const LAST_CHECKED: &str = "last_checked";
+    pub const LAST_INDEXED: &str = "last_indexed";
 }

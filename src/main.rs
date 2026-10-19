@@ -230,7 +230,12 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
-            let _watcher = watch::spawn(tx, opts.config.clone(), opts.file.clone())?;
+            let _watcher = watch::spawn(
+                tx,
+                opts.config.clone(),
+                opts.file.clone(),
+                opts.status.clone(),
+            )?;
             worker::run(rx, opts)?;
             Ok(true)
         }

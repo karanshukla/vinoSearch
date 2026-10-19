@@ -82,6 +82,8 @@ struct SettingsWindow {
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
+    /// `last_checked` when Check now was pressed, until a newer check lands.
+    check_asked: Option<u64>,
     notice: Option<String>,
     integration: Arc<Mutex<integration::State>>,
     focused: bool,
@@ -102,6 +104,7 @@ impl SettingsWindow {
             picked: Arc::new(Mutex::new(None)),
             picking: false,
             confirm: None,
+            check_asked: None,
             notice: None,
             integration: Arc::new(Mutex::new(integration::State::read())),
             focused: true,
@@ -225,6 +228,50 @@ impl SettingsWindow {
                     ),
                 );
             });
+            row(ui, "Last change:", "", |ui| {
+                if s.last_indexed == 0 {
+                    value(
+                        ui,
+                        RichText::new("None since the service started").color(p.muted),
+                    );
+                } else {
+                    value(ui, format!("Indexed {}", ago(s.last_indexed)));
+                }
+            });
+            if self.check_asked.is_some_and(|at| s.last_checked != at) {
+                self.check_asked = None;
+            }
+            row(
+                ui,
+                "Checked:",
+                "Changes are indexed within seconds of happening. Every folder is also compared \
+                 with the index once an hour, after the machine wakes, and whenever the kernel \
+                 drops change events, in case one was missed. It reads no file contents and \
+                 takes about a second.",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(ui.spacing().interact_size.y);
+                        if self.check_asked.is_some() {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(if s.indexing {
+                                "Waiting for indexing to finish"
+                            } else {
+                                "Checking…"
+                            });
+                        } else {
+                            ui.label(if s.last_checked == 0 {
+                                "Not yet".to_owned()
+                            } else {
+                                ago(s.last_checked)
+                            });
+                            if ui.button("Check now").clicked() {
+                                self.check_asked = Some(s.last_checked);
+                                self.link.send(Request::CheckNow);
+                            }
+                        }
+                    });
+                },
+            );
         }
 
         section(ui, "Folders");
@@ -586,6 +633,25 @@ fn tilde(path: &Path) -> String {
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Unix seconds as "just now", "12 min ago", "3 h ago" or "2 days ago".
+fn ago(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    ago_from(at, now)
+}
+
+fn ago_from(at: u64, now: u64) -> String {
+    let s = now.saturating_sub(at);
+    match s {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86400 => format!("{} h ago", s / 3600),
+        _ if s < 2 * 86400 => "1 day ago".to_owned(),
+        _ => format!("{} days ago", s / 86400),
+    }
 }
 
 /// 41924 as "41,924".
@@ -960,6 +1026,17 @@ mod tests {
         assert_eq!(count(41924), "41,924");
         assert_eq!(count(1234567), "1,234,567");
         assert_eq!(count(-1234), "-1,234");
+    }
+
+    #[test]
+    fn times_read_as_ago() {
+        let now = 1_000_000;
+        assert_eq!(ago_from(now - 5, now), "just now");
+        assert_eq!(ago_from(now + 5, now), "just now");
+        assert_eq!(ago_from(now - 12 * 60, now), "12 min ago");
+        assert_eq!(ago_from(now - 3 * 3600 - 59, now), "3 h ago");
+        assert_eq!(ago_from(now - 30 * 3600, now), "1 day ago");
+        assert_eq!(ago_from(now - 5 * 86400, now), "5 days ago");
     }
 
     #[test]

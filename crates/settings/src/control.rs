@@ -30,6 +30,9 @@ pub struct Status {
     pub index_bytes: u64,
     pub model_bytes: u64,
     pub cache_bytes: u64,
+    /// Unix seconds; 0 for not since the runner started.
+    pub last_checked: u64,
+    pub last_indexed: u64,
 }
 
 impl Status {
@@ -74,6 +77,8 @@ impl Status {
             index_bytes: unsigned(status::INDEX_BYTES),
             model_bytes: unsigned(status::MODEL_BYTES),
             cache_bytes: unsigned(status::CACHE_BYTES),
+            last_checked: unsigned(status::LAST_CHECKED),
+            last_indexed: unsigned(status::LAST_INDEXED),
         }
     }
 }
@@ -86,6 +91,7 @@ pub enum Request {
     FetchModel,
     DeleteModel,
     ClearCache,
+    CheckNow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -169,6 +175,7 @@ fn call(conn: &mut Option<zbus::blocking::Connection>, request: &Request) -> Res
         Request::FetchModel => p.call("FetchModel", &()),
         Request::DeleteModel => p.call("DeleteModel", &()),
         Request::ClearCache => p.call("ClearCache", &()),
+        Request::CheckNow => p.call("CheckNow", &()),
     });
     result.map_err(|e| explain(conn, e))
 }

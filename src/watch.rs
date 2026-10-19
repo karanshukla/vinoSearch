@@ -4,17 +4,24 @@
 //! indexing, so build output and hidden trees cost no watches (a recursive
 //! watch would add one for every directory under `target/` and
 //! `node_modules/`). Events are debounced and handed to the worker as paths.
+//!
+//! inotify can still miss changes: the kernel drops events when its queue
+//! overflows, directories past the watch limit go unwatched, and nothing is
+//! watched while the machine sleeps. So every root is also compared with the
+//! index by mtime and size, as at startup: after an overflow, every
+//! CATCH_UP_EVERY, after a resume, and when asked (`Control1.CheckNow`).
 
 use crate::config::{Config, Excludes};
 use crate::index;
-use crate::worker::Job;
+use crate::worker::{Job, Status, unix_now};
 use anyhow::Result;
 use notify::event::{Event, EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Quiet period before a batch of changes is indexed: editors write a file in
 /// several steps, and builds touch many at once.
@@ -22,6 +29,11 @@ const DEBOUNCE: Duration = Duration::from_secs(2);
 /// How often to look for roots added by `vinosearch index`, and re-read the
 /// config, while running.
 const ROOTS_EVERY: Duration = Duration::from_secs(30);
+/// How often every root is compared with the index. It reads no files and
+/// loads no model: 0.5 s for 45,418 paths under a home directory (2026-10-18).
+const CATCH_UP_EVERY: Duration = Duration::from_secs(60 * 60);
+/// Wall time running this far ahead of monotonic time means the machine slept.
+const SLEPT: Duration = Duration::from_secs(60);
 
 struct State {
     watcher: RecommendedWatcher,
@@ -101,22 +113,40 @@ impl State {
                 // Catch up on what changed while nothing was watching (before
                 // login, or with the runner stopped). Watches are already in
                 // place, so nothing falls between this scan and them.
-                let t0 = Instant::now();
-                match index::stale(conn, &root, &self.excludes) {
-                    Ok(paths) if !paths.is_empty() => {
-                        eprintln!(
-                            "{}: {} paths changed while unwatched (checked in {:.1} s)",
-                            root.display(),
-                            paths.len(),
-                            t0.elapsed().as_secs_f64()
-                        );
-                        let _ = jobs.send(Job::Changed(paths));
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("checking {}: {e:#}", root.display()),
-                }
+                self.check(conn, jobs, &root);
                 self.roots.push(root);
             }
+        }
+    }
+
+    /// Queue whatever under `root` differs from the index.
+    fn check(&self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: &Path) {
+        let t0 = Instant::now();
+        match index::stale(conn, root, &self.excludes) {
+            Ok(paths) if !paths.is_empty() => {
+                eprintln!(
+                    "{}: {} paths changed while unwatched (checked in {:.1} s)",
+                    root.display(),
+                    paths.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                let _ = jobs.send(Job::Changed(paths));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("checking {}: {e:#}", root.display()),
+        }
+    }
+
+    /// Check every root, and retry watches the limit refused last time, in
+    /// case it was raised.
+    fn catch_up(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, why: &str) {
+        eprintln!("checking for missed changes ({why})");
+        for root in self.roots.clone() {
+            if self.warned_limit {
+                self.warned_limit = false;
+                self.watch_tree(&root);
+            }
+            self.check(conn, jobs, &root);
         }
     }
 
@@ -167,12 +197,45 @@ fn interesting(kind: &EventKind) -> bool {
     }
 }
 
+/// Monotonic time stops while the machine is suspended (Rust's Instant is
+/// CLOCK_MONOTONIC on Linux); wall time does not.
+struct Clock {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl Clock {
+    fn now() -> Self {
+        Clock {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    /// Whether the machine slept since the last call. A wall clock stepped
+    /// forward reads the same, and costs one needless check.
+    fn slept(&mut self) -> bool {
+        let now = Clock::now();
+        let slept = now.ahead_of(self) > SLEPT;
+        *self = now;
+        slept
+    }
+
+    /// How much further wall time moved than monotonic time since `before`.
+    fn ahead_of(&self, before: &Clock) -> Duration {
+        let wall = self.wall.duration_since(before.wall).unwrap_or_default();
+        wall.saturating_sub(self.mono - before.mono)
+    }
+}
+
 /// `config` is re-read every ROOTS_EVERY; when it differs from `file` (what
-/// it held at startup), the new contents go to the worker.
+/// it held at startup), the new contents go to the worker. `status` carries
+/// CheckNow requests in, and when the last check ran out.
 pub fn spawn(
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
     mut file: Config,
+    status: Arc<Status>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let excludes = file.excludes()?;
     let conn = index::open(&index::default_db()?)?;
@@ -187,11 +250,21 @@ pub fn spawn(
             excludes,
         };
         st.sync_roots(&conn, &jobs);
+        status.last_checked.store(unix_now(), Ordering::Relaxed);
         let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut last_event = Instant::now();
         let mut last_roots = Instant::now();
+        let mut last_check = Instant::now();
+        let mut clock = Clock::now();
+        // Why the next check is due, once indexing allows it.
+        let mut due: Option<&str> = None;
         loop {
             match events.recv_timeout(Duration::from_millis(500)) {
+                Ok(Ok(event)) if event.need_rescan() => {
+                    // The kernel's queue overflowed: some changes were dropped.
+                    due.get_or_insert("events were dropped");
+                    last_event = Instant::now();
+                }
                 Ok(Ok(event)) if interesting(&event.kind) => {
                     // Before anything below re-adds the destination of a rename.
                     for path in gone(&event) {
@@ -252,6 +325,53 @@ pub fn spawn(
                 st.sync_roots(&conn, &jobs);
                 last_roots = Instant::now();
             }
+            if clock.slept() {
+                due.get_or_insert("woke from sleep");
+            }
+            if last_check.elapsed() >= CATCH_UP_EVERY {
+                due.get_or_insert("hourly");
+            }
+            if status.check_now.swap(false, Ordering::Relaxed) {
+                due.get_or_insert("asked to");
+            }
+            // After a burst settles, and not mid-job: what the worker hasn't
+            // reached yet would all be queued twice.
+            if let Some(why) = due
+                && last_event.elapsed() >= DEBOUNCE
+                && !status.indexing.load(Ordering::Relaxed)
+                && status.queued_reindex.load(Ordering::Relaxed) == 0
+            {
+                st.catch_up(&conn, &jobs, why);
+                status.last_checked.store(unix_now(), Ordering::Relaxed);
+                last_check = Instant::now();
+                due = None;
+            }
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wall_clock_jump_reads_as_sleep() {
+        let before = Clock::now();
+        let awake = Clock {
+            mono: before.mono + Duration::from_secs(5),
+            wall: before.wall + Duration::from_secs(5),
+        };
+        assert!(awake.ahead_of(&before) <= SLEPT);
+        let resumed = Clock {
+            mono: before.mono + Duration::from_secs(5),
+            wall: before.wall + Duration::from_secs(8 * 3600),
+        };
+        assert!(resumed.ahead_of(&before) > SLEPT);
+        // A clock stepped back is not sleep.
+        let stepped_back = Clock {
+            mono: before.mono + Duration::from_secs(5),
+            wall: before.wall - Duration::from_secs(3600),
+        };
+        assert_eq!(stepped_back.ahead_of(&before), Duration::ZERO);
+    }
 }

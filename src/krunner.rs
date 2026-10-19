@@ -317,6 +317,12 @@ impl Control {
             key::MODEL_BYTES.into(),
             owned(Value::from(disk_bytes(&model_dir))),
         );
+        for (k, at) in [
+            (key::LAST_CHECKED, &st.last_checked),
+            (key::LAST_INDEXED, &st.last_indexed),
+        ] {
+            out.insert(k.into(), owned(Value::from(u64_of(at))));
+        }
         let cache = crate::cache_dir().map_err(failed)?;
         out.insert(
             key::CACHE_BYTES.into(),
@@ -338,6 +344,13 @@ impl Control {
     fn forget(&self, path: String) -> zbus::fdo::Result<()> {
         let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
         self.send(Job::Forget(root))
+    }
+
+    /// Compare every root with the index now, as the watcher does hourly,
+    /// and index what differs. Waits for any indexing job to finish first.
+    fn check_now(&self) -> zbus::fdo::Result<()> {
+        self.status.check_now.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Free the model now.
@@ -416,7 +429,12 @@ fn per_file(hits: Vec<Hit>) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let _watcher = watch::spawn(tx.clone(), opts.config.clone(), opts.file.clone())?;
+    let _watcher = watch::spawn(
+        tx.clone(),
+        opts.config.clone(),
+        opts.file.clone(),
+        opts.status.clone(),
+    )?;
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
