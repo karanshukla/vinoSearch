@@ -290,12 +290,13 @@ pub enum Outcome {
 
 /// Index one file if it is wanted and changed since it was last indexed.
 /// `between` runs after each chunk is embedded, so a 1 MiB file (~1,100
-/// chunks, ~40 s) does not hold a waiting query for its whole length.
+/// chunks, ~40 s) does not hold a waiting query for its whole length. An
+/// error from it stops the file unwritten.
 pub fn index_file(
     conn: &mut Connection,
     emb: &mut Embedder,
     path: &Path,
-    between: &mut dyn FnMut(&Connection, &mut Embedder),
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
 ) -> Result<Outcome> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES && wanted(path) => m,
@@ -371,7 +372,7 @@ pub fn index_file(
     let mut vectors = Vec::with_capacity(inputs.len());
     for input in &inputs {
         vectors.extend(emb.documents(std::slice::from_ref(input))?);
-        between(conn, emb);
+        between(conn, emb)?;
     }
 
     let tx = conn.transaction()?;
@@ -470,7 +471,8 @@ pub fn compact(conn: &Connection) -> Result<()> {
 
 /// Called after each file `index` looks at, with the connection and model
 /// lent back: for progress, and for the runner to answer queries mid-index.
-pub type AfterFile<'a> = dyn FnMut(&Stats, &Connection, &mut Embedder) + 'a;
+/// An error from it stops indexing; every file finished so far is kept.
+pub type AfterFile<'a> = dyn FnMut(&Stats, &Connection, &mut Embedder) -> Result<()> + 'a;
 
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
@@ -526,7 +528,7 @@ pub fn index(
                 }
             }
         }
-        after(&stats, conn, emb);
+        after(&stats, conn, emb)?;
     }
 
     let gone: Vec<String> = {

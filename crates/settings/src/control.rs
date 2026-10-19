@@ -17,6 +17,7 @@ const POLL: Duration = Duration::from_secs(1);
 pub struct Status {
     pub model_loaded: bool,
     pub indexing: bool,
+    pub paused: bool,
     pub indexed_files: u64,
     pub device: String,
     pub files: i64,
@@ -64,6 +65,7 @@ impl Status {
         Status {
             model_loaded: flag(status::MODEL_LOADED),
             indexing: flag(status::INDEXING),
+            paused: flag(status::PAUSED),
             indexed_files: unsigned(status::INDEXED_FILES),
             device: text(status::DEVICE),
             files: signed(status::FILES),
@@ -92,6 +94,8 @@ pub enum Request {
     DeleteModel,
     ClearCache,
     CheckNow,
+    PauseIndexing,
+    ResumeIndexing,
     /// Answered in `Shared::largest`.
     LargestFolders(u32),
 }
@@ -194,6 +198,8 @@ fn call(conn: &mut Option<zbus::blocking::Connection>, request: &Request) -> Res
         Request::DeleteModel => p.call("DeleteModel", &()),
         Request::ClearCache => p.call("ClearCache", &()),
         Request::CheckNow => p.call("CheckNow", &()),
+        Request::PauseIndexing => p.call("PauseIndexing", &()),
+        Request::ResumeIndexing => p.call("ResumeIndexing", &()),
         Request::LargestFolders(_) => unreachable!("answered in the loop"),
     });
     result.map_err(|e| explain(conn, e))

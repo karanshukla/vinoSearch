@@ -47,8 +47,8 @@ pub enum Job {
     DeleteModel,
     /// Delete OpenVINO's compiled-model cache (the next load recompiles).
     ClearCache,
-    /// The model may load now (a download finished): run the indexing that
-    /// waited for it.
+    /// The model may load now (a download finished), or indexing was
+    /// resumed: run the indexing that waited.
     Retry,
 }
 
@@ -77,6 +77,26 @@ pub struct Status {
     pub last_indexed: AtomicU64,
     /// Set by CheckNow; the watcher takes it.
     pub check_now: AtomicBool,
+    /// Indexing is paused: a running job stops after its current chunk, and
+    /// new ones wait until Retry.
+    pub paused: AtomicBool,
+}
+
+/// An indexing job stopped part way, to be run again.
+#[derive(Debug)]
+struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+fn interrupted(r: &Result<impl Sized>) -> bool {
+    r.as_ref()
+        .is_err_and(|e| e.downcast_ref::<Interrupted>().is_some())
 }
 
 pub fn unix_now() -> u64 {
@@ -170,7 +190,7 @@ fn changed(
         } else {
             st.removed += index::remove(conn, &path)?;
         }
-        after(&st, conn, emb);
+        after(&st, conn, emb)?;
     }
     if st.files_embedded + st.removed + st.duplicates > 0 {
         eprintln!(
@@ -350,7 +370,25 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }
                 continue;
             }
+            // Held while paused, with the work that waits for the model.
+            Job::Changed(paths) if status.paused.load(Ordering::Relaxed) => {
+                waiting.extend(paths);
+                continue;
+            }
+            Job::Reindex(root) if status.paused.load(Ordering::Relaxed) => {
+                status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
+                waiting_roots.push(root);
+                continue;
+            }
             Job::Forget(root) => {
+                // A Reindex of it still queued (one this Forget interrupted,
+                // say) would make it a root again.
+                let before = deferred.len();
+                deferred.retain(|j| !matches!(j, Job::Reindex(r) if *r == root));
+                status
+                    .queued_reindex
+                    .fetch_sub(before - deferred.len(), Ordering::Relaxed);
+                waiting_roots.retain(|r| *r != root);
                 match index::forget(&conn, &root) {
                     Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
                     Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
@@ -432,7 +470,14 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         }
         emb.set_document_share(pace.share());
         let idle = indexes.then(sched::Idle::enter);
+        // Set when a change drops files this job may be indexing (new
+        // exclusions, a forgotten root): the job stops, the change applies,
+        // and the job runs again after it.
+        let mut restart = false;
         let mut after = |st: &index::Stats, conn: &rusqlite::Connection, emb: &mut Embedder| {
+            if status.paused.load(Ordering::Relaxed) || restart {
+                return Err(Interrupted.into());
+            }
             // Plugged in or unplugged mid-job, or the setting changed.
             emb.set_document_share(pace.share());
             status
@@ -447,17 +492,23 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                             None => serve(),
                         }
                     }
-                    // The rest of the change waits for the job; the pace
-                    // applies now.
+                    // The pace applies now; new exclusions stop the job so
+                    // they apply before it runs again.
                     Job::Config(file) => {
                         if let Ok(new) = share(&file) {
                             pace.set(new);
                         }
+                        restart |= file.excludes().is_ok_and(|ex| ex != excludes);
                         deferred.push_back(Job::Config(file));
+                    }
+                    Job::Forget(root) => {
+                        restart = true;
+                        deferred.push_back(Job::Forget(root));
                     }
                     other => deferred.push_back(other),
                 }
             }
+            Ok(())
         };
         match job {
             Job::Match { query, k, reply } => {
@@ -467,14 +518,24 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 answer(&conn, emb, vectors, &query, k, reply);
             }
             Job::Changed(paths) => {
-                match changed(&mut conn, emb, paths, &excludes, &mut after) {
+                let r = changed(&mut conn, emb, paths.clone(), &excludes, &mut after);
+                match r {
                     Ok(s) => touched(status, &s),
+                    // Jobs held while paused go back through the main loop.
+                    Err(_) if interrupted(&r) => deferred.push_back(Job::Changed(paths)),
                     Err(e) => eprintln!("updating index: {e:#}"),
                 }
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Reindex(root) => {
-                match index::index(&mut conn, emb, &root, &excludes, &mut after) {
+                let r = index::index(&mut conn, emb, &root, &excludes, &mut after);
+                if interrupted(&r) {
+                    eprintln!("indexing {} stopped", root.display());
+                    status.queued_reindex.fetch_add(1, Ordering::Relaxed);
+                    deferred.push_back(Job::Reindex(root.clone()));
+                }
+                match r {
+                    Err(_) if interrupted(&r) => {}
                     Ok(s) => {
                         eprintln!(
                             "{}: {} files seen, {} embedded ({} chunks), {} removed",

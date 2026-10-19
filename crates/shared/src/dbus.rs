@@ -29,6 +29,8 @@ pub mod status {
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current indexing job.
     pub const INDEXED_FILES: &str = "indexed_files";
+    /// PauseIndexing was called and ResumeIndexing not since.
+    pub const PAUSED: &str = "paused";
     pub const MODEL_PRESENT: &str = "model_present";
     pub const FETCHING: &str = "fetching";
     pub const FETCH_DONE: &str = "fetch_done";

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,8 @@ struct SettingsWindow {
     confirm: Option<Confirm>,
     /// `last_checked` when Check now was pressed, until a newer check lands.
     check_asked: Option<u64>,
+    /// Roots asked to be forgotten that Status still lists, hidden meanwhile.
+    forgetting: HashSet<String>,
     notice: Option<String>,
     integration: Arc<Mutex<integration::State>>,
     doctor: Arc<Mutex<doctor::State>>,
@@ -123,6 +126,7 @@ impl SettingsWindow {
             picking: false,
             confirm: None,
             check_asked: None,
+            forgetting: HashSet::new(),
             notice: None,
             integration: Arc::new(Mutex::new(integration::State::read())),
             doctor: Arc::default(),
@@ -231,12 +235,20 @@ impl SettingsWindow {
             row(ui, "Now:", "", |ui| {
                 ui.horizontal(|ui| {
                     ui.set_min_height(ui.spacing().interact_size.y);
-                    if s.indexing {
+                    if s.paused {
+                        ui.label("Indexing stopped. What's indexed so far is kept.");
+                        if ui.button("Resume").clicked() {
+                            self.link.send(Request::ResumeIndexing);
+                        }
+                    } else if s.indexing {
                         spinner(ui);
                         ui.label(format!(
                             "Indexing, {} files so far",
                             count(s.indexed_files as i64)
                         ));
+                        if ui.button("Stop").clicked() {
+                            self.link.send(Request::PauseIndexing);
+                        }
                     } else {
                         ui.label("Up to date");
                     }
@@ -322,7 +334,9 @@ impl SettingsWindow {
              (target, node_modules, vendor, …) are always skipped, as are config formats like \
              TOML, YAML and JSON, where credentials live.",
         );
-        let roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
+        let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
+        self.forgetting.retain(|r| roots.contains(r));
+        roots.retain(|r| !self.forgetting.contains(r));
         let indexing = reachable.is_some_and(|s| s.indexing);
         if reachable.is_some() && roots.is_empty() {
             ui.label(RichText::new("Nothing is indexed yet.").color(p.muted));
@@ -336,6 +350,7 @@ impl SettingsWindow {
                     }
                     if ui.button("Remove and drop its index").clicked() {
                         self.link.send(Request::Forget(root.clone()));
+                        self.forgetting.insert(root.clone());
                         self.confirm = None;
                     }
                 } else {
