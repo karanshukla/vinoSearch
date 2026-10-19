@@ -204,6 +204,16 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut excludes = opts.excludes.clone();
     let mut device = opts.device.clone();
     let mut idle = opts.idle;
+    let share = |file: &Config| {
+        config::index_share(
+            file.index_busy_percent
+                .unwrap_or(config::DEFAULT_INDEX_BUSY_PERCENT),
+        )
+    };
+    let mut pace = sched::Pace::new(share(&opts.file).unwrap_or_else(|e| {
+        eprintln!("{e:#}");
+        config::index_share(config::DEFAULT_INDEX_BUSY_PERCENT).unwrap()
+    }));
     let purged = index::purge(&conn, &excludes)?;
     if purged > 0 {
         eprintln!("removed {purged} excluded files from the index");
@@ -296,6 +306,10 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                         // Loaded again, on the new device, by the next job that needs it.
                         unload(&mut loaded, "device changed");
                     }
+                }
+                match share(&file) {
+                    Ok(new) => pace.set(new),
+                    Err(e) => eprintln!("index_busy_percent not applied: {e:#}"),
                 }
                 if !opts.pinned.idle_unload {
                     let m = file
@@ -391,8 +405,11 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         if indexes && let Err(e) = emb.prepare_documents() {
             eprintln!("compiling the document model: {e:#}");
         }
+        emb.set_document_share(pace.share());
         let idle = indexes.then(sched::Idle::enter);
         let mut after = |st: &index::Stats, conn: &rusqlite::Connection, emb: &mut Embedder| {
+            // Plugged in or unplugged mid-job, or the setting changed.
+            emb.set_document_share(pace.share());
             status
                 .indexed_files
                 .store(st.files_embedded as u64, Ordering::Relaxed);
@@ -404,6 +421,14 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                             Some(idle) => idle.normal(serve),
                             None => serve(),
                         }
+                    }
+                    // The rest of the change waits for the job; the pace
+                    // applies now.
+                    Job::Config(file) => {
+                        if let Ok(new) = share(&file) {
+                            pace.set(new);
+                        }
+                        deferred.push_back(Job::Config(file));
                     }
                     other => deferred.push_back(other),
                 }
