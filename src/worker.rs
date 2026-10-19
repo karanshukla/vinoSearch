@@ -148,25 +148,28 @@ fn changed(
         files_embedded: 0,
         chunks: 0,
         removed: 0,
+        duplicates: 0,
     };
     for path in files {
         if path.exists() {
             st.files_seen += 1;
-            if let Outcome::Embedded(n) =
-                index::index_file(conn, emb, &path, &mut |c, e| after(&st, c, e))?
-            {
-                st.files_embedded += 1;
-                st.chunks += n;
+            match index::index_file(conn, emb, &path, &mut |c, e| after(&st, c, e))? {
+                Outcome::Embedded(n) => {
+                    st.files_embedded += 1;
+                    st.chunks += n;
+                }
+                Outcome::Duplicate => st.duplicates += 1,
+                Outcome::Unchanged | Outcome::Skipped => {}
             }
         } else {
             st.removed += index::remove(conn, &path)?;
         }
         after(&st, conn, emb);
     }
-    if st.files_embedded + st.removed > 0 {
+    if st.files_embedded + st.removed + st.duplicates > 0 {
         eprintln!(
-            "updated: {} files embedded ({} chunks), {} removed",
-            st.files_embedded, st.chunks, st.removed
+            "updated: {} files embedded ({} chunks), {} duplicates, {} removed",
+            st.files_embedded, st.chunks, st.duplicates, st.removed
         );
     }
     Ok(st)
@@ -174,7 +177,7 @@ fn changed(
 
 /// Record when the index last changed, for Status.
 fn touched(status: &Status, st: &index::Stats) {
-    if st.files_embedded + st.removed > 0 {
+    if st.files_embedded + st.removed + st.duplicates > 0 {
         status.last_indexed.store(unix_now(), Ordering::Relaxed);
     }
 }

@@ -203,11 +203,12 @@ fn run(cli: Cli) -> Result<bool> {
                     eprintln!();
                 }
                 println!(
-                    "{}: {} files seen, {} embedded ({} chunks), {} removed",
+                    "{}: {} files seen, {} embedded ({} chunks), {} duplicates, {} removed",
                     p.display(),
                     st.files_seen,
                     st.files_embedded,
                     st.chunks,
+                    st.duplicates,
                     st.removed
                 );
             }
@@ -261,6 +262,9 @@ fn run(cli: Cli) -> Result<bool> {
                     h.line,
                     snippet(&h.text)
                 );
+                if !h.copies.is_empty() {
+                    println!("       same as: {}", h.copies.join(", "));
+                }
             }
             Ok(true)
         }
