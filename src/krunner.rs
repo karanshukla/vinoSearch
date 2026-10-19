@@ -526,7 +526,9 @@ fn config_home() -> Result<PathBuf> {
     })
 }
 
-/// The vinoPilot landing page's vinoSearch mark.
+/// The vinoPilot landing page's vinoSearch mark, with the viewBox cropped to
+/// a 2 px margin: the page's 4 px left the tile visibly smaller than other
+/// apps' icons in a task manager.
 const ICON_SVG: &str = include_str!("../data/dev.vinosearch.svg");
 
 fn icon_path() -> Result<PathBuf> {
