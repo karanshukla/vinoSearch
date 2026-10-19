@@ -1,4 +1,5 @@
 mod embed;
+mod icons;
 mod index;
 mod krunner;
 mod model;

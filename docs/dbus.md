@@ -18,7 +18,7 @@ The same search KRunner's `Match` runs: the best chunk per file, files scoring a
 |---|---|
 | `GetInitialResultSet(as terms)` | Joins the terms with spaces and searches. Under 3 characters returns nothing, as KRunner's plugin waits for 3 letters. |
 | `GetSubsearchResultSet(as previous, as terms)` | Searches afresh: a semantic match does not narrow as the query grows. |
-| `GetResultMetas(as ids)` | `id`, `name` (file name), `description` (directory, line and snippet; the directory alone for an image), `gicon` (`text-x-generic` or `image-x-generic`). Ids from an older search get the path as description. |
+| `GetResultMetas(as ids)` | `id`, `name` (file name), `description` (directory, line and snippet; the directory alone for an image), `gicon` (the file type's icon from shared-mime-info, such as `text-markdown` or `image-png`, falling back to `text-x-generic` or `image-x-generic`). Ids from an older search get the path as description. |
 | `ActivateResult(s id, as terms, u timestamp)` | `xdg-open` the file. |
 | `LaunchSearch(as terms, u timestamp)` | Opens the settings window, if `vinosearch-settings` is installed beside `vinosearch`. |
 

@@ -456,7 +456,8 @@ pub fn index_file(
         // One chunk, with no text and line 0, from the pixels alone.
         Kind::Image => {
             let pixels =
-                match crate::vision::load(path).and_then(|img| crate::vision::prepare(&img)) {
+                // From the bytes hashed, so the file can't change in between.
+                match crate::vision::load(&bytes).and_then(|img| crate::vision::prepare(&img)) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("skip {}: {e:#}", path.display());

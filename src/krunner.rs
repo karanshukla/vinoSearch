@@ -117,13 +117,6 @@ fn describe(h: &Hit) -> (String, String) {
     (name, description)
 }
 
-fn icon(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Text => "text-x-generic",
-        Kind::Image => "image-x-generic",
-    }
-}
-
 fn owned(v: Value<'_>) -> OwnedValue {
     v.try_into().expect("string values have no fds")
 }
@@ -133,16 +126,19 @@ fn to_match(h: Hit, floors: Floors) -> Match {
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Value::from(subtext)));
     props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
-    // Images in a group of their own (#73); text stays under the runner's name.
-    if h.kind == Kind::Image {
-        props.insert("category".into(), owned(Value::from("Images")));
-    }
+    // A group per kind, named so each reads as ours (#73).
+    let category = match h.kind {
+        Kind::Text => "vinoSearch Text",
+        Kind::Image => "vinoSearch Images",
+    };
+    props.insert("category".into(), owned(Value::from(category)));
     let floor = floors.of(h.kind);
+    let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0));
     (
         h.path,
         name,
-        icon(h.kind).into(),
+        icon.into(),
         RELEVANCE_MODERATE,
         relevance,
         props,
@@ -280,7 +276,10 @@ impl Gnome {
                 let mut meta = HashMap::new();
                 meta.insert("name".into(), owned(Value::from(name)));
                 meta.insert("description".into(), owned(Value::from(description)));
-                meta.insert("gicon".into(), owned(Value::from(icon(kind))));
+                // A serialized GThemedIcon, which falls back to the generic name.
+                let (specific, generic) = crate::icons::for_path(Path::new(&id), kind);
+                let gicon = format!(". GThemedIcon {specific} {generic}");
+                meta.insert("gicon".into(), owned(Value::from(gicon)));
                 meta.insert("id".into(), owned(Value::from(id)));
                 meta
             })

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, imageops::FilterType};
-use std::path::Path;
+use std::io::Cursor;
 
 /// Soft tokens per image. 140 retrieves within 1.8 recall@1 of the
 /// processor's 280 on Flickr30k (84.5 against 86.3, recall@10 98.6 against
@@ -18,9 +18,11 @@ const PATCH: usize = 16;
 const POOL: usize = 3;
 pub const PATCHES: usize = SOFT_TOKENS * POOL * POOL;
 pub const PATCH_DIM: usize = PATCH * PATCH * 3;
-/// Decoding a huge image can take far more memory than the file: refused
-/// past this many bytes of decoded pixels (a 16k x 10k photo is 480 MB).
-const MAX_DECODED_BYTES: u64 = 512 << 20;
+/// Decoding a huge image can take far more memory than the file. Refused
+/// past this many bytes held at once: the decoded pixels, a copy if its
+/// orientation turns it, and the 8-bit RGB copy (a 100-megapixel RGB photo
+/// is 3 x 300 MB).
+const MAX_DECODED_BYTES: u64 = 1 << 30;
 
 /// One image, patched and padded for the vision encoder.
 pub struct Pixels {
@@ -53,15 +55,26 @@ fn target_size(height: u32, width: u32) -> Result<(u32, u32)> {
     Ok((h as u32, w as u32))
 }
 
-/// Decode `path`, turned upright by its EXIF orientation. Animations give their first frame.
-pub fn load(path: &Path) -> Result<RgbImage> {
-    let mut reader = ImageReader::open(path)?.with_guessed_format()?;
+/// Decode an image file's bytes, turned upright by its EXIF orientation.
+/// Animations give their first frame.
+pub fn load(bytes: &[u8]) -> Result<RgbImage> {
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_DECODED_BYTES);
     reader.limits(limits);
     let mut decoder = reader
         .into_decoder()
         .context("not an image this build reads")?;
+    // Everything the steps below hold, judged from the header before decoding.
+    let (w, h) = decoder.dimensions();
+    let needed = 2 * decoder.total_bytes() + u64::from(w) * u64::from(h) * 3;
+    if needed > MAX_DECODED_BYTES {
+        bail!(
+            "{w}x{h} needs {} MB to decode, more than {}",
+            needed >> 20,
+            MAX_DECODED_BYTES >> 20
+        );
+    }
     let orientation = decoder.orientation()?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
@@ -89,8 +102,9 @@ fn patchify(img: &RgbImage) -> Result<Pixels> {
     let (h, w) = (img.height(), img.width());
     let (rows, cols) = (h as usize / PATCH, w as usize / PATCH);
     let n = rows * cols;
-    if n > PATCHES {
-        bail!("{w}x{h} is {n} patches, more than {PATCHES}");
+    // At least one whole soft token, so the image has a row of features.
+    if n > PATCHES || rows < POOL || cols < POOL {
+        bail!("{w}x{h} is {rows}x{cols} patches, not 3x3 to {PATCHES}");
     }
     let mut values = vec![0f32; PATCHES * PATCH_DIM];
     let mut positions = vec![-1i64; PATCHES * 2];
@@ -145,6 +159,29 @@ mod tests {
     #[test]
     fn a_sliver_gets_one_soft_token_row() {
         assert_eq!(target_size(10, 4000).unwrap(), (48, 6720));
+    }
+
+    #[test]
+    fn an_image_too_big_to_decode_is_refused_from_its_header() {
+        // A 40,000 x 40,000 24-bit BMP, 4.8 GB decoded: its header alone.
+        let (w, h) = (40_000i32, 40_000i32);
+        let mut bmp = b"BM".to_vec();
+        bmp.extend(54u32.to_le_bytes()); // file size, not checked
+        bmp.extend([0; 4]);
+        bmp.extend(54u32.to_le_bytes()); // pixel data offset
+        bmp.extend(40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bmp.extend(w.to_le_bytes());
+        bmp.extend(h.to_le_bytes());
+        bmp.extend(1u16.to_le_bytes());
+        bmp.extend(24u16.to_le_bytes());
+        bmp.extend([0; 24]);
+        let err = load(&bmp).unwrap_err().to_string();
+        assert!(err.contains("needs"), "{err}");
+    }
+
+    #[test]
+    fn a_grid_without_a_whole_soft_token_is_refused() {
+        assert!(patchify(&RgbImage::new(480, 32)).is_err());
     }
 
     #[test]
