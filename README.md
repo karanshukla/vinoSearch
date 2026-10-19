@@ -1,3 +1,5 @@
+<p align="center"><img src="data/dev.vinosearch.svg" width="96" height="96" alt="vinoSearch icon: a magnifier on the dark vino tile"></p>
+
 # vinoSearch
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
@@ -44,13 +46,23 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 ## Settings
 
-`vinosearch-settings` is an egui window in the style of vinoWhisper's settings, with three pages:
+`vinosearch-settings` is the settings window: egui, in the same style as vinoWhisper's settings (Inter, flat surfaces, the vino green), with the icon above. Install it with `cargo install --path crates/settings`, then run `vinosearch krunner --install` once more so the **vinoSearch** entry in the app menu opens it. Or run `vinosearch-settings` directly; `--page index|model|integration` opens a given page.
 
-- **Index**: progress while indexing, file and chunk counts, the indexed folders (add, re-index, remove) and the exclude list.
-- **Model**: download, verify or delete the model, unload it, clear the compiled-model cache, pick the device and the idle unload time.
-- **Integration**: KRunner and GNOME search on or off, which runs `vinosearch krunner --install` or `--uninstall`.
+| Page | Shows | Lets you |
+|---|---|---|
+| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk | Add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
+| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
+| Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 
-It reads the runner's state over `dev.vinosearch.Control1` once a second and edits `config.toml` directly, keeping your comments, so the runner picks changes up within 30 seconds. It never loads OpenVINO. Folders are picked through the desktop's own file chooser (xdg-desktop-portal), or typed. `krunner --install` makes the vinoSearch app-menu entry open it when it is installed next to `vinosearch`; `--page model` opens a given page.
+How it behaves:
+
+- **Live.** It asks the runner for `Status` over `dev.vinosearch.Control1` once a second, from a background thread, so the counts move while indexing runs and a slow D-Bus start never freezes the window. If the runner isn't installed, the pages say so.
+- **Settings go to `config.toml`.** Exclusions, device and idle unload are written straight to the file, keeping your comments and layout, and the runner applies them within 30 seconds. A file that doesn't parse is left alone and the window says why.
+- **Destructive actions ask twice.** Removing a folder drops its part of the index, and deleting the model stops search until it is downloaded again, so both need a second click.
+- **Fits the desktop.** It follows the light or dark preference from the desktop portal, and on Plasma its header takes the colour scheme's header colours, so it runs into the title bar like Dolphin's toolbar. Below 620 px wide the sidebar folds into tabs.
+- **Light.** It never loads OpenVINO or the model: it only depends on `vinosearch-shared`, eframe and zbus.
+
+It is Wayland only for now, as vinoWhisper's window is. Not there yet (#5): chunks per directory with a one-click exclude, and what `vinosearch doctor` reports.
 
 ## Performance
 
