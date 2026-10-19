@@ -35,7 +35,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `Forget` | `(s path) → ()` | Stop indexing and watching a root, and drop what was indexed under it. |
 | `CheckNow` | `() → ()` | Compare every root with the index by mtime and size, as the watcher does hourly, and index what differs. Runs once any indexing job has finished; `last_checked` in `Status` moves when it has. |
 | `Unload` | `() → ()` | Free the model now instead of after the idle timeout. |
-| `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (306 MB, every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
+| `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (308 MB, every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 
