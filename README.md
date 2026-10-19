@@ -1,21 +1,24 @@
+<p align="center"><img src="data/dev.vinosearch.svg" width="96" height="96" alt="vinoSearch icon: a magnifier on the dark vino tile"></p>
+
 # vinoSearch
 
 Semantic file search for Linux, run on Intel NPUs through OpenVINO. The goal is a background daemon that indexes your files and answers queries from KRunner and GNOME Shell search, with every model on the NPU.
 
-Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell.
+Early days: a working proof of concept for text files, searched from the command line, KRunner or GNOME Shell, with a settings window for the rest.
 
 ## Usage
 
 ```bash
 git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
 cargo install --path .                     # vinosearch into ~/.cargo/bin
+cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
 cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch, see Runtime
 vinosearch fetch-model                     # 274 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch watch                           # keep indexed roots current (the KRunner runner also does this)
 vinosearch search "how do I rotate the signing key"
-vinosearch krunner --install               # register with KRunner and GNOME Shell search, and as a systemd user service started at login
+vinosearch krunner --install               # register with KRunner and GNOME Shell search, as a systemd user service started at login, and in the app menu
 systemctl --user restart plasma-krunner.service
 ```
 
@@ -31,7 +34,7 @@ idle_unload_minutes = 5
 
 Adding an exclusion drops anything already indexed under it. A running runner applies changes to any of the three within 30 seconds, unless a flag or environment variable sets that one (see [docs/dbus.md](docs/dbus.md#settings)). `vinosearch index` refuses an excluded path.
 
-Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds.
+Indexed roots are watched with inotify, one non-recursive watch per directory indexing would visit, so `target/`, `node_modules/` and hidden trees cost nothing (a whole home directory here is ~22,600 watches against the 135,178 limit). Changes are indexed after 2 quiet seconds; new roots from `vinosearch index` are picked up within 30 seconds. inotify can still miss changes (the kernel drops events when its queue overflows, and directories past the watch limit go unwatched), so every root is also compared with the index by mtime and size once an hour, after the machine wakes from sleep, right after dropped events, and on demand from the settings window. That reads no file contents: 0.5 s for 45,418 paths under a home directory here.
 
 The runner frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 553 MB loaded with a 23k-chunk index and no load spike (it compiles from a static-shape graph, so a cached model is loaded without reading the weights), 12 MB unloaded, ~1 s to reload. `vinosearch krunner --uninstall` stops the service and removes the KRunner, D-Bus and systemd files.
 
@@ -40,6 +43,26 @@ The runner runs as `vinosearch.service` (logs: `journalctl --user -u vinosearch`
 The runner also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index).
 
 The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat it like the files it indexes; encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
+
+## Settings
+
+`vinosearch-settings` is the settings window: egui, in the same style as vinoWhisper's settings (Inter, flat surfaces, the vino green), with the icon above. Install it with `cargo install --path crates/settings`, then run `vinosearch krunner --install` once more so the **vinoSearch** entry in the app menu opens it. Or run `vinosearch-settings` directly; `--page index|model|integration` opens a given page.
+
+| Page | Shows | Lets you |
+|---|---|---|
+| Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes | Check now, add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
+| Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
+| Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
+
+How it behaves:
+
+- **Live.** It asks the runner for `Status` over `dev.vinosearch.Control1` once a second, from a background thread, so the counts move while indexing runs and a slow D-Bus start never freezes the window. If the runner isn't installed, the pages say so.
+- **Settings go to `config.toml`.** Exclusions, device and idle unload are written straight to the file, keeping your comments and layout, and the runner applies them within 30 seconds. A file that doesn't parse is left alone and the window says why.
+- **Destructive actions ask twice.** Removing a folder drops its part of the index, and deleting the model stops search until it is downloaded again, so both need a second click.
+- **Fits the desktop.** It follows the light or dark preference from the desktop portal, and on Plasma its header takes the colour scheme's header colours, so it runs into the title bar like Dolphin's toolbar. Below 620 px wide the sidebar folds into tabs.
+- **Light.** It never loads OpenVINO or the model: it only depends on `vinosearch-shared`, eframe and zbus.
+
+It is Wayland only for now, as vinoWhisper's window is. Not there yet (#5): chunks per directory with a one-click exclude, and what `vinosearch doctor` reports.
 
 ## Performance
 

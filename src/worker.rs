@@ -65,6 +65,18 @@ pub struct Status {
     pub fetch_error: std::sync::Mutex<String>,
     /// The device the model runs, or will next load, on.
     pub device: std::sync::Mutex<String>,
+    /// Unix seconds when the watcher last compared every root with the
+    /// index, and when an indexing job last changed it; 0 for not yet.
+    pub last_checked: AtomicU64,
+    pub last_indexed: AtomicU64,
+    /// Set by CheckNow; the watcher takes it.
+    pub check_now: AtomicBool,
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl Status {
@@ -108,7 +120,7 @@ fn changed(
     paths: Vec<PathBuf>,
     ex: &Excludes,
     after: &mut index::AfterFile,
-) -> Result<()> {
+) -> Result<index::Stats> {
     let roots = index::roots(conn)?;
     let mut files = Vec::new();
     for path in paths {
@@ -157,7 +169,14 @@ fn changed(
             st.files_embedded, st.chunks, st.removed
         );
     }
-    Ok(())
+    Ok(st)
+}
+
+/// Record when the index last changed, for Status.
+fn touched(status: &Status, st: &index::Stats) {
+    if st.files_embedded + st.removed > 0 {
+        status.last_indexed.store(unix_now(), Ordering::Relaxed);
+    }
 }
 
 fn answer(
@@ -395,21 +414,25 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 answer(&conn, emb, vectors, &query, k, reply);
             }
             Job::Changed(paths) => {
-                if let Err(e) = changed(&mut conn, emb, paths, &excludes, &mut after) {
-                    eprintln!("updating index: {e:#}");
+                match changed(&mut conn, emb, paths, &excludes, &mut after) {
+                    Ok(s) => touched(status, &s),
+                    Err(e) => eprintln!("updating index: {e:#}"),
                 }
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Reindex(root) => {
                 match index::index(&mut conn, emb, &root, &excludes, &mut after) {
-                    Ok(s) => eprintln!(
-                        "{}: {} files seen, {} embedded ({} chunks), {} removed",
-                        root.display(),
-                        s.files_seen,
-                        s.files_embedded,
-                        s.chunks,
-                        s.removed
-                    ),
+                    Ok(s) => {
+                        eprintln!(
+                            "{}: {} files seen, {} embedded ({} chunks), {} removed",
+                            root.display(),
+                            s.files_seen,
+                            s.files_embedded,
+                            s.chunks,
+                            s.removed
+                        );
+                        touched(status, &s);
+                    }
                     Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
                 }
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);

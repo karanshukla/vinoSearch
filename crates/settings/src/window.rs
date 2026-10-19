@@ -1,0 +1,1055 @@
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+
+use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke};
+use vinosearch_shared::config::{self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES};
+
+use crate::control::{Link, Request, Status};
+use crate::{integration, portal, theme};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Index,
+    Model,
+    Integration,
+}
+
+impl Page {
+    const ALL: [Page; 3] = [Page::Index, Page::Model, Page::Integration];
+
+    fn parse(name: &str) -> Option<Page> {
+        Page::ALL
+            .into_iter()
+            .find(|page| page.title().eq_ignore_ascii_case(name))
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Page::Index => "Index",
+            Page::Model => "Model",
+            Page::Integration => "Integration",
+        }
+    }
+}
+
+const DEVICES: [&str; 3] = ["NPU", "GPU", "CPU"];
+
+fn device_label(device: &'static str) -> &'static str {
+    match device {
+        "NPU" => "NPU (recommended)",
+        "GPU" => "GPU",
+        _ => "CPU",
+    }
+}
+
+// Below this the sidebar folds into tabs in the header, and form labels go above their control.
+const SIDEBAR_FROM: f32 = 620.0;
+const SIDEBAR_WIDTH: f32 = 180.0;
+const LABEL_WIDTH: f32 = 150.0;
+const FORM_MAX_WIDTH: f32 = 620.0;
+// Between the form and the scroll bar, which sits on the window's right edge.
+const SCROLL_GAP: f32 = 24.0;
+const TWO_COLUMNS_FROM: f32 = 440.0;
+
+/// What a folder from the chooser is for.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Root,
+    Exclude,
+}
+
+/// What the chooser answered: None when it was cancelled.
+type Picked = (Target, Result<Option<PathBuf>, String>);
+
+/// A destructive action waiting for a second click.
+#[derive(Clone, PartialEq)]
+enum Confirm {
+    Forget(String),
+    DeleteModel,
+}
+
+struct SettingsWindow {
+    page: Page,
+    link: Link,
+    config_path: PathBuf,
+    config: Config,
+    // Set when the file doesn't parse: saving would replace what the user wrote.
+    config_broken: Option<String>,
+    idle_dirty: bool,
+    new_root: String,
+    new_exclude: String,
+    picked: Arc<Mutex<Option<Picked>>>,
+    picking: bool,
+    confirm: Option<Confirm>,
+    /// `last_checked` when Check now was pressed, until a newer check lands.
+    check_asked: Option<u64>,
+    notice: Option<String>,
+    integration: Arc<Mutex<integration::State>>,
+    focused: bool,
+    kde_header: Option<theme::KdeHeader>,
+}
+
+impl SettingsWindow {
+    fn new(ctx: &egui::Context, page: Option<Page>) -> Self {
+        let mut window = SettingsWindow {
+            page: page.unwrap_or(Page::Index),
+            link: Link::start(ctx),
+            config_path: config::default_path().unwrap_or_default(),
+            config: Config::default(),
+            config_broken: None,
+            idle_dirty: false,
+            new_root: String::new(),
+            new_exclude: String::new(),
+            picked: Arc::new(Mutex::new(None)),
+            picking: false,
+            confirm: None,
+            check_asked: None,
+            notice: None,
+            integration: Arc::new(Mutex::new(integration::State::read())),
+            focused: true,
+            kde_header: theme::kde_header(),
+        };
+        window.reload_config();
+        window
+    }
+
+    fn reload_config(&mut self) {
+        match Config::load(&self.config_path) {
+            Ok(c) => {
+                self.config = c;
+                self.config_broken = None;
+            }
+            Err(e) => self.config_broken = Some(format!("{e:#}")),
+        }
+    }
+
+    fn save_config(&mut self) {
+        if self.config_broken.is_some() {
+            return;
+        }
+        if let Err(e) = self.config.save(&self.config_path) {
+            self.notice = Some(format!("Couldn't save the settings: {e:#}"));
+        }
+    }
+
+    fn pick(&mut self, ctx: &egui::Context, target: Target) {
+        self.picking = true;
+        let picked = Arc::clone(&self.picked);
+        let ctx = ctx.clone();
+        let title = match target {
+            Target::Root => "Add a folder to the index",
+            Target::Exclude => "Exclude a folder",
+        };
+        std::thread::spawn(move || {
+            let answer = portal::pick_folder(title).map_err(|e| format!("{e:#}"));
+            *picked.lock().unwrap() = Some((target, answer));
+            ctx.request_repaint();
+        });
+    }
+
+    fn add(&mut self, target: Target, path: &Path) {
+        match target {
+            Target::Root => self.link.send(Request::Reindex(path.display().to_string())),
+            Target::Exclude => {
+                let entry = tilde(path);
+                if !self.config.exclude.contains(&entry) {
+                    self.config.exclude.push(entry);
+                    self.save_config();
+                }
+            }
+        }
+    }
+
+    /// A typed path: `~/` expanded, then it must be absolute.
+    fn add_typed(&mut self, target: Target) {
+        let typed = match target {
+            Target::Root => std::mem::take(&mut self.new_root),
+            Target::Exclude => std::mem::take(&mut self.new_exclude),
+        };
+        let typed = typed.trim();
+        let path = match (typed.strip_prefix("~/"), home()) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ if typed == "~" => home().unwrap_or_default(),
+            _ => PathBuf::from(typed),
+        };
+        if !path.is_absolute() {
+            self.notice = Some(format!("{typed}: use a full path, or one starting with ~/"));
+            return;
+        }
+        self.add(target, &path);
+    }
+
+    fn index(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        let p = theme::palette(ui.ctx());
+        section(ui, "Status");
+        let reachable = match status {
+            None => {
+                row(ui, "Now:", "", |ui| {
+                    value(
+                        ui,
+                        RichText::new("Asking the search service…").color(p.muted),
+                    );
+                });
+                None
+            }
+            Some(Err(why)) => {
+                row(ui, "Now:", "", |ui| {
+                    let color = ui.visuals().error_fg_color;
+                    value(ui, RichText::new(why).color(color));
+                });
+                None
+            }
+            Some(Ok(s)) => Some(s),
+        };
+        if let Some(s) = reachable {
+            row(ui, "Now:", "", |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    if s.indexing {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(format!(
+                            "Indexing, {} files so far",
+                            count(s.indexed_files as i64)
+                        ));
+                    } else {
+                        ui.label("Up to date");
+                    }
+                });
+            });
+            row(ui, "Contents:", "", |ui| {
+                value(
+                    ui,
+                    format!(
+                        "{} files, {} chunks, {} on disk",
+                        count(s.files),
+                        count(s.chunks),
+                        size(s.index_bytes)
+                    ),
+                );
+            });
+            row(ui, "Last change:", "", |ui| {
+                if s.last_indexed == 0 {
+                    value(
+                        ui,
+                        RichText::new("None since the service started").color(p.muted),
+                    );
+                } else {
+                    value(ui, format!("Indexed {}", ago(s.last_indexed)));
+                }
+            });
+            if self.check_asked.is_some_and(|at| s.last_checked != at) {
+                self.check_asked = None;
+            }
+            row(
+                ui,
+                "Checked:",
+                "Changes are indexed within seconds of happening. Every folder is also compared \
+                 with the index once an hour, after the machine wakes, and whenever the kernel \
+                 drops change events, in case one was missed. It reads no file contents and \
+                 takes about a second.",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(ui.spacing().interact_size.y);
+                        if self.check_asked.is_some() {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(if s.indexing {
+                                "Waiting for indexing to finish"
+                            } else {
+                                "Checking…"
+                            });
+                        } else {
+                            ui.label(if s.last_checked == 0 {
+                                "Not yet".to_owned()
+                            } else {
+                                ago(s.last_checked)
+                            });
+                            if ui.button("Check now").clicked() {
+                                self.check_asked = Some(s.last_checked);
+                                self.link.send(Request::CheckNow);
+                            }
+                        }
+                    });
+                },
+            );
+        }
+
+        section(ui, "Folders");
+        help_line(
+            ui,
+            "Indexed, then watched for changes. Hidden folders, build output and dependencies \
+             (target, node_modules, vendor, …) are always skipped, as are config formats like \
+             TOML, YAML and JSON, where credentials live.",
+        );
+        let roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
+        let indexing = reachable.is_some_and(|s| s.indexing);
+        if reachable.is_some() && roots.is_empty() {
+            ui.label(RichText::new("Nothing is indexed yet.").color(p.muted));
+        }
+        for root in &roots {
+            let forget = Confirm::Forget(root.clone());
+            listed(ui, &tilde(Path::new(root)), |ui| {
+                if self.confirm.as_ref() == Some(&forget) {
+                    if ui.button("Cancel").clicked() {
+                        self.confirm = None;
+                    }
+                    if ui.button("Remove and drop its index").clicked() {
+                        self.link.send(Request::Forget(root.clone()));
+                        self.confirm = None;
+                    }
+                } else {
+                    if ui.button("Remove").clicked() {
+                        self.confirm = Some(forget);
+                    }
+                    if ui
+                        .add_enabled(!indexing, egui::Button::new("Re-index"))
+                        .on_hover_text("Look for anything the watcher missed")
+                        .clicked()
+                    {
+                        self.link.send(Request::Reindex(root.clone()));
+                    }
+                }
+            });
+        }
+        ui.add_enabled_ui(reachable.is_some(), |ui| {
+            self.adder(ui, Target::Root);
+        });
+
+        section(ui, "Excluded");
+        help_line(
+            ui,
+            "Never indexed or watched, even inside a folder above. Adding one drops what is \
+             already indexed under it within 30 seconds.",
+        );
+        if let Some(why) = &self.config_broken {
+            ui.label(
+                RichText::new(format!(
+                    "{} doesn't parse, so it isn't changed from here: {why}",
+                    self.config_path.display()
+                ))
+                .color(ui.visuals().error_fg_color),
+            );
+            return;
+        }
+        if self.config.exclude.is_empty() {
+            ui.label(RichText::new("Nothing is excluded.").color(p.muted));
+        }
+        let mut remove = None;
+        for (i, entry) in self.config.exclude.iter().enumerate() {
+            listed(ui, entry, |ui| {
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.config.exclude.remove(i);
+            self.save_config();
+        }
+        self.adder(ui, Target::Exclude);
+    }
+
+    /// "Add folder…" through the desktop's chooser, or a typed path.
+    fn adder(&mut self, ui: &mut egui::Ui, target: Target) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let (button, hint) = match target {
+                Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
+                Target::Exclude => ("Exclude folder…", "or type a path, e.g. ~/Downloads/tax"),
+            };
+            if ui
+                .add_enabled(!self.picking, egui::Button::new(button))
+                .clicked()
+            {
+                self.pick(ui.ctx(), target);
+            }
+            let text = match target {
+                Target::Root => &mut self.new_root,
+                Target::Exclude => &mut self.new_exclude,
+            };
+            let width = (ui.available_width() - 60.0).clamp(120.0, 300.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text(hint)
+                    .desired_width(width)
+                    // As tall as the buttons beside it.
+                    .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
+                    .vertical_align(Align::Center),
+            );
+            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let typed = !text.trim().is_empty();
+            if (ui.add_enabled(typed, egui::Button::new("Add")).clicked() || entered) && typed {
+                self.add_typed(target);
+            }
+        });
+    }
+
+    fn model(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        let p = theme::palette(ui.ctx());
+        let s = match status {
+            Some(Ok(s)) => Some(s),
+            Some(Err(why)) => {
+                ui.add_space(10.0);
+                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                None
+            }
+            None => None,
+        };
+        if let Some(s) = s {
+            section(ui, "EmbeddingGemma 2");
+            row(
+                ui,
+                "Download:",
+                "Search and indexing need it. From Hugging Face, every file checked against a \
+                 pinned SHA-256; Verify fetches only what is missing or corrupt.",
+                |ui| {
+                    // Status and buttons on one line, as on the rows below.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.set_min_height(ui.spacing().interact_size.y);
+                        if s.fetching {
+                            let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .text(format!(
+                                        "{} of {}",
+                                        size(s.fetch_done),
+                                        size(s.fetch_total)
+                                    ))
+                                    .desired_width(220.0),
+                            );
+                        } else if s.model_present {
+                            ui.label(format!("Downloaded, {}", size(s.model_bytes)));
+                        } else {
+                            let color = ui.visuals().warn_fg_color;
+                            ui.label(RichText::new("Not downloaded").color(color));
+                        }
+                        let label = if s.model_present {
+                            "Verify"
+                        } else {
+                            "Download"
+                        };
+                        if ui
+                            .add_enabled(!s.fetching, egui::Button::new(label))
+                            .clicked()
+                        {
+                            self.link.send(Request::FetchModel);
+                        }
+                        let deletable = s.model_present && !s.fetching;
+                        if self.confirm == Some(Confirm::DeleteModel) {
+                            if ui.button("Cancel").clicked() {
+                                self.confirm = None;
+                            }
+                            if ui.button("Delete the model").clicked() {
+                                self.link.send(Request::DeleteModel);
+                                self.confirm = None;
+                            }
+                        } else if ui
+                            .add_enabled(deletable, egui::Button::new("Delete…"))
+                            .clicked()
+                        {
+                            self.confirm = Some(Confirm::DeleteModel);
+                        }
+                    });
+                    if !s.fetch_error.is_empty() {
+                        ui.label(
+                            RichText::new(format!("The last download failed: {}", s.fetch_error))
+                                .color(ui.visuals().error_fg_color),
+                        );
+                    }
+                },
+            );
+            row(
+                ui,
+                "Memory:",
+                "The model loads with the first query or indexing job.",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if s.model_loaded {
+                            ui.label(format!("Loaded on {}", s.device));
+                        } else {
+                            ui.label(RichText::new("Not loaded").color(p.muted));
+                        }
+                        if ui
+                            .add_enabled(s.model_loaded, egui::Button::new("Unload now"))
+                            .clicked()
+                        {
+                            self.link.send(Request::Unload);
+                        }
+                    });
+                },
+            );
+            row(
+                ui,
+                "Compiled cache:",
+                "OpenVINO's compiled copy of the model. Clearing it makes the next load \
+                 recompile, about 4 s on the NPU.",
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(size(s.cache_bytes));
+                        if ui
+                            .add_enabled(s.cache_bytes > 0, egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            self.link.send(Request::ClearCache);
+                        }
+                    });
+                },
+            );
+        }
+
+        section(ui, "Running");
+        if self.config_broken.is_some() {
+            help_line(ui, "The settings file doesn't parse; see the Index page.");
+            return;
+        }
+        let mut changed = false;
+        row(
+            ui,
+            "Device:",
+            "On the NPU, indexing runs about 5x faster than on the CPU, at a tenth of the \
+             energy per file. Applies within 30 seconds.",
+            |ui| {
+                let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
+                let mut picked = DEVICES
+                    .into_iter()
+                    .find(|d| d.eq_ignore_ascii_case(current))
+                    .unwrap_or(DEFAULT_DEVICE);
+                let before = picked;
+                egui::ComboBox::from_id_salt("device")
+                    .width(240.0)
+                    .selected_text(device_label(picked))
+                    .show_ui(ui, |ui| {
+                        for d in DEVICES {
+                            ui.selectable_value(&mut picked, d, device_label(d));
+                        }
+                    });
+                if picked != before {
+                    self.config.device = (picked != DEFAULT_DEVICE).then(|| picked.to_owned());
+                    changed = true;
+                }
+            },
+        );
+        row(
+            ui,
+            "Unload after:",
+            "Idle minutes before the model is freed (553 MB loaded, about 1 s to load again). \
+             0 keeps it loaded.",
+            |ui| {
+                let mut minutes = self
+                    .config
+                    .idle_unload_minutes
+                    .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut minutes)
+                            .range(0.0..=1440.0)
+                            .speed(0.25)
+                            .custom_formatter(|m, _| {
+                                if m.fract() == 0.0 {
+                                    format!("{m:.0}")
+                                } else {
+                                    format!("{m:.1}")
+                                }
+                            })
+                            .suffix(" min"),
+                    )
+                    // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
+                    .on_hover_cursor(egui::CursorIcon::Text);
+                if response.changed() {
+                    self.config.idle_unload_minutes = Some(minutes);
+                    self.idle_dirty = true;
+                }
+            },
+        );
+        if changed {
+            self.save_config();
+        }
+    }
+
+    fn integration(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui.ctx());
+        let state = self.integration.lock().unwrap().clone();
+        section(ui, "Desktop search");
+        row(
+            ui,
+            "KRunner, GNOME:",
+            "Adds vinoSearch to KRunner and GNOME Shell's search, and starts it at login as a \
+             user service so the index stays current. GNOME shows results from the next login. \
+             Turning it off stops the service; the index and model stay.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    if state.running {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label("Working…");
+                    } else if state.registered {
+                        ui.label("On");
+                    } else {
+                        ui.label(RichText::new("Off").color(p.muted));
+                    }
+                    let (label, install) = if state.registered {
+                        ("Turn off", false)
+                    } else {
+                        ("Turn on", true)
+                    };
+                    if ui
+                        .add_enabled(!state.running, egui::Button::new(label))
+                        .clicked()
+                    {
+                        integration::run(Arc::clone(&self.integration), ui.ctx(), install);
+                    }
+                });
+            },
+        );
+        if let Some(output) = &state.output {
+            row(ui, "", "", |ui| {
+                egui::Frame::NONE
+                    .fill(p.code_bg)
+                    .stroke(Stroke::new(1.0_f32, p.rule))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
+                    });
+            });
+        }
+        section(ui, "Command line");
+        row(ui, "Search:", "", |ui| {
+            command(ui, "vinosearch search \"what you're looking for\"");
+        });
+        row(ui, "Check the NPU:", "", |ui| {
+            command(ui, "vinosearch doctor")
+        });
+    }
+}
+
+/// `/home/u/x` as `~/x`, the way the config file writes it.
+fn tilde(path: &Path) -> String {
+    match home().and_then(|h| path.strip_prefix(&h).ok().map(Path::to_owned)) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Unix seconds as "just now", "12 min ago", "3 h ago" or "2 days ago".
+fn ago(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    ago_from(at, now)
+}
+
+fn ago_from(at: u64, now: u64) -> String {
+    let s = now.saturating_sub(at);
+    match s {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86400 => format!("{} h ago", s / 3600),
+        _ if s < 2 * 86400 => "1 day ago".to_owned(),
+        _ => format!("{} days ago", s / 86400),
+    }
+}
+
+/// 41924 as "41,924".
+fn count(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// Decimal units, as the README and `fetch-model` give sizes.
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for u in UNITS {
+        if value < 1000.0 {
+            break;
+        }
+        value /= 1000.0;
+        unit = u;
+    }
+    if value < 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+fn command(ui: &mut egui::Ui, text: &str) {
+    value(ui, RichText::new(text).monospace());
+}
+
+/// Text in a row's control column, centred on the label as a button would be.
+fn value(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(ui.spacing().interact_size.y);
+        ui.label(text);
+    });
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(14.0);
+    ui.label(RichText::new(title).family(theme::bold()).size(14.0));
+    ui.add_space(6.0);
+}
+
+fn help_line(ui: &mut egui::Ui, text: &str) {
+    let p = theme::palette(ui.ctx());
+    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.muted)).wrap());
+    ui.add_space(4.0);
+}
+
+/// One folder in a list: its path, with its buttons on the right.
+fn listed(ui: &mut egui::Ui, path: &str, buttons: impl FnOnce(&mut egui::Ui)) {
+    let p = theme::palette(ui.ctx());
+    egui::Frame::NONE
+        .stroke(Stroke::new(1.0_f32, p.rule))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    buttons(ui);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(path).monospace()).truncate())
+                            .on_hover_text(path);
+                    });
+                });
+            });
+        });
+    ui.add_space(2.0);
+}
+
+// Like a Kirigami FormLayout: right-aligned labels beside their controls, or above them
+// when the window is too narrow for two columns.
+fn row(ui: &mut egui::Ui, label: &str, help: &str, control: impl FnOnce(&mut egui::Ui)) {
+    let p = theme::palette(ui.ctx());
+    let help = |ui: &mut egui::Ui| {
+        if !help.is_empty() {
+            ui.add(egui::Label::new(RichText::new(help).size(12.5).color(p.muted)).wrap());
+        }
+    };
+    let width = ui.available_width();
+    if width >= TWO_COLUMNS_FROM {
+        let column = width - LABEL_WIDTH - ui.spacing().item_spacing.x;
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(LABEL_WIDTH, ui.spacing().interact_size.y),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.set_min_width(LABEL_WIDTH);
+                    ui.label(label);
+                },
+            );
+            ui.vertical(|ui| {
+                // A horizontal parent leaves its children unbounded; wrap at the window's edge.
+                ui.set_max_width(column);
+                control(ui);
+                help(ui);
+            });
+        });
+    } else {
+        if !label.is_empty() {
+            ui.label(label);
+        }
+        control(ui);
+        help(ui);
+    }
+    ui.add_space(8.0);
+}
+
+fn sidebar_item(ui: &mut egui::Ui, page: Page, current: &mut Page) {
+    let p = theme::palette(ui.ctx());
+    let selected = *current == page;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
+    let fill = if selected {
+        p.link.gamma_multiply(0.22)
+    } else if response.hovered() {
+        p.code_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    ui.painter().text(
+        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        page.title(),
+        FontId::proportional(14.0),
+        p.text,
+    );
+    if response.clicked() {
+        *current = page;
+    }
+}
+
+fn tab_item(ui: &mut egui::Ui, page: Page, current: &mut Page, header: theme::Header) {
+    let active = *current == page;
+    let galley = ui.painter().layout_no_wrap(
+        page.title().to_owned(),
+        if active {
+            FontId::new(14.0, theme::bold())
+        } else {
+            FontId::proportional(14.0)
+        },
+        // left for the paint call below, so hovering can change it
+        Color32::PLACEHOLDER,
+    );
+    let (rect, response) =
+        ui.allocate_exact_size(galley.size() + egui::vec2(0.0, 6.0), Sense::click());
+    let lit = active || response.hovered();
+    ui.painter().galley(
+        rect.left_top(),
+        galley,
+        if lit { header.text } else { header.muted },
+    );
+    if active {
+        let p = theme::palette(ui.ctx());
+        ui.painter().hline(
+            rect.left()..=rect.right(),
+            rect.bottom(),
+            Stroke::new(2.0_f32, p.link),
+        );
+    }
+    if response.clicked() {
+        *current = page;
+    }
+}
+
+impl eframe::App for SettingsWindow {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.idle_dirty {
+            self.save_config();
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let focused = ctx.input(|input| input.focused);
+        if focused && !self.focused {
+            // The desktop's light/dark switch may have flipped while we were in the background,
+            // and the config file or the KRunner registration may have changed under us.
+            theme::follow_desktop(ctx);
+            self.kde_header = theme::kde_header();
+            if !self.idle_dirty {
+                self.reload_config();
+            }
+            let mut integration = self.integration.lock().unwrap();
+            if !integration.running {
+                integration.registered = integration::State::read().registered;
+            }
+        }
+        self.focused = focused;
+
+        let picked = self.picked.lock().unwrap().take();
+        if let Some((target, answer)) = picked {
+            self.picking = false;
+            match answer {
+                Ok(Some(path)) => self.add(target, &path),
+                Ok(None) => {}
+                Err(e) => self.notice = Some(format!("No folder chooser: {e}")),
+            }
+        }
+        let shared = self.link.shared.lock().unwrap().clone();
+        if let Some(refused) = shared.refused {
+            self.link.shared.lock().unwrap().refused = None;
+            self.notice = Some(refused);
+        }
+
+        let p = theme::palette(ctx);
+        let header = theme::header(ctx, self.kde_header.as_ref(), focused);
+        let wide = ctx.content_rect().width() >= SIDEBAR_FROM;
+
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::NONE
+                    .fill(header.bg)
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if wide {
+                        ui.add_space(SIDEBAR_WIDTH - 16.0 + 24.0);
+                        ui.label(
+                            RichText::new(self.page.title())
+                                .family(theme::bold())
+                                .size(16.0)
+                                .color(header.text),
+                        );
+                    } else {
+                        ui.spacing_mut().item_spacing.x = 18.0;
+                        for page in Page::ALL {
+                            tab_item(ui, page, &mut self.page, header);
+                        }
+                    }
+                });
+            });
+
+        if wide {
+            egui::SidePanel::left("pages")
+                .resizable(false)
+                .exact_width(SIDEBAR_WIDTH)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.bg)
+                        .inner_margin(egui::Margin::same(8)),
+                )
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for page in Page::ALL {
+                        sidebar_item(ui, page, &mut self.page);
+                    }
+                });
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.bg)
+                    // No right margin: the scroll bar belongs on the window's edge, and the
+                    // content keeps its own gap from it below.
+                    .inner_margin(egui::Margin {
+                        left: 24,
+                        right: 0,
+                        top: 4,
+                        bottom: 4,
+                    }),
+            )
+            .show(ctx, |ui| {
+                // A solid bar, always drawn: the floating one only shows on hover, so a page
+                // that runs past the window gave no sign there was more below.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle {
+                    bar_width: 10.0,
+                    ..egui::style::ScrollStyle::solid()
+                };
+                let scrolled = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        ui.set_max_width((ui.available_width() - SCROLL_GAP).min(FORM_MAX_WIDTH));
+                        if let Some(notice) = self.notice.clone() {
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(notice).color(ui.visuals().error_fg_color));
+                                if ui.small_button("Dismiss").clicked() {
+                                    self.notice = None;
+                                }
+                            });
+                        }
+                        let status = shared.status.as_ref();
+                        match self.page {
+                            Page::Index => self.index(ui, status),
+                            Page::Model => self.model(ui, status),
+                            Page::Integration => self.integration(ui),
+                        }
+                        ui.add_space(12.0);
+                    });
+                // The bar alone is easy to miss: fade the last lines out while more is below.
+                let view = scrolled.inner_rect;
+                if scrolled.state.offset.y + view.height() < scrolled.content_size.y - 1.0 {
+                    let fade = egui::Rect::from_min_max(
+                        egui::pos2(view.left(), view.bottom() - 48.0),
+                        view.right_bottom(),
+                    );
+                    let mut mesh = egui::Mesh::default();
+                    mesh.colored_vertex(fade.left_top(), Color32::TRANSPARENT);
+                    mesh.colored_vertex(fade.right_top(), Color32::TRANSPARENT);
+                    mesh.colored_vertex(fade.right_bottom(), p.bg);
+                    mesh.colored_vertex(fade.left_bottom(), p.bg);
+                    mesh.add_triangle(0, 1, 2);
+                    mesh.add_triangle(0, 2, 3);
+                    ui.painter().add(mesh);
+                }
+            });
+
+        // Typing or dragging a number changes it every frame; write the file once it settles.
+        if self.idle_dirty && ctx.dragged_id().is_none() && !ctx.wants_keyboard_input() {
+            self.idle_dirty = false;
+            self.save_config();
+        }
+    }
+}
+
+pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
+    let page = page.and_then(Page::parse);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("vinoSearch settings")
+            .with_app_id(app_id)
+            .with_inner_size([820.0, 640.0])
+            .with_min_inner_size([340.0, 320.0]),
+        // As in vinoWhisper: with vsync, a swap waits on a frame callback KWin holds back from
+        // a window it considers hidden, and the window stops answering pings.
+        vsync: false,
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        "vinoSearch settings",
+        options,
+        Box::new(|cc| {
+            theme::install(&cc.egui_ctx);
+            theme::visible_scroll_handles(&cc.egui_ctx);
+            Ok(Box::new(SettingsWindow::new(&cc.egui_ctx, page)))
+        }),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("vinosearch-settings: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_get_thousands_separators() {
+        assert_eq!(count(0), "0");
+        assert_eq!(count(999), "999");
+        assert_eq!(count(1000), "1,000");
+        assert_eq!(count(41924), "41,924");
+        assert_eq!(count(1234567), "1,234,567");
+        assert_eq!(count(-1234), "-1,234");
+    }
+
+    #[test]
+    fn times_read_as_ago() {
+        let now = 1_000_000;
+        assert_eq!(ago_from(now - 5, now), "just now");
+        assert_eq!(ago_from(now + 5, now), "just now");
+        assert_eq!(ago_from(now - 12 * 60, now), "12 min ago");
+        assert_eq!(ago_from(now - 3 * 3600 - 59, now), "3 h ago");
+        assert_eq!(ago_from(now - 30 * 3600, now), "1 day ago");
+        assert_eq!(ago_from(now - 5 * 86400, now), "5 days ago");
+    }
+
+    #[test]
+    fn sizes_use_decimal_units() {
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(176_577_856), "177 MB");
+        assert_eq!(size(307_607_341), "308 MB");
+        assert_eq!(size(1_500_000_000), "1.5 GB");
+    }
+
+    #[test]
+    fn pages_parse_by_title() {
+        assert!(Page::parse("model") == Some(Page::Model));
+        assert!(Page::parse("nope").is_none());
+    }
+}
