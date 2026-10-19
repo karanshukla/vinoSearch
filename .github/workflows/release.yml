@@ -1,0 +1,47 @@
+name: Release
+
+# Publishing a GitHub release builds the binaries and attaches them to it.
+# Re-run for an existing release from the Actions tab with its tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload to, e.g. v1
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The glibc here is the oldest the binaries run on: 2.39.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      CARGO_PROFILE_RELEASE_STRIP: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release --locked -p vinosearch -p vinosearch-settings
+      - run: cargo install --locked ovfetch --root "$RUNNER_TEMP/ovfetch"
+      - name: Package
+        run: |
+          dir=vinosearch
+          mkdir -p "$dir/bin" "$dir/scripts"
+          cp target/release/vinosearch target/release/vinosearch-settings "$RUNNER_TEMP/ovfetch/bin/ovfetch" "$dir/bin/"
+          cp scripts/install.sh scripts/install-runtime.sh "$dir/scripts/"
+          cp README.md LICENSE "$dir/"
+          tar czf vinosearch-x86_64-linux.tar.gz "$dir"
+          sha256sum vinosearch-x86_64-linux.tar.gz > vinosearch-x86_64-linux.tar.gz.sha256
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" vinosearch-x86_64-linux.tar.gz vinosearch-x86_64-linux.tar.gz.sha256 --clobber

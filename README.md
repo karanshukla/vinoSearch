@@ -20,21 +20,30 @@ It's early days: a working proof of concept, used daily on one laptop. Expect ro
 
 - Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU? `--device CPU` works, just slower.
 - KDE Plasma or GNOME. The settings window is Wayland only for now.
-- Rust and a C compiler, to build it.
+- Rust and a C compiler, only to build from source.
 
 ## Install
+
+```bash
+curl -L https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64-linux.tar.gz | tar xz
+vinosearch/scripts/install.sh --index ~/Documents
+```
+
+That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 308 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with KRunner and GNOME Shell as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
+
+`vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
+
+<details>
+<summary>From source instead</summary>
+
+Needs Rust and a C compiler. The same script builds the binaries with cargo into `~/.cargo/bin` when run from a checkout, and `git pull` then a re-run upgrades:
 
 ```bash
 git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
 scripts/install.sh --index ~/Documents
 ```
 
-That builds and installs the binaries, fetches OpenVINO and the 308 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with KRunner and GNOME Shell as a service started at login. It skips whatever is already done, so re-running it after a `git pull` upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
-
-`scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
-
-<details>
-<summary>Step by step instead</summary>
+Or step by step:
 
 ```bash
 cargo install --path .                     # vinosearch into ~/.cargo/bin
