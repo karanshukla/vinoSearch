@@ -5,9 +5,10 @@
 
 Nothing here is a screen capture. The layouts follow KRunner (Breeze Dark)
 and the settings window's Index page; file names, snippets and counts are
-made up, so no real index or photo ends up in the repo.
+made up, so no real index ends up in the repo. The photo is\nfrom Unsplash (dog-sunset.webp, downscaled).
 """
 
+import base64
 from html import escape
 from pathlib import Path
 
@@ -107,40 +108,19 @@ def row(y, icon, title, sub, selected_from=None, tl=None, t1=None) -> str:
     )
 
 
-def dog_beach(x, y, w, h) -> str:
-    """The photo the image query finds: a dog on a beach at sunset."""
+def photo(x, y, w, h) -> str:
+    """The photo the image query finds, embedded since an <img> SVG loads nothing else."""
+    data = base64.b64encode((Path(__file__).parent / "dog-sunset.webp").read_bytes()).decode()
     return (
-        f'<g transform="translate({x},{y})"><defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#2b3a6b"/><stop offset=".55" stop-color="#e2725b"/>'
-        '<stop offset="1" stop-color="#f5b867"/></linearGradient>'
-        f'<clipPath id="photo"><rect width="{w}" height="{h}"/></clipPath></defs>'
-        '<g clip-path="url(#photo)">'
-        f'<rect width="{w}" height="{h}" fill="url(#sky)"/>'
-        f'<circle cx="{w * .62}" cy="{h * .56}" r="{h * .13}" fill="#ffd98a"/>'
-        f'<rect y="{h * .58}" width="{w}" height="{h * .17}" fill="#3d5a80"/>'
-        + "".join(
-            f'<rect x="{w * .62 - h * (.16 - i * .03)}" y="{h * (.6 + i * .035)}" width="{h * (.32 - i * .06)}" '
-            f'height="2.5" fill="#ffd98a" fill-opacity="{.7 - i * .15}"/>'
-            for i in range(4)
-        )
-        + f'<path d="M0 {h * .75} Q{w * .5} {h * .7} {w} {h * .76} V{h} H0z" fill="#d9a066"/>'
-        f'<path d="M0 {h * .82} Q{w * .4} {h * .78} {w} {h * .84} V{h} H0z" fill="#c78a52"/>'
-        # The dog, in silhouette, mid-run.
-        f'<g transform="translate({w * .3},{h * .66}) scale({h / 300})" fill="#2a1d1a">'
-        '<ellipse cx="0" cy="0" rx="46" ry="17"/><circle cx="50" cy="-20" r="15"/>'
-        '<path d="M58 -16 l22 4 -2 9 -22 -1z"/><path d="M42 -32 l6 -14 8 12z"/>'
-        '<path d="M-44 -6 q-24 -22 -30 -30 q10 4 32 22z"/>'
-        '<path d="M28 6 l16 30 -7 3 -17 -28z"/><path d="M14 8 l-4 34 7 1 6 -32z"/>'
-        '<path d="M-30 6 l-24 26 5 5 26 -24z"/><path d="M-20 8 l2 34 7 -1 -1 -33z"/></g>'
-        f'<ellipse cx="{w * .3}" cy="{h * .82}" rx="{h * .2}" ry="4" fill="#000" fill-opacity=".18"/>'
-        "</g></g>"
+        f'<image x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="xMidYMid slice" '
+        f'href="data:image/webp;base64,{data}"/>'
     )
 
 
 def krunner() -> str:
     tl = Timeline(17)
     q1 = "how do I rotate the signing key"
-    q2 = "dog on a beach at sunset"
+    q2 = "dog watching the sunset"
     open_at, viewer_at, end = 1.0, 12.4, 16.4
     t1_start = 1.4
     t1_end = t1_start + len(q1) * .055
@@ -211,10 +191,10 @@ def krunner() -> str:
 
     # Image results: the names say nothing, the pixels matched.
     images = [
-        ("IMG_2041.jpg", "~/Pictures/2025/Tofino"),
-        ("IMG_2038.jpg", "~/Pictures/2025/Tofino"),
+        ("IMG_2041.jpg", "~/Pictures/2025/Summer evenings"),
+        ("IMG_2038.jpg", "~/Pictures/2025/Summer evenings"),
         ("PXL_20240812_201544.jpg", "~/Pictures/Phone/Camera"),
-        ("DSC00417.jpg", "~/Pictures/2023/Outer Banks"),
+        ("DSC00417.jpg", "~/Pictures/2023/Cottage"),
     ]
     out.append(f'<g class="a" {tl.show(res2, viewer_at, .2)}>{text(178, head + 21, "vinoSearch Images", 12, "#a1a9b1", 700)}</g>')
     for i, (name, sub) in enumerate(images):
@@ -234,7 +214,7 @@ def krunner() -> str:
         f'<rect x="{vx}" y="{vy + 26}" width="{vw}" height="8" fill="#2a2e32"/>'
         + text(vx + vw / 2, vy + 22, "IMG_2041.jpg  ·  Image Viewer", 13, "#dfe1e3", 600, "middle")
         + f'<circle cx="{vx + vw - 18}" cy="{vy + 17}" r="7" fill="#4d5359"/>'
-        + dog_beach(vx + 10, vy + 44, vw - 20, vh - 54)
+        + photo(vx + 10, vy + 44, vw - 20, vh - 54)
     )
     out.append(f'<g class="a" {tl.show(viewer_at, end, .3)}>{viewer}</g>')
 
