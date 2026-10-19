@@ -963,6 +963,48 @@ fn row(ui: &mut egui::Ui, label: &str, help: &str, control: impl FnOnce(&mut egu
     ui.add_space(8.0);
 }
 
+/// `data/dev.vinosearch.svg`, painted at `size` points square, so it stays sharp at any
+/// scale without an SVG renderer.
+fn logo(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    // The SVG's viewBox is 60 units from (2, 2).
+    let k = size / 60.0;
+    let at = |x: f32, y: f32| rect.min + egui::vec2((x - 2.0) * k, (y - 2.0) * k);
+    let box_ =
+        |x: f32, y: f32, w: f32, h: f32| egui::Rect::from_min_max(at(x, y), at(x + w, y + h));
+    let green = Color32::from_rgb(0x56, 0xcc, 0x78);
+    let painter = ui.painter();
+    painter.rect_filled(
+        box_(4.0, 4.0, 56.0, 56.0),
+        14.0 * k,
+        Color32::from_rgb(0x0e, 0x0e, 0x10),
+    );
+    painter.rect_stroke(
+        box_(5.0, 5.0, 54.0, 54.0),
+        13.0 * k,
+        Stroke::new(2.0 * k, Color32::from_white_alpha(46)),
+        egui::StrokeKind::Middle,
+    );
+    painter.circle_stroke(
+        at(28.0, 28.0),
+        12.0 * k,
+        Stroke::new(5.0 * k, Color32::from_rgb(0xfa, 0xfa, 0xfa)),
+    );
+    painter.rect_filled(
+        box_(22.0, 22.0, 12.0, 4.0),
+        2.0 * k,
+        Color32::from_rgb(0xa0, 0xa4, 0xac).gamma_multiply(0.5),
+    );
+    painter.rect_filled(box_(22.0, 30.0, 8.0, 4.0), 2.0 * k, green);
+    // The handle's round caps: egui strokes end square.
+    painter.line_segment(
+        [at(37.0, 37.0), at(47.0, 47.0)],
+        Stroke::new(6.0 * k, green),
+    );
+    painter.circle_filled(at(37.0, 37.0), 3.0 * k, green);
+    painter.circle_filled(at(47.0, 47.0), 3.0 * k, green);
+}
+
 fn sidebar_item(ui: &mut egui::Ui, page: Page, current: &mut Page) {
     let p = theme::palette(ui.ctx());
     let selected = *current == page;
@@ -1072,8 +1114,18 @@ impl eframe::App for SettingsWindow {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let start = ui.cursor().left();
+                    logo(ui, 22.0);
                     if wide {
-                        ui.add_space(SIDEBAR_WIDTH - 16.0 + 24.0);
+                        ui.label(
+                            RichText::new("vinoSearch")
+                                .family(theme::bold())
+                                .size(15.0)
+                                .color(header.text),
+                        );
+                        // The page title lines up with the content, past the sidebar.
+                        let title_at = start + SIDEBAR_WIDTH - 16.0 + 24.0;
+                        ui.add_space((title_at - ui.cursor().left()).max(12.0));
                         ui.label(
                             RichText::new(self.page.title())
                                 .family(theme::bold())
