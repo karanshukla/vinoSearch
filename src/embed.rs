@@ -287,6 +287,16 @@ impl Embedder {
         Ok(())
     }
 
+    /// Free the document stage; the next document (or long query) compiles it
+    /// again, from the cache.
+    pub fn release_documents(&mut self) -> bool {
+        self.docs.take().is_some()
+    }
+
+    pub fn has_documents(&self) -> bool {
+        self.docs.is_some()
+    }
+
     /// Embed documents already formatted with [`document_text`].
     pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.prepare_documents()?;
