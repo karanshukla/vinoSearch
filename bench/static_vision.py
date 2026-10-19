@@ -1,6 +1,6 @@
 """Give the EmbeddingGemma 2 vision encoder static shapes, so it compiles on the NPU.
 
-    uv run --python 3.13 --no-project --with onnx --with numpy bench/static_vision.py <dir with onnx/vision_encoder.onnx>
+    uv run --python 3.13 --no-project --with onnx --with numpy bench/static_vision.py <dir with onnx/vision_encoder.onnx> [soft tokens]
 
 The processor pads every image to 2520 patches (280 soft tokens of 3x3), and
 the encoder pools them into 280 cells, then keeps the cells holding a real
@@ -9,7 +9,8 @@ the NPU compiler refuses it (#2). This drops it: image_features is all 280
 rows, and the caller keeps the first (h/3)*(w/3), h x w being the patch grid.
 image_mask is the graph's own answer for that, right on CPU but not on the
 NPU, so don't use it there. Writes onnx/vision_encoder_static.onnx, sharing
-vision_encoder.onnx_data.
+vision_encoder.onnx_data; with fewer soft tokens than 280 (the processor's
+max_soft_tokens, set to match), onnx/vision_encoder_static_<tokens>.onnx.
 """
 
 import sys
@@ -19,7 +20,9 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-PATCHES, CELLS, WIDTH, OUT = 2520, 280, 768, 512
+WIDTH, OUT = 768, 512
+# One soft token pools 3x3 patches.
+POOL = 9
 
 
 def static(dims, values):
@@ -30,9 +33,11 @@ def static(dims, values):
 
 def main():
     src = Path(sys.argv[1]) / "onnx" / "vision_encoder.onnx"
+    cells = int(sys.argv[2]) if len(sys.argv) > 2 else 280
+    patches = cells * POOL
     model = onnx.load(str(src), load_external_data=False)
     graph = model.graph
-    for inp, dims in zip(graph.input, ((1, PATCHES, WIDTH), (1, PATCHES, 2))):
+    for inp, dims in zip(graph.input, ((1, patches, WIDTH), (1, patches, 2))):
         static(inp.type.tensor_type.shape.dim, dims)
 
     gather = next(n for n in graph.node if n.op_type == "GatherND")
@@ -49,8 +54,8 @@ def main():
         helper.make_node("Reshape", [pooled, "static_rows_shape"], [gather.output[0]], name="static_rows"),
         helper.make_node("Reshape", [nonzero.input[0], "static_flat"], ["image_mask"], name="static_mask"),
     ])
-    static(graph.output[0].type.tensor_type.shape.dim, (CELLS, OUT))
-    graph.output.append(helper.make_tensor_value_info("image_mask", TensorProto.BOOL, [CELLS]))
+    static(graph.output[0].type.tensor_type.shape.dim, (cells, OUT))
+    graph.output.append(helper.make_tensor_value_info("image_mask", TensorProto.BOOL, [cells]))
 
     # The new Reshapes were appended; ONNX wants producers before consumers.
     pending, ready = list(graph.node), {""}
@@ -62,7 +67,7 @@ def main():
         ready.update(n.output)
         pending.remove(n)
 
-    dst = src.parent / "vision_encoder_static.onnx"
+    dst = src.parent / ("vision_encoder_static.onnx" if cells == 280 else f"vision_encoder_static_{cells}.onnx")
     onnx.save(model, str(dst))
     print(f"{dst}: outputs {[o.name for o in graph.output]}")
 
