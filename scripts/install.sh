@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Install vinoSearch for this user, from this checkout: the binaries, the
-# OpenVINO runtime, the model, the first indexed folder, and KRunner / GNOME
-# search with a user service. Safe to re-run: each step skips what is done.
+# Install vinoSearch for this user: the binaries, the OpenVINO runtime, the
+# model, the first indexed folder, and KRunner / GNOME search with a user
+# service. Safe to re-run: each step skips what is done.
+#
+# From a release download (bin/ next to scripts/) it copies the prebuilt
+# binaries into ~/.local/bin; from a source checkout it builds them with cargo.
 #
 #   scripts/install.sh [--index DIR]... [--device NPU|GPU|CPU] [--no-settings]
 #   scripts/install.sh --uninstall [--purge]
@@ -20,7 +23,12 @@ cd "$(dirname "$0")/.."
 
 OVFETCH_MIN="0.5.0"
 USER_PATH="$PATH"
-BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+CARGO_BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+LOCAL_BIN="$HOME/.local/bin"
+prebuilt=0
+[ -x bin/vinosearch ] && prebuilt=1
+BIN="$CARGO_BIN"
+[ "$prebuilt" = 1 ] && BIN="$LOCAL_BIN"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/vinosearch"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/vinosearch"
 RUNTIME="${VINOSEARCH_OPENVINO_DIR:-$HOME/.local/lib/vinosearch/openvino}"
@@ -50,22 +58,25 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
 if [ "$uninstall" = 1 ]; then
-    if [ -x "$BIN/vinosearch" ]; then
+    for dir in "$CARGO_BIN" "$LOCAL_BIN"; do
+        [ -x "$dir/vinosearch" ] || continue
         step "Removing the service and KRunner / GNOME search files"
-        "$BIN/vinosearch" krunner --uninstall
+        "$dir/vinosearch" krunner --uninstall
         systemctl --user is-active --quiet plasma-krunner.service 2>/dev/null &&
             systemctl --user restart plasma-krunner.service
-    fi
+        break
+    done
     step "Removing the binaries"
     for b in vinosearch vinosearch-settings; do
-        if [ -x "$BIN/$b" ]; then cargo uninstall "$b"; fi
+        if [ -x "$CARGO_BIN/$b" ]; then cargo uninstall "$b"; fi
+        if [ -x "$LOCAL_BIN/$b" ]; then rm -f -- "$LOCAL_BIN/$b" && echo "removed $LOCAL_BIN/$b"; fi
     done
     if [ "$purge" = 1 ]; then
         step "Deleting the index, model, compiled cache and runtime"
         for d in "$DATA" "$CACHE" "$RUNTIME"; do
             if [ -e "$d" ]; then rm -rf -- "$d" && echo "removed $d"; fi
         done
-        echo "kept $CONFIG and ovfetch (cargo uninstall ovfetch)"
+        echo "kept $CONFIG and ovfetch"
     else
         echo "kept the index, model and runtime; --uninstall --purge deletes them"
     fi
@@ -74,10 +85,12 @@ fi
 [ "$purge" = 0 ] || die "--purge only goes with --uninstall"
 
 # Prerequisites, before anything is built or downloaded.
-command -v cargo >/dev/null || [ -x "$HOME/.cargo/bin/cargo" ] ||
-    die "Rust is not installed: get it from https://rustup.rs, then run this again"
-command -v cargo >/dev/null || PATH="$HOME/.cargo/bin:$PATH"
-command -v cc >/dev/null || die "no C compiler (cc): install gcc, then run this again"
+if [ "$prebuilt" = 0 ]; then
+    command -v cargo >/dev/null || [ -x "$HOME/.cargo/bin/cargo" ] ||
+        die "Rust is not installed: get it from https://rustup.rs, then run this again"
+    command -v cargo >/dev/null || PATH="$HOME/.cargo/bin:$PATH"
+    command -v cc >/dev/null || die "no C compiler (cc): install gcc, then run this again"
+fi
 for r in "${roots[@]}"; do
     [ -d "$r" ] || die "--index $r: not a directory"
 done
@@ -101,15 +114,26 @@ ovfetch_ok() {
     return 1
 }
 
-step "Building vinosearch"
-cargo install --locked --path .
-if [ "$settings" = 1 ]; then
-    step "Building vinosearch-settings"
-    cargo install --locked --path crates/settings
-fi
-if ! ovfetch_ok; then
-    step "Installing ovfetch"
-    cargo install --locked ovfetch
+if [ "$prebuilt" = 1 ]; then
+    step "Installing the binaries into $BIN"
+    mkdir -p "$BIN"
+    bins=(vinosearch)
+    [ "$settings" = 1 ] && bins+=(vinosearch-settings)
+    ovfetch_ok || bins+=(ovfetch)
+    for b in "${bins[@]}"; do
+        cp --remove-destination "bin/$b" "$BIN/$b" && echo "installed $BIN/$b"
+    done
+else
+    step "Building vinosearch"
+    cargo install --locked --path .
+    if [ "$settings" = 1 ]; then
+        step "Building vinosearch-settings"
+        cargo install --locked --path crates/settings
+    fi
+    if ! ovfetch_ok; then
+        step "Installing ovfetch"
+        cargo install --locked ovfetch
+    fi
 fi
 export PATH="$BIN:$PATH"
 
@@ -153,7 +177,7 @@ step "KRunner and GNOME search"
 was_running=0
 systemctl --user is-active --quiet vinosearch.service 2>/dev/null && was_running=1
 vinosearch krunner --install
-# A re-run that rebuilt the binary: run the new one.
+# A re-run that replaced the binary: run the new one.
 if [ "$was_running" = 1 ]; then
     systemctl --user restart vinosearch.service && echo "restarted vinosearch.service"
 fi

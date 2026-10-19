@@ -1,6 +1,6 @@
 [package]
 name = "vinosearch-shared"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "What vinoSearch's daemon, CLI and settings app agree on: the config file and the D-Bus names"
