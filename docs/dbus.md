@@ -20,7 +20,7 @@ The same search KRunner's `Match` runs: the best chunk per file, files scoring a
 | `GetSubsearchResultSet(as previous, as terms)` | Searches afresh: a semantic match does not narrow as the query grows. |
 | `GetResultMetas(as ids)` | `id`, `name` (file name), `description` (directory, line and snippet), `gicon` (`text-x-generic`). Ids from an older search get the path as description. |
 | `ActivateResult(s id, as terms, u timestamp)` | `xdg-open` the file. |
-| `LaunchSearch(as terms, u timestamp)` | Nothing yet; the settings app (#5) will be the target. |
+| `LaunchSearch(as terms, u timestamp)` | Opens the settings window, if `vinosearch-settings` is installed beside `vinosearch`. |
 
 GNOME Shell only reads search providers from the system data dirs, never `~/.local/share`, so `krunner --install` writes the provider file to `~/.local/share/vinosearch/xdg/gnome-shell/search-providers/` and appends that directory to `XDG_DATA_DIRS` in `~/.config/environment.d/60-vinosearch.conf`, the way Flatpak exports per-user apps. It also writes `~/.local/share/applications/dev.vinosearch.desktop`, which GNOME Shell needs to show the provider (a hidden entry disables it). Results appear from the next login; `--uninstall` removes all three.
 
@@ -38,6 +38,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (308 MB, every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
+| `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 
 ### `Status` keys
 

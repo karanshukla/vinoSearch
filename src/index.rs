@@ -610,6 +610,59 @@ pub fn roots(conn: &Connection) -> Result<Vec<PathBuf>> {
     Ok(rows.filter_map(Result::ok).map(PathBuf::from).collect())
 }
 
+/// The folders holding most of the index, biggest first, for the settings
+/// window to offer excluding: at most `limit`, none inside another, never a
+/// root or above one. A folder gives way to a subfolder holding 3/4 of its
+/// chunks, so a copied source tree shows as the part of it that is the bulk
+/// (on ~/Development, two copies of one driver tree were 55% of the index).
+pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, u64)>> {
+    let roots = roots(conn)?;
+    let mut chunks: HashMap<PathBuf, u64> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT f.path, count(*) FROM chunks c JOIN files f ON f.id = c.file_id GROUP BY c.file_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (path, n) = row?;
+        for dir in Path::new(&path).ancestors().skip(1) {
+            if roots.iter().any(|r| r == dir) || !roots.iter().any(|r| dir.starts_with(r)) {
+                break;
+            }
+            *chunks.entry(dir.to_owned()).or_default() += n as u64;
+        }
+    }
+    let mut biggest_child: HashMap<&Path, u64> = HashMap::new();
+    for (dir, n) in &chunks {
+        if let Some(parent) = dir.parent() {
+            let m = biggest_child.entry(parent).or_default();
+            *m = (*m).max(*n);
+        }
+    }
+    let mut dirs: Vec<(&PathBuf, u64)> = chunks.iter().map(|(d, n)| (d, *n)).collect();
+    // Of equal folders, the deeper says more.
+    dirs.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(b.0.components().count().cmp(&a.0.components().count()))
+            .then(a.0.cmp(b.0))
+    });
+    let mut picked: Vec<(PathBuf, u64)> = Vec::new();
+    for (dir, n) in dirs {
+        if picked.len() == limit {
+            break;
+        }
+        let gives_way = biggest_child
+            .get(dir.as_path())
+            .is_some_and(|m| m * 4 >= n * 3);
+        let overlaps = picked
+            .iter()
+            .any(|(p, _)| p.starts_with(dir) || dir.starts_with(p));
+        if !gives_way && !overlaps {
+            picked.push((dir.clone(), n));
+        }
+    }
+    Ok(picked)
+}
+
 pub struct Hit {
     pub score: f32,
     pub path: String,
@@ -1095,6 +1148,53 @@ mod tests {
         conn.execute_batch("DELETE FROM roots WHERE path != '/dev/proj'")
             .unwrap();
         assert_eq!(forget(&conn, Path::new("/dev/proj")).unwrap(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn largest_folders_name_where_the_bulk_is() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-largest-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute_batch("INSERT INTO roots VALUES ('/h'), ('/h/dev/app');")
+            .unwrap();
+        let mut v = vec![0f32; DIM];
+        v[0] = 1.0;
+        for (path, n) in [
+            // Almost all of linux/ is drivers/gpu: that is what to show.
+            ("/h/dev/linux/drivers/gpu/a.c", 40),
+            ("/h/dev/linux/drivers/gpu/b.c", 50),
+            ("/h/dev/linux/README", 5),
+            ("/h/notes/x.md", 20),
+            ("/h/notes/y.md", 10),
+            // A root inside a root: its folders count, the root itself doesn't.
+            ("/h/dev/app/src/main.rs", 30),
+            ("/h/top.md", 99),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+                [path],
+            )
+            .unwrap();
+            let file = conn.last_insert_rowid();
+            for _ in 0..n {
+                conn.execute(
+                    "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, 1, '', ?2)",
+                    params![file, to_blob(&v)],
+                )
+                .unwrap();
+            }
+        }
+        let got = largest_folders(&conn, 10).unwrap();
+        let got: Vec<(&str, u64)> = got.iter().map(|(p, n)| (p.to_str().unwrap(), *n)).collect();
+        assert_eq!(
+            got,
+            [
+                ("/h/dev/linux/drivers/gpu", 90),
+                ("/h/dev/app/src", 30),
+                ("/h/notes", 30)
+            ]
+        );
+        assert_eq!(largest_folders(&conn, 1).unwrap().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

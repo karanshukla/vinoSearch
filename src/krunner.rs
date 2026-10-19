@@ -243,10 +243,20 @@ impl Gnome {
         open(&self.db, &id, false);
     }
 
-    /// Clicking the provider's icon. Nothing to show yet; the settings app
-    /// (#5) is the natural target.
+    /// Clicking the provider's icon: the settings window, when it is
+    /// installed beside us.
     #[zbus(name = "LaunchSearch")]
-    fn launch(&self, _terms: Vec<String>, _timestamp: u32) {}
+    fn launch(&self, _terms: Vec<String>, _timestamp: u32) {
+        let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
+        match settings {
+            Ok(s) if s.is_file() => {
+                if let Err(e) = std::process::Command::new(&s).spawn() {
+                    eprintln!("{}: {e}", s.display());
+                }
+            }
+            _ => eprintln!("LaunchSearch: vinosearch-settings is not installed beside vinosearch"),
+        }
+    }
 }
 
 struct Control {
@@ -380,6 +390,17 @@ impl Control {
     fn forget(&self, path: String) -> zbus::fdo::Result<()> {
         let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
         self.send(Job::Forget(root))
+    }
+
+    /// The folders holding most of the index, biggest first, with their
+    /// chunk counts: at most `limit`, none inside another (index::largest_folders).
+    fn largest_folders(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, u64)>> {
+        let db = self.db.lock().unwrap();
+        Ok(index::largest_folders(&db, limit as usize)
+            .map_err(failed)?
+            .into_iter()
+            .map(|(p, n)| (p.to_string_lossy().into_owned(), n))
+            .collect())
     }
 
     /// Compare every root with the index now, as the watcher does hourly,

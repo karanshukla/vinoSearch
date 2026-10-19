@@ -2,6 +2,7 @@
 //! `dev.vinosearch.Control1` and edits `config.toml`, which the runner re-reads.
 
 mod control;
+mod doctor;
 mod integration;
 mod portal;
 mod theme;
@@ -12,7 +13,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 vinosearch-settings: the vinoSearch settings window
 
-Usage: vinosearch-settings [--page index|model|integration]
+Usage: vinosearch-settings [--page index|folders|model|hardware|integration]
 ";
 
 fn main() -> ExitCode {

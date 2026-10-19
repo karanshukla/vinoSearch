@@ -6,17 +6,25 @@ use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke
 use vinosearch_shared::config::{self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES};
 
 use crate::control::{Link, Request, Status};
-use crate::{integration, portal, theme};
+use crate::{doctor, integration, portal, theme};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Index,
+    Folders,
     Model,
+    Hardware,
     Integration,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::Index, Page::Model, Page::Integration];
+    const ALL: [Page; 5] = [
+        Page::Index,
+        Page::Folders,
+        Page::Model,
+        Page::Hardware,
+        Page::Integration,
+    ];
 
     fn parse(name: &str) -> Option<Page> {
         Page::ALL
@@ -27,7 +35,9 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::Index => "Index",
+            Page::Folders => "Folders",
             Page::Model => "Model",
+            Page::Hardware => "Hardware",
             Page::Integration => "Integration",
         }
     }
@@ -51,6 +61,8 @@ const FORM_MAX_WIDTH: f32 = 620.0;
 // Between the form and the scroll bar, which sits on the window's right edge.
 const SCROLL_GAP: f32 = 24.0;
 const TWO_COLUMNS_FROM: f32 = 440.0;
+/// Folders listed under Largest folders.
+const LARGEST: u32 = 8;
 
 /// What a folder from the chooser is for.
 #[derive(Clone, Copy, PartialEq)]
@@ -86,6 +98,10 @@ struct SettingsWindow {
     check_asked: Option<u64>,
     notice: Option<String>,
     integration: Arc<Mutex<integration::State>>,
+    doctor: Arc<Mutex<doctor::State>>,
+    /// The chunk count Largest folders was last asked for at, to ask again
+    /// once the index changes.
+    largest_for: Option<i64>,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
 }
@@ -107,6 +123,8 @@ impl SettingsWindow {
             check_asked: None,
             notice: None,
             integration: Arc::new(Mutex::new(integration::State::read())),
+            doctor: Arc::default(),
+            largest_for: None,
             focused: true,
             kde_header: theme::kde_header(),
         };
@@ -180,7 +198,12 @@ impl SettingsWindow {
         self.add(target, &path);
     }
 
-    fn index(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+    fn index(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: Option<&Result<Status, String>>,
+        largest: Option<&Vec<(String, u64)>>,
+    ) {
         let p = theme::palette(ui.ctx());
         section(ui, "Status");
         let reachable = match status {
@@ -273,8 +296,24 @@ impl SettingsWindow {
                 },
             );
         }
+        if let Some(s) = reachable.filter(|s| s.chunks > 0) {
+            self.largest(ui, s, largest);
+        }
+    }
 
-        section(ui, "Folders");
+    /// What is indexed and what never is.
+    fn folders(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        let p = theme::palette(ui.ctx());
+        let reachable = match status {
+            Some(Ok(s)) => Some(s),
+            Some(Err(why)) => {
+                ui.add_space(10.0);
+                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                None
+            }
+            None => None,
+        };
+        section(ui, "Included");
         help_line(
             ui,
             "Indexed, then watched for changes. Hidden folders, build output and dependencies \
@@ -318,7 +357,7 @@ impl SettingsWindow {
         section(ui, "Excluded");
         help_line(
             ui,
-            "Never indexed or watched, even inside a folder above. Adding one drops what is \
+            "Never indexed or watched, even inside an included folder. Adding one drops what is \
              already indexed under it within 30 seconds.",
         );
         if let Some(why) = &self.config_broken {
@@ -347,6 +386,52 @@ impl SettingsWindow {
             self.save_config();
         }
         self.adder(ui, Target::Exclude);
+    }
+
+    /// Where the index goes, with a one-click exclude: generated and copied
+    /// trees are often most of it, which nobody would guess without seeing it.
+    fn largest(&mut self, ui: &mut egui::Ui, s: &Status, largest: Option<&Vec<(String, u64)>>) {
+        let p = theme::palette(ui.ctx());
+        // Asked at once, then again whenever the index has changed and indexing
+        // has settled: a first index can run for hours.
+        if (self.largest_for.is_none() || !s.indexing) && self.largest_for != Some(s.chunks) {
+            self.largest_for = Some(s.chunks);
+            self.link.send(Request::LargestFolders(LARGEST));
+        }
+        section(ui, "Largest folders");
+        help_line(
+            ui,
+            "Where the index goes. Copied source trees and generated files are often most of \
+             it; excluding one drops it from the index and makes indexing that much quicker.",
+        );
+        let Some(largest) = largest else {
+            ui.label(RichText::new("Counting…").color(p.muted));
+            return;
+        };
+        if largest.is_empty() {
+            ui.label(RichText::new("No folders inside the indexed ones yet.").color(p.muted));
+            return;
+        }
+        let mut exclude = None;
+        for (path, chunks) in largest {
+            let entry = tilde(Path::new(path));
+            let excluded = self.config.exclude.contains(&entry);
+            listed(ui, &entry, |ui| {
+                let can = !excluded && self.config_broken.is_none();
+                let label = if excluded { "Excluded" } else { "Exclude" };
+                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                    exclude = Some(PathBuf::from(path));
+                }
+                let share = *chunks as f64 * 100.0 / s.chunks.max(1) as f64;
+                ui.label(
+                    RichText::new(format!("{} chunks, {share:.0}%", count(*chunks as i64)))
+                        .color(p.muted),
+                );
+            });
+        }
+        if let Some(path) = exclude {
+            self.add(Target::Exclude, &path);
+        }
     }
 
     /// "Add folder…" through the desktop's chooser, or a typed path.
@@ -499,7 +584,7 @@ impl SettingsWindow {
 
         section(ui, "Running");
         if self.config_broken.is_some() {
-            help_line(ui, "The settings file doesn't parse; see the Index page.");
+            help_line(ui, "The settings file doesn't parse; see the Folders page.");
             return;
         }
         let mut changed = false;
@@ -564,6 +649,57 @@ impl SettingsWindow {
         if changed {
             self.save_config();
         }
+    }
+
+    /// What `vinosearch doctor` reports, run the first time the page shows.
+    /// The device it probes is the one picked on the Model page.
+    fn hardware(&mut self, ui: &mut egui::Ui) {
+        let state = self.doctor.lock().unwrap().clone();
+        if state.report.is_none() && !state.running {
+            doctor::run(Arc::clone(&self.doctor), ui.ctx());
+        }
+        section(ui, "This machine");
+        if let Some(report) = &state.report {
+            for (label, text) in &report.lines {
+                let failed = label == "Probe:" && !report.ok;
+                row(ui, label, "", |ui| {
+                    let text = RichText::new(text);
+                    value(
+                        ui,
+                        if failed {
+                            text.color(ui.visuals().error_fg_color)
+                        } else if label == "Warning:" {
+                            text.color(ui.visuals().warn_fg_color)
+                        } else {
+                            text
+                        },
+                    );
+                });
+            }
+            if let Some(error) = &report.error {
+                row(ui, "Problem:", "", |ui| {
+                    let color = ui.visuals().error_fg_color;
+                    ui.add(egui::Label::new(RichText::new(error).color(color)).wrap());
+                });
+            }
+        }
+        row(
+            ui,
+            "",
+            "Runs a tiny model on the device picked on the Model page, in a separate \
+             process, as vinosearch doctor does.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    if state.running {
+                        spinner(ui);
+                        ui.label("Checking…");
+                    } else if ui.button("Check again").clicked() {
+                        doctor::run(Arc::clone(&self.doctor), ui.ctx());
+                    }
+                });
+            },
+        );
     }
 
     fn integration(&mut self, ui: &mut egui::Ui) {
@@ -911,10 +1047,13 @@ impl eframe::App for SettingsWindow {
                                 .color(header.text),
                         );
                     } else {
-                        ui.spacing_mut().item_spacing.x = 18.0;
-                        for page in Page::ALL {
-                            tab_item(ui, page, &mut self.page, header);
-                        }
+                        // Five tabs: wrap rather than clip at the narrowest widths.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(18.0, 6.0);
+                            for page in Page::ALL {
+                                tab_item(ui, page, &mut self.page, header);
+                            }
+                        });
                     }
                 });
             });
@@ -972,8 +1111,10 @@ impl eframe::App for SettingsWindow {
                         }
                         let status = shared.status.as_ref();
                         match self.page {
-                            Page::Index => self.index(ui, status),
+                            Page::Index => self.index(ui, status, shared.largest.as_ref()),
+                            Page::Folders => self.folders(ui, status),
                             Page::Model => self.model(ui, status),
+                            Page::Hardware => self.hardware(ui),
                             Page::Integration => self.integration(ui),
                         }
                         ui.add_space(12.0);
@@ -1071,6 +1212,8 @@ mod tests {
     #[test]
     fn pages_parse_by_title() {
         assert!(Page::parse("model") == Some(Page::Model));
+        assert!(Page::parse("Hardware") == Some(Page::Hardware));
+        assert!(Page::parse("folders") == Some(Page::Folders));
         assert!(Page::parse("nope").is_none());
     }
 }
