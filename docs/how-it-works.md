@@ -8,6 +8,8 @@ The details behind the [README](../README.md): what gets indexed, how the index 
 
 **Images** (off by default). Embedded from their pixels with EmbeddingGemma 2's vision encoder, both stages on the NPU: 1.3 s an image, about 4.4 J on the package, up to 64 MiB a file, with no CPU time beyond decoding. Text queries search them directly. KRunner shows them in a **vinoSearch Images** group, apart from **vinoSearch Text**; GNOME lists them after the text results. Each result carries its file type's icon. Turning images on queues a check of every root for the images already there (run `vinosearch fetch-model` first, or Download on the Model page), and turning them off drops them from the index. Images score lower against a query than text does, hence their own `min_score`.
 
+**Documents** (off by default). PDF (text per page), Word, PowerPoint, Excel, OpenDocument, CSV and TSV, by their extracted text, through the same model as text. Results say which page, slide or row they're on, in a **vinoSearch Documents** group. Spreadsheet and CSV chunks each start with the header row. Scanned PDFs have no text layer and are skipped, as is any document with over 1 MiB of text. These are where statements, tax forms and bank exports live, and the index isn't encrypted yet ([#4](https://github.com/karanshukla/vinoSearch/issues/4)), so their text sits in it readable. Turning documents off drops them from the index.
+
 **Excluded by default.** Without an `exclude` line in the config, `~/snap`, `~/go/pkg`, `~/sdk`, `~/Android/Sdk`, `~/R`, `~/perl5` and `~/Games` are skipped: trees of installed packages that take long to index and are rarely searched. Conda installs (`miniconda3`, `anaconda3`, ...) are skipped wherever they are. Adding an exclusion drops anything already indexed under it, and `vinosearch index` refuses an excluded path.
 
 A running runner applies changes to `exclude`, `[formats]` and the device within 30 seconds, unless a flag or environment variable sets that one (see [dbus.md](dbus.md#settings)).
@@ -36,7 +38,7 @@ It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `St
 |---|---|---|
 | Index | Whether it is indexing and how many files it has done, files, chunks and index size on disk, when a change was last indexed and when the folders were last checked for missed changes, the largest folders inside the indexed ones and their share of the index | Check now, exclude one of the largest folders in one click |
 | Folders | The included (indexed) folders and the excluded ones | Add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
-| Search | What is indexed (text always, images by a switch, with their file extensions) and how close a result must be to show, per kind | Turn images on or off, edit their extensions, slide each kind between fewer, closer and more, looser results |
+| Search | What is indexed (text always, images and documents by a switch, with image file extensions) and how close a result must be to show, per kind | Turn images and documents on or off, edit image extensions, slide each kind between fewer, closer and more, looser results |
 | Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
 | Hardware | What `vinosearch doctor` reports: NPU, driver, NPU compiler, OpenVINO, devices, and a probe run on the device picked on the Model page | Check again |
 | Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
@@ -46,6 +48,27 @@ It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `St
 - **Destructive actions ask twice.** Removing a folder drops its part of the index, and deleting the model stops search until it is downloaded again, so both need a second click.
 - **Fits the desktop.** It follows the light or dark preference from the desktop portal, and on Plasma its header takes the colour scheme's header colours, so it runs into the title bar like Dolphin's toolbar. Below 620 px wide the sidebar folds into tabs.
 - **Light.** It never loads OpenVINO or the model: it only depends on `vinosearch-shared`, eframe and zbus.
+
+### Each setting
+
+The window keeps its help to a line; the rest is here.
+
+| Setting | Details |
+|---|---|
+| Checked | Changes are indexed within seconds. Every folder is also compared with the index once an hour, after the machine wakes, and whenever the kernel drops change events. It reads no file contents and takes about a second. |
+| Included folders | Hidden folders, build output and dependencies (`target`, `node_modules`, `vendor`, ...) are always skipped, as are config formats like TOML, YAML and JSON. |
+| Excluded folders | Adding one drops what is indexed under it within 30 seconds. The default list is folders of installed packages and games. |
+| Largest folders | Copied source trees and generated files are often most of the index; excluding one also makes indexing quicker. |
+| Model download | From Hugging Face, every file checked against a pinned SHA-256. Verify fetches only what is missing or corrupt. The model loads with the first query or indexing job. |
+| Compiled cache | OpenVINO's compiled copy of the model. Clearing it makes the next load recompile, about 4 s on the NPU. |
+| Device | On the NPU, indexing runs about 5x faster than on the CPU at a tenth of the energy per chunk. Applies within 30 seconds. |
+| Unload after | The model is 553 MB loaded and takes about 1 s to load again. |
+| Indexing share | The most of the device's time background indexing may take, half that on battery. Lower leaves more room for face unlock and dictation. |
+| Images | Found by what is in them, from a text search: "a cat", "a receipt". About 1.3 s each on the NPU. The vision model is a 671 MB download. Turning them off drops them from the index. Extensions apply on Enter. |
+| Documents | See [Documents](#what-gets-indexed) above. |
+| How close results must be | Results scoring below the line are left out; applies from the next search. For text, an unrelated query tops out around 0.60 and real matches score 0.70 and up. Images score lower: right matches about 0.61 to 0.69, the rest 0.57 to 0.60. |
+| Hardware | Runs a tiny model on the device picked on the Model page, in a separate process, as `vinosearch doctor` does. |
+| Desktop search | Adds vinoSearch to KRunner and GNOME Shell's search and starts it at login as a user service. Turning it off stops the service; the index and model stay. |
 
 **Largest folders** lists up to 8 folders inside the indexed ones, biggest first, none inside another. A folder gives way to a subfolder holding three quarters of it, so a copied source tree shows as the part that is its bulk. It refreshes once the index changes and indexing settles.
 
