@@ -446,14 +446,18 @@ pub fn index_file(
             return Ok(Outcome::Unchanged);
         }
     }
-    if holder.is_some() {
+    // A file indexed with no chunks of its own.
+    let record = |conn: &mut Connection| -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
         tx.execute(
             "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
             params![key, mtime, size, hash],
         )?;
-        tx.commit()?;
+        Ok(tx.commit()?)
+    };
+    if holder.is_some() {
+        record(conn)?;
         return Ok(Outcome::Duplicate);
     }
     let (chunks, vectors) = match kind {
@@ -474,7 +478,16 @@ pub fn index_file(
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
         Kind::Document => {
+            // Recorded first: a parser can take the runner down in ways
+            // catch_unwind doesn't catch (abort, stack overflow, out of
+            // memory), and the file must not be parsed again on every
+            // restart. Dropped again once it parses, so a stop while
+            // embedding leaves it to be indexed next time.
+            record(conn)?;
             let chunks = document_chunks(path, &bytes);
+            if !chunks.is_empty() {
+                conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
+            }
             let title = path
                 .file_name()
                 .map(|n| n.to_string_lossy())

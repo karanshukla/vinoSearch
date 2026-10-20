@@ -39,6 +39,9 @@ pub fn unit(path: &Path) -> &'static str {
 
 /// `path`'s text as numbered chunks, from `bytes`, its content.
 pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+    if bytes.starts_with(b"PK") {
+        check_zip(bytes)?;
+    }
     match ext(path).as_str() {
         "pdf" => pdf(bytes),
         "docx" => Ok(chunk(&xml_text(
@@ -98,10 +101,17 @@ fn pptx(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
         .filter_map(|n| Some((slide(&n)?, n.into_owned())))
         .collect();
     slides.sort();
-    let texts = slides
-        .iter()
-        .map(|(_, n)| Ok(xml_text(&read(&mut zip, n)?, &Tags::PPTX)))
-        .collect::<Result<Vec<_>>>()?;
+    // MAX_PART_BYTES across all slides, not each.
+    let mut total = 0;
+    let mut texts = Vec::with_capacity(slides.len());
+    for (_, n) in &slides {
+        let xml = read(&mut zip, n)?;
+        total += xml.len() as u64;
+        if total > MAX_PART_BYTES {
+            bail!("slides are over {MAX_PART_BYTES} bytes");
+        }
+        texts.push(xml_text(&xml, &Tags::PPTX));
+    }
     Ok(numbered(texts.iter()))
 }
 
@@ -160,6 +170,28 @@ fn cut(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Zips that say they unpack past this, or hold more entries, aren't opened.
+/// Their text would be over MAX_FILE_BYTES anyway, and calamine unpacks
+/// without a limit of its own. A zip can lie about its sizes, so this stops
+/// accidents and naive zip bombs, not a crafted one.
+const MAX_UNZIPPED_BYTES: u64 = 256 << 20;
+const MAX_ZIP_ENTRIES: usize = 10_000;
+
+fn check_zip(bytes: &[u8]) -> Result<()> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
+    if zip.len() > MAX_ZIP_ENTRIES {
+        bail!("{} zip entries", zip.len());
+    }
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        total = total.saturating_add(zip.by_index_raw(i)?.size());
+    }
+    if total > MAX_UNZIPPED_BYTES {
+        bail!("unzips to {total} bytes");
+    }
+    Ok(())
 }
 
 fn part(bytes: &[u8], name: &str) -> Result<String> {
@@ -339,6 +371,34 @@ mod tests {
             let first = text.lines().nth(1).unwrap();
             assert_eq!(csv.lines().nth(row - 1), Some(first));
         }
+    }
+
+    #[test]
+    fn zips_that_unpack_too_far_are_not_opened() {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        w.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        let zeros = vec![0u8; 1 << 20];
+        for _ in 0..(MAX_UNZIPPED_BYTES >> 20) + 1 {
+            w.write_all(&zeros).unwrap();
+        }
+        let bomb = w.finish().unwrap().into_inner();
+        assert!(bomb.len() < 1 << 20);
+        let e = chunks(Path::new("a.xlsx"), &bomb).unwrap_err();
+        assert!(e.to_string().starts_with("unzips to"), "{e}");
+
+        let names: Vec<(String, &str)> = (0..=MAX_ZIP_ENTRIES)
+            .map(|i| (format!("f{i}"), ""))
+            .collect();
+        let many = zipped(
+            &names
+                .iter()
+                .map(|(n, b)| (n.as_str(), *b))
+                .collect::<Vec<_>>(),
+        );
+        assert!(chunks(Path::new("a.docx"), &many).is_err());
     }
 
     #[test]
