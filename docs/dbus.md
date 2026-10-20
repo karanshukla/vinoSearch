@@ -80,7 +80,7 @@ min_score = 0.65
 [formats.images]
 enabled = true
 extensions = ["jpg", "png"]
-min_score = 0.6
+min_score = 0.63
 ```
 
 A running runner re-reads the file every 30 seconds and applies what changed:

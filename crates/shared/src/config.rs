@@ -14,7 +14,7 @@
 //! [formats.images]
 //! enabled = true
 //! extensions = ["jpg", "jpeg", "png", "heic"]
-//! min_score = 0.6
+//! min_score = 0.63
 //!
 //! [formats.documents]
 //! enabled = true
@@ -51,9 +51,11 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
 /// Text results scoring below this are left out. An off-topic query against a
 /// code index topped out at 0.60; real matches scored 0.72 to 0.83.
 pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
-/// Images score lower against a text query than text does: on ~/Pictures,
-/// right matches scored 0.61 to 0.69 and the rest 0.57 to 0.60.
-pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.6;
+/// Images score lower against a text query than text does. On Flickr30k's 1k
+/// test images, 0.60 showed images for 85% of off-topic queries ("bills",
+/// "tax return") and 0.63 for 38%, while 99.8% of captions still found their
+/// own image. On ~/Pictures, right matches scored from 0.61, so not higher yet.
+pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.63;
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] =
     &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
 
@@ -116,7 +118,7 @@ pub struct ImageFormat {
     pub enabled: Option<bool>,
     /// File extensions taken for images [default: DEFAULT_IMAGE_EXTENSIONS].
     pub extensions: Option<Vec<String>>,
-    /// Results scoring below this are left out [default: 0.6].
+    /// Results scoring below this are left out [default: 0.63].
     pub min_score: Option<f32>,
 }
 
