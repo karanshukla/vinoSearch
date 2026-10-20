@@ -87,10 +87,7 @@ min_score = 0.65            # lower it for more, looser results
 [formats.images]
 enabled = true              # off by default: the vision encoder is a 671 MB download
 extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"]
-min_score = 0.6
-
-[formats.documents]
-enabled = true              # off by default: PDFs, Office files and CSVs land in the unencrypted index
+min_score = 0.63
 ```
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda installs are excluded by default; [how it works](docs/how-it-works.md#what-gets-indexed) has the list.

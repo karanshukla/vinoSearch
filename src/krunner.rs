@@ -555,8 +555,15 @@ fn disk_bytes(path: &Path) -> u64 {
         .sum()
 }
 
+/// Images further than this below the best text or document result are left
+/// out. Their floor alone lets photos through for queries text answers well:
+/// "bills" here: a document at 0.704 and a photo at 0.632, a gap of 0.072.
+/// Not yet checked against a query where text and a photo are both right.
+const IMAGE_GAP: f32 = 0.06;
+
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
-/// of each kind: text, then documents, then images.
+/// of each kind: text, then documents, then images, less images too far
+/// below the best of the others (IMAGE_GAP).
 fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 3] = Default::default();
@@ -573,6 +580,12 @@ fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
             group.push(h);
         }
     }
+    let best = groups[..2]
+        .iter()
+        .flatten()
+        .map(|h| h.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    groups[2].retain(|h| h.score >= best - IMAGE_GAP);
     groups.into_iter().flatten().collect()
 }
 
@@ -926,6 +939,54 @@ pub fn uninstall() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(kind: Kind, score: f32, path: &str) -> Hit {
+        Hit {
+            kind,
+            score,
+            path: path.to_owned(),
+            line: 1,
+            text: String::new(),
+            copies: Vec::new(),
+        }
+    }
+
+    const FLOORS: Floors = Floors {
+        text: 0.65,
+        image: 0.63,
+    };
+
+    fn paths(hits: Vec<Hit>) -> Vec<String> {
+        per_file(hits, FLOORS).into_iter().map(|h| h.path).collect()
+    }
+
+    #[test]
+    fn images_far_below_a_strong_text_hit_are_dropped() {
+        let hits = vec![
+            hit(Kind::Document, 0.704, "/statement.csv"),
+            hit(Kind::Image, 0.632, "/cat.png"),
+        ];
+        assert_eq!(paths(hits), ["/statement.csv"]);
+    }
+
+    #[test]
+    fn images_close_to_the_best_text_hit_stay() {
+        let hits = vec![
+            hit(Kind::Text, 0.74, "/wedding-plan.md"),
+            hit(Kind::Image, 0.70, "/wedding.jpg"),
+            hit(Kind::Image, 0.64, "/blurry.jpg"),
+        ];
+        assert_eq!(paths(hits), ["/wedding-plan.md", "/wedding.jpg"]);
+    }
+
+    #[test]
+    fn images_alone_need_only_their_floor() {
+        let hits = vec![
+            hit(Kind::Text, 0.60, "/below-floor.md"),
+            hit(Kind::Image, 0.64, "/dog.jpg"),
+        ];
+        assert_eq!(paths(hits), ["/dog.jpg"]);
+    }
 
     #[test]
     fn exec_lines_quote_every_argument() {
