@@ -711,7 +711,7 @@ impl SettingsWindow {
         row(
             ui,
             "Text:",
-            "Notes, documents and source code. Always on.",
+            "Notes, Markdown and source code. Always on.",
             |ui| value(ui, "On"),
         );
         row(
@@ -791,6 +791,22 @@ impl SettingsWindow {
                 },
             );
         }
+
+        row(
+            ui,
+            "Documents:",
+            "PDF, Word, PowerPoint, Excel, OpenDocument and CSV files, by their text. These \
+             are where statements, tax forms and bank exports live, and the index isn't \
+             encrypted yet, so their text sits in it readable. Scanned PDFs have no text and \
+             are skipped. Turning them off drops them from the index.",
+            |ui| {
+                let mut on = self.config.formats.documents_enabled();
+                if ui.checkbox(&mut on, "Index documents").changed() {
+                    self.config.formats.documents.enabled = on.then_some(true);
+                    changed = true;
+                }
+            },
+        );
 
         section(ui, "How close results must be");
         help_line(

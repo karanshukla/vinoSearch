@@ -62,7 +62,7 @@ systemctl --user restart plasma-krunner.service
 
 ## Use it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text** and **vinoSearch Images** groups.
+- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups.
 - **GNOME:** the overview's search, from the next login.
 - **Terminal:** `vinosearch search "how do I rotate the signing key"`.
 

@@ -18,7 +18,7 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 /// About 250 tokens of English, inside the 256-token document shape.
-const CHUNK_CHARS: usize = 900;
+pub(crate) const CHUNK_CHARS: usize = 900;
 const MAX_FILE_BYTES: u64 = 1 << 20;
 const EXTENSIONS: &[&str] = &[
     "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
@@ -69,20 +69,26 @@ const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
 /// Images past this are skipped: decoding takes several times the file in memory.
 const MAX_IMAGE_BYTES: u64 = 64 << 20;
+/// Documents are parsed whole in memory too. Their extracted text is held to
+/// MAX_FILE_BYTES like any text file.
+const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 
 /// What a chunk was embedded from, stored in `chunks.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Text = 0,
     Image = 1,
+    /// Text extracted from a PDF, Office file or spreadsheet (#55). Scored
+    /// like text, but searched apart so neither crowds the other out.
+    Document = 2,
 }
 
 impl Kind {
     fn from_db(v: i64) -> Self {
-        if v == Kind::Image as i64 {
-            Kind::Image
-        } else {
-            Kind::Text
+        match v {
+            1 => Kind::Image,
+            2 => Kind::Document,
+            _ => Kind::Text,
         }
     }
 
@@ -90,21 +96,24 @@ impl Kind {
         match self {
             Kind::Text => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
+            Kind::Document => MAX_DOCUMENT_BYTES,
         }
     }
 }
 
-/// The file types indexed: text always, images by extension while they are
-/// on (#73).
+/// The file types indexed: text always, images by extension and documents
+/// while they are on (#73, #55).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileTypes {
     images: Vec<String>,
+    documents: bool,
 }
 
 impl FileTypes {
     pub fn new(formats: &Formats) -> Result<Self> {
         Ok(Self {
             images: formats.image_extensions()?,
+            documents: formats.documents_enabled(),
         })
     }
 
@@ -112,6 +121,9 @@ impl FileTypes {
     pub fn kind(&self, path: &Path) -> Option<Kind> {
         if text_file(path) {
             return Some(Kind::Text);
+        }
+        if self.documents && crate::extract::is_document(path) {
+            return Some(Kind::Document);
         }
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         self.images.contains(&ext).then_some(Kind::Image)
@@ -244,7 +256,8 @@ pub(crate) fn skipped_dir(name: &str) -> bool {
 }
 
 /// Line-aligned chunks of up to CHUNK_CHARS, with the line each starts on.
-/// A single longer line is split on char boundaries.
+/// A single longer line is split between words, or failing that on char
+/// boundaries.
 pub fn chunk(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -261,6 +274,11 @@ pub fn chunk(text: &str) -> Vec<(usize, String)> {
             let mut cut = CHUNK_CHARS;
             while !rest.is_char_boundary(cut) {
                 cut -= 1;
+            }
+            // Between words if there is a space in the back half: a PDF
+            // page's text layer is often a few very long lines.
+            if let Some(space) = rest[..cut].rfind(' ').filter(|&i| i >= CHUNK_CHARS / 2) {
+                cut = space + 1;
             }
             out.push((i + 1, rest[..cut].to_string()));
             rest = &rest[cut..];
@@ -397,7 +415,7 @@ pub fn index_file(
     }
     let read = match kind {
         Kind::Text => fs::read_to_string(path).map(String::into_bytes),
-        Kind::Image => fs::read(path),
+        Kind::Image | Kind::Document => fs::read(path),
     };
     let Ok(bytes) = read else {
         remove(conn, path)?;
@@ -453,6 +471,21 @@ pub fn index_file(
             }
             (chunks, vectors)
         }
+        // A file that can't be read, or has no text (a scan), keeps a row with
+        // no chunks, so it isn't parsed again until it changes.
+        Kind::Document => {
+            let chunks = document_chunks(path, &bytes);
+            let title = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            let mut vectors = Vec::with_capacity(chunks.len());
+            for (_, c) in &chunks {
+                vectors.extend(emb.documents(&[document_text(&title, c)])?);
+                between(conn, emb)?;
+            }
+            (chunks, vectors)
+        }
         // One chunk, with no text and line 0, from the pixels alone.
         Kind::Image => {
             let pixels =
@@ -489,6 +522,30 @@ pub fn index_file(
 }
 
 /// Another file with content `hash` that holds its chunks, if there is one.
+/// `path`'s chunks, or none if it doesn't parse or its text is over
+/// MAX_FILE_BYTES. Files come from anywhere, so a parser panic is caught and
+/// counts as not parsing.
+fn document_chunks(path: &Path, bytes: &[u8]) -> Vec<(usize, String)> {
+    let parsed = std::panic::catch_unwind(|| crate::extract::chunks(path, bytes));
+    let chunks = match parsed {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("skip {}: {e:#}", path.display());
+            return Vec::new();
+        }
+        Err(_) => {
+            eprintln!("skip {}: the parser panicked", path.display());
+            return Vec::new();
+        }
+    };
+    let size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
+    if size as u64 > MAX_FILE_BYTES {
+        eprintln!("skip {}: {size} bytes of text", path.display());
+        return Vec::new();
+    }
+    chunks
+}
+
 fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
@@ -1109,6 +1166,17 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_split_between_words() {
+        let text = "word ".repeat(CHUNK_CHARS);
+        let chunks = chunk(&text);
+        assert!(chunks.len() >= 5);
+        for (_, c) in &chunks {
+            assert!(c.len() <= CHUNK_CHARS + 1);
+            assert!(c.trim_end().split(' ').all(|w| w == "word"), "{c:?}");
+        }
+    }
+
+    #[test]
     fn blank_text_has_no_chunks() {
         assert!(chunk("\n\n  \n").is_empty());
     }
@@ -1522,6 +1590,49 @@ mod tests {
         assert_eq!(on.kind(Path::new("/p/a.webp")), Some(Kind::Image));
         assert_eq!(on.kind(Path::new("/p/a.md")), Some(Kind::Text));
         assert_eq!(on.kind(Path::new("/p/a.xcf")), None);
+    }
+
+    #[test]
+    fn documents_are_wanted_only_while_on() {
+        let doc = Path::new("/p/statement.PDF");
+        assert_eq!(FileTypes::default().kind(doc), None);
+        let mut f = Formats::default();
+        f.documents.enabled = Some(true);
+        let on = FileTypes::new(&f).unwrap();
+        assert_eq!(on.kind(doc), Some(Kind::Document));
+        assert_eq!(on.kind(Path::new("/p/a.csv")), Some(Kind::Document));
+        assert_eq!(on.kind(Path::new("/p/a.md")), Some(Kind::Text));
+        assert_eq!(on.kind(Path::new("/p/a.doc")), None);
+    }
+
+    #[test]
+    fn documents_are_searched_apart_from_text() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-docs-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes.md", &[0]);
+        add_file(&conn, "/a.pdf", &[0]);
+        conn.execute("UPDATE chunks SET kind = 2 WHERE file_id = (SELECT id FROM files WHERE path = '/a.pdf')", []).unwrap();
+        let v = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let paths = |kind| -> Vec<String> {
+            search(&conn, &v, &q, kind, 5)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(paths(Kind::Text), ["/notes.md"]);
+        assert_eq!(paths(Kind::Document), ["/a.pdf"]);
+        assert!(paths(Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_document_that_does_not_parse_has_no_chunks() {
+        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf").is_empty());
+        let csv = format!("h\n{}", "x\n".repeat(MAX_FILE_BYTES as usize));
+        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes()).is_empty());
     }
 
     #[test]

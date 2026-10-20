@@ -220,8 +220,10 @@ fn answer(
     reply: oneshot::Sender<Vec<Hit>>,
 ) {
     let hits = emb.query(query).and_then(|q| {
-        let mut hits = index::search(conn, vectors, &q, Kind::Text, k)?;
-        hits.extend(index::search(conn, vectors, &q, Kind::Image, k)?);
+        let mut hits = Vec::new();
+        for kind in [Kind::Text, Kind::Document, Kind::Image] {
+            hits.extend(index::search(conn, vectors, &q, kind, k)?);
+        }
         Ok(hits)
     });
     let _ = reply.send(hits.unwrap_or_else(|e| {
