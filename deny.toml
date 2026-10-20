@@ -12,6 +12,9 @@ ignore = [
     # paste is unmaintained but only pulled in transitively by tokenizers;
     # no safe upgrade is available.
     "RUSTSEC-2024-0436",
+    # ttf-parser is unmaintained; lopdf uses it only to embed fonts when
+    # writing a PDF, which reading text never does. No safe upgrade is available.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]

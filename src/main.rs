@@ -1,4 +1,5 @@
 mod embed;
+mod extract;
 mod icons;
 mod index;
 mod krunner;
@@ -262,8 +263,10 @@ fn run(cli: Cli) -> Result<bool> {
             let q = emb.query(&query)?;
             let t1 = Instant::now();
             let vectors = index::Vectors::load(&conn)?;
-            let mut hits = index::search(&conn, &vectors, &q, index::Kind::Text, n)?;
-            hits.extend(index::search(&conn, &vectors, &q, index::Kind::Image, n)?);
+            let mut hits = Vec::new();
+            for kind in [index::Kind::Text, index::Kind::Document, index::Kind::Image] {
+                hits.extend(index::search(&conn, &vectors, &q, kind, n)?);
+            }
             eprintln!(
                 "query {:.1} ms, search {:.1} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
@@ -274,11 +277,16 @@ fn run(cli: Cli) -> Result<bool> {
                     println!("{:.3}  {}  (image)", h.score, h.path);
                     continue;
                 }
+                let at = match h.kind {
+                    index::Kind::Document => {
+                        format!(", {} {}", extract::unit(Path::new(&h.path)), h.line)
+                    }
+                    _ => format!(":{}", h.line),
+                };
                 println!(
-                    "{:.3}  {}:{}\n       {}",
+                    "{:.3}  {}{at}\n       {}",
                     h.score,
                     h.path,
-                    h.line,
                     snippet(&h.text)
                 );
                 if !h.copies.is_empty() {

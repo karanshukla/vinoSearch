@@ -288,10 +288,7 @@ impl SettingsWindow {
             row(
                 ui,
                 "Checked:",
-                "Changes are indexed within seconds of happening. Every folder is also compared \
-                 with the index once an hour, after the machine wakes, and whenever the kernel \
-                 drops change events, in case one was missed. It reads no file contents and \
-                 takes about a second.",
+                "Also checked hourly and after sleep, for missed changes.",
                 |ui| {
                     ui.horizontal(|ui| {
                         ui.set_min_height(ui.spacing().interact_size.y);
@@ -335,12 +332,7 @@ impl SettingsWindow {
             None => None,
         };
         section(ui, "Included");
-        help_line(
-            ui,
-            "Indexed, then watched for changes. Hidden folders, build output and dependencies \
-             (target, node_modules, vendor, …) are always skipped, as are config formats like \
-             TOML, YAML and JSON, where credentials live.",
-        );
+        help_line(ui, "Indexed and watched for changes.");
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
         self.forgetting.retain(|r| roots.contains(r));
         roots.retain(|r| !self.forgetting.contains(r));
@@ -379,12 +371,7 @@ impl SettingsWindow {
         });
 
         section(ui, "Excluded");
-        help_line(
-            ui,
-            "Never indexed or watched, even inside an included folder. Adding one drops what is \
-             already indexed under it within 30 seconds. The list starts with folders of \
-             installed packages and games, which take long to index and are rarely searched for.",
-        );
+        help_line(ui, "Never indexed, even inside an included folder.");
         if let Some(why) = &self.config_broken {
             ui.label(
                 RichText::new(format!(
@@ -424,11 +411,7 @@ impl SettingsWindow {
             self.link.send(Request::LargestFolders(LARGEST));
         }
         section(ui, "Largest folders");
-        help_line(
-            ui,
-            "Where the index goes. Copied source trees and generated files are often most of \
-             it; excluding one drops it from the index and makes indexing that much quicker.",
-        );
+        help_line(ui, "Excluding one drops it from the index.");
         let Some(largest) = largest else {
             ui.label(RichText::new("Counting…").color(p.muted));
             return;
@@ -507,92 +490,76 @@ impl SettingsWindow {
         };
         if let Some(s) = s {
             section(ui, "EmbeddingGemma 2");
-            row(
-                ui,
-                "Download:",
-                "Search and indexing need it. From Hugging Face, every file checked against a \
-                 pinned SHA-256; Verify fetches only what is missing or corrupt.",
-                |ui| {
-                    // Status and buttons on one line, as on the rows below.
-                    ui.horizontal_wrapped(|ui| {
-                        ui.set_min_height(ui.spacing().interact_size.y);
-                        if s.fetching {
-                            let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
-                            ui.add(
-                                egui::ProgressBar::new(fraction)
-                                    .text(format!(
-                                        "{} of {}",
-                                        size(s.fetch_done),
-                                        size(s.fetch_total)
-                                    ))
-                                    .desired_width(220.0),
-                            );
-                        } else if s.model_present {
-                            ui.label(format!("Downloaded, {}", size(s.model_bytes)));
-                        } else {
-                            let color = ui.visuals().warn_fg_color;
-                            ui.label(RichText::new("Not downloaded").color(color));
-                        }
-                        let label = if s.model_present {
-                            "Verify"
-                        } else {
-                            "Download"
-                        };
-                        if ui
-                            .add_enabled(!s.fetching, egui::Button::new(label))
-                            .clicked()
-                        {
-                            self.link.send(Request::FetchModel);
-                        }
-                        let deletable = s.model_present && !s.fetching;
-                        if self.confirm == Some(Confirm::DeleteModel) {
-                            if ui.button("Cancel").clicked() {
-                                self.confirm = None;
-                            }
-                            if ui.button("Delete the model").clicked() {
-                                self.link.send(Request::DeleteModel);
-                                self.confirm = None;
-                            }
-                        } else if ui
-                            .add_enabled(deletable, egui::Button::new("Delete…"))
-                            .clicked()
-                        {
-                            self.confirm = Some(Confirm::DeleteModel);
-                        }
-                    });
-                    if !s.fetch_error.is_empty() {
-                        ui.label(
-                            RichText::new(format!("The last download failed: {}", s.fetch_error))
-                                .color(ui.visuals().error_fg_color),
+            row(ui, "Download:", "Needed for search and indexing.", |ui| {
+                // Status and buttons on one line, as on the rows below.
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    if s.fetching {
+                        let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .text(format!("{} of {}", size(s.fetch_done), size(s.fetch_total)))
+                                .desired_width(220.0),
                         );
+                    } else if s.model_present {
+                        ui.label(format!("Downloaded, {}", size(s.model_bytes)));
+                    } else {
+                        let color = ui.visuals().warn_fg_color;
+                        ui.label(RichText::new("Not downloaded").color(color));
                     }
-                },
-            );
-            row(
-                ui,
-                "Memory:",
-                "The model loads with the first query or indexing job.",
-                |ui| {
-                    ui.horizontal(|ui| {
-                        if s.model_loaded {
-                            ui.label(format!("Loaded on {}", s.device));
-                        } else {
-                            ui.label(RichText::new("Not loaded").color(p.muted));
+                    let label = if s.model_present {
+                        "Verify"
+                    } else {
+                        "Download"
+                    };
+                    if ui
+                        .add_enabled(!s.fetching, egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.link.send(Request::FetchModel);
+                    }
+                    let deletable = s.model_present && !s.fetching;
+                    if self.confirm == Some(Confirm::DeleteModel) {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm = None;
                         }
-                        if ui
-                            .add_enabled(s.model_loaded, egui::Button::new("Unload now"))
-                            .clicked()
-                        {
-                            self.link.send(Request::Unload);
+                        if ui.button("Delete the model").clicked() {
+                            self.link.send(Request::DeleteModel);
+                            self.confirm = None;
                         }
-                    });
-                },
-            );
+                    } else if ui
+                        .add_enabled(deletable, egui::Button::new("Delete…"))
+                        .clicked()
+                    {
+                        self.confirm = Some(Confirm::DeleteModel);
+                    }
+                });
+                if !s.fetch_error.is_empty() {
+                    ui.label(
+                        RichText::new(format!("The last download failed: {}", s.fetch_error))
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
+            });
+            row(ui, "Memory:", "", |ui| {
+                ui.horizontal(|ui| {
+                    if s.model_loaded {
+                        ui.label(format!("Loaded on {}", s.device));
+                    } else {
+                        ui.label(RichText::new("Not loaded").color(p.muted));
+                    }
+                    if ui
+                        .add_enabled(s.model_loaded, egui::Button::new("Unload now"))
+                        .clicked()
+                    {
+                        self.link.send(Request::Unload);
+                    }
+                });
+            });
             row(
                 ui,
                 "Compiled cache:",
-                "OpenVINO's compiled copy of the model. Clearing it makes the next load \
-                 recompile, about 4 s on the NPU.",
+                "Clearing it makes the next load slower.",
                 |ui| {
                     ui.horizontal(|ui| {
                         ui.label(size(s.cache_bytes));
@@ -616,8 +583,7 @@ impl SettingsWindow {
         row(
             ui,
             "Device:",
-            "On the NPU, indexing runs about 5x faster than on the CPU, at a tenth of the \
-             energy per file. Applies within 30 seconds.",
+            "The NPU is fastest and uses the least power.",
             |ui| {
                 let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
                 let mut picked = DEVICES
@@ -639,55 +605,43 @@ impl SettingsWindow {
                 }
             },
         );
-        row(
-            ui,
-            "Unload after:",
-            "Idle minutes before the model is freed (553 MB loaded, about 1 s to load again). \
-             0 keeps it loaded.",
-            |ui| {
-                let mut minutes = self
-                    .config
-                    .idle_unload_minutes
-                    .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
-                let response = ui
-                    .add(
-                        egui::DragValue::new(&mut minutes)
-                            .range(0.0..=1440.0)
-                            .speed(0.25)
-                            .custom_formatter(|m, _| {
-                                if m.fract() == 0.0 {
-                                    format!("{m:.0}")
-                                } else {
-                                    format!("{m:.1}")
-                                }
-                            })
-                            .suffix(" min"),
-                    )
-                    // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
-                    .on_hover_cursor(egui::CursorIcon::Text);
-                if response.changed() {
-                    self.config.idle_unload_minutes = Some(minutes);
-                    self.idle_dirty = true;
-                }
-            },
-        );
-        row(
-            ui,
-            "Indexing share:",
-            "Most of the device's time background indexing may take, half that on battery. \
-             Lower leaves more room for face unlock and dictation; indexing takes longer.",
-            |ui| {
-                let mut percent = self
-                    .config
-                    .index_busy_percent
-                    .unwrap_or(DEFAULT_INDEX_BUSY_PERCENT);
-                let response = ui.add(egui::Slider::new(&mut percent, 10..=100).suffix(" %"));
-                if response.changed() {
-                    self.config.index_busy_percent = Some(percent);
-                    self.idle_dirty = true;
-                }
-            },
-        );
+        row(ui, "Unload after:", "0 keeps it loaded.", |ui| {
+            let mut minutes = self
+                .config
+                .idle_unload_minutes
+                .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut minutes)
+                        .range(0.0..=1440.0)
+                        .speed(0.25)
+                        .custom_formatter(|m, _| {
+                            if m.fract() == 0.0 {
+                                format!("{m:.0}")
+                            } else {
+                                format!("{m:.1}")
+                            }
+                        })
+                        .suffix(" min"),
+                )
+                // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
+                .on_hover_cursor(egui::CursorIcon::Text);
+            if response.changed() {
+                self.config.idle_unload_minutes = Some(minutes);
+                self.idle_dirty = true;
+            }
+        });
+        row(ui, "Indexing share:", "Halved on battery.", |ui| {
+            let mut percent = self
+                .config
+                .index_busy_percent
+                .unwrap_or(DEFAULT_INDEX_BUSY_PERCENT);
+            let response = ui.add(egui::Slider::new(&mut percent, 10..=100).suffix(" %"));
+            if response.changed() {
+                self.config.index_busy_percent = Some(percent);
+                self.idle_dirty = true;
+            }
+        });
         if changed {
             self.save_config();
         }
@@ -708,18 +662,13 @@ impl SettingsWindow {
         }
         let mut changed = false;
         section(ui, "What to index");
-        row(
-            ui,
-            "Text:",
-            "Notes, documents and source code. Always on.",
-            |ui| value(ui, "On"),
-        );
+        row(ui, "Text:", "Notes, Markdown and source code.", |ui| {
+            value(ui, "On")
+        });
         row(
             ui,
             "Images:",
-            "Found by what is in them, from a text search: \"a cat\", \"a receipt\". Each \
-             takes about 1.3 s on the NPU to index. Needs the vision model, a 671 MB download. \
-             Turning them off drops them from the index.",
+            "Found by what's in them. A 671 MB download.",
             |ui| {
                 let mut on = self.config.formats.images_enabled();
                 if ui.checkbox(&mut on, "Index images").changed() {
@@ -749,8 +698,7 @@ impl SettingsWindow {
             row(
                 ui,
                 "Image types:",
-                "File extensions taken as images, separated by commas. Empty restores the \
-                 default list. Applies on Enter.",
+                "Comma-separated. Empty restores the defaults.",
                 |ui| {
                     let current = self
                         .config
@@ -792,22 +740,23 @@ impl SettingsWindow {
             );
         }
 
-        section(ui, "How close results must be");
-        help_line(
+        row(
             ui,
-            "Results scoring below the line are left out. Slide right for more, looser \
-             results; left for fewer, closer ones. Applies from the next search.",
+            "Documents:",
+            "PDF, Office and CSV. Their text is stored unencrypted.",
+            |ui| {
+                let mut on = self.config.formats.documents_enabled();
+                if ui.checkbox(&mut on, "Index documents").changed() {
+                    self.config.formats.documents.enabled = on.then_some(true);
+                    changed = true;
+                }
+            },
         );
+
+        section(ui, "How close results must be");
+        help_line(ui, "Right for more results, left for fewer, closer ones.");
         let text = self.config.formats.text.min_score;
-        if let Some(v) = score_row(
-            ui,
-            "Text:",
-            "A query unrelated to anything indexed tops out around 0.60; real matches score \
-             0.70 and up.",
-            text,
-            DEFAULT_TEXT_MIN_SCORE,
-            0.85..=0.45,
-        ) {
+        if let Some(v) = score_row(ui, "Text:", "", text, DEFAULT_TEXT_MIN_SCORE, 0.85..=0.45) {
             self.config.formats.text.min_score = v;
             self.idle_dirty = true;
         }
@@ -815,8 +764,7 @@ impl SettingsWindow {
         if let Some(v) = score_row(
             ui,
             "Images:",
-            "Images score lower against a query than text does: right matches about 0.61 to \
-             0.69, the rest 0.57 to 0.60.",
+            "",
             image,
             DEFAULT_IMAGE_MIN_SCORE,
             0.75..=0.45,
@@ -861,23 +809,17 @@ impl SettingsWindow {
                 });
             }
         }
-        row(
-            ui,
-            "",
-            "Runs a tiny model on the device picked on the Model page, in a separate \
-             process, as vinosearch doctor does.",
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.set_min_height(ui.spacing().interact_size.y);
-                    if state.running {
-                        spinner(ui);
-                        ui.label("Checking…");
-                    } else if ui.button("Check again").clicked() {
-                        doctor::run(Arc::clone(&self.doctor), ui.ctx());
-                    }
-                });
-            },
-        );
+        row(ui, "", "Same as vinosearch doctor.", |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                if state.running {
+                    spinner(ui);
+                    ui.label("Checking…");
+                } else if ui.button("Check again").clicked() {
+                    doctor::run(Arc::clone(&self.doctor), ui.ctx());
+                }
+            });
+        });
     }
 
     fn integration(&mut self, ui: &mut egui::Ui) {
@@ -887,9 +829,7 @@ impl SettingsWindow {
         row(
             ui,
             "KRunner, GNOME:",
-            "Adds vinoSearch to KRunner and GNOME Shell's search, and starts it at login as a \
-             user service so the index stays current. GNOME shows results from the next login. \
-             Turning it off stops the service; the index and model stay.",
+            "Runs at login. GNOME shows it from the next login.",
             |ui| {
                 ui.horizontal(|ui| {
                     if state.running {

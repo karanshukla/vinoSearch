@@ -73,14 +73,14 @@ impl Floors {
 
     fn of(&self, kind: Kind) -> f32 {
         match kind {
-            Kind::Text => self.text,
+            Kind::Text | Kind::Document => self.text,
             Kind::Image => self.image,
         }
     }
 }
 
 /// The best chunk of each of the best files for `query`, text first, then
-/// images, as KRunner and GNOME Shell both show them. Empty if the worker
+/// documents, then images, as KRunner and GNOME Shell both show them. Empty if the worker
 /// has stopped.
 async fn search(jobs: &Mutex<mpsc::Sender<Job>>, floors: Floors, query: String) -> Vec<Hit> {
     let (tx, rx) = oneshot::channel();
@@ -113,6 +113,12 @@ fn describe(h: &Hit) -> (String, String) {
     let description = match h.kind {
         Kind::Text => format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
         Kind::Image => format!("{dir}{copies}"),
+        Kind::Document => format!(
+            "{dir}, {} {}{copies}  {}",
+            crate::extract::unit(path),
+            h.line,
+            crate::snippet(&h.text)
+        ),
     };
     (name, description)
 }
@@ -129,6 +135,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
     // A group per kind, named so each reads as ours (#73).
     let category = match h.kind {
         Kind::Text => "vinoSearch Text",
+        Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
     };
     props.insert("category".into(), owned(Value::from(category)));
@@ -549,17 +556,24 @@ fn disk_bytes(path: &Path) -> u64 {
 }
 
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
-/// of each kind: text, then images.
+/// of each kind: text, then documents, then images.
 fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let (text, images): (Vec<Hit>, Vec<Hit>) = hits
-        .into_iter()
-        .filter(|h| h.score >= floors.of(h.kind) && seen.insert(h.path.clone()))
-        .partition(|h| h.kind == Kind::Text);
-    text.into_iter()
-        .take(RESULTS)
-        .chain(images.into_iter().take(RESULTS))
-        .collect()
+    let mut groups: [Vec<Hit>; 3] = Default::default();
+    for h in hits {
+        if h.score < floors.of(h.kind) || !seen.insert(h.path.clone()) {
+            continue;
+        }
+        let group = &mut groups[match h.kind {
+            Kind::Text => 0,
+            Kind::Document => 1,
+            Kind::Image => 2,
+        }];
+        if group.len() < RESULTS {
+            group.push(h);
+        }
+    }
+    groups.into_iter().flatten().collect()
 }
 
 pub fn serve(opts: Options) -> Result<()> {

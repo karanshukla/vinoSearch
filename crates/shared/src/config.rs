@@ -15,6 +15,9 @@
 //! enabled = true
 //! extensions = ["jpg", "jpeg", "png", "heic"]
 //! min_score = 0.6
+//!
+//! [formats.documents]
+//! enabled = true
 //! ```
 //!
 //! A missing file is the defaults, and a missing `exclude` is
@@ -95,6 +98,7 @@ pub struct Config {
 pub struct Formats {
     pub text: TextFormat,
     pub images: ImageFormat,
+    pub documents: DocumentFormat,
 }
 
 /// Text is always indexed for now.
@@ -114,6 +118,16 @@ pub struct ImageFormat {
     pub extensions: Option<Vec<String>>,
     /// Results scoring below this are left out [default: 0.6].
     pub min_score: Option<f32>,
+}
+
+/// PDF, Office and OpenDocument files, spreadsheets and CSV (#55). Searched
+/// with text, so they share its `min_score`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocumentFormat {
+    /// Index documents' text. Off by default: statements, tax forms and
+    /// exports end up in an index that isn't encrypted yet (#4) [default: false].
+    pub enabled: Option<bool>,
 }
 
 impl Default for Config {
@@ -140,6 +154,10 @@ pub fn min_score(score: Option<f32>, default: f32) -> Result<f32> {
 impl Formats {
     pub fn images_enabled(&self) -> bool {
         self.images.enabled.unwrap_or(false)
+    }
+
+    pub fn documents_enabled(&self) -> bool {
+        self.documents.enabled.unwrap_or(false)
     }
 
     pub fn text_min_score(&self) -> Result<f32> {
@@ -266,6 +284,12 @@ impl Config {
             "images",
             "min_score",
             f.images.min_score.map(score),
+        );
+        set(
+            &mut doc,
+            "documents",
+            "enabled",
+            f.documents.enabled.map(toml_edit::value),
         );
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
@@ -552,10 +576,15 @@ mod tests {
         let mut c = Config::load(&path).unwrap();
         c.formats.images.enabled = Some(true);
         c.formats.text.min_score = Some(0.7);
+        c.formats.documents.enabled = Some(true);
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("enabled = true # big download"), "{text}");
         assert!(text.contains("min_score = 0.7\n"), "{text}");
+        assert!(
+            text.contains("[formats.documents]\nenabled = true"),
+            "{text}"
+        );
         assert_eq!(Config::load(&path).unwrap(), c);
         c.formats = Formats::default();
         c.save(&path).unwrap();

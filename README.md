@@ -62,7 +62,7 @@ systemctl --user restart plasma-krunner.service
 
 ## Use it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text** and **vinoSearch Images** groups.
+- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups.
 - **GNOME:** the overview's search, from the next login.
 - **Terminal:** `vinosearch search "how do I rotate the signing key"`.
 
@@ -72,7 +72,7 @@ Results need 3 or more characters. Enter opens the file.
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets you add folders and exclusions, turn images on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off. Changes apply within 30 seconds, no restart.
 
 Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
 
@@ -88,6 +88,9 @@ min_score = 0.65            # lower it for more, looser results
 enabled = true              # off by default: the vision encoder is a 671 MB download
 extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"]
 min_score = 0.6
+
+[formats.documents]
+enabled = true              # off by default: PDFs, Office files and CSVs land in the unencrypted index
 ```
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda installs are excluded by default; [how it works](docs/how-it-works.md#what-gets-indexed) has the list.
