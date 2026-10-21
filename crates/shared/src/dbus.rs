@@ -47,4 +47,6 @@ pub mod status {
     /// Why files are being indexed again after a start: a model changed
     /// (#80). Empty otherwise, and once that indexing is done.
     pub const MODEL_CHANGED: &str = "model_changed";
+    /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
+    pub const NO_DECODER: &str = "no_decoder";
 }

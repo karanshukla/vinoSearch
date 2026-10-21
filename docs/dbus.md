@@ -63,6 +63,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `cache_bytes` | `t` | OpenVINO's compiled-model cache on disk (one blob per stage, ~270 MB each on the NPU). |
 | `last_checked` | `t` | Unix seconds when every root was last compared with the index (at startup, hourly, after a resume, after dropped inotify events, or on `CheckNow`); 0 before the first. |
 | `last_indexed` | `t` | Unix seconds when an indexing job last embedded or removed a file; 0 for not since the runner started. |
+| `no_decoder` | `x` | HEIC, HEIF and AVIF files skipped because no HEIF decoder (libheif's `heif-convert`) is installed ([#79](https://github.com/karanshukla/vinoSearch/issues/79)); 0 once one is. |
 | `model_changed` | `s` | Why part of the index was dropped at this start to be indexed again: the text or image model is not the one that made those vectors ([#80](https://github.com/karanshukla/vinoSearch/issues/80)). Empty otherwise, and again once that indexing has finished. |
 
 ## Settings
@@ -92,7 +93,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
 | `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
 | `index_busy_percent` | at once, mid-index included: most of the device's time background indexing takes, 1 to 100, default 50, half that on battery |
-| `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff |
+| `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, heif, avif |
 | `formats.text.min_score`, `formats.images.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65 and 0.6) |
 
 A setting given as a flag or environment variable (`--device`, `--idle-unload-minutes`, `VINOSEARCH_IDLE_UNLOAD_MINUTES`, or baked into the service by `krunner --install --device ...`) wins over the file, so file changes to it are ignored until the runner restarts without the flag. A file that fails to parse, or has an invalid `exclude`, changes nothing; an invalid `idle_unload_minutes` keeps the current timeout.

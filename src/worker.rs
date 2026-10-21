@@ -118,15 +118,20 @@ impl Status {
     }
 }
 
-/// Before the watcher compares the roots with the index: drop what this
-/// build must index again (vectors from another model, #80), so that first
-/// comparison finds it, and say so in `status` for the Index page.
+/// Before the watcher compares the roots with the index: drop what must be
+/// indexed again (vectors from another model, #80; photos skipped for want
+/// of a decoder that is installed now, #79), so that first comparison finds
+/// it, and say so in `status` for the Index page.
 pub fn prepare(status: &Status) -> Result<()> {
     let conn = index::open(&index::default_db()?)?;
     let purged = index::purge_other_models(&conn)?;
     if let Some(why) = model_changed(&purged) {
         eprintln!("{why}");
         *status.model_changed.lock().unwrap() = why;
+    }
+    let retry = index::retry_undecodable(&conn)?;
+    if retry > 0 {
+        eprintln!("a HEIF decoder is installed now: {retry} photos will be indexed");
     }
     Ok(())
 }
@@ -203,13 +208,7 @@ fn changed(
             files.push(path);
         }
     }
-    let mut st = index::Stats {
-        files_seen: 0,
-        files_embedded: 0,
-        chunks: 0,
-        removed: 0,
-        duplicates: 0,
-    };
+    let mut st = index::Stats::default();
     for path in files {
         if path.exists() {
             st.files_seen += 1;
@@ -219,6 +218,7 @@ fn changed(
                     st.chunks += n;
                 }
                 Outcome::Duplicate => st.duplicates += 1,
+                Outcome::Unreadable { no_decoder } => st.no_decoder += usize::from(no_decoder),
                 Outcome::Unchanged | Outcome::Skipped => {}
             }
         } else {

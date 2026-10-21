@@ -205,6 +205,7 @@ fn run(cli: Cli) -> Result<bool> {
             if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
                 eprintln!("{why}");
             }
+            index::retry_undecodable(&conn)?;
             for p in &paths {
                 let t0 = Instant::now();
                 let mut shown = 0;
@@ -239,6 +240,12 @@ fn run(cli: Cli) -> Result<bool> {
                     st.duplicates,
                     st.removed
                 );
+                if st.no_decoder > 0 {
+                    eprintln!(
+                        "{} photos skipped: HEIC and AVIF need libheif's heif-convert installed",
+                        st.no_decoder
+                    );
+                }
             }
             Ok(true)
         }

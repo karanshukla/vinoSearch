@@ -56,8 +56,11 @@ pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
 /// "tax return") and 0.63 for 38%, while 99.8% of captions still found their
 /// own image. On ~/Pictures, right matches scored from 0.61, so not higher yet.
 pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.63;
-pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] =
-    &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
+/// HEIC, HEIF and AVIF need libheif's heif-convert installed (#79); without
+/// it they are counted and skipped.
+pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif",
+];
 
 /// `index_busy_percent` as a share of the device's time, in (0, 1].
 pub fn index_share(percent: u8) -> Result<f64> {

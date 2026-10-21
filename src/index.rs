@@ -337,6 +337,7 @@ fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     })
 }
 
+#[derive(Default)]
 pub struct Stats {
     pub files_seen: usize,
     pub files_embedded: usize,
@@ -344,6 +345,8 @@ pub struct Stats {
     pub removed: usize,
     /// Files whose content was already indexed, so nothing was embedded.
     pub duplicates: usize,
+    /// Images skipped for want of a decoder this build lacks (HEIF, #79).
+    pub no_decoder: usize,
 }
 
 /// Hidden directories and build output under `root` (not `root` itself).
@@ -403,6 +406,12 @@ pub enum Outcome {
     Unchanged,
     /// Same content as a file already indexed, whose chunks it shares.
     Duplicate,
+    /// Recorded with no chunks: an image that doesn't decode, so it isn't
+    /// tried again until it changes. `no_decoder` when a decoder this build
+    /// lacks would have read it (#79).
+    Unreadable {
+        no_decoder: bool,
+    },
     /// Not a wanted file (type, size, encoding); any old entry for it is dropped.
     Skipped,
 }
@@ -527,7 +536,9 @@ pub fn index_file(
             }
             (chunks, vectors)
         }
-        // One chunk, with no text and line 0, from the pixels alone.
+        // One chunk, with no text and line 0, from the pixels alone. One that
+        // doesn't decode keeps a row with no chunks, like a document with no
+        // text, so it isn't decoded again at every check.
         Kind::Image => {
             let pixels =
                 // From the bytes hashed, so the file can't change in between.
@@ -535,8 +546,10 @@ pub fn index_file(
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("skip {}: {e:#}", path.display());
-                        remove(conn, path)?;
-                        return Ok(Outcome::Skipped);
+                        record(conn)?;
+                        return Ok(Outcome::Unreadable {
+                            no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
+                        });
                     }
                 };
             let v = emb.image(&pixels)?;
@@ -733,6 +746,52 @@ fn drop_kind(tx: &Connection, kind: Kind) -> Result<usize> {
     Ok(n)
 }
 
+/// `LIKE` patterns for files with a HEIF extension (#79).
+fn heif_patterns() -> Vec<String> {
+    crate::vision::HEIF_EXTENSIONS
+        .iter()
+        .map(|e| format!("%.{e}"))
+        .collect()
+}
+
+/// Images recorded without chunks for want of a HEIF decoder: by extension,
+/// leaving out copies of a file that did decode. What the Index page counts
+/// while heif-convert is missing (#79).
+pub fn undecodable(conn: &Connection) -> Result<i64> {
+    let mut n = 0;
+    for pattern in heif_patterns() {
+        n += conn.query_row(
+            "SELECT count(*) FROM files f
+             WHERE lower(f.path) LIKE ?1
+               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                               WHERE g.sha256 = f.sha256)",
+            [pattern],
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    Ok(n)
+}
+
+/// Forget the images recorded as undecodable once a decoder is there, so the
+/// next check of each root indexes them. Returns files dropped.
+pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
+    if crate::vision::heif_convert().is_none() {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for pattern in heif_patterns() {
+        n += conn.execute(
+            "DELETE FROM files WHERE lower(path) LIKE ?1
+               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
+               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                               WHERE g.sha256 = files.sha256)",
+            [pattern],
+        )?;
+    }
+    Ok(n)
+}
+
 /// Hand freed space back once over a quarter of the file is free pages.
 /// SQLite otherwise keeps a purged index's full size: excluding 80% of a
 /// 113k-chunk index left the file at 470 MB until a VACUUM took it to 92 MB
@@ -774,13 +833,7 @@ pub fn index(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
         [root.to_string_lossy()],
     )?;
-    let mut stats = Stats {
-        files_seen: 0,
-        files_embedded: 0,
-        chunks: 0,
-        removed: 0,
-        duplicates: 0,
-    };
+    let mut stats = Stats::default();
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path(), types) {
@@ -801,6 +854,10 @@ pub fn index(
             Outcome::Duplicate => {
                 stats.duplicates += 1;
                 stats.files_seen += 1;
+            }
+            Outcome::Unreadable { no_decoder } => {
+                stats.files_seen += 1;
+                stats.no_decoder += usize::from(no_decoder);
             }
             Outcome::Skipped => {
                 if let Some(p) = entry.path().to_str() {
@@ -1764,6 +1821,35 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undecodable_photos_are_counted_but_not_their_decoded_copies() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-heif-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let file = |path: &str, hash: &[u8]| {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?2)",
+                params![path, hash],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        file("/p/IMG_1.HEIC", b"a");
+        file("/p/IMG_2.heic", b"b");
+        file("/p/render.avif", b"c");
+        // Decoded, and a byte-identical copy of it holding no chunks.
+        let decoded = file("/p/IMG_3.heic", b"d");
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, 0, '', ?2, 1)",
+            params![decoded, axis(0)],
+        )
+        .unwrap();
+        file("/p/copy.heic", b"d");
+        // Not HEIF: a document with no text.
+        file("/p/scan.pdf", b"e");
+        assert_eq!(undecodable(&conn).unwrap(), 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 

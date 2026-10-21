@@ -36,6 +36,8 @@ pub struct Status {
     pub last_indexed: u64,
     /// Why files are being indexed again after a start; empty otherwise.
     pub model_changed: String,
+    /// Photos skipped because no HEIF decoder is installed.
+    pub no_decoder: i64,
 }
 
 impl Status {
@@ -84,6 +86,7 @@ impl Status {
             last_checked: unsigned(status::LAST_CHECKED),
             last_indexed: unsigned(status::LAST_INDEXED),
             model_changed: text(status::MODEL_CHANGED),
+            no_decoder: signed(status::NO_DECODER),
         }
     }
 }

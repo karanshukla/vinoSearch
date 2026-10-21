@@ -440,6 +440,13 @@ impl Control {
             key::MODEL_CHANGED.into(),
             owned(Value::from(st.model_changed.lock().unwrap().clone())),
         );
+        // Counted from the index: with a decoder installed, they are retried
+        // at the next start and the count would mislead until then.
+        let no_decoder = match crate::vision::heif_convert() {
+            None => index::undecodable(&db).map_err(failed)?,
+            Some(_) => 0,
+        };
+        out.insert(key::NO_DECODER.into(), owned(Value::from(no_decoder)));
         let cache = crate::cache_dir().map_err(failed)?;
         out.insert(
             key::CACHE_BYTES.into(),

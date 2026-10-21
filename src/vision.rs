@@ -9,6 +9,10 @@
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, imageops::FilterType};
 use std::io::Cursor;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Soft tokens per image. 140 retrieves within 1.8 recall@1 of the
 /// processor's 280 on Flickr30k (84.5 against 86.3, recall@10 98.6 against
@@ -55,9 +59,106 @@ fn target_size(height: u32, width: u32) -> Result<(u32, u32)> {
     Ok((h as u32, w as u32))
 }
 
+/// HEIF containers: HEIC from iPhones (and some Android phones), AVIF. The
+/// `image` crate decodes neither, so they go through libheif's heif-convert
+/// when it is installed (#79). By extension, as `formats.images.extensions`
+/// names them.
+pub const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
+/// heif-convert on a 12-megapixel photo takes about a second; a hang
+/// shouldn't hold indexing for long.
+const CONVERT_WALL: Duration = Duration::from_secs(60);
+
+/// An image this build has no decoder for, told apart from a broken file so
+/// the indexer can count it and say what to install.
+#[derive(Debug)]
+pub struct NoDecoder;
+
+impl std::fmt::Display for NoDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("needs a HEIF decoder: install libheif's heif-convert")
+    }
+}
+
+impl std::error::Error for NoDecoder {}
+
+/// An ISO base media file whose brand is a HEIF image: `ftyp` at byte 4,
+/// then the major brand.
+fn is_heif(bytes: &[u8]) -> bool {
+    bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(
+            &bytes[8..12],
+            b"heic"
+                | b"heix"
+                | b"hevc"
+                | b"hevx"
+                | b"heim"
+                | b"heis"
+                | b"mif1"
+                | b"msf1"
+                | b"avif"
+                | b"avis"
+        )
+}
+
+/// heif-convert, if it is on PATH. Looked up once: a tree of HEIC files
+/// with no decoder would otherwise search PATH for each.
+pub fn heif_convert() -> Option<&'static Path> {
+    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|d| d.join("heif-convert"))
+                    .find(|p| p.is_file())
+            })
+        })
+        .as_deref()
+}
+
+/// Decode a HEIF file by converting it to JPEG with heif-convert in a
+/// directory of its own. libheif applies the file's rotation and mirroring
+/// properties as it decodes.
+fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
+    let Some(tool) = heif_convert() else {
+        return Err(NoDecoder.into());
+    };
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "vinosearch-heif-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let converted = (|| -> Result<Vec<u8>> {
+        let input = dir.join("in.heic");
+        let output = dir.join("out.jpg");
+        std::fs::write(&input, bytes)?;
+        let mut cmd = std::process::Command::new(tool);
+        cmd.arg("-q").arg("90").arg(&input).arg(&output);
+        crate::proc::run(cmd, &[], CONVERT_WALL).context("heif-convert")?;
+        // A file holding several images (a burst) is written as out-1.jpg, ...
+        let first = dir.join("out-1.jpg");
+        let path = if output.is_file() { output } else { first };
+        std::fs::read(&path).context("heif-convert wrote nothing")
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    decode(&converted?)
+}
+
 /// Decode an image file's bytes, turned upright by its EXIF orientation.
 /// Animations give their first frame.
 pub fn load(bytes: &[u8]) -> Result<RgbImage> {
+    if is_heif(bytes) {
+        return load_heif(bytes);
+    }
+    decode(bytes)
+}
+
+fn decode(bytes: &[u8]) -> Result<RgbImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_DECODED_BYTES);
@@ -177,6 +278,28 @@ mod tests {
         bmp.extend([0; 24]);
         let err = load(&bmp).unwrap_err().to_string();
         assert!(err.contains("needs"), "{err}");
+    }
+
+    #[test]
+    fn heif_files_are_told_by_their_brand() {
+        let heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic";
+        let avif = b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00avifmif1";
+        let mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42";
+        assert!(is_heif(heic));
+        assert!(is_heif(avif));
+        assert!(!is_heif(mp4));
+        assert!(!is_heif(b"\x89PNG\r\n"));
+        assert!(!is_heif(b"ftyp"));
+    }
+
+    #[test]
+    fn a_heif_file_without_a_decoder_says_what_to_install() {
+        if heif_convert().is_some() {
+            return;
+        }
+        let heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic";
+        let e = load(heic).unwrap_err();
+        assert!(e.downcast_ref::<NoDecoder>().is_some(), "{e}");
     }
 
     #[test]

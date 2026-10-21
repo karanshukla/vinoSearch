@@ -279,6 +279,24 @@ impl SettingsWindow {
                     ),
                 );
             });
+            if s.no_decoder > 0 {
+                row(
+                    ui,
+                    "Skipped:",
+                    "HEIC and AVIF need libheif's heif-convert, from your distribution.",
+                    |ui| {
+                        let color = ui.visuals().warn_fg_color;
+                        value(
+                            ui,
+                            RichText::new(format!(
+                                "{} photos, no HEIF decoder installed",
+                                count(s.no_decoder)
+                            ))
+                            .color(color),
+                        );
+                    },
+                );
+            }
             row(ui, "Last change:", "", |ui| {
                 if s.last_indexed == 0 {
                     value(
