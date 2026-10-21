@@ -686,9 +686,33 @@ impl SettingsWindow {
             return;
         }
         let mut changed = false;
+        let s = match status {
+            Some(Ok(s)) => Some(s),
+            _ => None,
+        };
+        // What a format holds now and its share of the index, so the switch
+        // says what it costs (#73).
+        let share = |files: i64, chunks: Option<i64>| -> Option<String> {
+            let s = s.filter(|_| files > 0)?;
+            let what = match chunks {
+                Some(c) => format!("{} files, {} chunks", count(files), count(c)),
+                None => format!("{} photos", count(files)),
+            };
+            let pct = chunks.unwrap_or(files) as f64 * 100.0 / s.chunks.max(1) as f64;
+            Some(format!("{what}, {pct:.0}% of the index"))
+        };
+        let p = theme::palette(ui.ctx());
         section(ui, "What to index");
         row(ui, "Text:", "Notes, Markdown and source code.", |ui| {
-            value(ui, "On")
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                ui.label("On");
+                if let Some(s) = s
+                    && let Some(text) = share(s.text_files, Some(s.text_chunks))
+                {
+                    ui.label(RichText::new(text).color(p.muted));
+                }
+            });
         });
         row(
             ui,
@@ -696,10 +720,17 @@ impl SettingsWindow {
             "Found by what's in them. A 671 MB download.",
             |ui| {
                 let mut on = self.config.formats.images_enabled();
-                if ui.checkbox(&mut on, "Index images").changed() {
-                    self.config.formats.images.enabled = on.then_some(true);
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, "Index images").changed() {
+                        self.config.formats.images.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.image_files, None)
+                    {
+                        ui.label(RichText::new(text).color(p.muted));
+                    }
+                });
                 if on
                     && let Some(Ok(s)) = status
                     && !s.model_present
@@ -771,10 +802,17 @@ impl SettingsWindow {
             "PDF, Office and CSV. Their text is stored unencrypted.",
             |ui| {
                 let mut on = self.config.formats.documents_enabled();
-                if ui.checkbox(&mut on, "Index documents").changed() {
-                    self.config.formats.documents.enabled = on.then_some(true);
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, "Index documents").changed() {
+                        self.config.formats.documents.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.document_files, Some(s.document_chunks))
+                    {
+                        ui.label(RichText::new(text).color(p.muted));
+                    }
+                });
             },
         );
 

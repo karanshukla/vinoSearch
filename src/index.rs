@@ -957,6 +957,31 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
     ))
 }
 
+/// (files, chunks) of each kind in the index, in `Kind::ALL`'s order (#73).
+/// A file counts under the kind of its chunks, so one recorded without any
+/// (a scan, a photo with no decoder) counts under none.
+pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 3]> {
+    let mut out = [(0, 0); 3];
+    let mut stmt =
+        conn.prepare("SELECT kind, count(DISTINCT file_id), count(*) FROM chunks GROUP BY kind")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            Kind::from_db(r.get(0)?),
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, files, chunks) = row?;
+        let i = Kind::ALL
+            .iter()
+            .position(|k| *k == kind)
+            .expect("every kind is listed");
+        out[i] = (files, chunks);
+    }
+    Ok(out)
+}
+
 /// Roots `index` has been run on, which the watcher follows.
 pub fn roots(conn: &Connection) -> Result<Vec<PathBuf>> {
     let mut stmt = conn.prepare("SELECT path FROM roots ORDER BY path")?;
@@ -1836,6 +1861,25 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_are_split_by_kind() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-bykind-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes.md", &[0, 1]);
+        add_file(&conn, "/more.md", &[2]);
+        add_file(&conn, "/cat.png", &[3]);
+        conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
+        // A document recorded without text counts under nothing.
+        conn.execute(
+            "INSERT INTO files (path, mtime, size) VALUES ('/scan.pdf', 0, 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(counts_by_kind(&conn).unwrap(), [(2, 3), (0, 0), (1, 1)]);
+        assert_eq!(counts(&conn).unwrap(), (4, 4));
         fs::remove_dir_all(&dir).unwrap();
     }
 

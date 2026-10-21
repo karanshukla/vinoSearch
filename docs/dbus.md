@@ -53,6 +53,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
 | `chunks` | `x` | Chunks in the index. |
+| `text_files`, `text_chunks`, `document_files`, `document_chunks`, `image_files` | `x` | The same per format ([#73](https://github.com/karanshukla/vinoSearch/issues/73)); a file counts under the kind of its chunks, so one recorded with none (a scan, a photo with no decoder) is in `files` only. An image is one chunk. |
 | `roots` | `as` | Indexed roots, canonical paths. |
 | `model_present` | `b` | Every model file is on disk, the vision encoder's included while images are on. |
 | `fetching` | `b` | A `FetchModel` download is running. |

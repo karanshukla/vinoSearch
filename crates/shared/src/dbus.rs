@@ -35,6 +35,13 @@ pub mod status {
     pub const DEVICE: &str = "device";
     pub const FILES: &str = "files";
     pub const CHUNKS: &str = "chunks";
+    /// The same, per format (#73): a file counts under its chunks' kind.
+    pub const TEXT_FILES: &str = "text_files";
+    pub const TEXT_CHUNKS: &str = "text_chunks";
+    pub const DOCUMENT_FILES: &str = "document_files";
+    pub const DOCUMENT_CHUNKS: &str = "document_chunks";
+    /// One chunk per image, so no chunk count.
+    pub const IMAGE_FILES: &str = "image_files";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current indexing job.
     pub const INDEXED_FILES: &str = "indexed_files";

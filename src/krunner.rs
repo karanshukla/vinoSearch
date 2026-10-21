@@ -389,6 +389,16 @@ impl Control {
         );
         out.insert(key::FILES.into(), owned(Value::from(files)));
         out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
+        let [text, documents, images] = index::counts_by_kind(&db).map_err(failed)?;
+        for (k, n) in [
+            (key::TEXT_FILES, text.0),
+            (key::TEXT_CHUNKS, text.1),
+            (key::DOCUMENT_FILES, documents.0),
+            (key::DOCUMENT_CHUNKS, documents.1),
+            (key::IMAGE_FILES, images.0),
+        ] {
+            out.insert(k.into(), owned(Value::from(n)));
+        }
         out.insert(key::ROOTS.into(), owned(Value::from(roots)));
         let st = &self.status;
         let u64_of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
@@ -795,6 +805,7 @@ fn restart_krunner() {
     let unit = "plasma-krunner.service";
     let active = std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", unit])
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
     if active && systemctl(&["restart", unit]) {
