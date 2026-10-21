@@ -238,11 +238,8 @@ fn read_aloud(db: &Db, speaking: &Mutex<Option<Child>>, id: &str) {
         return;
     };
     let mut speaking = speaking.lock().unwrap();
-    if let Some(mut old) = speaking.take() {
-        if old.try_wait().is_ok_and(|done| done.is_none()) {
-            let _ = old.kill();
-        }
-        let _ = old.wait();
+    if let Some(old) = speaking.take() {
+        stop_reading(old);
     }
     match std::process::Command::new(&bin)
         .arg("--file")
@@ -253,6 +250,25 @@ fn read_aloud(db: &Db, speaking: &Mutex<Option<Child>>, id: &str) {
         Ok(child) => *speaking = Some(child),
         Err(e) => eprintln!("{}: {e}", bin.display()),
     }
+}
+
+/// Ctrl+C, so vinospeak stops its audio player on the way out; a kill would
+/// leave the player running out the audio it already has. Killed if it
+/// hasn't gone in two seconds.
+fn stop_reading(mut child: Child) {
+    if child.try_wait().is_ok_and(|done| done.is_none()) {
+        // SAFETY: kill(2) on our own child, which is not reaped until below.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while child.try_wait().is_ok_and(|done| done.is_none()) {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let _ = child.wait();
 }
 
 #[interface(name = "org.kde.krunner1")]
