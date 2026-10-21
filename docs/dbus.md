@@ -10,6 +10,14 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 | `/gnome` | `org.gnome.Shell.SearchProvider2` | GNOME Shell's overview search |
 | `/control` | `dev.vinosearch.Control1` | the settings app |
 
+## `org.kde.krunner1`
+
+| Method | What it does |
+|---|---|
+| `Actions() → a(sss)` | `open-folder` (Open containing folder) and `read-aloud` (Read aloud). |
+| `Match(s query)` | The search below. Each match sets `subtext`, `urls`, `category`, and `actions`, the action ids KRunner shows for it: both for a text file, `open-folder` alone for a document or image. |
+| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action `xdg-open`s the file, `open-folder` its directory. `read-aloud` runs `vinospeak --file <path>` ([vinoSpeak](https://github.com/karanshukla/vinoSpeak), from `PATH` or else `~/.local/bin`), stopping a read still playing; without vinoSpeak it logs a line and does nothing. |
+
 ## `org.gnome.Shell.SearchProvider2`
 
 The same search KRunner's `Match` runs: the best chunk per file, files scoring at least their kind's `min_score`, the top 5 text files, then the top 5 images. Result ids are file paths.

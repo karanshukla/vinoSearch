@@ -15,8 +15,10 @@ use crate::worker::{self, Job, Options, Status};
 use anyhow::{Context, Result};
 use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use zbus::interface;
@@ -47,6 +49,8 @@ struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
     config: PathBuf,
+    /// The vinoSpeak read playing, if any; one at a time.
+    speaking: Mutex<Option<Child>>,
 }
 
 /// How close a result must be, per kind (`formats.*.min_score`).
@@ -139,6 +143,12 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
     };
     props.insert("category".into(), owned(Value::from(category)));
+    // The actions KRunner shows for this match: vinoSpeak reads UTF-8 text.
+    let actions = match h.kind {
+        Kind::Text => vec!["open-folder", "read-aloud"],
+        Kind::Document | Kind::Image => vec!["open-folder"],
+    };
+    props.insert("actions".into(), owned(Value::from(actions)));
     let floor = floors.of(h.kind);
     let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0));
@@ -166,19 +176,26 @@ fn file_url(path: &str) -> String {
     url
 }
 
-/// Open the indexed file `id`, or its folder. Ids come from callers on the
-/// session bus, so anything this runner could not have returned is refused.
-fn open(db: &Db, id: &str, folder: bool) {
+/// Whether `id` is an indexed file. Ids come from callers on the session
+/// bus, so anything this runner could not have returned is refused.
+fn indexed(db: &Db, id: &str, doing: &str) -> bool {
     match index::is_indexed(&db.lock().unwrap(), id) {
-        Ok(true) => {}
+        Ok(true) => true,
         Ok(false) => {
-            eprintln!("not opening {id}: not an indexed file");
-            return;
+            eprintln!("not {doing} {id}: not an indexed file");
+            false
         }
         Err(e) => {
-            eprintln!("not opening {id}: {e:#}");
-            return;
+            eprintln!("not {doing} {id}: {e:#}");
+            false
         }
+    }
+}
+
+/// Open the indexed file `id`, or its folder.
+fn open(db: &Db, id: &str, folder: bool) {
+    if !indexed(db, id, "opening") {
+        return;
     }
     let path = Path::new(id);
     let target = if folder {
@@ -191,15 +208,68 @@ fn open(db: &Db, id: &str, folder: bool) {
     }
 }
 
+/// vinoSpeak's CLI: on `path` first, else in `~/.local/bin`, where `uv tool
+/// install` puts it and which the systemd user service's PATH often lacks.
+fn vinospeak(
+    path: Option<&OsStr>,
+    home: Option<&OsStr>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let on_path = path.into_iter().flat_map(std::env::split_paths);
+    let local = home.map(|h| Path::new(h).join(".local/bin"));
+    // Absolute only: an empty or relative PATH entry means the cwd.
+    on_path
+        .chain(local)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join("vinospeak"))
+        .find(|p| is_file(p))
+}
+
+/// Read the indexed file `id` aloud with vinoSpeak, stopping any read still
+/// playing (and reaping one that has finished).
+fn read_aloud(db: &Db, speaking: &Mutex<Option<Child>>, id: &str) {
+    if !indexed(db, id, "reading") {
+        return;
+    }
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    let Some(bin) = vinospeak(path.as_deref(), home.as_deref(), Path::is_file) else {
+        eprintln!("not reading {id}: vinospeak is not installed (uv tool install vinospeak)");
+        return;
+    };
+    let mut speaking = speaking.lock().unwrap();
+    if let Some(mut old) = speaking.take() {
+        if old.try_wait().is_ok_and(|done| done.is_none()) {
+            let _ = old.kill();
+        }
+        let _ = old.wait();
+    }
+    match std::process::Command::new(&bin)
+        .arg("--file")
+        .arg(id)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => *speaking = Some(child),
+        Err(e) => eprintln!("{}: {e}", bin.display()),
+    }
+}
+
 #[interface(name = "org.kde.krunner1")]
 impl Runner {
     #[zbus(name = "Actions")]
     fn actions(&self) -> Vec<(String, String, String)> {
-        vec![(
-            "open-folder".into(),
-            "Open containing folder".into(),
-            "document-open-folder".into(),
-        )]
+        [
+            (
+                "open-folder",
+                "Open containing folder",
+                "document-open-folder",
+            ),
+            ("read-aloud", "Read aloud", "audio-volume-high"),
+        ]
+        .into_iter()
+        .map(|(id, text, icon)| (id.into(), text.into(), icon.into()))
+        .collect()
     }
 
     #[zbus(name = "Match")]
@@ -214,7 +284,10 @@ impl Runner {
 
     #[zbus(name = "Run")]
     fn run(&self, match_id: String, action_id: String) {
-        open(&self.db, &match_id, action_id == "open-folder");
+        match action_id.as_str() {
+            "read-aloud" => read_aloud(&self.db, &self.speaking, &match_id),
+            a => open(&self.db, &match_id, a == "open-folder"),
+        }
     }
 
     #[zbus(name = "Teardown")]
@@ -636,6 +709,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 jobs: Mutex::new(tx.clone()),
                 db: db.clone(),
                 config: config.clone(),
+                speaking: Mutex::default(),
             },
         )?
         .serve_at(
@@ -1168,6 +1242,31 @@ mod tests {
         assert_eq!(
             desktop_quote(odd),
             r#""/a \\"b\\" \\\\c \\$d \\`e\\` 100%%""#
+        );
+    }
+
+    #[test]
+    fn vinospeak_is_found_on_path_then_in_local_bin() {
+        let path = OsStr::new("/usr/bin:/opt/vs/bin");
+        let home = Some(OsStr::new("/home/u"));
+        let only = |want: &'static str| move |p: &Path| p == Path::new(want);
+        assert_eq!(
+            vinospeak(Some(path), home, only("/opt/vs/bin/vinospeak")),
+            Some(PathBuf::from("/opt/vs/bin/vinospeak"))
+        );
+        assert_eq!(
+            vinospeak(Some(path), home, only("/home/u/.local/bin/vinospeak")),
+            Some(PathBuf::from("/home/u/.local/bin/vinospeak"))
+        );
+        assert_eq!(
+            vinospeak(None, home, only("/home/u/.local/bin/vinospeak")),
+            Some(PathBuf::from("/home/u/.local/bin/vinospeak"))
+        );
+        assert_eq!(vinospeak(Some(path), None, |_| false), None);
+        let both = |p: &Path| p.starts_with("/usr/bin") || p.starts_with("/home");
+        assert_eq!(
+            vinospeak(Some(path), home, both),
+            Some(PathBuf::from("/usr/bin/vinospeak"))
         );
     }
 
