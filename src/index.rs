@@ -71,7 +71,7 @@ const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 const MAX_IMAGE_BYTES: u64 = 64 << 20;
 /// Documents are parsed whole in memory too. Their extracted text is held to
 /// MAX_FILE_BYTES like any text file.
-const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 
 /// What a chunk was embedded from, stored in `chunks.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,13 +507,12 @@ pub fn index_file(
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
         Kind::Document => {
-            // Recorded first: a parser can take the runner down in ways
-            // catch_unwind doesn't catch (abort, stack overflow, out of
-            // memory), and the file must not be parsed again on every
-            // restart. Dropped again once it parses, so a stop while
-            // embedding leaves it to be indexed next time.
+            // Recorded first: the parser runs in a child with limits, but a
+            // file the child cannot parse must not be parsed again on every
+            // restart, and a stop while embedding must leave it to be indexed
+            // next time, so the record goes once it parses.
             record(conn)?;
-            let chunks = document_chunks(path, &bytes);
+            let chunks = document_chunks(path, &bytes, crate::extract::chunks_in_child);
             if !chunks.is_empty() {
                 conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
             }
@@ -563,20 +562,17 @@ pub fn index_file(
     Ok(Outcome::Embedded(chunks.len()))
 }
 
-/// Another file with content `hash` that holds its chunks, if there is one.
-/// `path`'s chunks, or none if it doesn't parse or its text is over
-/// MAX_FILE_BYTES. Files come from anywhere, so a parser panic is caught and
-/// counts as not parsing.
-fn document_chunks(path: &Path, bytes: &[u8]) -> Vec<(usize, String)> {
-    let parsed = std::panic::catch_unwind(|| crate::extract::chunks(path, bytes));
-    let chunks = match parsed {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
+/// `path`'s chunks through `parse` (the child process, #84), or none if it
+/// doesn't parse, the child was stopped, or its text is over MAX_FILE_BYTES.
+fn document_chunks(
+    path: &Path,
+    bytes: &[u8],
+    parse: crate::extract::Parser,
+) -> Vec<(usize, String)> {
+    let chunks = match parse(path, bytes) {
+        Ok(c) => c,
+        Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
-            return Vec::new();
-        }
-        Err(_) => {
-            eprintln!("skip {}: the parser panicked", path.display());
             return Vec::new();
         }
     };
@@ -588,6 +584,7 @@ fn document_chunks(path: &Path, bytes: &[u8]) -> Vec<(usize, String)> {
     chunks
 }
 
+/// Another file with content `hash` that holds its chunks, if there is one.
 fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
@@ -1731,9 +1728,10 @@ mod tests {
 
     #[test]
     fn a_document_that_does_not_parse_has_no_chunks() {
-        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf").is_empty());
+        let parse = crate::extract::chunks;
+        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf", parse).is_empty());
         let csv = format!("h\n{}", "x\n".repeat(MAX_FILE_BYTES as usize));
-        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes()).is_empty());
+        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes(), parse).is_empty());
     }
 
     #[test]

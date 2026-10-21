@@ -4,6 +4,7 @@ mod icons;
 mod index;
 mod krunner;
 mod model;
+mod proc;
 mod runtime;
 mod sched;
 mod vision;
@@ -63,6 +64,11 @@ enum Command {
         #[arg(short, default_value_t = 10)]
         n: usize,
     },
+    /// Parse the document on stdin as PATH's type and write its chunks to
+    /// stdout as JSON, under memory and CPU limits. The indexer runs this on
+    /// itself for every document (#84).
+    #[command(hide = true)]
+    Extract { path: PathBuf },
 }
 
 /// OpenVINO's compiled-model cache.
@@ -164,6 +170,11 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 fn run(cli: Cli) -> Result<bool> {
+    // Before the settings: a broken config file must not stop every document.
+    if let Command::Extract { path } = &cli.command {
+        extract::child_main(path)?;
+        return Ok(true);
+    }
     let s = settings(&cli)?;
     match cli.command {
         Command::Doctor => {
@@ -300,6 +311,7 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
+        Command::Extract { .. } => unreachable!("handled before the settings"),
     }
 }
 

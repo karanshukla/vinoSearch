@@ -1,14 +1,72 @@
 //! Text out of documents (#55): PDF pages, the XML inside Office and
 //! OpenDocument zips, spreadsheets, and CSV with its header on every chunk.
 //! What comes out is chunked like any text file, numbered by page, slide or
-//! row instead of line.
+//! row instead of line. The indexer runs it in a child process with limits
+//! (#84), since the files come from anywhere.
 
-use crate::index::{CHUNK_CHARS, chunk};
+use crate::index::{CHUNK_CHARS, MAX_DOCUMENT_BYTES, chunk};
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use std::io::{Cursor, Read};
 use std::path::Path;
+use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
+
+/// Address space the extracting child may map (#84). The runner's own share
+/// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
+/// streams, decompressed, and lopdf's objects for them fit many times over.
+const CHILD_ADDRESS_SPACE: u64 = 1 << 30;
+/// CPU seconds before the child gets SIGXCPU. Parsing is well under a second
+/// a document; a zip bomb or a quadratic parser isn't.
+const CHILD_CPU_SECONDS: u64 = 30;
+/// Wall-clock limit, for a child that hangs rather than spins. Indexing
+/// runs at idle priority, so a busy machine can stretch 30 CPU seconds out.
+const CHILD_WALL: Duration = Duration::from_secs(120);
+
+/// A document's bytes to its numbered chunks: `chunks`, or `chunks_in_child`.
+pub type Parser = fn(&Path, &[u8]) -> Result<Vec<(usize, String)>>;
+
+/// `chunks`, run in a child process (the runner executing itself as
+/// `vinosearch extract <path>`, with `bytes` on its stdin) under memory, CPU
+/// and wall-clock limits, so a parser that aborts, overflows its stack, eats
+/// memory or hangs costs that process, not the runner (#84). Err for a
+/// parser error, a child its limits stopped, or one that failed to start.
+pub fn chunks_in_child(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("extract").arg(path);
+    let out = crate::proc::run(cmd, bytes, CHILD_WALL)?;
+    serde_json::from_slice(&out).context("reading the extractor's output")
+}
+
+/// The child's side: set the limits, read the document from stdin, write
+/// its chunks to stdout as JSON. `path` is only for its extension.
+pub fn child_main(path: &Path) -> Result<()> {
+    limit(libc::RLIMIT_AS, CHILD_ADDRESS_SPACE)?;
+    limit(libc::RLIMIT_CPU, CHILD_CPU_SECONDS)?;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        bail!("over {MAX_DOCUMENT_BYTES} bytes");
+    }
+    let chunks = chunks(path, &bytes)?;
+    serde_json::to_writer(std::io::stdout().lock(), &chunks)?;
+    Ok(())
+}
+
+fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<()> {
+    let lim = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // SAFETY: setrlimit reads one rlimit through a valid pointer.
+    if unsafe { libc::setrlimit(resource, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("setting a resource limit");
+    }
+    Ok(())
+}
 
 /// Taken as documents while they are on.
 pub const EXTENSIONS: &[&str] = &[
