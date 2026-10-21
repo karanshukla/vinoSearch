@@ -13,8 +13,17 @@ pub const DESKTOP_ID: &str = "dev.vinosearch.desktop";
 pub const SETTINGS_APP_ID: &str = "dev.vinosearch";
 /// Icon name, installed under hicolor/scalable/apps.
 pub const ICON: &str = "dev.vinosearch";
-/// KRunner's plugin file, under the XDG data directory.
+/// KRunner's plugin file, under the XDG data directory. Its presence is the
+/// KDE search place being on (#45).
 pub const KRUNNER_PLUGIN: &str = "krunner/dbusplugins/vinosearch.desktop";
+/// GNOME Shell's search provider file, under the XDG data directory, in a
+/// directory of ours that environment.d adds to XDG_DATA_DIRS. Its presence
+/// is the GNOME search place being on.
+pub const GNOME_PROVIDER: &str =
+    "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini";
+/// The D-Bus activation file, under the XDG data directory: the service is
+/// installed while it exists.
+pub const DBUS_SERVICE_FILE: &str = "dbus-1/services/dev.vinosearch.Runner.service";
 /// The settings app's interface lives here.
 pub const CONTROL_PATH: &str = "/control";
 pub const CONTROL_INTERFACE: &str = "dev.vinosearch.Control1";
@@ -26,6 +35,13 @@ pub mod status {
     pub const DEVICE: &str = "device";
     pub const FILES: &str = "files";
     pub const CHUNKS: &str = "chunks";
+    /// The same, per format (#73): a file counts under its chunks' kind.
+    pub const TEXT_FILES: &str = "text_files";
+    pub const TEXT_CHUNKS: &str = "text_chunks";
+    pub const DOCUMENT_FILES: &str = "document_files";
+    pub const DOCUMENT_CHUNKS: &str = "document_chunks";
+    /// One chunk per image, so no chunk count.
+    pub const IMAGE_FILES: &str = "image_files";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current indexing job.
     pub const INDEXED_FILES: &str = "indexed_files";
@@ -44,4 +60,9 @@ pub mod status {
     /// last indexing job that changed it. 0 for not since the runner started.
     pub const LAST_CHECKED: &str = "last_checked";
     pub const LAST_INDEXED: &str = "last_indexed";
+    /// Why files are being indexed again after a start: a model changed
+    /// (#80). Empty otherwise, and once that indexing is done.
+    pub const MODEL_CHANGED: &str = "model_changed";
+    /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
+    pub const NO_DECODER: &str = "no_decoder";
 }

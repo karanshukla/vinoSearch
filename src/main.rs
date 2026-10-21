@@ -4,6 +4,7 @@ mod icons;
 mod index;
 mod krunner;
 mod model;
+mod proc;
 mod runtime;
 mod sched;
 mod vision;
@@ -45,14 +46,23 @@ enum Command {
     FetchModel,
     /// Index text files under each path. Unchanged files are skipped.
     Index { paths: Vec<PathBuf> },
-    /// Serve KRunner over D-Bus, or register/unregister the runner with it.
+    /// Serve KRunner, GNOME Shell and the settings app over D-Bus, or install/remove the service.
     Krunner {
-        /// Write the KRunner plugin and D-Bus service files, then exit.
+        /// Write the service files and the running desktop's search place (KRunner on Plasma,
+        /// GNOME Shell on GNOME, both elsewhere), then exit. `integrate` adds or removes one.
         #[arg(long)]
         install: bool,
-        /// Remove those files, then exit.
+        /// Remove the service and every search place, then exit.
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
+    },
+    /// Turn one search place on (or off with --off): kde is KRunner and the Plasma launcher,
+    /// gnome is GNOME Shell's overview search, from the next login.
+    Integrate {
+        place: krunner::Place,
+        /// Remove this place's files instead of writing them. The service stays.
+        #[arg(long)]
+        off: bool,
     },
     /// Keep the index current: watch every indexed root and re-index changes.
     Watch,
@@ -63,6 +73,23 @@ enum Command {
         #[arg(short, default_value_t = 10)]
         n: usize,
     },
+    /// Indexed images that look like one: an indexed image costs nothing to
+    /// encode, any other image one encode on the device.
+    Similar {
+        image: PathBuf,
+        /// Number of results.
+        #[arg(short, default_value_t = 10)]
+        n: usize,
+        /// Leave out images scoring below this (cosine, -1 to 1). Image to
+        /// image scores sit well above text to image ones [default: none]
+        #[arg(long)]
+        min_score: Option<f32>,
+    },
+    /// Parse the document on stdin as PATH's type and write its chunks to
+    /// stdout as JSON, under memory and CPU limits. The indexer runs this on
+    /// itself for every document (#84).
+    #[command(hide = true)]
+    Extract { path: PathBuf },
 }
 
 /// OpenVINO's compiled-model cache.
@@ -164,6 +191,11 @@ pub(crate) fn snippet(text: &str) -> String {
 }
 
 fn run(cli: Cli) -> Result<bool> {
+    // Before the settings: a broken config file must not stop every document.
+    if let Command::Extract { path } = &cli.command {
+        extract::child_main(path)?;
+        return Ok(true);
+    }
     let s = settings(&cli)?;
     match cli.command {
         Command::Doctor => {
@@ -191,6 +223,10 @@ fn run(cli: Cli) -> Result<bool> {
             }
             let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
             let mut conn = index::open(&index::default_db()?)?;
+            if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
+                eprintln!("{why}");
+            }
+            index::retry_undecodable(&conn)?;
             for p in &paths {
                 let t0 = Instant::now();
                 let mut shown = 0;
@@ -225,6 +261,13 @@ fn run(cli: Cli) -> Result<bool> {
                     st.duplicates,
                     st.removed
                 );
+                if st.no_decoder > 0 {
+                    eprintln!(
+                        "{} photos skipped: HEIC and AVIF need heif-convert installed ({})",
+                        st.no_decoder,
+                        config::HEIF_CONVERT_PACKAGES
+                    );
+                }
             }
             Ok(true)
         }
@@ -242,9 +285,14 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
+        Command::Integrate { place, off } => {
+            krunner::integrate(place, !off)?;
+            Ok(true)
+        }
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
+            worker::prepare(&opts.status)?;
             let _watcher = watch::spawn(
                 tx,
                 opts.config.clone(),
@@ -259,6 +307,7 @@ fn run(cli: Cli) -> Result<bool> {
             let conn = index::open(&index::default_db()?)?;
             index::purge(&conn, &s.excludes)?;
             index::purge_types(&conn, &s.types)?;
+            index::purge_other_models(&conn)?;
             let t0 = Instant::now();
             let q = emb.query(&query)?;
             let t1 = Instant::now();
@@ -295,6 +344,46 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
+        Command::Similar {
+            image,
+            n,
+            min_score,
+        } => {
+            let conn = index::open(&index::default_db()?)?;
+            let path = std::fs::canonicalize(&image).unwrap_or(image);
+            let key = path.to_string_lossy().into_owned();
+            let t0 = Instant::now();
+            let q = match index::image_vector(&conn, &key)? {
+                Some(v) => v,
+                None => {
+                    let bytes = std::fs::read(&path)?;
+                    let pixels = vision::prepare(&vision::load(&bytes)?)?;
+                    let mut emb = embedder(cli.openvino_dir, &s.device)?;
+                    emb.image(&pixels)?
+                }
+            };
+            let t1 = Instant::now();
+            let vectors = index::Vectors::load(&conn)?;
+            // One more than asked, for the image itself.
+            let hits = index::search(&conn, &vectors, &q, index::Kind::Image, n + 1)?;
+            eprintln!(
+                "vector {:.1} ms, search {:.1} ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+            let shown = hits
+                .into_iter()
+                .filter(|h| h.path != key && min_score.is_none_or(|m| h.score >= m))
+                .take(n);
+            for h in shown {
+                println!("{:.3}  {}", h.score, h.path);
+                if !h.copies.is_empty() {
+                    println!("       same as: {}", h.copies.join(", "));
+                }
+            }
+            Ok(true)
+        }
+        Command::Extract { .. } => unreachable!("handled before the settings"),
     }
 }
 

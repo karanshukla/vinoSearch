@@ -22,6 +22,12 @@ pub struct Status {
     pub device: String,
     pub files: i64,
     pub chunks: i64,
+    /// Per format: a file counts under its chunks' kind.
+    pub text_files: i64,
+    pub text_chunks: i64,
+    pub document_files: i64,
+    pub document_chunks: i64,
+    pub image_files: i64,
     pub roots: Vec<String>,
     pub model_present: bool,
     pub fetching: bool,
@@ -34,6 +40,10 @@ pub struct Status {
     /// Unix seconds; 0 for not since the runner started.
     pub last_checked: u64,
     pub last_indexed: u64,
+    /// Why files are being indexed again after a start; empty otherwise.
+    pub model_changed: String,
+    /// Photos skipped because no HEIF decoder is installed.
+    pub no_decoder: i64,
 }
 
 impl Status {
@@ -70,6 +80,11 @@ impl Status {
             device: text(status::DEVICE),
             files: signed(status::FILES),
             chunks: signed(status::CHUNKS),
+            text_files: signed(status::TEXT_FILES),
+            text_chunks: signed(status::TEXT_CHUNKS),
+            document_files: signed(status::DOCUMENT_FILES),
+            document_chunks: signed(status::DOCUMENT_CHUNKS),
+            image_files: signed(status::IMAGE_FILES),
             roots,
             model_present: flag(status::MODEL_PRESENT),
             fetching: flag(status::FETCHING),
@@ -81,6 +96,8 @@ impl Status {
             cache_bytes: unsigned(status::CACHE_BYTES),
             last_checked: unsigned(status::LAST_CHECKED),
             last_indexed: unsigned(status::LAST_INDEXED),
+            model_changed: text(status::MODEL_CHANGED),
+            no_decoder: signed(status::NO_DECODER),
         }
     }
 }
@@ -233,6 +250,7 @@ mod tests {
         };
         put(status::INDEXING, Value::Bool(true));
         put(status::FILES, Value::I64(4395));
+        put(status::IMAGE_FILES, Value::I64(12));
         put(status::INDEXED_FILES, Value::U64(1709));
         put(status::DEVICE, Value::from("NPU"));
         put(
@@ -247,5 +265,7 @@ mod tests {
         assert_eq!(s.device, "NPU");
         assert_eq!(s.roots, ["/home/u", "/home/u/Development"]);
         assert_eq!(s.chunks, 0);
+        assert_eq!(s.image_files, 12);
+        assert_eq!(s.text_files, 0);
     }
 }

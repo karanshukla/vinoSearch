@@ -260,6 +260,13 @@ impl SettingsWindow {
                         ui.label("Up to date");
                     }
                 });
+                // Why it is indexing after a start: a model changed (#80).
+                if !s.model_changed.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(&s.model_changed).size(12.5).color(p.muted))
+                            .wrap(),
+                    );
+                }
             });
             row(ui, "Contents:", "", |ui| {
                 value(
@@ -272,6 +279,27 @@ impl SettingsWindow {
                     ),
                 );
             });
+            if s.no_decoder > 0 {
+                row(
+                    ui,
+                    "Skipped:",
+                    &format!(
+                        "HEIC and AVIF need heif-convert: {}.",
+                        config::HEIF_CONVERT_PACKAGES
+                    ),
+                    |ui| {
+                        let color = ui.visuals().warn_fg_color;
+                        value(
+                            ui,
+                            RichText::new(format!(
+                                "{} photos, no HEIF decoder installed",
+                                count(s.no_decoder)
+                            ))
+                            .color(color),
+                        );
+                    },
+                );
+            }
             row(ui, "Last change:", "", |ui| {
                 if s.last_indexed == 0 {
                     value(
@@ -661,9 +689,33 @@ impl SettingsWindow {
             return;
         }
         let mut changed = false;
+        let s = match status {
+            Some(Ok(s)) => Some(s),
+            _ => None,
+        };
+        // What a format holds now and its share of the index, so the switch
+        // says what it costs (#73).
+        let share = |files: i64, chunks: Option<i64>| -> Option<String> {
+            let s = s.filter(|_| files > 0)?;
+            let what = match chunks {
+                Some(c) => format!("{} files, {} chunks", count(files), count(c)),
+                None => format!("{} photos", count(files)),
+            };
+            let pct = chunks.unwrap_or(files) as f64 * 100.0 / s.chunks.max(1) as f64;
+            Some(format!("{what}, {pct:.0}% of the index"))
+        };
+        let p = theme::palette(ui.ctx());
         section(ui, "What to index");
         row(ui, "Text:", "Notes, Markdown and source code.", |ui| {
-            value(ui, "On")
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                ui.label("On");
+                if let Some(s) = s
+                    && let Some(text) = share(s.text_files, Some(s.text_chunks))
+                {
+                    ui.label(RichText::new(text).color(p.muted));
+                }
+            });
         });
         row(
             ui,
@@ -671,10 +723,17 @@ impl SettingsWindow {
             "Found by what's in them. A 671 MB download.",
             |ui| {
                 let mut on = self.config.formats.images_enabled();
-                if ui.checkbox(&mut on, "Index images").changed() {
-                    self.config.formats.images.enabled = on.then_some(true);
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, "Index images").changed() {
+                        self.config.formats.images.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.image_files, None)
+                    {
+                        ui.label(RichText::new(text).color(p.muted));
+                    }
+                });
                 if on
                     && let Some(Ok(s)) = status
                     && !s.model_present
@@ -746,10 +805,17 @@ impl SettingsWindow {
             "PDF, Office and CSV. Their text is stored unencrypted.",
             |ui| {
                 let mut on = self.config.formats.documents_enabled();
-                if ui.checkbox(&mut on, "Index documents").changed() {
-                    self.config.formats.documents.enabled = on.then_some(true);
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, "Index documents").changed() {
+                        self.config.formats.documents.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.document_files, Some(s.document_chunks))
+                    {
+                        ui.label(RichText::new(text).color(p.muted));
+                    }
+                });
             },
         );
 
@@ -825,35 +891,68 @@ impl SettingsWindow {
     fn integration(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
         let state = self.integration.lock().unwrap().clone();
-        section(ui, "Desktop search");
-        row(
+        let (kde, gnome) = integration::desktops();
+        section(ui, "Search places");
+        help_line(
             ui,
-            "KRunner, GNOME:",
-            "Runs at login. GNOME shows it from the next login.",
-            |ui| {
-                ui.horizontal(|ui| {
+            "Each place has its own switch; only what's on is installed.",
+        );
+        let mut flip: Option<(integration::Switch, bool)> = None;
+        let mut switch_row = |ui: &mut egui::Ui,
+                              label: &str,
+                              help: &str,
+                              switch: integration::Switch,
+                              absent: Option<&str>| {
+            row(ui, label, help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    let on = state.is_on(switch);
                     if state.running {
                         spinner(ui);
                         ui.label("Working…");
-                    } else if state.registered {
+                    } else if on {
                         ui.label("On");
                     } else {
                         ui.label(RichText::new("Off").color(p.muted));
                     }
-                    let (label, install) = if state.registered {
-                        ("Turn off", false)
-                    } else {
-                        ("Turn on", true)
-                    };
+                    let button = if on { "Turn off" } else { "Turn on" };
                     if ui
-                        .add_enabled(!state.running, egui::Button::new(label))
+                        .add_enabled(!state.running, egui::Button::new(button))
                         .clicked()
                     {
-                        integration::run(Arc::clone(&self.integration), ui.ctx(), install);
+                        flip = Some((switch, !on));
+                    }
+                    if let Some(note) = absent {
+                        ui.label(RichText::new(note).color(p.muted));
                     }
                 });
-            },
+            });
+        };
+        switch_row(
+            ui,
+            "KRunner:",
+            "Alt+Space, and the search in the Plasma app launcher.",
+            integration::Switch::Kde,
+            (!kde).then_some("Plasma isn't running in this session."),
         );
+        switch_row(
+            ui,
+            "GNOME Shell:",
+            "The overview's search, from the next login.",
+            integration::Switch::Gnome,
+            (!gnome).then_some("GNOME isn't running in this session."),
+        );
+        section(ui, "Service");
+        switch_row(
+            ui,
+            "Search service:",
+            "Runs at login. Turning it off removes every search place too.",
+            integration::Switch::Service,
+            None,
+        );
+        if let Some((switch, on)) = flip {
+            integration::run(Arc::clone(&self.integration), ui.ctx(), switch, on);
+        }
         if let Some(output) = &state.output {
             row(ui, "", "", |ui| {
                 egui::Frame::NONE
@@ -869,6 +968,9 @@ impl SettingsWindow {
         section(ui, "Command line");
         row(ui, "Search:", "", |ui| {
             command(ui, "vinosearch search \"what you're looking for\"");
+        });
+        row(ui, "Similar photos:", "", |ui| {
+            command(ui, "vinosearch similar ~/Pictures/IMG_2041.jpg");
         });
         row(ui, "Check the NPU:", "", |ui| {
             command(ui, "vinosearch doctor")
@@ -1202,7 +1304,11 @@ impl eframe::App for SettingsWindow {
             }
             let mut integration = self.integration.lock().unwrap();
             if !integration.running {
-                integration.registered = integration::State::read().registered;
+                let output = integration.output.take();
+                *integration = integration::State {
+                    output,
+                    ..integration::State::read()
+                };
             }
         }
         self.focused = focused;

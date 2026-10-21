@@ -71,7 +71,7 @@ const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 const MAX_IMAGE_BYTES: u64 = 64 << 20;
 /// Documents are parsed whole in memory too. Their extracted text is held to
 /// MAX_FILE_BYTES like any text file.
-const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 
 /// What a chunk was embedded from, stored in `chunks.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Text, Kind::Document, Kind::Image];
+
     fn from_db(v: i64) -> Self {
         match v {
             1 => Kind::Image,
@@ -97,6 +99,30 @@ impl Kind {
             Kind::Text => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document => MAX_DOCUMENT_BYTES,
+        }
+    }
+
+    /// What made this kind's vectors, as `meta` records it (#80): the text
+    /// model's revision, and for images the vision encoder's and the
+    /// soft-token count too. Vectors with another tag score against this
+    /// build's queries without erroring, just wrongly, so they are dropped.
+    pub fn model_tag(self) -> String {
+        match self {
+            Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
+            Kind::Image => format!(
+                "{}+{}/{}",
+                crate::model::REVISION,
+                crate::model::VISION_REVISION,
+                crate::vision::SOFT_TOKENS
+            ),
+        }
+    }
+
+    fn meta_key(self) -> &'static str {
+        match self {
+            Kind::Text => "model.text",
+            Kind::Document => "model.document",
+            Kind::Image => "model.image",
         }
     }
 }
@@ -192,7 +218,10 @@ pub fn open(path: &Path) -> Result<Connection> {
          CREATE TRIGGER IF NOT EXISTS chunk_log_delete AFTER DELETE ON chunks
          BEGIN INSERT INTO chunk_log (chunk_id) VALUES (OLD.id); END;
          CREATE TRIGGER IF NOT EXISTS chunk_log_prune AFTER INSERT ON chunk_log
-         BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;"
+         BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;
+         -- Facts about the index as a whole: which model made each kind's
+         -- vectors (#80), under model.<kind>.
+         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     ))?;
     // Content hashes (#28), added to databases from before them. Their rows
     // stay NULL until `index` next sees the file.
@@ -297,7 +326,6 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-#[cfg(test)]
 fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     (b.len() == DIM * 4).then(|| {
         b.as_chunks::<4>()
@@ -308,6 +336,7 @@ fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     })
 }
 
+#[derive(Default)]
 pub struct Stats {
     pub files_seen: usize,
     pub files_embedded: usize,
@@ -315,6 +344,8 @@ pub struct Stats {
     pub removed: usize,
     /// Files whose content was already indexed, so nothing was embedded.
     pub duplicates: usize,
+    /// Images skipped for want of a decoder this build lacks (HEIF, #79).
+    pub no_decoder: usize,
 }
 
 /// Hidden directories and build output under `root` (not `root` itself).
@@ -374,6 +405,12 @@ pub enum Outcome {
     Unchanged,
     /// Same content as a file already indexed, whose chunks it shares.
     Duplicate,
+    /// Recorded with no chunks: an image that doesn't decode, so it isn't
+    /// tried again until it changes. `no_decoder` when a decoder this build
+    /// lacks would have read it (#79).
+    Unreadable {
+        no_decoder: bool,
+    },
     /// Not a wanted file (type, size, encoding); any old entry for it is dropped.
     Skipped,
 }
@@ -478,13 +515,12 @@ pub fn index_file(
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
         Kind::Document => {
-            // Recorded first: a parser can take the runner down in ways
-            // catch_unwind doesn't catch (abort, stack overflow, out of
-            // memory), and the file must not be parsed again on every
-            // restart. Dropped again once it parses, so a stop while
-            // embedding leaves it to be indexed next time.
+            // Recorded first: the parser runs in a child with limits, but a
+            // file the child cannot parse must not be parsed again on every
+            // restart, and a stop while embedding must leave it to be indexed
+            // next time, so the record goes once it parses.
             record(conn)?;
-            let chunks = document_chunks(path, &bytes);
+            let chunks = document_chunks(path, &bytes, crate::extract::chunks_in_child);
             if !chunks.is_empty() {
                 conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
             }
@@ -499,7 +535,9 @@ pub fn index_file(
             }
             (chunks, vectors)
         }
-        // One chunk, with no text and line 0, from the pixels alone.
+        // One chunk, with no text and line 0, from the pixels alone. One that
+        // doesn't decode keeps a row with no chunks, like a document with no
+        // text, so it isn't decoded again at every check.
         Kind::Image => {
             let pixels =
                 // From the bytes hashed, so the file can't change in between.
@@ -507,8 +545,10 @@ pub fn index_file(
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("skip {}: {e:#}", path.display());
-                        remove(conn, path)?;
-                        return Ok(Outcome::Skipped);
+                        record(conn)?;
+                        return Ok(Outcome::Unreadable {
+                            no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
+                        });
                     }
                 };
             let v = emb.image(&pixels)?;
@@ -534,20 +574,17 @@ pub fn index_file(
     Ok(Outcome::Embedded(chunks.len()))
 }
 
-/// Another file with content `hash` that holds its chunks, if there is one.
-/// `path`'s chunks, or none if it doesn't parse or its text is over
-/// MAX_FILE_BYTES. Files come from anywhere, so a parser panic is caught and
-/// counts as not parsing.
-fn document_chunks(path: &Path, bytes: &[u8]) -> Vec<(usize, String)> {
-    let parsed = std::panic::catch_unwind(|| crate::extract::chunks(path, bytes));
-    let chunks = match parsed {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
+/// `path`'s chunks through `parse` (the child process, #84), or none if it
+/// doesn't parse, the child was stopped, or its text is over MAX_FILE_BYTES.
+fn document_chunks(
+    path: &Path,
+    bytes: &[u8],
+    parse: crate::extract::Parser,
+) -> Vec<(usize, String)> {
+    let chunks = match parse(path, bytes) {
+        Ok(c) => c,
+        Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
-            return Vec::new();
-        }
-        Err(_) => {
-            eprintln!("skip {}: the parser panicked", path.display());
             return Vec::new();
         }
     };
@@ -559,6 +596,7 @@ fn document_chunks(path: &Path, bytes: &[u8]) -> Vec<(usize, String)> {
     chunks
 }
 
+/// Another file with content `hash` that holds its chunks, if there is one.
 fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
@@ -648,6 +686,111 @@ pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
     Ok(n)
 }
 
+/// Drop the vectors of every kind made by a model other than this build's,
+/// and record this build's (#80). The files holding them go too (with their
+/// copies), so the next check of each root indexes them afresh. An index
+/// with no record for a kind is taken as this build's and tagged: nothing
+/// else has shipped for it. Returns (kind, files dropped) per kind purged.
+pub fn purge_other_models(conn: &Connection) -> Result<Vec<(Kind, usize)>> {
+    let tags: Vec<(Kind, String)> = Kind::ALL.iter().map(|k| (*k, k.model_tag())).collect();
+    purge_models_but(conn, &tags)
+}
+
+fn purge_models_but(conn: &Connection, tags: &[(Kind, String)]) -> Result<Vec<(Kind, usize)>> {
+    let mut out = Vec::new();
+    let tx = conn.unchecked_transaction()?;
+    for (kind, tag) in tags {
+        let was: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [kind.meta_key()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if was.as_deref().is_some_and(|w| w != tag) {
+            out.push((*kind, drop_kind(&tx, *kind)?));
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![kind.meta_key(), tag],
+        )?;
+    }
+    tx.commit()?;
+    if out.iter().any(|(_, n)| *n > 0) {
+        compact(conn)?;
+    }
+    Ok(out)
+}
+
+/// Every chunk of `kind`, and the files holding them and their copies.
+/// Returns files removed.
+fn drop_kind(tx: &Connection, kind: Kind) -> Result<usize> {
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS dropped (id INTEGER, sha BLOB); DELETE FROM dropped;",
+    )?;
+    tx.execute(
+        "INSERT INTO dropped SELECT DISTINCT f.id, f.sha256 FROM files f
+         JOIN chunks c ON c.file_id = f.id WHERE c.kind = ?1",
+        [kind as i64],
+    )?;
+    // Chunks first: deleting a file with chunks hands them to a copy
+    // (files_hand_over), and these must go.
+    tx.execute("DELETE FROM chunks WHERE kind = ?1", [kind as i64])?;
+    let n = tx.execute(
+        "DELETE FROM files WHERE id IN (SELECT id FROM dropped)
+         OR sha256 IN (SELECT sha FROM dropped WHERE sha IS NOT NULL)",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE dropped")?;
+    Ok(n)
+}
+
+/// `LIKE` patterns for files with a HEIF extension (#79).
+fn heif_patterns() -> Vec<String> {
+    crate::vision::HEIF_EXTENSIONS
+        .iter()
+        .map(|e| format!("%.{e}"))
+        .collect()
+}
+
+/// Images recorded without chunks for want of a HEIF decoder: by extension,
+/// leaving out copies of a file that did decode. What the Index page counts
+/// while heif-convert is missing (#79).
+pub fn undecodable(conn: &Connection) -> Result<i64> {
+    let mut n = 0;
+    for pattern in heif_patterns() {
+        n += conn.query_row(
+            "SELECT count(*) FROM files f
+             WHERE lower(f.path) LIKE ?1
+               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                               WHERE g.sha256 = f.sha256)",
+            [pattern],
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    Ok(n)
+}
+
+/// Forget the images recorded as undecodable once a decoder is there, so the
+/// next check of each root indexes them. Returns files dropped.
+pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
+    if crate::vision::heif_convert().is_none() {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for pattern in heif_patterns() {
+        n += conn.execute(
+            "DELETE FROM files WHERE lower(path) LIKE ?1
+               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
+               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                               WHERE g.sha256 = files.sha256)",
+            [pattern],
+        )?;
+    }
+    Ok(n)
+}
+
 /// Hand freed space back once over a quarter of the file is free pages.
 /// SQLite otherwise keeps a purged index's full size: excluding 80% of a
 /// 113k-chunk index left the file at 470 MB until a VACUUM took it to 92 MB
@@ -689,13 +832,7 @@ pub fn index(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
         [root.to_string_lossy()],
     )?;
-    let mut stats = Stats {
-        files_seen: 0,
-        files_embedded: 0,
-        chunks: 0,
-        removed: 0,
-        duplicates: 0,
-    };
+    let mut stats = Stats::default();
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {
         if !entry.file_type().is_file() || !wanted(entry.path(), types) {
@@ -716,6 +853,10 @@ pub fn index(
             Outcome::Duplicate => {
                 stats.duplicates += 1;
                 stats.files_seen += 1;
+            }
+            Outcome::Unreadable { no_decoder } => {
+                stats.files_seen += 1;
+                stats.no_decoder += usize::from(no_decoder);
             }
             Outcome::Skipped => {
                 if let Some(p) = entry.path().to_str() {
@@ -784,6 +925,22 @@ pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// An indexed image's vector (#77), its holder's if it is a byte-identical
+/// copy; None for a path that isn't an indexed image.
+pub fn image_vector(conn: &Connection, path: &str) -> Result<Option<Vec<f32>>> {
+    let blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT c.embedding FROM files f
+             JOIN files g ON g.id = f.id OR (g.sha256 IS NOT NULL AND g.sha256 = f.sha256)
+             JOIN chunks c ON c.file_id = g.id
+             WHERE f.path = ?1 AND c.kind = ?2 LIMIT 1",
+            params![path, Kind::Image as i64],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(blob.as_deref().and_then(from_blob))
+}
+
 /// Whether `path` is an indexed file.
 pub fn is_indexed(conn: &Connection, path: &str) -> Result<bool> {
     Ok(conn
@@ -798,6 +955,31 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
         conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?,
         conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?,
     ))
+}
+
+/// (files, chunks) of each kind in the index, in `Kind::ALL`'s order (#73).
+/// A file counts under the kind of its chunks, so one recorded without any
+/// (a scan, a photo with no decoder) counts under none.
+pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 3]> {
+    let mut out = [(0, 0); 3];
+    let mut stmt =
+        conn.prepare("SELECT kind, count(DISTINCT file_id), count(*) FROM chunks GROUP BY kind")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            Kind::from_db(r.get(0)?),
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, files, chunks) = row?;
+        let i = Kind::ALL
+            .iter()
+            .position(|k| *k == kind)
+            .expect("every kind is listed");
+        out[i] = (files, chunks);
+    }
+    Ok(out)
 }
 
 /// Roots `index` has been run on, which the watcher follows.
@@ -1643,9 +1825,10 @@ mod tests {
 
     #[test]
     fn a_document_that_does_not_parse_has_no_chunks() {
-        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf").is_empty());
+        let parse = crate::extract::chunks;
+        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf", parse).is_empty());
         let csv = format!("h\n{}", "x\n".repeat(MAX_FILE_BYTES as usize));
-        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes()).is_empty());
+        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes(), parse).is_empty());
     }
 
     #[test]
@@ -1678,6 +1861,143 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_are_split_by_kind() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-bykind-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes.md", &[0, 1]);
+        add_file(&conn, "/more.md", &[2]);
+        add_file(&conn, "/cat.png", &[3]);
+        conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
+        // A document recorded without text counts under nothing.
+        conn.execute(
+            "INSERT INTO files (path, mtime, size) VALUES ('/scan.pdf', 0, 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(counts_by_kind(&conn).unwrap(), [(2, 3), (0, 0), (1, 1)]);
+        assert_eq!(counts(&conn).unwrap(), (4, 4));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_indexed_image_gives_its_vector_and_so_does_a_copy() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-simv-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/p/a.jpg', 0, 0, x'aa')",
+            [],
+        )
+        .unwrap();
+        let a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, 0, '', ?2, 1)",
+            params![a, axis(3)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/p/copy.jpg', 0, 0, x'aa')",
+            [],
+        )
+        .unwrap();
+        add_file(&conn, "/p/notes.md", &[4]);
+        let mut want = vec![0f32; DIM];
+        want[3] = 1.0;
+        assert_eq!(image_vector(&conn, "/p/a.jpg").unwrap(), Some(want.clone()));
+        assert_eq!(image_vector(&conn, "/p/copy.jpg").unwrap(), Some(want));
+        assert_eq!(image_vector(&conn, "/p/notes.md").unwrap(), None);
+        assert_eq!(image_vector(&conn, "/p/missing.jpg").unwrap(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undecodable_photos_are_counted_but_not_their_decoded_copies() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-heif-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let file = |path: &str, hash: &[u8]| {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?2)",
+                params![path, hash],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        file("/p/IMG_1.HEIC", b"a");
+        file("/p/IMG_2.heic", b"b");
+        file("/p/render.avif", b"c");
+        // Decoded, and a byte-identical copy of it holding no chunks.
+        let decoded = file("/p/IMG_3.heic", b"d");
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, 0, '', ?2, 1)",
+            params![decoded, axis(0)],
+        )
+        .unwrap();
+        file("/p/copy.heic", b"d");
+        // Not HEIF: a document with no text.
+        file("/p/scan.pdf", b"e");
+        assert_eq!(undecodable(&conn).unwrap(), 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vectors_from_another_model_are_dropped_with_their_files() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-model-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let tag = |kind: Kind, t: &str| (kind, t.to_owned());
+        let v1 = [
+            tag(Kind::Text, "text-1"),
+            tag(Kind::Document, "text-1"),
+            tag(Kind::Image, "text-1+vision-1/140"),
+        ];
+        // A fresh index has no record: nothing to drop, this build is recorded.
+        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
+        add_file(&conn, "/notes.md", &[0, 1]);
+        add_file(&conn, "/cat.png", &[2]);
+        conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
+        // A byte-identical copy of the photo, holding no chunks of its own.
+        conn.execute(
+            "UPDATE files SET sha256 = x'01' WHERE path = '/cat.png'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/copy.png', 0, 0, x'01')",
+            [],
+        )
+        .unwrap();
+        // Same models again: nothing happens.
+        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
+        assert_eq!(counts(&conn).unwrap(), (3, 3));
+
+        // A new vision encoder: the images go, the copy included; text stays.
+        let v2 = [
+            tag(Kind::Text, "text-1"),
+            tag(Kind::Document, "text-1"),
+            tag(Kind::Image, "text-1+vision-2/140"),
+        ];
+        assert_eq!(purge_models_but(&conn, &v2).unwrap(), [(Kind::Image, 2)]);
+        assert_eq!(counts(&conn).unwrap(), (1, 2));
+        assert!(is_indexed(&conn, "/notes.md").unwrap());
+        assert!(purge_models_but(&conn, &v2).unwrap().is_empty());
+
+        // A new text model: everything of that kind goes.
+        let v3 = [
+            tag(Kind::Text, "text-2"),
+            tag(Kind::Document, "text-2"),
+            tag(Kind::Image, "text-1+vision-2/140"),
+        ];
+        let purged = purge_models_but(&conn, &v3).unwrap();
+        assert_eq!(purged, [(Kind::Text, 1), (Kind::Document, 0)]);
+        assert_eq!(counts(&conn).unwrap(), (0, 0));
+        let recorded: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'model.text'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, "text-2");
         fs::remove_dir_all(&dir).unwrap();
     }
 
