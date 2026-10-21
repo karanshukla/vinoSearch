@@ -61,6 +61,9 @@ pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.63;
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif",
 ];
+/// Where heif-convert comes from, for the messages that say to install it.
+pub const HEIF_CONVERT_PACKAGES: &str =
+    "libheif-tools on Fedora, libheif-examples on Debian and Ubuntu, libheif on Arch";
 
 /// `index_busy_percent` as a share of the device's time, in (0, 1].
 pub fn index_share(percent: u8) -> Result<f64> {

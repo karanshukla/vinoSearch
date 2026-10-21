@@ -263,8 +263,9 @@ fn run(cli: Cli) -> Result<bool> {
                 );
                 if st.no_decoder > 0 {
                     eprintln!(
-                        "{} photos skipped: HEIC and AVIF need libheif's heif-convert installed",
-                        st.no_decoder
+                        "{} photos skipped: HEIC and AVIF need heif-convert installed ({})",
+                        st.no_decoder,
+                        config::HEIF_CONVERT_PACKAGES
                     );
                 }
             }

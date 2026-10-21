@@ -283,7 +283,10 @@ impl SettingsWindow {
                 row(
                     ui,
                     "Skipped:",
-                    "HEIC and AVIF need libheif's heif-convert, from your distribution.",
+                    &format!(
+                        "HEIC and AVIF need heif-convert: {}.",
+                        config::HEIF_CONVERT_PACKAGES
+                    ),
                     |ui| {
                         let color = ui.visuals().warn_fg_color;
                         value(

@@ -75,7 +75,11 @@ pub struct NoDecoder;
 
 impl std::fmt::Display for NoDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("needs a HEIF decoder: install libheif's heif-convert")
+        write!(
+            f,
+            "needs a HEIF decoder: install heif-convert ({})",
+            vinosearch_shared::config::HEIF_CONVERT_PACKAGES
+        )
     }
 }
 
