@@ -260,6 +260,13 @@ impl SettingsWindow {
                         ui.label("Up to date");
                     }
                 });
+                // Why it is indexing after a start: a model changed (#80).
+                if !s.model_changed.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(&s.model_changed).size(12.5).color(p.muted))
+                            .wrap(),
+                    );
+                }
             });
             row(ui, "Contents:", "", |ui| {
                 value(

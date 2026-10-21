@@ -81,6 +81,9 @@ pub struct Status {
     /// Indexing is paused: a running job stops after its current chunk, and
     /// new ones wait until Retry.
     pub paused: AtomicBool,
+    /// Why this start dropped part of the index to be indexed again (a model
+    /// changed, #80), until that indexing is done; empty otherwise.
+    pub model_changed: std::sync::Mutex<String>,
 }
 
 /// An indexing job stopped part way, to be run again.
@@ -113,6 +116,34 @@ impl Status {
             ..Default::default()
         }
     }
+}
+
+/// Before the watcher compares the roots with the index: drop what this
+/// build must index again (vectors from another model, #80), so that first
+/// comparison finds it, and say so in `status` for the Index page.
+pub fn prepare(status: &Status) -> Result<()> {
+    let conn = index::open(&index::default_db()?)?;
+    let purged = index::purge_other_models(&conn)?;
+    if let Some(why) = model_changed(&purged) {
+        eprintln!("{why}");
+        *status.model_changed.lock().unwrap() = why;
+    }
+    Ok(())
+}
+
+/// One sentence on what `purge_other_models` dropped, for the Index page;
+/// None when nothing was.
+pub fn model_changed(purged: &[(Kind, usize)]) -> Option<String> {
+    let dropped = |kind: Kind| purged.iter().any(|(k, _)| *k == kind);
+    let files: usize = purged.iter().map(|(_, n)| n).sum();
+    let text = dropped(Kind::Text) || dropped(Kind::Document);
+    let what = match (text, dropped(Kind::Image)) {
+        (true, true) => "The models changed, so everything",
+        (true, false) => "The text model changed, so text and documents",
+        (false, true) => "The image model changed, so images",
+        (false, false) => return None,
+    };
+    Some(format!("{what} ({files} files) will be indexed again."))
 }
 
 /// Settings given as flags or environment variables, which config file
@@ -586,6 +617,16 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         // that compiled it. Short queries leave the timer alone.
         if emb.has_documents() && (indexes || !had_docs) {
             free_docs = Some(Instant::now() + DOCS_HOLD);
+        }
+        // The re-indexing a model change asked for is done once no indexing
+        // is left queued.
+        if indexes
+            && status.queued_reindex.load(Ordering::Relaxed) == 0
+            && !deferred
+                .iter()
+                .any(|j| matches!(j, Job::Changed(_) | Job::Reindex(_)))
+        {
+            status.model_changed.lock().unwrap().clear();
         }
     }
     Ok(())

@@ -436,6 +436,10 @@ impl Control {
         ] {
             out.insert(k.into(), owned(Value::from(u64_of(at))));
         }
+        out.insert(
+            key::MODEL_CHANGED.into(),
+            owned(Value::from(st.model_changed.lock().unwrap().clone())),
+        );
         let cache = crate::cache_dir().map_err(failed)?;
         out.insert(
             key::CACHE_BYTES.into(),
@@ -591,6 +595,7 @@ fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
+    worker::prepare(&opts.status)?;
     let _watcher = watch::spawn(
         tx.clone(),
         opts.config.clone(),

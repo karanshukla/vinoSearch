@@ -63,6 +63,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `cache_bytes` | `t` | OpenVINO's compiled-model cache on disk (one blob per stage, ~270 MB each on the NPU). |
 | `last_checked` | `t` | Unix seconds when every root was last compared with the index (at startup, hourly, after a resume, after dropped inotify events, or on `CheckNow`); 0 before the first. |
 | `last_indexed` | `t` | Unix seconds when an indexing job last embedded or removed a file; 0 for not since the runner started. |
+| `model_changed` | `s` | Why part of the index was dropped at this start to be indexed again: the text or image model is not the one that made those vectors ([#80](https://github.com/karanshukla/vinoSearch/issues/80)). Empty otherwise, and again once that indexing has finished. |
 
 ## Settings
 

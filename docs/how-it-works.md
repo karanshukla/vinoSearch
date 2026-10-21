@@ -24,6 +24,8 @@ inotify can still miss changes: the kernel drops events when its queue overflows
 
 The runner runs as `vinosearch.service` (logs: `journalctl --user -u vinosearch`), started at login so the watcher is always running. Each time it starts it compares every indexed root against the index by mtime and size, without loading the model (under 0.1 s for 2,600 files here), and indexes whatever changed while nothing was watching. Without systemd, D-Bus starts it on the first query instead.
 
+The index records which model made each kind's vectors (the text model's revision; for images the vision encoder's and the soft-token count too). A build shipping a different one drops that kind's vectors and files at startup, so the startup check indexes them again, and the Index page says why ([#80](https://github.com/karanshukla/vinoSearch/issues/80)). Vectors from another model would otherwise score against new queries without erroring, just wrongly.
+
 It frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH_IDLE_UNLOAD_MINUTES`; 0 keeps it loaded): 553 MB loaded with a 23k-chunk index and no load spike (it compiles from a static-shape graph, so a cached model is loaded without reading the weights), 12 MB unloaded, ~1 s to reload.
 
 It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index). The full interface is in [dbus.md](dbus.md).

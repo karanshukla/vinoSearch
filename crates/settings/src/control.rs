@@ -34,6 +34,8 @@ pub struct Status {
     /// Unix seconds; 0 for not since the runner started.
     pub last_checked: u64,
     pub last_indexed: u64,
+    /// Why files are being indexed again after a start; empty otherwise.
+    pub model_changed: String,
 }
 
 impl Status {
@@ -81,6 +83,7 @@ impl Status {
             cache_bytes: unsigned(status::CACHE_BYTES),
             last_checked: unsigned(status::LAST_CHECKED),
             last_indexed: unsigned(status::LAST_INDEXED),
+            model_changed: text(status::MODEL_CHANGED),
         }
     }
 }

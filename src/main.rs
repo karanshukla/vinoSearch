@@ -191,6 +191,9 @@ fn run(cli: Cli) -> Result<bool> {
             }
             let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
             let mut conn = index::open(&index::default_db()?)?;
+            if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
+                eprintln!("{why}");
+            }
             for p in &paths {
                 let t0 = Instant::now();
                 let mut shown = 0;
@@ -245,6 +248,7 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
+            worker::prepare(&opts.status)?;
             let _watcher = watch::spawn(
                 tx,
                 opts.config.clone(),
@@ -259,6 +263,7 @@ fn run(cli: Cli) -> Result<bool> {
             let conn = index::open(&index::default_db()?)?;
             index::purge(&conn, &s.excludes)?;
             index::purge_types(&conn, &s.types)?;
+            index::purge_other_models(&conn)?;
             let t0 = Instant::now();
             let q = emb.query(&query)?;
             let t1 = Instant::now();

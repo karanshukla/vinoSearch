@@ -84,6 +84,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Text, Kind::Document, Kind::Image];
+
     fn from_db(v: i64) -> Self {
         match v {
             1 => Kind::Image,
@@ -97,6 +99,30 @@ impl Kind {
             Kind::Text => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document => MAX_DOCUMENT_BYTES,
+        }
+    }
+
+    /// What made this kind's vectors, as `meta` records it (#80): the text
+    /// model's revision, and for images the vision encoder's and the
+    /// soft-token count too. Vectors with another tag score against this
+    /// build's queries without erroring, just wrongly, so they are dropped.
+    pub fn model_tag(self) -> String {
+        match self {
+            Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
+            Kind::Image => format!(
+                "{}+{}/{}",
+                crate::model::REVISION,
+                crate::model::VISION_REVISION,
+                crate::vision::SOFT_TOKENS
+            ),
+        }
+    }
+
+    fn meta_key(self) -> &'static str {
+        match self {
+            Kind::Text => "model.text",
+            Kind::Document => "model.document",
+            Kind::Image => "model.image",
         }
     }
 }
@@ -192,7 +218,10 @@ pub fn open(path: &Path) -> Result<Connection> {
          CREATE TRIGGER IF NOT EXISTS chunk_log_delete AFTER DELETE ON chunks
          BEGIN INSERT INTO chunk_log (chunk_id) VALUES (OLD.id); END;
          CREATE TRIGGER IF NOT EXISTS chunk_log_prune AFTER INSERT ON chunk_log
-         BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;"
+         BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;
+         -- Facts about the index as a whole: which model made each kind's
+         -- vectors (#80), under model.<kind>.
+         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     ))?;
     // Content hashes (#28), added to databases from before them. Their rows
     // stay NULL until `index` next sees the file.
@@ -645,6 +674,65 @@ pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
     if n > 0 {
         compact(conn)?;
     }
+    Ok(n)
+}
+
+/// Drop the vectors of every kind made by a model other than this build's,
+/// and record this build's (#80). The files holding them go too (with their
+/// copies), so the next check of each root indexes them afresh. An index
+/// with no record for a kind is taken as this build's and tagged: nothing
+/// else has shipped for it. Returns (kind, files dropped) per kind purged.
+pub fn purge_other_models(conn: &Connection) -> Result<Vec<(Kind, usize)>> {
+    let tags: Vec<(Kind, String)> = Kind::ALL.iter().map(|k| (*k, k.model_tag())).collect();
+    purge_models_but(conn, &tags)
+}
+
+fn purge_models_but(conn: &Connection, tags: &[(Kind, String)]) -> Result<Vec<(Kind, usize)>> {
+    let mut out = Vec::new();
+    let tx = conn.unchecked_transaction()?;
+    for (kind, tag) in tags {
+        let was: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [kind.meta_key()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if was.as_deref().is_some_and(|w| w != tag) {
+            out.push((*kind, drop_kind(&tx, *kind)?));
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![kind.meta_key(), tag],
+        )?;
+    }
+    tx.commit()?;
+    if out.iter().any(|(_, n)| *n > 0) {
+        compact(conn)?;
+    }
+    Ok(out)
+}
+
+/// Every chunk of `kind`, and the files holding them and their copies.
+/// Returns files removed.
+fn drop_kind(tx: &Connection, kind: Kind) -> Result<usize> {
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS dropped (id INTEGER, sha BLOB); DELETE FROM dropped;",
+    )?;
+    tx.execute(
+        "INSERT INTO dropped SELECT DISTINCT f.id, f.sha256 FROM files f
+         JOIN chunks c ON c.file_id = f.id WHERE c.kind = ?1",
+        [kind as i64],
+    )?;
+    // Chunks first: deleting a file with chunks hands them to a copy
+    // (files_hand_over), and these must go.
+    tx.execute("DELETE FROM chunks WHERE kind = ?1", [kind as i64])?;
+    let n = tx.execute(
+        "DELETE FROM files WHERE id IN (SELECT id FROM dropped)
+         OR sha256 IN (SELECT sha FROM dropped WHERE sha IS NOT NULL)",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE dropped")?;
     Ok(n)
 }
 
@@ -1678,6 +1766,65 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vectors_from_another_model_are_dropped_with_their_files() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-model-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let tag = |kind: Kind, t: &str| (kind, t.to_owned());
+        let v1 = [
+            tag(Kind::Text, "text-1"),
+            tag(Kind::Document, "text-1"),
+            tag(Kind::Image, "text-1+vision-1/140"),
+        ];
+        // A fresh index has no record: nothing to drop, this build is recorded.
+        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
+        add_file(&conn, "/notes.md", &[0, 1]);
+        add_file(&conn, "/cat.png", &[2]);
+        conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
+        // A byte-identical copy of the photo, holding no chunks of its own.
+        conn.execute(
+            "UPDATE files SET sha256 = x'01' WHERE path = '/cat.png'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/copy.png', 0, 0, x'01')",
+            [],
+        )
+        .unwrap();
+        // Same models again: nothing happens.
+        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
+        assert_eq!(counts(&conn).unwrap(), (3, 3));
+
+        // A new vision encoder: the images go, the copy included; text stays.
+        let v2 = [
+            tag(Kind::Text, "text-1"),
+            tag(Kind::Document, "text-1"),
+            tag(Kind::Image, "text-1+vision-2/140"),
+        ];
+        assert_eq!(purge_models_but(&conn, &v2).unwrap(), [(Kind::Image, 2)]);
+        assert_eq!(counts(&conn).unwrap(), (1, 2));
+        assert!(is_indexed(&conn, "/notes.md").unwrap());
+        assert!(purge_models_but(&conn, &v2).unwrap().is_empty());
+
+        // A new text model: everything of that kind goes.
+        let v3 = [
+            tag(Kind::Text, "text-2"),
+            tag(Kind::Document, "text-2"),
+            tag(Kind::Image, "text-1+vision-2/140"),
+        ];
+        let purged = purge_models_but(&conn, &v3).unwrap();
+        assert_eq!(purged, [(Kind::Text, 1), (Kind::Document, 0)]);
+        assert_eq!(counts(&conn).unwrap(), (0, 0));
+        let recorded: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'model.text'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, "text-2");
         fs::remove_dir_all(&dir).unwrap();
     }
 

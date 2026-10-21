@@ -44,4 +44,7 @@ pub mod status {
     /// last indexing job that changed it. 0 for not since the runner started.
     pub const LAST_CHECKED: &str = "last_checked";
     pub const LAST_INDEXED: &str = "last_indexed";
+    /// Why files are being indexed again after a start: a model changed
+    /// (#80). Empty otherwise, and once that indexing is done.
+    pub const MODEL_CHANGED: &str = "model_changed";
 }
