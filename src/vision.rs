@@ -306,6 +306,60 @@ mod tests {
         assert!(e.downcast_ref::<NoDecoder>().is_some(), "{e}");
     }
 
+    /// An iPhone portrait is stored sideways with both an `irot` property and
+    /// EXIF orientation 6. libheif turns the pixels upright, so the JPEG it
+    /// writes must not carry the orientation on for `decode` to apply again.
+    #[test]
+    fn an_iphone_portrait_is_turned_upright_once() {
+        let Some(enc) = heif_convert()
+            .map(|c| c.with_file_name("heif-enc"))
+            .filter(|e| e.is_file())
+        else {
+            return;
+        };
+        // Upright: 64x32, red on the left, blue on the right.
+        let upright = RgbImage::from_fn(64, 32, |x, _| {
+            image::Rgb(if x < 32 { [255, 0, 0] } else { [0, 0, 255] })
+        });
+        let stored = image::imageops::rotate270(&upright);
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(&stored)
+            .unwrap();
+        // APP1 after SOI: Exif, a little-endian TIFF header, one IFD entry,
+        // Orientation (0x0112) SHORT 6.
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0".to_vec();
+        exif.extend([0; 4]);
+        let mut app1 = vec![0xff, 0xe1];
+        app1.extend((exif.len() as u16 + 2).to_be_bytes());
+        app1.extend(exif);
+        jpeg.splice(2..2, app1);
+
+        let dir = std::env::temp_dir().join(format!("vinosearch-irot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, heic) = (dir.join("in.jpg"), dir.join("in.heic"));
+        std::fs::write(&src, &jpeg).unwrap();
+        let ok = std::process::Command::new(enc)
+            .arg("-q")
+            .arg("95")
+            .arg(&src)
+            .arg("-o")
+            .arg(&heic)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        let bytes = std::fs::read(&heic);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "heif-enc failed");
+
+        let img = load(&bytes.unwrap()).unwrap();
+        assert_eq!(img.dimensions(), (64, 32));
+        let (left, right) = (img.get_pixel(8, 16), img.get_pixel(56, 16));
+        assert!(left[0] > 200 && left[2] < 60, "left {left:?}");
+        assert!(right[2] > 200 && right[0] < 60, "right {right:?}");
+    }
+
     #[test]
     fn a_grid_without_a_whole_soft_token_is_refused() {
         assert!(patchify(&RgbImage::new(480, 32)).is_err());
