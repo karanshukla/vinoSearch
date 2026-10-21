@@ -66,3 +66,10 @@ pub mod status {
     /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
     pub const NO_DECODER: &str = "no_decoder";
 }
+
+/// `Control1.RecentFiles`: the kinds it returns, and the most it returns.
+pub mod recent {
+    pub const TEXT: &str = "text";
+    pub const DOCUMENT: &str = "document";
+    pub const MAX: u32 = 50;
+}

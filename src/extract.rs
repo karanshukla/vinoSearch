@@ -4,7 +4,7 @@
 //! row instead of line. The indexer runs it in a child process with limits
 //! (#84), since the files come from anywhere.
 
-use crate::index::{CHUNK_CHARS, MAX_DOCUMENT_BYTES, chunk};
+use crate::index::{CHUNK_CHARS, MAX_DOCUMENT_BYTES, MAX_FILE_BYTES, chunk};
 use anyhow::{Context, Result, bail};
 use quick_xml::events::Event;
 use std::io::{Cursor, Read};
@@ -36,6 +36,65 @@ pub fn chunks_in_child(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>
     cmd.arg("extract").arg(path);
     let out = crate::proc::run(cmd, bytes, CHILD_WALL)?;
     serde_json::from_slice(&out).context("reading the extractor's output")
+}
+
+/// `path`'s whole text, for reading aloud: parsed in the child as indexing
+/// does, under the same limits, then joined back up.
+pub fn text(path: &Path) -> Result<String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        bail!("over {MAX_DOCUMENT_BYTES} bytes");
+    }
+    let chunks = chunks_in_child(path, &bytes)?;
+    let size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
+    if size as u64 > MAX_FILE_BYTES {
+        bail!("{size} bytes of text");
+    }
+    Ok(join(path, chunks))
+}
+
+/// Chunks back into the text they came from. `chunk` cuts without overlap,
+/// so a part's chunks concatenate back into it; pages and slides are kept
+/// apart by a blank line. A table's chunks each repeat its header (and a
+/// sheet's name), which is kept once per sheet.
+fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
+    let header_lines = match ext(path).as_str() {
+        "csv" | "tsv" => 1,
+        "xlsx" | "xls" | "ods" => 2,
+        _ => 0,
+    };
+    let by_part = matches!(unit(path), "page" | "slide");
+    let mut out = String::new();
+    let mut last_part = None;
+    let mut last_header = None;
+    for (n, text) in &chunks {
+        let header_end = text
+            .match_indices('\n')
+            .nth(header_lines.max(1) - 1)
+            .map_or(text.len(), |(i, _)| i + 1);
+        let header = (header_lines > 0).then(|| &text[..header_end]);
+        let new_part = if header_lines > 0 {
+            header != last_header
+        } else {
+            by_part && last_part != Some(*n)
+        };
+        if new_part && !out.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(match header {
+            Some(_) if !new_part => &text[header_end..],
+            _ => text,
+        });
+        last_part = Some(*n);
+        last_header = header;
+    }
+    out
 }
 
 /// The child's side: set the limits, read the document from stdin, write
@@ -429,6 +488,56 @@ mod tests {
             let first = text.lines().nth(1).unwrap();
             assert_eq!(csv.lines().nth(row - 1), Some(first));
         }
+    }
+
+    #[test]
+    fn joined_chunks_give_back_the_text() {
+        let long = "word ".repeat(CHUNK_CHARS);
+        let xml = format!(
+            "<w:document><w:body><w:p><w:r><w:t>{long}</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>after</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let docx = Path::new("a.docx");
+        let c = chunks(docx, &zipped(&[("word/document.xml", &xml)])).unwrap();
+        assert!(c.len() > 2);
+        assert_eq!(join(docx, c), format!("{long}\nafter\n"));
+
+        let rows: Vec<String> = (0..200).map(|i| format!("{i},payee {i},12.34")).collect();
+        let csv = format!("n,payee,amount\n{}\n", rows.join("\n"));
+        let path = Path::new("a.csv");
+        let c = chunks(path, csv.as_bytes()).unwrap();
+        assert!(c.len() > 1);
+        assert_eq!(join(path, c), csv);
+    }
+
+    #[test]
+    fn pages_and_sheets_are_joined_with_a_blank_line() {
+        let page = |n: usize, t: &str| (n, t.to_owned());
+        assert_eq!(
+            join(
+                Path::new("a.pdf"),
+                vec![page(1, "one "), page(1, "more\n"), page(3, "three\n")]
+            ),
+            "one more\n\nthree\n"
+        );
+        assert_eq!(
+            join(
+                Path::new("a.ods"),
+                vec![
+                    page(2, "S1\nh\nr1\n"),
+                    page(3, "S1\nh\nr2\n"),
+                    page(2, "S2\nh\nq\n"),
+                ]
+            ),
+            "S1\nh\nr1\nr2\n\nS2\nh\nq\n"
+        );
+        let slide = |t: &str| format!("<p:sld><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:sld>");
+        let pptx = Path::new("a.pptx");
+        let doc = zipped(&[
+            ("ppt/slides/slide1.xml", &slide("one")),
+            ("ppt/slides/slide2.xml", &slide("two")),
+        ]);
+        assert_eq!(join(pptx, chunks(pptx, &doc).unwrap()), "one\n\ntwo\n");
     }
 
     #[test]

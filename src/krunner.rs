@@ -12,13 +12,14 @@ use crate::index::{self, Hit, Kind};
 use crate::model;
 use crate::watch;
 use crate::worker::{self, Job, Options, Status};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use zbus::interface;
@@ -26,7 +27,7 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
-    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, status as key,
+    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, recent, status as key,
 };
 /// Files of each kind shown.
 const RESULTS: usize = 5;
@@ -45,12 +46,16 @@ type Match = (
 /// One connection for the handlers that read the index; queries are short.
 type Db = Arc<Mutex<rusqlite::Connection>>;
 
+/// The vinoSpeak process reading, shared with the thread that extracts a
+/// document's text before it starts one.
+type Speaking = Arc<Mutex<Option<Child>>>;
+
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
     config: PathBuf,
     /// The vinoSpeak read playing, if any; one at a time.
-    speaking: Mutex<Option<Child>>,
+    speaking: Speaking,
 }
 
 /// How close a result must be, per kind (`formats.*.min_score`).
@@ -143,10 +148,11 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
     };
     props.insert("category".into(), owned(Value::from(category)));
-    // The actions KRunner shows for this match: vinoSpeak reads UTF-8 text.
+    // The actions KRunner shows for this match: vinoSpeak reads text, and a
+    // document's text extracted here.
     let actions = match h.kind {
-        Kind::Text => vec!["open-folder", "read-aloud"],
-        Kind::Document | Kind::Image => vec!["open-folder"],
+        Kind::Text | Kind::Document => vec!["open-folder", "read-aloud"],
+        Kind::Image => vec!["open-folder"],
     };
     props.insert("actions".into(), owned(Value::from(actions)));
     let floor = floors.of(h.kind);
@@ -225,29 +231,93 @@ fn vinospeak(
         .find(|p| is_file(p))
 }
 
+/// The text of the indexed file `id`, for reading aloud: a text file's
+/// contents, or a document's text from the extractor child (seconds for a
+/// big PDF). Err for anything else, an image included.
+fn file_text(db: &Db, id: &str) -> Result<String> {
+    if !index::is_indexed(&db.lock().unwrap(), id)? {
+        bail!("{id} is not an indexed file");
+    }
+    let path = Path::new(id);
+    match index::readable_kind(path) {
+        Some(Kind::Text) => {
+            let mut text = String::new();
+            fs::File::open(path)?
+                .take(index::MAX_FILE_BYTES + 1)
+                .read_to_string(&mut text)
+                .with_context(|| format!("{id}: not UTF-8"))?;
+            if text.len() as u64 > index::MAX_FILE_BYTES {
+                bail!("{id} is over {} bytes", index::MAX_FILE_BYTES);
+            }
+            Ok(text)
+        }
+        Some(Kind::Document) => {
+            crate::extract::text(path).with_context(|| format!("extracting {id}"))
+        }
+        _ => bail!("{id} is not a text file or document"),
+    }
+}
+
 /// Read the indexed file `id` aloud with vinoSpeak, stopping any read still
-/// playing (and reaping one that has finished).
-fn read_aloud(db: &Db, speaking: &Mutex<Option<Child>>, id: &str) {
+/// playing (and reaping one that has finished). A text file goes by path,
+/// since vinoSpeak cleans markdown up by its suffix; a document's text is
+/// extracted on a thread of its own and piped in.
+fn read_aloud(db: &Db, speaking: &Speaking, id: &str) {
     if !indexed(db, id, "reading") {
         return;
     }
+    let Some(kind) = index::readable_kind(Path::new(id)) else {
+        eprintln!("not reading {id}: not a text file or document");
+        return;
+    };
     let path = std::env::var_os("PATH");
     let home = std::env::var_os("HOME");
     let Some(bin) = vinospeak(path.as_deref(), home.as_deref(), Path::is_file) else {
         eprintln!("not reading {id}: vinospeak is not installed (uv tool install vinospeak)");
         return;
     };
+    if let Some(old) = speaking.lock().unwrap().take() {
+        stop_reading(old);
+    }
+    if kind == Kind::Text {
+        start_reading(&bin, speaking, OsStr::new(id), None);
+        return;
+    }
+    let (db, speaking, id) = (db.clone(), speaking.clone(), id.to_owned());
+    std::thread::spawn(move || match file_text(&db, &id) {
+        Ok(text) => start_reading(&bin, &speaking, OsStr::new("-"), Some(text)),
+        Err(e) => eprintln!("not reading {id}: {e:#}"),
+    });
+}
+
+/// `vinospeak --file <file>`, with `text` written to its stdin when given;
+/// it replaces any read started meanwhile.
+fn start_reading(bin: &Path, speaking: &Speaking, file: &OsStr, text: Option<String>) {
     let mut speaking = speaking.lock().unwrap();
     if let Some(old) = speaking.take() {
         stop_reading(old);
     }
-    match std::process::Command::new(&bin)
+    let stdin = if text.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    match std::process::Command::new(bin)
         .arg("--file")
-        .arg(id)
-        .stdin(std::process::Stdio::null())
+        .arg(file)
+        .stdin(stdin)
         .spawn()
     {
-        Ok(child) => *speaking = Some(child),
+        Ok(mut child) => {
+            if let (Some(text), Some(mut pipe)) = (text, child.stdin.take()) {
+                // Dropped when written, so vinospeak sees EOF; a read stopped
+                // early closes its end, and the write just fails.
+                std::thread::spawn(move || {
+                    let _ = pipe.write_all(text.as_bytes());
+                });
+            }
+            *speaking = Some(child);
+        }
         Err(e) => eprintln!("{}: {e}", bin.display()),
     }
 }
@@ -601,6 +671,39 @@ impl Control {
         self.send(Job::Retry)
     }
 
+    /// Indexed text files and documents, newest first by modification
+    /// time, as (path, kind, unix seconds): at most `limit`, capped at
+    /// recent::MAX. Files gone since they were indexed are left out.
+    fn recent_files(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, String, i64)>> {
+        let db = self.db.lock().unwrap();
+        let files = index::recent_files(&db, limit.min(recent::MAX) as usize, Path::exists)
+            .map_err(failed)?;
+        Ok(files
+            .into_iter()
+            .map(|(path, kind, mtime)| {
+                let kind = match kind {
+                    Kind::Document => recent::DOCUMENT,
+                    _ => recent::TEXT,
+                };
+                (path, kind.to_owned(), mtime)
+            })
+            .collect())
+    }
+
+    /// The whole text of an indexed text file or document, for reading
+    /// aloud. A document is parsed on a thread of its own, so the bus is not
+    /// held while a big PDF is.
+    async fn file_text(&self, path: String) -> zbus::fdo::Result<String> {
+        let db = self.db.clone();
+        let (tx, rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(file_text(&db, &path));
+        });
+        rx.await
+            .map_err(|_| failed("reading the file stopped"))?
+            .map_err(|e| failed(format!("{e:#}")))
+    }
+
     /// Free the model now.
     fn unload(&self) -> zbus::fdo::Result<()> {
         self.send(Job::Unload)
@@ -725,7 +828,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 jobs: Mutex::new(tx.clone()),
                 db: db.clone(),
                 config: config.clone(),
-                speaking: Mutex::default(),
+                speaking: Speaking::default(),
             },
         )?
         .serve_at(
@@ -1284,6 +1387,34 @@ mod tests {
             vinospeak(Some(path), home, both),
             Some(PathBuf::from("/usr/bin/vinospeak"))
         );
+    }
+
+    #[test]
+    fn file_text_is_for_indexed_text_and_documents_only() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-text-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let conn = index::open(&dir.join("i.sqlite")).unwrap();
+        let note = dir.join("note.md");
+        let photo = dir.join("photo.jpg");
+        fs::write(&note, "# Hello\n").unwrap();
+        fs::write(&photo, b"\xff\xd8").unwrap();
+        for p in [&note, &photo] {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+                [p.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let db: Db = Arc::new(Mutex::new(conn));
+        assert_eq!(file_text(&db, note.to_str().unwrap()).unwrap(), "# Hello\n");
+        let e = file_text(&db, photo.to_str().unwrap()).unwrap_err();
+        assert!(
+            e.to_string().ends_with("is not a text file or document"),
+            "{e}"
+        );
+        let e = file_text(&db, "/etc/passwd").unwrap_err();
+        assert!(e.to_string().ends_with("is not an indexed file"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
