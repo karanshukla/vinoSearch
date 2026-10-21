@@ -13,8 +13,17 @@ pub const DESKTOP_ID: &str = "dev.vinosearch.desktop";
 pub const SETTINGS_APP_ID: &str = "dev.vinosearch";
 /// Icon name, installed under hicolor/scalable/apps.
 pub const ICON: &str = "dev.vinosearch";
-/// KRunner's plugin file, under the XDG data directory.
+/// KRunner's plugin file, under the XDG data directory. Its presence is the
+/// KDE search place being on (#45).
 pub const KRUNNER_PLUGIN: &str = "krunner/dbusplugins/vinosearch.desktop";
+/// GNOME Shell's search provider file, under the XDG data directory, in a
+/// directory of ours that environment.d adds to XDG_DATA_DIRS. Its presence
+/// is the GNOME search place being on.
+pub const GNOME_PROVIDER: &str =
+    "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini";
+/// The D-Bus activation file, under the XDG data directory: the service is
+/// installed while it exists.
+pub const DBUS_SERVICE_FILE: &str = "dbus-1/services/dev.vinosearch.Runner.service";
 /// The settings app's interface lives here.
 pub const CONTROL_PATH: &str = "/control";
 pub const CONTROL_INTERFACE: &str = "dev.vinosearch.Control1";

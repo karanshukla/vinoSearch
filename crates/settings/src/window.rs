@@ -850,35 +850,68 @@ impl SettingsWindow {
     fn integration(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
         let state = self.integration.lock().unwrap().clone();
-        section(ui, "Desktop search");
-        row(
+        let (kde, gnome) = integration::desktops();
+        section(ui, "Search places");
+        help_line(
             ui,
-            "KRunner, GNOME:",
-            "Runs at login. GNOME shows it from the next login.",
-            |ui| {
-                ui.horizontal(|ui| {
+            "Each place has its own switch; only what's on is installed.",
+        );
+        let mut flip: Option<(integration::Switch, bool)> = None;
+        let mut switch_row = |ui: &mut egui::Ui,
+                              label: &str,
+                              help: &str,
+                              switch: integration::Switch,
+                              absent: Option<&str>| {
+            row(ui, label, help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_min_height(ui.spacing().interact_size.y);
+                    let on = state.is_on(switch);
                     if state.running {
                         spinner(ui);
                         ui.label("Working…");
-                    } else if state.registered {
+                    } else if on {
                         ui.label("On");
                     } else {
                         ui.label(RichText::new("Off").color(p.muted));
                     }
-                    let (label, install) = if state.registered {
-                        ("Turn off", false)
-                    } else {
-                        ("Turn on", true)
-                    };
+                    let button = if on { "Turn off" } else { "Turn on" };
                     if ui
-                        .add_enabled(!state.running, egui::Button::new(label))
+                        .add_enabled(!state.running, egui::Button::new(button))
                         .clicked()
                     {
-                        integration::run(Arc::clone(&self.integration), ui.ctx(), install);
+                        flip = Some((switch, !on));
+                    }
+                    if let Some(note) = absent {
+                        ui.label(RichText::new(note).color(p.muted));
                     }
                 });
-            },
+            });
+        };
+        switch_row(
+            ui,
+            "KRunner:",
+            "Alt+Space, and the search in the Plasma app launcher.",
+            integration::Switch::Kde,
+            (!kde).then_some("Plasma isn't running in this session."),
         );
+        switch_row(
+            ui,
+            "GNOME Shell:",
+            "The overview's search, from the next login.",
+            integration::Switch::Gnome,
+            (!gnome).then_some("GNOME isn't running in this session."),
+        );
+        section(ui, "Service");
+        switch_row(
+            ui,
+            "Search service:",
+            "Runs at login. Turning it off removes every search place too.",
+            integration::Switch::Service,
+            None,
+        );
+        if let Some((switch, on)) = flip {
+            integration::run(Arc::clone(&self.integration), ui.ctx(), switch, on);
+        }
         if let Some(output) = &state.output {
             row(ui, "", "", |ui| {
                 egui::Frame::NONE
@@ -894,6 +927,9 @@ impl SettingsWindow {
         section(ui, "Command line");
         row(ui, "Search:", "", |ui| {
             command(ui, "vinosearch search \"what you're looking for\"");
+        });
+        row(ui, "Similar photos:", "", |ui| {
+            command(ui, "vinosearch similar ~/Pictures/IMG_2041.jpg");
         });
         row(ui, "Check the NPU:", "", |ui| {
             command(ui, "vinosearch doctor")
@@ -1227,7 +1263,11 @@ impl eframe::App for SettingsWindow {
             }
             let mut integration = self.integration.lock().unwrap();
             if !integration.running {
-                integration.registered = integration::State::read().registered;
+                let output = integration.output.take();
+                *integration = integration::State {
+                    output,
+                    ..integration::State::read()
+                };
             }
         }
         self.focused = focused;

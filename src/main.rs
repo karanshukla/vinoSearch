@@ -46,14 +46,23 @@ enum Command {
     FetchModel,
     /// Index text files under each path. Unchanged files are skipped.
     Index { paths: Vec<PathBuf> },
-    /// Serve KRunner over D-Bus, or register/unregister the runner with it.
+    /// Serve KRunner, GNOME Shell and the settings app over D-Bus, or install/remove the service.
     Krunner {
-        /// Write the KRunner plugin and D-Bus service files, then exit.
+        /// Write the service files and the running desktop's search place (KRunner on Plasma,
+        /// GNOME Shell on GNOME, both elsewhere), then exit. `integrate` adds or removes one.
         #[arg(long)]
         install: bool,
-        /// Remove those files, then exit.
+        /// Remove the service and every search place, then exit.
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
+    },
+    /// Turn one search place on (or off with --off): kde is KRunner and the Plasma launcher,
+    /// gnome is GNOME Shell's overview search, from the next login.
+    Integrate {
+        place: krunner::Place,
+        /// Remove this place's files instead of writing them. The service stays.
+        #[arg(long)]
+        off: bool,
     },
     /// Keep the index current: watch every indexed root and re-index changes.
     Watch,
@@ -273,6 +282,10 @@ fn run(cli: Cli) -> Result<bool> {
             } else {
                 krunner::serve(worker_options(&cli, s))?;
             }
+            Ok(true)
+        }
+        Command::Integrate { place, off } => {
+            krunner::integrate(place, !off)?;
             Ok(true)
         }
         Command::Watch => {

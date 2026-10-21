@@ -29,7 +29,7 @@ curl -L https://github.com/karanshukla/vinoSearch/releases/latest/download/vinos
 vinosearch/scripts/install.sh --index ~/Documents
 ```
 
-That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 308 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with KRunner and GNOME Shell as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
+That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 308 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
 
 `vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
 
@@ -52,8 +52,8 @@ cargo install ovfetch                      # 0.5.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch
 vinosearch fetch-model                     # 308 MB, every file checked against a pinned SHA-256
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
-vinosearch krunner --install               # KRunner, GNOME Shell, the systemd user service and the app menu entry
-systemctl --user restart plasma-krunner.service
+vinosearch krunner --install               # the systemd user service, the app menu entry and the running desktop's search
+vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
 ```
 
 `vinosearch doctor` checks the NPU, driver and runtime, then compiles and runs a probe model.
@@ -72,7 +72,7 @@ Results need 3 or more characters. Enter opens the file.
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
 
 Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
 

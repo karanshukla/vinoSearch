@@ -32,7 +32,7 @@ It frees the model after 5 idle minutes (`--idle-unload-minutes`, or `VINOSEARCH
 
 It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `Status` (model loaded, indexing, device, file/chunk counts, roots), `Reindex(path)`, `Forget(path)` and `Unload`. Status answers while the worker is busy (4 ms mid-index). The full interface is in [dbus.md](dbus.md).
 
-`vinosearch krunner --uninstall` stops the service and removes the KRunner, D-Bus and systemd files.
+`vinosearch krunner --install` writes the service's files (D-Bus activation, the systemd unit, the icon) and the search place for the running desktop, read from `XDG_CURRENT_DESKTOP`: the KRunner plugin on Plasma, which the app launcher's search shares, or GNOME Shell's provider on GNOME, and both when it is neither. `vinosearch integrate kde|gnome [--off]` turns one place on or off by itself, writing or removing only that place's files and restarting KRunner when it is running; the service stays while any place is on, and for the CLI and the settings app. `vinosearch krunner --uninstall` stops the service and removes everything ([#45](https://github.com/karanshukla/vinoSearch/issues/45)).
 
 ## The settings window
 
@@ -45,7 +45,7 @@ It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `St
 | Search | What is indexed (text always, images and documents by a switch, with image file extensions) and how close a result must be to show, per kind | Turn images and documents on or off, edit image extensions, slide each kind between fewer, closer and more, looser results |
 | Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
 | Hardware | What `vinosearch doctor` reports: NPU, driver, NPU compiler, OpenVINO, devices, and a probe run on the device picked on the Model page | Check again |
-| Integration | Whether KRunner and GNOME search are on | Turn them on or off (`vinosearch krunner --install` / `--uninstall`), with the command's output |
+| Integration | Whether KRunner (with the Plasma launcher) and GNOME Shell search are each on, with a note for the desktop that isn't running, and whether the service is | Turn each place on or off (`vinosearch integrate kde\|gnome [--off]`), or the service with everything (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 
 - **Live.** It asks the runner for `Status` once a second, from a background thread, so the counts move while indexing runs and a slow D-Bus start never freezes the window. If the runner isn't installed, the pages say so.
 - **Settings go to `config.toml`.** Exclusions, device and idle unload are written straight to the file, keeping your comments and layout. A file that doesn't parse is left alone and the window says why.
@@ -72,7 +72,8 @@ The window keeps its help to a line; the rest is here.
 | Documents | See [Documents](#what-gets-indexed) above. |
 | How close results must be | Results scoring below the line are left out; applies from the next search. For text, an unrelated query tops out around 0.60 and real matches score 0.70 and up. Images score lower: right matches about 0.61 to 0.69, the rest 0.57 to 0.60. |
 | Hardware | Runs a tiny model on the device picked on the Model page, in a separate process, as `vinosearch doctor` does. |
-| Desktop search | Adds vinoSearch to KRunner and GNOME Shell's search and starts it at login as a user service. Turning it off stops the service; the index and model stay. |
+| Search places | One switch each for KRunner (and the Plasma app launcher, which shares KRunner's plugins) and GNOME Shell. Each writes or removes its own files; GNOME shows the change from the next login, KRunner at once. The one for a desktop that isn't running says so, but still works. |
+| Search service | Starts at login, watches the folders and answers searches. Turning it on also adds the running desktop's search place; turning it off removes every place with it. The index and model stay. |
 
 **Largest folders** lists up to 8 folders inside the indexed ones, biggest first, none inside another. A folder gives way to a subfolder holding three quarters of it, so a copied source tree shows as the part that is its bulk. It refreshes once the index changes and indexing settles.
 

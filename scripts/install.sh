@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install vinoSearch for this user: the binaries, the OpenVINO runtime, the
-# model, the first indexed folder, and KRunner / GNOME search with a user
-# service. Safe to re-run: each step skips what is done.
+# model, the first indexed folder, and the running desktop's search (KRunner
+# on Plasma, GNOME Shell on GNOME, both elsewhere) with a user service. Safe
+# to re-run: each step skips what is done. `vinosearch integrate kde|gnome`
+# adds or removes a search place later.
 #
 # From a release download (bin/ next to scripts/) it copies the prebuilt
 # binaries into ~/.local/bin; from a source checkout it builds them with cargo.
@@ -60,10 +62,8 @@ step() { printf '\n== %s\n' "$*"; }
 if [ "$uninstall" = 1 ]; then
     for dir in "$CARGO_BIN" "$LOCAL_BIN"; do
         [ -x "$dir/vinosearch" ] || continue
-        step "Removing the service and KRunner / GNOME search files"
+        step "Removing the service and the KRunner / GNOME search files"
         "$dir/vinosearch" krunner --uninstall
-        systemctl --user is-active --quiet plasma-krunner.service 2>/dev/null &&
-            systemctl --user restart plasma-krunner.service
         break
     done
     step "Removing the binaries"
@@ -173,19 +173,19 @@ else
     echo "nothing indexed; add folders later with vinosearch index DIR or the settings window"
 fi
 
-step "KRunner and GNOME search"
+step "Desktop search"
 was_running=0
 systemctl --user is-active --quiet vinosearch.service 2>/dev/null && was_running=1
+# The service, and the search place for the running desktop; it restarts
+# KRunner itself when that is running.
 vinosearch krunner --install
 # A re-run that replaced the binary: run the new one.
 if [ "$was_running" = 1 ]; then
     systemctl --user restart vinosearch.service && echo "restarted vinosearch.service"
 fi
-if systemctl --user is-active --quiet plasma-krunner.service 2>/dev/null; then
-    systemctl --user restart plasma-krunner.service && echo "restarted plasma-krunner"
-fi
 
 printf '\nDone. Search with: vinosearch search "..." , KRunner, or GNOME Shell (GNOME: from the next login).\n'
+echo 'Another desktop'"'"'s search: vinosearch integrate kde|gnome'
 case ":$USER_PATH:" in
     *":$BIN:"*) ;;
     *) echo "$BIN is not on your PATH; add it to run vinosearch by name." ;;

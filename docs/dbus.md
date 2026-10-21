@@ -22,7 +22,7 @@ The same search KRunner's `Match` runs: the best chunk per file, files scoring a
 | `ActivateResult(s id, as terms, u timestamp)` | `xdg-open` the file. |
 | `LaunchSearch(as terms, u timestamp)` | Opens the settings window, if `vinosearch-settings` is installed beside `vinosearch`. |
 
-GNOME Shell only reads search providers from the system data dirs, never `~/.local/share`, so `krunner --install` writes the provider file to `~/.local/share/vinosearch/xdg/gnome-shell/search-providers/` and appends that directory to `XDG_DATA_DIRS` in `~/.config/environment.d/60-vinosearch.conf`, the way Flatpak exports per-user apps. It also writes `~/.local/share/applications/dev.vinosearch.desktop`, which GNOME Shell needs to show the provider (a hidden entry disables it). Results appear from the next login; `--uninstall` removes all three.
+GNOME Shell only reads search providers from the system data dirs, never `~/.local/share`, so turning the GNOME place on (`vinosearch integrate gnome`, which `krunner --install` does in a GNOME session) writes the provider file to `~/.local/share/vinosearch/xdg/gnome-shell/search-providers/` and appends that directory to `XDG_DATA_DIRS` in `~/.config/environment.d/60-vinosearch.conf`, the way Flatpak exports per-user apps. It also writes `~/.local/share/applications/dev.vinosearch.desktop`, which GNOME Shell needs to show the provider (a hidden entry disables it). Results appear from the next login; `integrate gnome --off` (or `krunner --uninstall`) removes all three.
 
 ## `dev.vinosearch.Control1`
 

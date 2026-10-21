@@ -23,8 +23,8 @@ use zbus::interface;
 use zbus::zvariant::{OwnedValue, Value};
 
 use vinosearch_shared::dbus::{
-    CONTROL_PATH as CONTROL, DESKTOP_ID, GNOME_PATH as GNOME, ICON, KRUNNER_PLUGIN,
-    RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, status as key,
+    CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
+    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, status as key,
 };
 /// Files of each kind shown.
 const RESULTS: usize = 5;
@@ -647,6 +647,54 @@ pub fn serve(opts: Options) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("worker panicked"))?
 }
 
+/// A place vinoSearch's results show (#45). Each has files of its own, written
+/// and removed apart from the service's, so a Plasma session gets no GNOME
+/// provider and a GNOME session no KRunner plugin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Place {
+    /// KRunner (Alt+Space) and the Plasma app launcher's search, which reuses
+    /// KRunner's plugins; they can't be split.
+    Kde,
+    /// GNOME Shell's overview search, from the next login.
+    Gnome,
+}
+
+impl Place {
+    pub const ALL: [Place; 2] = [Place::Kde, Place::Gnome];
+
+    fn name(self) -> &'static str {
+        match self {
+            Place::Kde => "KRunner and the Plasma launcher",
+            Place::Gnome => "GNOME Shell",
+        }
+    }
+}
+
+/// The places for the running desktop, from XDG_CURRENT_DESKTOP (`KDE`,
+/// `ubuntu:GNOME`, ...). Both when it names neither (another desktop, a
+/// TTY, ssh), as every install did before #45.
+fn places_for(desktop: Option<&str>) -> Vec<Place> {
+    let names: Vec<String> = desktop
+        .unwrap_or_default()
+        .split(':')
+        .map(str::to_ascii_uppercase)
+        .collect();
+    let has = |n: &str| names.iter().any(|d| d == n);
+    let places: Vec<Place> = [(Place::Kde, has("KDE")), (Place::Gnome, has("GNOME"))]
+        .into_iter()
+        .filter_map(|(p, on)| on.then_some(p))
+        .collect();
+    if places.is_empty() {
+        Place::ALL.to_vec()
+    } else {
+        places
+    }
+}
+
+pub fn current_places() -> Vec<Place> {
+    places_for(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
+}
+
 /// GNOME Shell reads search providers from the system data dirs only, never
 /// the user's, so the provider file goes in a directory of ours that
 /// environment.d appends to XDG_DATA_DIRS, as Flatpak does for its per-user
@@ -662,7 +710,7 @@ fn gnome_files() -> Result<GnomeFiles> {
     let data = data_home()?;
     let xdg = data.join("vinosearch/xdg");
     Ok(GnomeFiles {
-        provider: xdg.join("gnome-shell/search-providers/dev.vinosearch.search-provider.ini"),
+        provider: data.join(GNOME_PROVIDER),
         desktop: data.join("applications").join(DESKTOP_ID),
         environment: config_home()?.join("environment.d/60-vinosearch.conf"),
         xdg,
@@ -718,6 +766,90 @@ fn install_gnome() -> Result<()> {
         g.desktop.display(),
         g.environment.display()
     );
+    Ok(())
+}
+
+fn install_kde() -> Result<()> {
+    let plugin = data_home()?.join(KRUNNER_PLUGIN);
+    fs::create_dir_all(plugin.parent().unwrap())?;
+    fs::write(
+        &plugin,
+        format!(
+            "[Desktop Entry]\nName=vinoSearch\nComment=Semantic file search on the NPU\n\
+             X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon={ICON}\n\
+             X-KDE-PluginInfo-Name=vinosearch\nX-KDE-PluginInfo-EnabledByDefault=true\n\
+             X-Plasma-API=DBus\nX-Plasma-DBusRunner-Service={SERVICE}\nX-Plasma-DBusRunner-Path={OBJECT}\n\
+             X-Plasma-Request-Actions-Once=true\nX-Plasma-Runner-Min-Letter-Count=3\n\
+             X-Plasma-Runner-Unique-Results=true\n"
+        ),
+    )?;
+    println!("wrote {}", plugin.display());
+    restart_krunner();
+    Ok(())
+}
+
+/// KRunner reads its plugins at start, so it is restarted when it is
+/// running: it comes back on the next Alt+Space, and the launcher's search
+/// stops (or starts) asking us at once.
+fn restart_krunner() {
+    let unit = "plasma-krunner.service";
+    let active = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|s| s.success());
+    if active && systemctl(&["restart", unit]) {
+        println!("restarted {unit}");
+    }
+}
+
+/// Write `place`'s files. The service is installed too if it isn't yet,
+/// with no flags: a plugin pointing at a bus name nothing activates would
+/// search nothing.
+pub fn install_place(place: Place) -> Result<()> {
+    if !data_home()?.join(DBUS_SERVICE_FILE).exists() {
+        install_service(None, None, None)?;
+    }
+    match place {
+        Place::Kde => install_kde(),
+        Place::Gnome => install_gnome(),
+    }
+}
+
+/// Remove `place`'s files; the service stays for the other place, the CLI
+/// and the settings app.
+pub fn uninstall_place(place: Place) -> Result<()> {
+    let files = match place {
+        Place::Kde => vec![data_home()?.join(KRUNNER_PLUGIN)],
+        Place::Gnome => {
+            let g = gnome_files()?;
+            vec![g.provider, g.desktop, g.environment]
+        }
+    };
+    let mut removed = 0;
+    for p in files {
+        if p.exists() {
+            fs::remove_file(&p)?;
+            println!("removed {}", p.display());
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        println!("{} was already off", place.name());
+    }
+    if place == Place::Kde {
+        restart_krunner();
+    }
+    Ok(())
+}
+
+/// Turn one place on or off (`vinosearch integrate kde|gnome [--off]`).
+pub fn integrate(place: Place, on: bool) -> Result<()> {
+    if on {
+        install_place(place)?;
+    } else {
+        uninstall_place(place)?;
+    }
+    println!("{}: {}", place.name(), if on { "on" } else { "off" });
     Ok(())
 }
 
@@ -783,12 +915,29 @@ fn runner_running() -> bool {
     owned().unwrap_or(false)
 }
 
-/// Register the runner with KRunner, and with systemd as a user service that
+/// Install the service and the search places for the running desktop (both
+/// when that is neither Plasma nor GNOME); `integrate` adds or removes one.
+pub fn install(
+    openvino_dir: Option<&Path>,
+    device: Option<&str>,
+    idle_unload_minutes: Option<f64>,
+) -> Result<()> {
+    install_service(openvino_dir, device, idle_unload_minutes)?;
+    for place in current_places() {
+        match place {
+            Place::Kde => install_kde()?,
+            Place::Gnome => install_gnome()?,
+        }
+    }
+    Ok(())
+}
+
+/// The icon, the D-Bus activation file and the systemd user service that
 /// starts at login, so the watcher keeps the index current from then on
 /// (D-Bus activation alone would start it only at the first query). Only
 /// flags given here are baked into the service; the rest come from the
 /// config file each time the runner starts.
-pub fn install(
+fn install_service(
     openvino_dir: Option<&Path>,
     device: Option<&str>,
     idle_unload_minutes: Option<f64>,
@@ -810,24 +959,12 @@ pub fn install(
         }
     }
     let data = data_home()?;
-    let plugin = data.join(KRUNNER_PLUGIN);
-    let service = data.join(format!("dbus-1/services/{SERVICE}.service"));
+    let service = data.join(DBUS_SERVICE_FILE);
     let icon = icon_path()?;
-    for p in [&plugin, &service, &icon] {
+    for p in [&service, &icon] {
         fs::create_dir_all(p.parent().unwrap())?;
     }
     fs::write(&icon, ICON_SVG)?;
-    fs::write(
-        &plugin,
-        format!(
-            "[Desktop Entry]\nName=vinoSearch\nComment=Semantic file search on the NPU\n\
-             X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon={ICON}\n\
-             X-KDE-PluginInfo-Name=vinosearch\nX-KDE-PluginInfo-EnabledByDefault=true\n\
-             X-Plasma-API=DBus\nX-Plasma-DBusRunner-Service={SERVICE}\nX-Plasma-DBusRunner-Path={OBJECT}\n\
-             X-Plasma-Request-Actions-Once=true\nX-Plasma-Runner-Min-Letter-Count=3\n\
-             X-Plasma-Runner-Unique-Results=true\n"
-        ),
-    )?;
     fs::write(
         &service,
         format!(
@@ -849,13 +986,11 @@ pub fn install(
         ),
     )?;
     println!(
-        "wrote {}\nwrote {}\nwrote {}\nwrote {}",
-        plugin.display(),
+        "wrote {}\nwrote {}\nwrote {}",
         service.display(),
         unit.display(),
         icon.display()
     );
-    install_gnome()?;
     if systemctl(&["daemon-reload"]) {
         if runner_running() {
             // Starting now would lose the bus name to it and fail; the unit
@@ -923,22 +1058,17 @@ fn desktop_quote(arg: &str) -> String {
     dbus_quote(arg).replace('\\', "\\\\").replace('%', "%%")
 }
 
+/// Everything off: both places, the service, the icon.
 pub fn uninstall() -> Result<()> {
     let data = data_home()?;
     let unit = unit_path()?;
-    let gnome = gnome_files()?;
     if unit.exists() {
         systemctl(&["disable", "--now", UNIT]);
     }
-    for p in [
-        data.join(KRUNNER_PLUGIN),
-        data.join(format!("dbus-1/services/{SERVICE}.service")),
-        unit,
-        gnome.provider,
-        gnome.desktop,
-        gnome.environment,
-        icon_path()?,
-    ] {
+    for place in Place::ALL {
+        uninstall_place(place)?;
+    }
+    for p in [data.join(DBUS_SERVICE_FILE), unit, icon_path()?] {
         if p.exists() {
             fs::remove_file(&p)?;
             println!("removed {}", p.display());
@@ -998,6 +1128,16 @@ mod tests {
             hit(Kind::Image, 0.64, "/dog.jpg"),
         ];
         assert_eq!(paths(hits), ["/dog.jpg"]);
+    }
+
+    #[test]
+    fn the_running_desktop_picks_the_places() {
+        assert_eq!(places_for(Some("KDE")), [Place::Kde]);
+        assert_eq!(places_for(Some("ubuntu:GNOME")), [Place::Gnome]);
+        assert_eq!(places_for(Some("GNOME-Classic:GNOME")), [Place::Gnome]);
+        assert_eq!(places_for(Some("XFCE")), Place::ALL);
+        assert_eq!(places_for(None), Place::ALL);
+        assert_eq!(places_for(Some("")), Place::ALL);
     }
 
     #[test]
