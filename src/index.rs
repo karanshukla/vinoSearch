@@ -326,7 +326,6 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-#[cfg(test)]
 fn from_blob(b: &[u8]) -> Option<Vec<f32>> {
     (b.len() == DIM * 4).then(|| {
         b.as_chunks::<4>()
@@ -924,6 +923,22 @@ pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
         compact(conn)?;
     }
     Ok(n)
+}
+
+/// An indexed image's vector (#77), its holder's if it is a byte-identical
+/// copy; None for a path that isn't an indexed image.
+pub fn image_vector(conn: &Connection, path: &str) -> Result<Option<Vec<f32>>> {
+    let blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT c.embedding FROM files f
+             JOIN files g ON g.id = f.id OR (g.sha256 IS NOT NULL AND g.sha256 = f.sha256)
+             JOIN chunks c ON c.file_id = g.id
+             WHERE f.path = ?1 AND c.kind = ?2 LIMIT 1",
+            params![path, Kind::Image as i64],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(blob.as_deref().and_then(from_blob))
 }
 
 /// Whether `path` is an indexed file.
@@ -1821,6 +1836,36 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_indexed_image_gives_its_vector_and_so_does_a_copy() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-simv-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/p/a.jpg', 0, 0, x'aa')",
+            [],
+        )
+        .unwrap();
+        let a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, 0, '', ?2, 1)",
+            params![a, axis(3)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/p/copy.jpg', 0, 0, x'aa')",
+            [],
+        )
+        .unwrap();
+        add_file(&conn, "/p/notes.md", &[4]);
+        let mut want = vec![0f32; DIM];
+        want[3] = 1.0;
+        assert_eq!(image_vector(&conn, "/p/a.jpg").unwrap(), Some(want.clone()));
+        assert_eq!(image_vector(&conn, "/p/copy.jpg").unwrap(), Some(want));
+        assert_eq!(image_vector(&conn, "/p/notes.md").unwrap(), None);
+        assert_eq!(image_vector(&conn, "/p/missing.jpg").unwrap(), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -64,6 +64,18 @@ enum Command {
         #[arg(short, default_value_t = 10)]
         n: usize,
     },
+    /// Indexed images that look like one: an indexed image costs nothing to
+    /// encode, any other image one encode on the device.
+    Similar {
+        image: PathBuf,
+        /// Number of results.
+        #[arg(short, default_value_t = 10)]
+        n: usize,
+        /// Leave out images scoring below this (cosine, -1 to 1). Image to
+        /// image scores sit well above text to image ones [default: none]
+        #[arg(long)]
+        min_score: Option<f32>,
+    },
     /// Parse the document on stdin as PATH's type and write its chunks to
     /// stdout as JSON, under memory and CPU limits. The indexer runs this on
     /// itself for every document (#84).
@@ -312,6 +324,45 @@ fn run(cli: Cli) -> Result<bool> {
                     h.path,
                     snippet(&h.text)
                 );
+                if !h.copies.is_empty() {
+                    println!("       same as: {}", h.copies.join(", "));
+                }
+            }
+            Ok(true)
+        }
+        Command::Similar {
+            image,
+            n,
+            min_score,
+        } => {
+            let conn = index::open(&index::default_db()?)?;
+            let path = std::fs::canonicalize(&image).unwrap_or(image);
+            let key = path.to_string_lossy().into_owned();
+            let t0 = Instant::now();
+            let q = match index::image_vector(&conn, &key)? {
+                Some(v) => v,
+                None => {
+                    let bytes = std::fs::read(&path)?;
+                    let pixels = vision::prepare(&vision::load(&bytes)?)?;
+                    let mut emb = embedder(cli.openvino_dir, &s.device)?;
+                    emb.image(&pixels)?
+                }
+            };
+            let t1 = Instant::now();
+            let vectors = index::Vectors::load(&conn)?;
+            // One more than asked, for the image itself.
+            let hits = index::search(&conn, &vectors, &q, index::Kind::Image, n + 1)?;
+            eprintln!(
+                "vector {:.1} ms, search {:.1} ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+            let shown = hits
+                .into_iter()
+                .filter(|h| h.path != key && min_score.is_none_or(|m| h.score >= m))
+                .take(n);
+            for h in shown {
+                println!("{:.3}  {}", h.score, h.path);
                 if !h.copies.is_empty() {
                     println!("       same as: {}", h.copies.join(", "));
                 }
