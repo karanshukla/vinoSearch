@@ -61,6 +61,9 @@ pub fn text(path: &Path) -> Result<String> {
 /// apart by a blank line. A table's chunks each repeat its header (and a
 /// sheet's name), which is kept once per sheet.
 fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
+    if ext(path) == "pdf" {
+        return pdf_pages(&chunks);
+    }
     let header_lines = match ext(path).as_str() {
         "csv" | "tsv" => 1,
         "xlsx" | "xls" | "ods" => 2,
@@ -95,6 +98,25 @@ fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
         last_header = header;
     }
     out
+}
+
+/// A PDF's pages, each on one line, a blank line apart. A text layer's line
+/// breaks are layout, not meaning: some PDFs put every word on its own line,
+/// which read aloud as one sentence per word.
+fn pdf_pages(chunks: &[(usize, String)]) -> String {
+    let mut pages: Vec<(usize, String)> = Vec::new();
+    for (n, text) in chunks {
+        match pages.last_mut() {
+            Some((last, page)) if last == n => page.push_str(text),
+            _ => pages.push((*n, text.clone())),
+        }
+    }
+    pages
+        .iter()
+        .map(|(_, page)| page.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|page| !page.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// The child's side: set the limits, read the document from stdin, write
@@ -518,7 +540,17 @@ mod tests {
                 Path::new("a.pdf"),
                 vec![page(1, "one "), page(1, "more\n"), page(3, "three\n")]
             ),
-            "one more\n\nthree\n"
+            "one more\n\nthree"
+        );
+        assert_eq!(
+            join(
+                Path::new("a.pdf"),
+                vec![
+                    page(1, "Commission\n \n-\n \nLicense\n \n"),
+                    page(1, "Agreement\n")
+                ]
+            ),
+            "Commission - License Agreement"
         );
         assert_eq!(
             join(
