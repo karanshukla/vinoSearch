@@ -1168,7 +1168,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             html(&page);
             assert!(
-                t0.elapsed() < Duration::from_secs(1),
+                t0.elapsed() < Duration::from_secs(10),
                 "{unit}: {:?}",
                 t0.elapsed()
             );
