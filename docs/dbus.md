@@ -10,6 +10,14 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 | `/gnome` | `org.gnome.Shell.SearchProvider2` | GNOME Shell's overview search |
 | `/control` | `dev.vinosearch.Control1` | the settings app |
 
+## `org.kde.krunner1`
+
+| Method | What it does |
+|---|---|
+| `Actions() → a(sss)` | `open-folder` (Open containing folder) and `read-aloud` (Read aloud). |
+| `Match(s query)` | The search below. Each match sets `subtext`, `urls`, `category`, and `actions`, the action ids KRunner shows for it: both for a text file or document, `open-folder` alone for an image. |
+| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action `xdg-open`s the file, `open-folder` its directory. `read-aloud` runs `vinospeak --file <path>` for a text file ([vinoSpeak](https://github.com/karanshukla/vinoSpeak), from `PATH` or else `~/.local/bin`), so vinoSpeak cleans markdown up by its suffix; for a document it extracts the text as `FileText` does, on a thread of its own, and pipes it to `vinospeak --file -`. Either stops a read still playing; without vinoSpeak it logs a line and does nothing. |
+
 ## `org.gnome.Shell.SearchProvider2`
 
 The same search KRunner's `Match` runs: the best chunk per file, files scoring at least their kind's `min_score`, the top 5 text files, then the top 5 images. Result ids are file paths.
@@ -26,7 +34,7 @@ GNOME Shell only reads search providers from the system data dirs, never `~/.loc
 
 ## `dev.vinosearch.Control1`
 
-Every method returns promptly, including while the runner is indexing or downloading: `Status` reads state the worker publishes, and the others only queue work. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
+Every method returns promptly, including while the runner is indexing or downloading: `Status` reads state the worker publishes, `RecentFiles` reads the index, and the others only queue work. `FileText` is the exception: a document's text takes as long as parsing it (seconds for a big PDF), on a thread of its own, so other calls are answered meanwhile. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
 
 | Method | Signature | What it does |
 |---|---|---|
@@ -41,6 +49,8 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
+| `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
+| `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string. |
 
 ### `Status` keys
 

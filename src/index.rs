@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 
 /// About 250 tokens of English, inside the 256-token document shape.
 pub(crate) const CHUNK_CHARS: usize = 900;
-const MAX_FILE_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_FILE_BYTES: u64 = 1 << 20;
 const EXTENSIONS: &[&str] = &[
     "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
     "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "css", "scss", "sql",
@@ -949,6 +949,41 @@ pub fn is_indexed(conn: &Connection, path: &str) -> Result<bool> {
         .is_some())
 }
 
+/// The kind `path` is read aloud as, by its name: text or a document,
+/// never an image. None for anything else.
+pub fn readable_kind(path: &Path) -> Option<Kind> {
+    if text_file(path) {
+        Some(Kind::Text)
+    } else if crate::extract::is_document(path) {
+        Some(Kind::Document)
+    } else {
+        None
+    }
+}
+
+/// Indexed text files and documents, newest first by the mtime the index
+/// recorded: at most `limit`, less those `exists` says are gone.
+pub fn recent_files(
+    conn: &Connection,
+    limit: usize,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<Vec<(String, Kind, i64)>> {
+    let mut stmt = conn.prepare("SELECT path, mtime FROM files ORDER BY mtime DESC, path")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let Some(row) = rows.next()? else { break };
+        let path: String = row.get(0)?;
+        let Some(kind) = readable_kind(Path::new(&path)) else {
+            continue;
+        };
+        if exists(Path::new(&path)) {
+            out.push((path, kind, row.get(1)?));
+        }
+    }
+    Ok(out)
+}
+
 /// Files and chunks in the index.
 pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
     Ok((
@@ -1402,6 +1437,39 @@ mod tests {
             Path::new("/home/u/.notes"),
             Path::new("/home/u/.notes/a.md")
         ));
+    }
+
+    #[test]
+    fn recent_files_are_text_and_documents_newest_first() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-recent-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        for (p, mtime) in [
+            ("/old.md", 1),
+            ("/report.pdf", 5),
+            ("/photo.jpg", 9),
+            ("/gone.txt", 8),
+            ("/notes.md", 7),
+            ("/deck.pptx", 3),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, 0)",
+                params![p, mtime],
+            )
+            .unwrap();
+        }
+        let exists = |p: &Path| p != Path::new("/gone.txt");
+        let recent = recent_files(&conn, 3, exists).unwrap();
+        assert_eq!(
+            recent,
+            [
+                ("/notes.md".to_owned(), Kind::Text, 7),
+                ("/report.pdf".to_owned(), Kind::Document, 5),
+                ("/deck.pptx".to_owned(), Kind::Document, 3),
+            ]
+        );
+        assert_eq!(recent_files(&conn, 10, exists).unwrap().len(), 4);
+        assert!(recent_files(&conn, 0, exists).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

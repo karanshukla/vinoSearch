@@ -68,6 +68,8 @@ vinosearch integrate gnome                 # or kde: add the other desktop's sea
 
 Results need 3 or more characters. Enter opens the file.
 
+"Read aloud" on a text or document result in KRunner speaks the file with vinoSpeak, if it is installed: `uv tool install vinospeak`. A document (PDF, Word, slides, ...) is read from the text vinoSearch extracts for indexing.
+
 ## Settings
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
