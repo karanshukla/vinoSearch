@@ -22,8 +22,8 @@ pub(crate) const CHUNK_CHARS: usize = 900;
 pub(crate) const MAX_FILE_BYTES: u64 = 1 << 20;
 const EXTENSIONS: &[&str] = &[
     "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
-    "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "css", "scss", "sql",
-    "lua", "zig", "nix", "cs", "php",
+    "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "htm", "css", "scss",
+    "sql", "lua", "zig", "nix", "cs", "php",
 ];
 // No config formats (toml, yaml, json, ini, conf, ...): they are where
 // credentials live, and the index is not encrypted yet (#4).
@@ -500,7 +500,11 @@ pub fn index_file(
     let (chunks, vectors) = match kind {
         Kind::Text => {
             let text = String::from_utf8(bytes).expect("read as a string");
-            let chunks = chunk(&text);
+            let chunks = if crate::extract::is_html(path) {
+                chunk(&crate::extract::html(&text))
+            } else {
+                chunk(&text)
+            };
             let title = path
                 .file_name()
                 .map(|n| n.to_string_lossy())
@@ -787,6 +791,45 @@ pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
                                WHERE g.sha256 = files.sha256)",
             [pattern],
         )?;
+    }
+    Ok(n)
+}
+
+/// Formats whose text is read differently now, with the reading's version:
+/// HTML through `extract::html` since 1 (#97). Mtime and size don't show the
+/// change, so files read the old way are dropped once instead.
+const READINGS: &[(&str, &[&str], u32)] = &[("html", &["html", "htm"], 1)];
+
+/// Forget the files of each format in `READINGS` indexed under an older
+/// reading, so the next check of each root indexes them again. Returns files
+/// dropped.
+pub fn reread_formats(conn: &Connection) -> Result<usize> {
+    let mut n = 0;
+    let tx = conn.unchecked_transaction()?;
+    for (format, extensions, version) in READINGS {
+        let key = format!("reading.{format}");
+        let was: Option<String> = tx
+            .query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if was == Some(version.to_string()) {
+            continue;
+        }
+        for e in *extensions {
+            n += tx.execute(
+                "DELETE FROM files WHERE lower(path) LIKE ?1",
+                [format!("%.{e}")],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![key, version.to_string()],
+        )?;
+    }
+    tx.commit()?;
+    if n > 0 {
+        compact(conn)?;
     }
     Ok(n)
 }
@@ -1897,6 +1940,21 @@ mod tests {
         assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf", parse).is_empty());
         let csv = format!("h\n{}", "x\n".repeat(MAX_FILE_BYTES as usize));
         assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes(), parse).is_empty());
+    }
+
+    #[test]
+    fn html_indexed_before_it_was_read_as_html_is_indexed_again_once() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-reread-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        for p in ["/site/index.html", "/site/OLD.HTM", "/notes.md"] {
+            add_file(&conn, p, &[0]);
+        }
+        assert_eq!(reread_formats(&conn).unwrap(), 2);
+        assert!(is_indexed(&conn, "/notes.md").unwrap());
+        assert!(!is_indexed(&conn, "/site/index.html").unwrap());
+        add_file(&conn, "/site/index.html", &[0]);
+        assert_eq!(reread_formats(&conn).unwrap(), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
