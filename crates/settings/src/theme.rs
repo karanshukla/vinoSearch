@@ -104,10 +104,32 @@ fn animations_off(reply: &str) -> bool {
     }
 }
 
+/// How much larger the desktop wants text: GNOME's Large Text, or Plasma's general font
+/// past its 10 pt default. 1.0 when neither says.
+pub fn text_scale() -> f32 {
+    let gnome = read_setting("org.gnome.desktop.interface", "text-scaling-factor");
+    let kde = read_setting("org.kde.kdeglobals.General", "font");
+    let gnome = gnome.as_deref().and_then(scaling_factor).unwrap_or(1.0);
+    let kde = kde.as_deref().and_then(kde_font_scale).unwrap_or(1.0);
+    gnome.max(kde).clamp(1.0, 3.0)
+}
+
+// "v d 1.25".
+fn scaling_factor(reply: &str) -> Option<f32> {
+    let factor = reply.split_whitespace().last()?.parse::<f32>().ok()?;
+    factor.is_finite().then_some(factor)
+}
+
+// A Qt font string, "v s \"Noto Sans,12,-1,5,50,0,0,0,0,0\"": family, then point size.
+fn kde_font_scale(reply: &str) -> Option<f32> {
+    let points = reply.split(',').nth(1)?.trim().parse::<f32>().ok()?;
+    (points > 0.0).then_some(points / 10.0)
+}
+
 /// No animation time is the signal: egui's own transitions go instant and `window::spinner`
 /// stops turning.
 pub fn still(ctx: &egui::Context) -> bool {
-    ctx.style().animation_time == 0.0
+    ctx.global_style().animation_time == 0.0
 }
 
 // 1 prefers dark, 2 prefers light, 0 is no preference, which desktops answer for their light default.
@@ -361,6 +383,19 @@ mod tests {
         assert_eq!(parse_color_scheme("v u 0\n"), Some(Theme::Light));
         assert_eq!(parse_color_scheme(""), None);
         assert_eq!(parse_color_scheme("garbage"), None);
+    }
+
+    #[test]
+    fn text_scale_reads_both_desktops() {
+        assert_eq!(scaling_factor("v d 1.25\n"), Some(1.25));
+        assert_eq!(scaling_factor("v d 1\n"), Some(1.0));
+        assert_eq!(scaling_factor("v d nan\n"), None);
+        assert_eq!(scaling_factor(""), None);
+        let font = |size: &str| format!("v s \"Noto Sans,{size},-1,5,50,0,0,0,0,0\"\n");
+        assert_eq!(kde_font_scale(&font("10")), Some(1.0));
+        assert_eq!(kde_font_scale(&font("15")), Some(1.5));
+        assert_eq!(kde_font_scale(&font("0")), None);
+        assert_eq!(kde_font_scale("v s \"Noto Sans\"\n"), None);
     }
 
     #[test]
