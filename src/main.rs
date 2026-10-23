@@ -261,6 +261,7 @@ fn run(cli: Cli) -> Result<bool> {
                 eprintln!("{why}");
             }
             index::retry_undecodable(&conn)?;
+            index::reread_formats(&conn)?;
             for p in &paths {
                 let t0 = Instant::now();
                 let mut shown = 0;

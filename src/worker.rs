@@ -120,8 +120,9 @@ impl Status {
 
 /// Before the watcher compares the roots with the index: drop what must be
 /// indexed again (vectors from another model, #80; photos skipped for want
-/// of a decoder that is installed now, #79), so that first comparison finds
-/// it, and say so in `status` for the Index page.
+/// of a decoder that is installed now, #79; files of a format read
+/// differently now, #97), so that first comparison finds it, and say so in
+/// `status` for the Index page.
 pub fn prepare(status: &Status) -> Result<()> {
     let conn = index::open(&index::default_db()?)?;
     let purged = index::purge_other_models(&conn)?;
@@ -132,6 +133,10 @@ pub fn prepare(status: &Status) -> Result<()> {
     let retry = index::retry_undecodable(&conn)?;
     if retry > 0 {
         eprintln!("a HEIF decoder is installed now: {retry} photos will be indexed");
+    }
+    let reread = index::reread_formats(&conn)?;
+    if reread > 0 {
+        eprintln!("{reread} files are read differently now and will be indexed again");
     }
     Ok(())
 }

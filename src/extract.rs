@@ -325,6 +325,168 @@ fn subtitles(text: &str) -> String {
     out
 }
 
+/// Read as text, but through `html` (#97).
+const HTML: &[&str] = &["html", "htm"];
+
+pub fn is_html(path: &Path) -> bool {
+    HTML.contains(&ext(path).as_str())
+}
+
+/// Tags whose content is not text.
+const HTML_SKIP: &[&str] = &["script", "style", "template", "svg"];
+/// Tags inside a word: the rest stand for a space, so `<td>a</td><td>b</td>`
+/// stays two words.
+const HTML_INLINE: &[&str] = &[
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em", "font", "i", "ins",
+    "kbd", "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var",
+    "wbr",
+];
+
+/// An HTML page's text: tags, comments, scripts and styles left out and
+/// entities decoded. Every newline of the source is kept, so a chunk's line
+/// is the line it starts on in the file.
+pub fn html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() / 2);
+    // Kept in place of skipped source: its newlines.
+    let newlines = |out: &mut String, skipped: &str| {
+        out.extend(std::iter::repeat_n('\n', skipped.matches('\n').count()));
+    };
+    // Lowercased once for finding closing tags: ASCII lowercasing keeps
+    // byte offsets, so it indexes like `text`.
+    let lower = text.to_ascii_lowercase();
+    let mut rest = text;
+    while let Some(i) = rest.find(['<', '&']) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        if rest.starts_with('&') {
+            // Bounded, so a page of bare `&`s isn't a scan to the end each.
+            let decoded = rest[1..]
+                .bytes()
+                .take(33)
+                .position(|b| b == b';')
+                .and_then(|end| Some((char_ref(&rest[1..=end])?, end + 2)));
+            match decoded {
+                Some((s, len)) => {
+                    out.push_str(&s);
+                    rest = &rest[len..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+            continue;
+        }
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            let end = comment.find("-->").map_or(comment.len(), |e| e + 3);
+            newlines(&mut out, &comment[..end]);
+            rest = &comment[end..];
+            continue;
+        }
+        let tag = &rest[1..];
+        let closing = tag.starts_with('/');
+        let tag = tag.strip_prefix('/').unwrap_or(tag);
+        if !(closing
+            || tag.starts_with(['!', '?'])
+            || tag.starts_with(|c: char| c.is_ascii_alphabetic()))
+        {
+            out.push('<');
+            rest = &rest[1..];
+            continue;
+        }
+        let name = tag[..tag
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(tag.len())]
+            .to_ascii_lowercase();
+        let end = tag_end(rest);
+        newlines(&mut out, &rest[..end]);
+        let self_closing = rest[..end].ends_with("/>");
+        rest = &rest[end..];
+        if !closing && !self_closing && HTML_SKIP.contains(&name.as_str()) {
+            let close = format!("</{name}");
+            let body = lower[text.len() - rest.len()..]
+                .find(&close)
+                .unwrap_or(rest.len());
+            newlines(&mut out, &rest[..body]);
+            rest = &rest[body..];
+            let end = tag_end(rest);
+            newlines(&mut out, &rest[..end]);
+            rest = &rest[end..];
+        }
+        if !HTML_INLINE.contains(&name.as_str()) {
+            out.push(' ');
+        }
+    }
+    out.push_str(rest);
+    out.split('\n')
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Where the tag `s` starts with ends, past its `>`. A `>` inside a quoted
+/// attribute value doesn't end it; an apostrophe in an unquoted one doesn't
+/// start a quote.
+fn tag_end(s: &str) -> usize {
+    let mut quote = None;
+    let mut last = ' ';
+    for (i, c) in s.char_indices().skip(1) {
+        match (quote, c) {
+            (None, '"' | '\'') if last == '=' => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '>') => return i + 1,
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            last = c;
+        }
+    }
+    s.len()
+}
+
+/// `name` from `&name;` as text: a numeric reference or one of `entity`'s.
+fn char_ref(name: &str) -> Option<String> {
+    if let Some(num) = name.strip_prefix('#') {
+        let code = match num.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => num.parse().ok()?,
+        };
+        return char::from_u32(code).map(String::from);
+    }
+    entity(name).map(str::to_owned)
+}
+
+/// XML's entities and the common ones of HTML, which EPUB 2 chapters also
+/// use through their DTD.
+fn entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => " ",
+        "mdash" => "—",
+        "ndash" => "–",
+        "hellip" => "…",
+        "lsquo" => "‘",
+        "rsquo" => "’",
+        "ldquo" => "“",
+        "rdquo" => "”",
+        "laquo" => "«",
+        "raquo" => "»",
+        "middot" => "·",
+        "bull" => "•",
+        "copy" => "©",
+        "reg" => "®",
+        "trade" => "™",
+        "euro" => "€",
+        "pound" => "£",
+        "times" => "×",
+        _ => return None,
+    })
+}
+
 /// One chunk or more per part, numbered from 1 by the part it came from.
 fn numbered<S: AsRef<str>>(parts: impl Iterator<Item = S>) -> Vec<(usize, String)> {
     parts
@@ -574,23 +736,7 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
             Ok(Event::Text(t)) if in_text && skipped == 0 => out.push_str(&t.xml10_content()),
             Ok(Event::GeneralRef(r)) if in_text && skipped == 0 => match r.resolve_char_ref() {
                 Ok(Some(c)) => out.push(c),
-                _ => out.push_str(match &*r {
-                    "amp" => "&",
-                    "lt" => "<",
-                    "gt" => ">",
-                    "quot" => "\"",
-                    "apos" => "'",
-                    // HTML's, which EPUB 2 chapters use through their DTD.
-                    "nbsp" => " ",
-                    "mdash" => "—",
-                    "ndash" => "–",
-                    "hellip" => "…",
-                    "lsquo" => "‘",
-                    "rsquo" => "’",
-                    "ldquo" => "“",
-                    "rdquo" => "”",
-                    _ => "",
-                }),
+                _ => out.push_str(entity(&r).unwrap_or("")),
             },
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -976,6 +1122,58 @@ mod tests {
                    <v Roger>Hello there.\n\n00:03.000 --> 00:04.000\nGoodbye.\n";
         assert_eq!(subtitles(vtt), "Hello there.\nGoodbye.\n");
         assert_eq!(unit(Path::new("a.vtt")), "line");
+    }
+
+    #[test]
+    fn html_keeps_the_text_on_its_own_lines() {
+        let page = "<!DOCTYPE html>\n<html><head><title>Fish &amp; chips</title>\n\
+                    <style>\nbody { color: red }\n</style>\n<script>if (a < b) {}</script>\n\
+                    </head>\n<body><!-- a\ncomment -->\n<p class=\"a>b\">Cod <b>and</b> \
+                    <i>ch</i>ips&nbsp;&#163;4 &#x2014; &bogus; 1 &lt; 2</p>\n\
+                    <table><tr><td>one</td><td>two</td></tr></table><br/>a < b\n</body></html>\n";
+        let text = html(page);
+        assert_eq!(text.lines().count(), page.lines().count());
+        assert_eq!(
+            text.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(),
+            [
+                "Fish & chips",
+                "Cod and chips £4 — &bogus; 1 < 2",
+                "one two a < b"
+            ]
+        );
+        assert_eq!(
+            text.lines().position(|l| l.starts_with("Cod")),
+            page.lines().position(|l| l.contains("Cod"))
+        );
+    }
+
+    #[test]
+    fn html_survives_broken_markup() {
+        for page in [
+            "<",
+            "&",
+            "<p",
+            "<script>never closed",
+            "<!-- never closed",
+            "</",
+            "<a href='x>",
+        ] {
+            let _ = html(page);
+        }
+        assert_eq!(html("<a title=don't>it</a>s"), "its");
+        // Each of these once scanned to the end of the page per occurrence:
+        // minutes at this size. Linear is about 1 s on CI in a debug build.
+        for unit in ["&", "<script>a</script>"] {
+            let page = unit.repeat((1 << 20) / unit.len());
+            let t0 = std::time::Instant::now();
+            html(&page);
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "{unit}: {:?}",
+                t0.elapsed()
+            );
+        }
+        assert!(is_html(Path::new("A.HTM")) && !is_html(Path::new("a.md")));
     }
 
     #[test]

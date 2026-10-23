@@ -232,8 +232,9 @@ fn vinospeak(
 }
 
 /// The text of the indexed file `id`, for reading aloud: a text file's
-/// contents, or a document's text from the extractor child (seconds for a
-/// big PDF). Err for anything else, an image included.
+/// contents (an HTML page's without its tags), or a document's text from the
+/// extractor child (seconds for a big PDF). Err for anything else, an image
+/// included.
 fn file_text(db: &Db, id: &str) -> Result<String> {
     if !index::is_indexed(&db.lock().unwrap(), id)? {
         bail!("{id} is not an indexed file");
@@ -249,6 +250,9 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
             if text.len() as u64 > index::MAX_FILE_BYTES {
                 bail!("{id} is over {} bytes", index::MAX_FILE_BYTES);
             }
+            if crate::extract::is_html(path) {
+                return Ok(crate::extract::html(&text));
+            }
             Ok(text)
         }
         Some(Kind::Document) => {
@@ -260,8 +264,8 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
 
 /// Read the indexed file `id` aloud with vinoSpeak, stopping any read still
 /// playing (and reaping one that has finished). A text file goes by path,
-/// since vinoSpeak cleans markdown up by its suffix; a document's text is
-/// extracted on a thread of its own and piped in.
+/// since vinoSpeak cleans markdown up by its suffix; a document's text, or
+/// an HTML page's, is extracted on a thread of its own and piped in.
 fn read_aloud(db: &Db, speaking: &Speaking, id: &str) {
     if !indexed(db, id, "reading") {
         return;
@@ -279,7 +283,7 @@ fn read_aloud(db: &Db, speaking: &Speaking, id: &str) {
     if let Some(old) = speaking.lock().unwrap().take() {
         stop_reading(old);
     }
-    if kind == Kind::Text {
+    if kind == Kind::Text && !crate::extract::is_html(Path::new(id)) {
         start_reading(&bin, speaking, OsStr::new(id), None);
         return;
     }
