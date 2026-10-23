@@ -908,7 +908,6 @@ pub fn current_places() -> Vec<Place> {
 /// exports. It takes effect from the next login.
 struct GnomeFiles {
     provider: PathBuf,
-    desktop: PathBuf,
     environment: PathBuf,
     xdg: PathBuf,
 }
@@ -918,31 +917,22 @@ fn gnome_files() -> Result<GnomeFiles> {
     let xdg = data.join("vinosearch/xdg");
     Ok(GnomeFiles {
         provider: data.join(GNOME_PROVIDER),
-        desktop: data.join("applications").join(DESKTOP_ID),
         environment: config_home()?.join("environment.d/60-vinosearch.conf"),
         xdg,
     })
 }
 
-fn install_gnome() -> Result<()> {
-    let g = gnome_files()?;
-    let xdg = g.xdg.to_str().context("data directory is not UTF-8")?;
-    if xdg.contains([':', '$', '\\', '\n']) {
-        anyhow::bail!("{xdg}: cannot go in XDG_DATA_DIRS");
-    }
-    for p in [&g.provider, &g.desktop, &g.environment] {
-        fs::create_dir_all(p.parent().unwrap())?;
-    }
-    fs::write(
-        &g.provider,
-        format!(
-            "[Shell Search Provider]\nDesktopId={DESKTOP_ID}\nBusName={SERVICE}\n\
-             ObjectPath={GNOME}\nVersion=2\n"
-        ),
-    )?;
-    // GNOME Shell skips a provider whose desktop entry is hidden
-    // (NoDisplay), so this one shows in the app grid. It opens the settings
-    // window when that is installed beside us, else the documentation.
+fn launcher_path() -> Result<PathBuf> {
+    Ok(data_home()?.join("applications").join(DESKTOP_ID))
+}
+
+/// The app menu entry. It belongs to the install, not to a search place:
+/// GNOME Shell also needs it to show the provider (a hidden entry disables
+/// it), but turning GNOME off must not take vinoSearch out of Plasma's menu.
+/// It opens the settings window when that is installed beside us, else the
+/// documentation.
+fn install_launcher() -> Result<PathBuf> {
+    let launcher = launcher_path()?;
     let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
     let exec = if settings.is_file() {
         let s = utf8(&settings)?;
@@ -953,14 +943,35 @@ fn install_gnome() -> Result<()> {
     } else {
         "xdg-open https://github.com/karanshukla/vinoSearch#readme".to_owned()
     };
+    fs::create_dir_all(launcher.parent().unwrap())?;
     fs::write(
-        &g.desktop,
+        &launcher,
         format!(
             "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
              Comment=Semantic file search on the NPU\nIcon={ICON}\nExec={exec}\n\
              StartupWMClass={SETTINGS_APP_ID}\nCategories=Utility;Settings;\nTerminal=false\n"
         ),
     )?;
+    Ok(launcher)
+}
+
+fn install_gnome() -> Result<()> {
+    let g = gnome_files()?;
+    let xdg = g.xdg.to_str().context("data directory is not UTF-8")?;
+    if xdg.contains([':', '$', '\\', '\n']) {
+        anyhow::bail!("{xdg}: cannot go in XDG_DATA_DIRS");
+    }
+    for p in [&g.provider, &g.environment] {
+        fs::create_dir_all(p.parent().unwrap())?;
+    }
+    fs::write(
+        &g.provider,
+        format!(
+            "[Shell Search Provider]\nDesktopId={DESKTOP_ID}\nBusName={SERVICE}\n\
+             ObjectPath={GNOME}\nVersion=2\n"
+        ),
+    )?;
+    let launcher = install_launcher()?;
     // Appended, so it never shadows anything the system provides. The
     // default is the XDG spec's, for sessions that leave the variable unset.
     fs::write(
@@ -970,7 +981,7 @@ fn install_gnome() -> Result<()> {
     println!(
         "wrote {}\nwrote {}\nwrote {} (GNOME Shell search: from the next login)",
         g.provider.display(),
-        g.desktop.display(),
+        launcher.display(),
         g.environment.display()
     );
     Ok(())
@@ -1030,7 +1041,7 @@ pub fn uninstall_place(place: Place) -> Result<()> {
         Place::Kde => vec![data_home()?.join(KRUNNER_PLUGIN)],
         Place::Gnome => {
             let g = gnome_files()?;
-            vec![g.provider, g.desktop, g.environment]
+            vec![g.provider, g.environment]
         }
     };
     let mut removed = 0;
@@ -1173,6 +1184,7 @@ fn install_service(
         fs::create_dir_all(p.parent().unwrap())?;
     }
     fs::write(&icon, ICON_SVG)?;
+    let launcher = install_launcher()?;
     fs::write(
         &service,
         format!(
@@ -1194,10 +1206,11 @@ fn install_service(
         ),
     )?;
     println!(
-        "wrote {}\nwrote {}\nwrote {}",
+        "wrote {}\nwrote {}\nwrote {}\nwrote {}",
         service.display(),
         unit.display(),
-        icon.display()
+        icon.display(),
+        launcher.display()
     );
     if systemctl(&["daemon-reload"]) {
         if runner_running() {
@@ -1266,7 +1279,7 @@ fn desktop_quote(arg: &str) -> String {
     dbus_quote(arg).replace('\\', "\\\\").replace('%', "%%")
 }
 
-/// Everything off: both places, the service, the icon.
+/// Everything off: both places, the service, the icon, the app menu entry.
 pub fn uninstall() -> Result<()> {
     let data = data_home()?;
     let unit = unit_path()?;
@@ -1276,7 +1289,12 @@ pub fn uninstall() -> Result<()> {
     for place in Place::ALL {
         uninstall_place(place)?;
     }
-    for p in [data.join(DBUS_SERVICE_FILE), unit, icon_path()?] {
+    for p in [
+        data.join(DBUS_SERVICE_FILE),
+        unit,
+        icon_path()?,
+        launcher_path()?,
+    ] {
         if p.exists() {
             fs::remove_file(&p)?;
             println!("removed {}", p.display());
