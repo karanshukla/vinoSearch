@@ -4,8 +4,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    self, Align, Color32, FontId, Id, Layout, RichText, Sense, Stroke, WidgetInfo, WidgetType,
-    accesskit,
+    self, Align, Color32, FontId, Id, Layout, RichText, Sense, Stroke, WidgetInfo, accesskit,
 };
 use vinosearch_shared::config::{
     self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES, DEFAULT_IMAGE_EXTENSIONS,
@@ -517,7 +516,7 @@ impl SettingsWindow {
                     .desired_width(width)
                     // As tall as the buttons beside it.
                     .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
-                    .vertical_align(Align::Center),
+                    .align(egui::Align2::LEFT_CENTER),
             );
             // The hint is only a placeholder; say what the field is for.
             let name = match target {
@@ -1120,7 +1119,7 @@ fn name_scrolling<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutp
             node.set_orientation(accesskit::Orientation::Vertical);
             node.set_min_numeric_value(0.0);
             node.set_max_numeric_value(f64::from(overflow));
-            node.set_numeric_value(f64::from(scrolled.state.offset.y));
+            node.set_numeric_value(f64::from(scrolled.state.clamped_offset().y));
         });
     if overflow > 0.0 {
         ui.ctx()
@@ -1167,9 +1166,7 @@ fn tab_list(ui: &egui::Ui) {
 
 /// One page in `tab_list`: its title is painted, so name it, and say which one is showing.
 fn page_tab(ui: &egui::Ui, response: &egui::Response, page: Page, selected: bool) {
-    response.widget_info(|| {
-        WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, page.title())
-    });
+    response.widget_info(|| WidgetInfo::selected(egui::Role::Tab, true, selected, page.title()));
     ui.ctx().accesskit_node_builder(response.id, |node| {
         node.set_role(accesskit::Role::Tab);
         node.clear_toggled();
@@ -1475,13 +1472,14 @@ impl eframe::App for SettingsWindow {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
     }
 }
 
 impl SettingsWindow {
-    fn ui(&mut self, ctx: &egui::Context) {
+    fn show(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
         let focused = ctx.input(|input| input.focused);
         if focused && !self.focused {
             // The desktop's light/dark switch may have flipped while we were in the background,
@@ -1529,13 +1527,15 @@ impl SettingsWindow {
         let header = theme::header(ctx, self.kde_header.as_ref(), focused);
         let wide = ctx.content_rect().width() >= SIDEBAR_FROM;
 
-        egui::TopBottomPanel::top("header")
+        egui::Panel::top("header")
+            // 0.33's central panel painted over this line; 0.37 draws it on top.
+            .show_separator_line(false)
             .frame(
                 egui::Frame::NONE
                     .fill(header.bg)
                     .inner_margin(egui::Margin::symmetric(16, 10)),
             )
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     let start = ui.cursor().left();
                     logo(ui, 22.0);
@@ -1570,15 +1570,15 @@ impl SettingsWindow {
             });
 
         if wide {
-            egui::SidePanel::left("pages")
+            egui::Panel::left("pages")
                 .resizable(false)
-                .exact_width(SIDEBAR_WIDTH)
+                .exact_size(SIDEBAR_WIDTH)
                 .frame(
                     egui::Frame::NONE
                         .fill(p.bg)
                         .inner_margin(egui::Margin::same(8)),
                 )
-                .show(ctx, |ui| {
+                .show(root, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     tab_list(ui);
                     for page in Page::ALL {
@@ -1600,7 +1600,7 @@ impl SettingsWindow {
                         bottom: 4,
                     }),
             )
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 // A solid bar, always drawn: the floating one only shows on hover, so a page
                 // that runs past the window gave no sign there was more below.
                 ui.spacing_mut().scroll = egui::style::ScrollStyle {
@@ -1641,7 +1641,8 @@ impl SettingsWindow {
                 let view = scrolled.inner_rect;
                 name_scrolling(ui, &scrolled, self.page.title());
                 // The bar alone is easy to miss: fade the last lines out while more is below.
-                if scrolled.state.offset.y + view.height() < scrolled.content_size.y - 1.0 {
+                if scrolled.state.clamped_offset().y + view.height() < scrolled.content_size.y - 1.0
+                {
                     let fade = egui::Rect::from_min_max(
                         egui::pos2(view.left(), view.bottom() - 48.0),
                         view.right_bottom(),
@@ -1658,7 +1659,7 @@ impl SettingsWindow {
             });
 
         // Typing or dragging a number changes it every frame; write the file once it settles.
-        if self.idle_dirty && ctx.dragged_id().is_none() && !ctx.wants_keyboard_input() {
+        if self.idle_dirty && ctx.dragged_id().is_none() && !ctx.egui_wants_keyboard_input() {
             self.idle_dirty = false;
             self.save_config();
         }
@@ -1675,7 +1676,10 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
             .with_min_inner_size([340.0, 320.0]),
         // As in vinoWhisper: with vsync, a swap waits on a frame callback KWin holds back from
         // a window it considers hidden, and the window stops answering pings.
-        vsync: false,
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let result = eframe::run_native(

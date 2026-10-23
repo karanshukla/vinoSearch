@@ -56,17 +56,17 @@ fn harness(w: SettingsWindow, size: [f32; 2], theme: Theme) -> Harness<'static, 
     let mut h = Harness::builder()
         .with_size(size)
         .with_theme(theme)
-        .build_state(
-            move |ctx, w: &mut SettingsWindow| {
+        .build_ui_state(
+            move |ui, w: &mut SettingsWindow| {
                 // Fonts set in a frame arrive with the next one, and the window needs its bold.
                 if !styled {
-                    theme::apply(ctx);
-                    theme::visible_scroll_handles(ctx);
+                    theme::apply(ui.ctx());
+                    theme::visible_scroll_handles(ui.ctx());
                     styled = true;
-                    ctx.request_repaint();
+                    ui.ctx().request_repaint();
                     return;
                 }
-                w.ui(ctx);
+                w.show(ui);
             },
             w,
         );
@@ -367,6 +367,27 @@ fn a_notice_is_announced_when_it_appears() {
     h.get_by_role_and_label(Role::Button, "Dismiss").click();
     settle(&mut h);
     assert!(h.state().notice.is_none());
+}
+
+#[test]
+fn a_greyed_out_button_says_it_is_disabled() {
+    let (w, _requests) = window(Page::Folders, "disabled");
+    let mut h = harness(w, WIDE, Theme::Light);
+    let disabled = |h: &Harness<'_, SettingsWindow>, name: &str| {
+        h.get_by_role_and_label(Role::Button, name)
+            .accesskit_node()
+            .is_disabled()
+    };
+    // The window's status is mid-index.
+    assert!(disabled(&h, "Re-index /srv/notes"));
+    assert!(disabled(&h, "Add to included"));
+    h.get_by_role_and_label(Role::TextInput, "Folder to add")
+        .click();
+    settle(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Folder to add")
+        .type_text("/srv/more");
+    settle(&mut h);
+    assert!(!disabled(&h, "Add to included"));
 }
 
 #[test]

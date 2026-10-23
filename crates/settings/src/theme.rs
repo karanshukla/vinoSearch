@@ -107,7 +107,7 @@ fn animations_off(reply: &str) -> bool {
 /// No animation time is the signal: egui's own transitions go instant and `window::spinner`
 /// stops turning.
 pub fn still(ctx: &egui::Context) -> bool {
-    ctx.style().animation_time == 0.0
+    ctx.global_style().animation_time == 0.0
 }
 
 // 1 prefers dark, 2 prefers light, 0 is no preference, which desktops answer for their light default.
