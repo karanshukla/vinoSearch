@@ -122,12 +122,25 @@ struct SettingsWindow {
     largest_for: Option<i64>,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
+    /// The desktop's text scale as last applied. Only a change is applied again, so a Ctrl +
+    /// zoom isn't undone every time the window gets focus.
+    text_scale: f32,
 }
 
 impl SettingsWindow {
     fn new(ctx: &egui::Context, page: Option<Page>) -> Self {
         let config_path = config::default_path().unwrap_or_default();
-        SettingsWindow::with(page, Link::start(ctx), config_path)
+        let mut window = SettingsWindow::with(page, Link::start(ctx), config_path);
+        window.follow_text_scale(ctx);
+        window
+    }
+
+    fn follow_text_scale(&mut self, ctx: &egui::Context) {
+        let scale = theme::text_scale();
+        if scale != self.text_scale {
+            self.text_scale = scale;
+            ctx.set_zoom_factor(scale);
+        }
     }
 
     fn with(page: Option<Page>, link: Link, config_path: PathBuf) -> Self {
@@ -153,6 +166,7 @@ impl SettingsWindow {
             largest_for: None,
             focused: true,
             kde_header: theme::kde_header(),
+            text_scale: 1.0,
         };
         window.reload_config();
         window
@@ -494,7 +508,8 @@ impl SettingsWindow {
     /// "Add folder…" through the desktop's chooser, or a typed path.
     fn adder(&mut self, ui: &mut egui::Ui, target: Target) {
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        // Wrapped: with large text on a narrow window the field and Add go under the button.
+        ui.horizontal_wrapped(|ui| {
             let (button, hint) = match target {
                 Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
                 Target::Exclude => ("Exclude folder…", "or type a path, e.g. ~/Downloads/tax"),
@@ -509,7 +524,11 @@ impl SettingsWindow {
                 Target::Root => &mut self.new_root,
                 Target::Exclude => &mut self.new_exclude,
             };
-            let width = (ui.available_width() - 60.0).clamp(120.0, 300.0);
+            let room = match ui.available_width() {
+                beside if beside >= 180.0 => beside,
+                _ => ui.max_rect().width(),
+            };
+            let width = (room - 60.0).clamp(120.0, 300.0);
             let edit = ui.add(
                 egui::TextEdit::singleline(text)
                     .hint_text(hint)
@@ -654,7 +673,7 @@ impl SettingsWindow {
                     .unwrap_or(DEFAULT_DEVICE);
                 let before = picked;
                 let combo = egui::ComboBox::from_id_salt("device")
-                    .width(240.0)
+                    .width(ui.available_width().min(240.0))
                     .selected_text(device_label(picked))
                     .show_ui(ui, |ui| {
                         for d in DEVICES {
@@ -1482,10 +1501,11 @@ impl SettingsWindow {
         let ctx = &root.ctx().clone();
         let focused = ctx.input(|input| input.focused);
         if focused && !self.focused {
-            // The desktop's light/dark switch may have flipped while we were in the background,
-            // and the config file or the KRunner registration may have changed under us.
+            // The desktop's light/dark switch or text size may have changed while we were in the
+            // background, and the config file or the KRunner registration may have changed under us.
             theme::follow_desktop(ctx);
             self.kde_header = theme::kde_header();
+            self.follow_text_scale(ctx);
             if !self.idle_dirty {
                 self.reload_config();
             }
