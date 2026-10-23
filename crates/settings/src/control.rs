@@ -178,6 +178,14 @@ impl Link {
         Link { requests, shared }
     }
 
+    /// No thread and no bus: what the window asks for lands on the receiver.
+    #[cfg(test)]
+    pub fn detached() -> (Self, mpsc::Receiver<Request>) {
+        let (requests, rx) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        (Link { requests, shared }, rx)
+    }
+
     pub fn send(&self, request: Request) {
         // The thread only stops with the window.
         let _ = self.requests.send(request);
