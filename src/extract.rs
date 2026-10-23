@@ -351,14 +351,19 @@ pub fn html(text: &str) -> String {
     let newlines = |out: &mut String, skipped: &str| {
         out.extend(std::iter::repeat_n('\n', skipped.matches('\n').count()));
     };
+    // Lowercased once for finding closing tags: ASCII lowercasing keeps
+    // byte offsets, so it indexes like `text`.
+    let lower = text.to_ascii_lowercase();
     let mut rest = text;
     while let Some(i) = rest.find(['<', '&']) {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
         if rest.starts_with('&') {
+            // Bounded, so a page of bare `&`s isn't a scan to the end each.
             let decoded = rest[1..]
-                .find(';')
-                .filter(|&end| end <= 32)
+                .bytes()
+                .take(33)
+                .position(|b| b == b';')
                 .and_then(|end| Some((char_ref(&rest[1..=end])?, end + 2)));
             match decoded {
                 Some((s, len)) => {
@@ -399,8 +404,9 @@ pub fn html(text: &str) -> String {
         rest = &rest[end..];
         if !closing && !self_closing && HTML_SKIP.contains(&name.as_str()) {
             let close = format!("</{name}");
-            // ASCII lowercasing keeps byte offsets.
-            let body = rest.to_ascii_lowercase().find(&close).unwrap_or(rest.len());
+            let body = lower[text.len() - rest.len()..]
+                .find(&close)
+                .unwrap_or(rest.len());
             newlines(&mut out, &rest[..body]);
             rest = &rest[body..];
             let end = tag_end(rest);
@@ -1155,6 +1161,17 @@ mod tests {
             let _ = html(page);
         }
         assert_eq!(html("<a title=don't>it</a>s"), "its");
+        // Each of these once scanned to the end of the page per occurrence.
+        for unit in ["&", "<script>a</script>"] {
+            let page = unit.repeat((1 << 20) / unit.len());
+            let t0 = std::time::Instant::now();
+            html(&page);
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "{unit}: {:?}",
+                t0.elapsed()
+            );
+        }
         assert!(is_html(Path::new("A.HTM")) && !is_html(Path::new("a.md")));
     }
 
