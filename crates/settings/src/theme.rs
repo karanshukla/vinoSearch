@@ -17,6 +17,8 @@ pub struct Palette {
     pub rule: Color32,
     pub code_bg: Color32,
     pub link: Color32,
+    /// egui's own red is 3.9:1 on the light page, under the 4.5:1 text needs.
+    pub error: Color32,
 }
 
 const fn rgb(hex: u32) -> Color32 {
@@ -30,6 +32,7 @@ pub const DARK: Palette = Palette {
     rule: rgb(0x2a2c30),
     code_bg: rgb(0x1e2023),
     link: rgb(0x7bdc97),
+    error: rgb(0xff6b6b),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -39,7 +42,14 @@ pub const LIGHT: Palette = Palette {
     rule: rgb(0xe2e3e6),
     code_bg: rgb(0xeef0f2),
     link: rgb(0x1a7040),
+    error: rgb(0xc5221f),
 };
+
+/// The outline of a checkbox or text field, a slider's rail and a scroll handle: 3:1 against
+/// the page and against `code_bg`, as WCAG asks of the edges that make a control findable.
+pub fn boundary(p: &Palette) -> Color32 {
+    p.rule.lerp_to_gamma(p.muted, 0.7)
+}
 
 pub fn palette(ctx: &egui::Context) -> &'static Palette {
     match ctx.theme() {
@@ -51,6 +61,11 @@ pub fn palette(ctx: &egui::Context) -> &'static Palette {
 // winit on Wayland only knows the theme of decorations it draws itself, so egui would fall
 // back to dark on a light desktop. Ask the portal instead.
 pub fn desktop_preference() -> Option<Theme> {
+    parse_color_scheme(&read_setting("org.freedesktop.appearance", "color-scheme")?)
+}
+
+/// One value from the portal's Settings, as busctl prints it ("v u 1").
+fn read_setting(namespace: &str, key: &str) -> Option<String> {
     let output = std::process::Command::new("busctl")
         .args([
             "--user",
@@ -60,8 +75,8 @@ pub fn desktop_preference() -> Option<Theme> {
             "org.freedesktop.portal.Settings",
             "ReadOne",
             "ss",
-            "org.freedesktop.appearance",
-            "color-scheme",
+            namespace,
+            key,
         ])
         .stderr(std::process::Stdio::null())
         .output()
@@ -69,7 +84,30 @@ pub fn desktop_preference() -> Option<Theme> {
     if !output.status.success() {
         return None;
     }
-    parse_color_scheme(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Whether the desktop asks for less motion: GNOME's "Reduce animation", or Plasma's
+/// animation speed slid to instant.
+fn reduced_motion() -> bool {
+    let gnome = read_setting("org.gnome.desktop.interface", "enable-animations");
+    let kde = read_setting("org.kde.kdeglobals.KDE", "AnimationDurationFactor");
+    gnome.as_deref().is_some_and(animations_off) || kde.as_deref().is_some_and(animations_off)
+}
+
+// "v b false", or a duration factor of "v d 0".
+fn animations_off(reply: &str) -> bool {
+    match reply.split_whitespace().last() {
+        Some("false") => true,
+        Some(n) => n.parse::<f64>().is_ok_and(|f| f == 0.0),
+        None => false,
+    }
+}
+
+/// No animation time is the signal: egui's own transitions go instant and `window::spinner`
+/// stops turning.
+pub fn still(ctx: &egui::Context) -> bool {
+    ctx.style().animation_time == 0.0
 }
 
 // 1 prefers dark, 2 prefers light, 0 is no preference, which desktops answer for their light default.
@@ -84,6 +122,12 @@ pub fn follow_desktop(ctx: &egui::Context) {
     if let Some(theme) = desktop_preference() {
         ctx.set_theme(theme);
     }
+    let animation_time = if reduced_motion() {
+        0.0
+    } else {
+        egui::Style::default().animation_time
+    };
+    ctx.all_styles_mut(|style| style.animation_time = animation_time);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,6 +266,7 @@ fn visuals(p: &Palette, base: Visuals) -> Visuals {
     v.faint_bg_color = p.code_bg;
     v.hyperlink_color = p.link;
     v.warn_fg_color = p.link;
+    v.error_fg_color = p.error;
     v.window_stroke = Stroke::new(1.0_f32, p.rule);
     v.selection.bg_fill = p.link.gamma_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0_f32, p.link);
@@ -240,8 +285,8 @@ fn visuals(p: &Palette, base: Visuals) -> Visuals {
     v.widgets.noninteractive.corner_radius = corner;
     v.widgets.inactive.bg_fill = p.code_bg;
     v.widgets.inactive.weak_bg_fill = p.code_bg;
-    // halfway to muted: the unchecked box of a checkbox has to show against the page
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, p.rule.lerp_to_gamma(p.muted, 0.5));
+    // most of the way to muted: the unchecked box of a checkbox has to show against the page
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, boundary(p));
     v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
     v.widgets.hovered.bg_fill = p.code_bg;
     v.widgets.hovered.weak_bg_fill = p.code_bg;
@@ -260,12 +305,13 @@ fn visuals(p: &Palette, base: Visuals) -> Visuals {
 /// A solid scroll bar paints its handle in `bg_fill` on an `extreme_bg_color`
 /// track, and the visuals above make both `code_bg`, so the handle vanished.
 /// Nothing else here uses `bg_fill` (buttons take `weak_bg_fill`), so give it
-/// the checkbox outline's grey, lighter while hovered and green while dragged.
+/// the checkbox outline's grey, lighter while hovered and green while dragged. Checkboxes and
+/// slider rails paint in `bg_fill` too, so they take the same grey.
 pub fn visible_scroll_handles(ctx: &egui::Context) {
     for (theme, p) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
         ctx.style_mut_of(theme, |style| {
             let w = &mut style.visuals.widgets;
-            w.inactive.bg_fill = p.rule.lerp_to_gamma(p.muted, 0.5);
+            w.inactive.bg_fill = boundary(p);
             w.hovered.bg_fill = p.muted;
             w.active.bg_fill = p.link;
         });
@@ -273,6 +319,12 @@ pub fn visible_scroll_handles(ctx: &egui::Context) {
 }
 
 pub fn install(ctx: &egui::Context) {
+    apply(ctx);
+    follow_desktop(ctx);
+}
+
+/// Fonts, colours and sizes, without asking the desktop anything.
+pub fn apply(ctx: &egui::Context) {
     ctx.set_fonts(fonts());
     ctx.set_visuals_of(Theme::Dark, visuals(&DARK, Visuals::dark()));
     ctx.set_visuals_of(Theme::Light, visuals(&LIGHT, Visuals::light()));
@@ -296,7 +348,6 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
         style.spacing.interact_size.y = 28.0;
     });
-    follow_desktop(ctx);
 }
 
 #[cfg(test)]
@@ -310,6 +361,82 @@ mod tests {
         assert_eq!(parse_color_scheme("v u 0\n"), Some(Theme::Light));
         assert_eq!(parse_color_scheme(""), None);
         assert_eq!(parse_color_scheme("garbage"), None);
+    }
+
+    #[test]
+    fn reduced_motion_reads_both_desktops() {
+        assert!(animations_off("v b false\n"));
+        assert!(!animations_off("v b true\n"));
+        assert!(animations_off("v d 0\n"));
+        assert!(!animations_off("v d 1\n"));
+        assert!(!animations_off(""));
+    }
+
+    /// WCAG 2.x relative luminance of an sRGB colour.
+    fn luminance(c: Color32) -> f64 {
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn contrast_ratio_matches_the_wcag_examples() {
+        assert!((contrast(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert!((contrast(rgb(0x777777), Color32::WHITE) - 4.48).abs() < 0.01);
+    }
+
+    /// 4.5:1 for text and 3:1 for the edges of controls (WCAG 1.4.3 and 1.4.11), in the
+    /// visuals as installed, both themes.
+    #[test]
+    fn text_and_control_edges_have_enough_contrast() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        visible_scroll_handles(&ctx);
+        for (theme, p) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
+            let style = ctx.style_of(theme);
+            let v = &style.visuals;
+            let w = &v.widgets;
+            for (what, fg) in [
+                ("text", p.text),
+                ("muted", p.muted),
+                ("link", v.hyperlink_color),
+                ("warning", v.warn_fg_color),
+                ("error", v.error_fg_color),
+                ("button text", w.inactive.fg_stroke.color),
+                ("noninteractive text", w.noninteractive.fg_stroke.color),
+            ] {
+                for (on, bg) in [("page", p.bg), ("field", p.code_bg)] {
+                    let ratio = contrast(fg, bg);
+                    assert!(ratio >= 4.5, "{theme:?}: {what} on {on} is {ratio:.2}:1");
+                }
+            }
+            for (what, edge) in [
+                ("checkbox and field outline", w.inactive.bg_stroke.color),
+                ("checkbox box, rail, scroll handle", w.inactive.bg_fill),
+                ("hovered outline", w.hovered.bg_stroke.color),
+                ("focus outline", w.active.bg_stroke.color),
+                ("text selection outline", v.selection.stroke.color),
+            ] {
+                for (on, bg) in [("page", p.bg), ("field", p.code_bg)] {
+                    let ratio = contrast(edge, bg);
+                    assert!(ratio >= 3.0, "{theme:?}: {what} on {on} is {ratio:.2}:1");
+                }
+            }
+            // The tick inside a checkbox, on the box's fill.
+            let tick = contrast(w.inactive.fg_stroke.color, w.inactive.bg_fill);
+            assert!(tick >= 3.0, "{theme:?}: checkbox tick is {tick:.2}:1");
+        }
     }
 
     const KDEGLOBALS: &str = "\

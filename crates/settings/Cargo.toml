@@ -11,6 +11,9 @@ publish = false
 [dependencies]
 vinosearch-shared = { path = "../shared" }
 anyhow = "1.0"
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
 zbus = "5"
 
+
+[dev-dependencies]
+egui_kittest = { version = "0.33.3", default-features = false }
