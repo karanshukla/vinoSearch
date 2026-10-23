@@ -205,17 +205,53 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
 /// Each page's text layer, NFKC so ligatures like `ﬁ` read as `fi`. A scan
 /// has none and comes out empty.
 fn pdf(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
-    let doc = lopdf::Document::load_mem(bytes)?;
+    let mut doc = lopdf::Document::load_mem(bytes)?;
     if doc.is_encrypted() {
         bail!("encrypted");
     }
+    prefer_to_unicode(&mut doc);
     let pages = doc.get_pages().into_keys().map(|p| {
-        doc.extract_text(&[p])
+        let text = doc
+            .extract_text(&[p])
             .unwrap_or_default()
             .nfkc()
-            .collect::<String>()
+            .collect::<String>();
+        if readable(&text) { text } else { String::new() }
     });
     Ok(numbered(pages))
+}
+
+/// lopdf decodes by a font's /Encoding whenever it has one and reads /ToUnicode only
+/// without, the reverse of the spec's order. A Type 3 font always has an /Encoding, and
+/// Chromium's Print to PDF draws web fonts as Type 3 with made-up glyph names, so its
+/// pages came out as glyph codes (#92). With /Encoding gone, lopdf takes /ToUnicode.
+fn prefer_to_unicode(doc: &mut lopdf::Document) {
+    for object in doc.objects.values_mut() {
+        if let Ok(font) = object.as_dict_mut()
+            && font.has_type(b"Font")
+            && font.has(b"ToUnicode")
+        {
+            font.remove(b"Encoding");
+        }
+    }
+}
+
+/// Whether a page's text is mostly letters and digits. A font lopdf still can't decode
+/// gives glyph codes, mostly punctuation, and they'd be embedded, shown as the snippet and
+/// read aloud; better the page has no chunks. A run of one mark counts once, so a table of
+/// contents' dot leaders don't count against it.
+fn readable(text: &str) -> bool {
+    let (mut words, mut all, mut last) = (0, 0, None);
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        if c.is_alphanumeric() {
+            words += 1;
+        } else if last == Some(c) {
+            continue;
+        }
+        all += 1;
+        last = Some(c);
+    }
+    words * 2 >= all
 }
 
 /// One chunk or more per part, numbered from 1 by the part it came from.
@@ -530,6 +566,90 @@ mod tests {
         let c = chunks(path, csv.as_bytes()).unwrap();
         assert!(c.len() > 1);
         assert_eq!(join(path, c), csv);
+    }
+
+    /// One page drawn in a Type 3 font the way Chromium writes one: made-up glyph names
+    /// in /Differences, the text only in /ToUnicode.
+    fn type3_pdf(codes: &[u8], unicode: &str) -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut cmap = String::from(
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+             /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+             1 begincodespacerange\n<00> <FF>\nendcodespacerange\n",
+        );
+        cmap.push_str(&format!("{} beginbfchar\n", codes.len()));
+        for (code, ch) in codes.iter().zip(unicode.chars()) {
+            cmap.push_str(&format!("<{code:02X}> <{:04X}>\n", ch as u32));
+        }
+        cmap.push_str(
+            "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n",
+        );
+        let to_unicode = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+        let names: Vec<Object> = codes
+            .iter()
+            .map(|c| Object::Name(format!("g{c}").into_bytes()))
+            .collect();
+        let mut differences = vec![Object::Integer(i64::from(codes[0]))];
+        differences.extend(names);
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontBBox" => vec![0.into(), 0.into(), 1000.into(), 1000.into()],
+            "FontMatrix" => vec![0.001.into(), 0.into(), 0.into(), 0.001.into(), 0.into(), 0.into()],
+            "CharProcs" => dictionary! {},
+            "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => differences },
+            "FirstChar" => i64::from(codes[0]),
+            "LastChar" => i64::from(codes[codes.len() - 1]),
+            "Widths" => codes.iter().map(|_| Object::Integer(500)).collect::<Vec<_>>(),
+            "ToUnicode" => to_unicode,
+        });
+        let mut content = b"BT /F1 12 Tf 72 720 Td (".to_vec();
+        for c in codes {
+            content.extend(format!("\\{c:03o}").bytes());
+        }
+        content.extend(b") Tj ET");
+        let content = doc.add_object(Stream::new(dictionary! {}, content));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into(),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_type3_font_is_read_through_its_to_unicode_map() {
+        let codes: Vec<u8> = (3..=11).collect();
+        let pdf = type3_pdf(&codes, "OpenResto");
+        let c = chunks(Path::new("a.pdf"), &pdf).unwrap();
+        assert_eq!(join(Path::new("a.pdf"), c), "OpenResto");
+    }
+
+    #[test]
+    fn glyph_codes_are_not_text() {
+        assert!(!readable("--\"+!_,+)6!*&+ 1&3&161/&)U,4+\"/_"));
+        assert!(readable("OpenResto: simple, secure, self hosted."));
+        assert!(readable("fn main() { println!(\"{}\", x[0]); }"));
+        assert!(readable("Total: $1,234.56 (2026-10-23)"));
+        assert!(readable(
+            "1. Introduction : : : : : : : : : : : : : : : : : : 1"
+        ));
+        assert!(readable(
+            "Code Pages ..................................... 4"
+        ));
+        assert!(readable(""));
     }
 
     #[test]
