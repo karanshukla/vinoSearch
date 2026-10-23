@@ -1,5 +1,6 @@
 //! Text out of documents (#55): PDF pages, the XML inside Office and
-//! OpenDocument zips, spreadsheets, and CSV with its header on every chunk.
+//! OpenDocument zips, spreadsheets, CSV with its header on every chunk, EPUB
+//! chapters and subtitles (#97).
 //! What comes out is chunked like any text file, numbered by page, slide or
 //! row instead of line. The indexer runs it in a child process with limits
 //! (#84), since the files come from anywhere.
@@ -66,10 +67,10 @@ fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
     }
     let header_lines = match ext(path).as_str() {
         "csv" | "tsv" => 1,
-        "xlsx" | "xls" | "ods" => 2,
+        e if SHEETS.contains(&e) => 2,
         _ => 0,
     };
-    let by_part = matches!(unit(path), "page" | "slide");
+    let by_part = matches!(unit(path), "page" | "slide" | "chapter");
     let mut out = String::new();
     let mut last_part = None;
     let mut last_header = None;
@@ -151,8 +152,16 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<()> {
 
 /// Taken as documents while they are on.
 pub const EXTENSIONS: &[&str] = &[
-    "pdf", "docx", "odt", "pptx", "odp", "xlsx", "xls", "ods", "csv", "tsv",
+    "pdf", "docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "pptx", "pptm", "potx", "ppsx",
+    "ppsm", "odp", "otp", "fodp", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "ods", "ots",
+    "csv", "tsv", "epub", "srt", "vtt",
 ];
+
+/// Word's macro and template files keep the text where a .docx does.
+const WORD: &[&str] = &["docx", "docm", "dotx", "dotm"];
+const SLIDES: &[&str] = &["pptx", "pptm", "potx", "ppsx", "ppsm"];
+/// calamine tells these apart by their content.
+const SHEETS: &[&str] = &["xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "ods", "ots"];
 
 fn ext(path: &Path) -> String {
     path.extension()
@@ -170,8 +179,12 @@ pub fn is_document(path: &Path) -> bool {
 pub fn unit(path: &Path) -> &'static str {
     match ext(path).as_str() {
         "pdf" => "page",
-        "pptx" | "odp" => "slide",
-        "xlsx" | "xls" | "ods" | "csv" | "tsv" => "row",
+        "odp" | "otp" | "fodp" => "slide",
+        e if SLIDES.contains(&e) => "slide",
+        "csv" | "tsv" => "row",
+        e if SHEETS.contains(&e) => "row",
+        "epub" => "chapter",
+        "srt" | "vtt" => "line",
         _ => "paragraph",
     }
 }
@@ -183,15 +196,20 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     }
     match ext(path).as_str() {
         "pdf" => pdf(bytes),
-        "docx" => Ok(chunk(&xml_text(
+        e if WORD.contains(&e) => Ok(chunk(&xml_text(
             &part(bytes, "word/document.xml")?,
             &Tags::DOCX,
         ))),
-        "odt" => Ok(chunk(&xml_text(&part(bytes, "content.xml")?, &Tags::ODF))),
-        "pptx" => pptx(bytes),
-        "odp" => Ok(numbered(
+        "odt" | "ott" => Ok(chunk(&xml_text(&part(bytes, "content.xml")?, &Tags::ODF))),
+        // Flat OpenDocument: the same XML, unzipped.
+        "fodt" => Ok(chunk(&xml_text(utf8(bytes)?, &Tags::ODF))),
+        e if SLIDES.contains(&e) => pptx(bytes),
+        "odp" | "otp" => Ok(numbered(
             xml_text(&part(bytes, "content.xml")?, &Tags::ODF).split('\u{c}'),
         )),
+        "fodp" => Ok(numbered(xml_text(utf8(bytes)?, &Tags::ODF).split('\u{c}'))),
+        "epub" => epub(bytes),
+        "srt" | "vtt" => Ok(chunk(&subtitles(&String::from_utf8_lossy(bytes)))),
         "csv" | "tsv" => {
             let text = std::str::from_utf8(bytes).context("not UTF-8")?;
             let mut lines = text.lines();
@@ -252,6 +270,59 @@ fn readable(text: &str) -> bool {
         last = Some(c);
     }
     words * 2 >= all
+}
+
+fn utf8(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).context("not UTF-8")
+}
+
+/// Each chapter in reading order. The size check in `chunks` has already run on the
+/// zip; rbook reads its entries without a limit of its own.
+fn epub(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+    let book = rbook::Epub::read(Cursor::new(bytes.to_vec()))?;
+    let mut reader = book.reader();
+    let mut chapters = Vec::new();
+    while let Some(chapter) = reader.read_next() {
+        chapters.push(xml_text(chapter?.content(), &Tags::XHTML));
+    }
+    Ok(numbered(chapters.iter()))
+}
+
+/// What's said in an SRT or WebVTT file: cue numbers and ids, timings, VTT's header
+/// and NOTE/STYLE blocks, and inline tags left out.
+fn subtitles(text: &str) -> String {
+    let mut out = String::new();
+    let mut lines = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .peekable();
+    let mut skipping = false;
+    while let Some(line) = lines.next() {
+        if line.is_empty() {
+            skipping = false;
+            continue;
+        }
+        let block = ["WEBVTT", "NOTE", "STYLE", "REGION"]
+            .iter()
+            .any(|word| line.split_whitespace().next() == Some(word));
+        let id = lines.peek().is_some_and(|next| next.contains("-->"));
+        skipping |= block;
+        if skipping || id || line.contains("-->") {
+            continue;
+        }
+        let mut depth = 0;
+        for c in line.chars() {
+            match c {
+                '<' | '{' => depth += 1,
+                '>' | '}' if depth > 0 => depth -= 1,
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// One chunk or more per part, numbered from 1 by the part it came from.
@@ -397,6 +468,8 @@ struct Tags {
     line_break: &'static [&'static str],
     /// Ends a page or slide: a form feed.
     page: &'static str,
+    /// Nothing inside these is text.
+    skip: &'static [&'static str],
 }
 
 impl Tags {
@@ -406,6 +479,7 @@ impl Tags {
         tab: &["w:tab"],
         line_break: &["w:br", "w:cr"],
         page: "",
+        skip: &[],
     };
     const PPTX: Tags = Tags {
         text: "a:t",
@@ -413,6 +487,7 @@ impl Tags {
         tab: &[],
         line_break: &["a:br"],
         page: "",
+        skip: &[],
     };
     const ODF: Tags = Tags {
         text: "",
@@ -420,6 +495,32 @@ impl Tags {
         tab: &["text:tab"],
         line_break: &["text:line-break"],
         page: "draw:page",
+        skip: &[],
+    };
+    /// An EPUB chapter.
+    const XHTML: Tags = Tags {
+        text: "",
+        paragraph: &[
+            "p",
+            "div",
+            "li",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "tr",
+            "dt",
+            "dd",
+            "blockquote",
+            "pre",
+            "figcaption",
+        ],
+        tab: &["td", "th"],
+        line_break: &["br"],
+        page: "",
+        skip: &["head", "script", "style"],
     };
 }
 
@@ -428,6 +529,7 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut out = String::new();
     let mut in_text = tags.text.is_empty();
+    let mut skipped = 0u32;
     // ODF's run of spaces, <text:s text:c="3"/>, counts as one: enough to
     // keep words apart.
     let mark = |out: &mut String, name: &str| {
@@ -447,6 +549,9 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
                 if name == tags.text {
                     in_text = true;
                 }
+                if tags.skip.contains(&name) {
+                    skipped += 1;
+                }
                 mark(&mut out, name);
             }
             Ok(Event::Empty(e)) => mark(&mut out, e.name().into_inner()),
@@ -456,6 +561,9 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
                 if !tags.text.is_empty() && name == tags.text {
                     in_text = false;
                 }
+                if tags.skip.contains(&name) {
+                    skipped = skipped.saturating_sub(1);
+                }
                 if tags.paragraph.contains(&name) {
                     out.push('\n');
                 }
@@ -463,8 +571,8 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
                     out.push('\u{c}');
                 }
             }
-            Ok(Event::Text(t)) if in_text => out.push_str(&t.xml10_content()),
-            Ok(Event::GeneralRef(r)) if in_text => match r.resolve_char_ref() {
+            Ok(Event::Text(t)) if in_text && skipped == 0 => out.push_str(&t.xml10_content()),
+            Ok(Event::GeneralRef(r)) if in_text && skipped == 0 => match r.resolve_char_ref() {
                 Ok(Some(c)) => out.push(c),
                 _ => out.push_str(match &*r {
                     "amp" => "&",
@@ -472,6 +580,15 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
                     "gt" => ">",
                     "quot" => "\"",
                     "apos" => "'",
+                    // HTML's, which EPUB 2 chapters use through their DTD.
+                    "nbsp" => " ",
+                    "mdash" => "—",
+                    "ndash" => "–",
+                    "hellip" => "…",
+                    "lsquo" => "‘",
+                    "rsquo" => "’",
+                    "ldquo" => "“",
+                    "rdquo" => "”",
                     _ => "",
                 }),
             },
@@ -718,6 +835,157 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert!(chunks(Path::new("a.docx"), &many).is_err());
+    }
+
+    fn epub_of(chapters: &[(&str, &str)]) -> Vec<u8> {
+        let container = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+        let mut manifest = String::new();
+        let mut spine = String::new();
+        for (i, (name, _)) in chapters.iter().enumerate() {
+            manifest.push_str(&format!(
+                r#"<item id="c{i}" href="{name}" media-type="application/xhtml+xml"/>"#
+            ));
+            spine.push_str(&format!(r#"<itemref idref="c{i}"/>"#));
+        }
+        let opf = format!(
+            r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="id">urn:uuid:1</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language>
+  </metadata>
+  <manifest>{manifest}</manifest>
+  <spine>{spine}</spine>
+</package>"#
+        );
+        let mut files = vec![
+            ("mimetype", "application/epub+zip".to_owned()),
+            ("META-INF/container.xml", container.to_owned()),
+            ("OEBPS/content.opf", opf),
+        ];
+        for (name, body) in chapters {
+            files.push((
+                Box::leak(format!("OEBPS/{name}").into_boxed_str()),
+                format!(
+                    "<?xml version=\"1.0\"?><html xmlns=\"http://www.w3.org/1999/xhtml\">\
+                     <head><title>skip me</title><style>p {{ color: red }}</style></head>\
+                     <body>{body}</body></html>"
+                ),
+            ));
+        }
+        let files: Vec<(&str, &str)> = files.iter().map(|(n, b)| (*n, b.as_str())).collect();
+        zipped(&files)
+    }
+
+    #[test]
+    fn epub_chapters_are_numbered_in_reading_order() {
+        // Listed out of name order: the spine decides.
+        let book = epub_of(&[
+            ("b.xhtml", "<h1>Two</h1><p>Fish&#160;&amp; chips</p>"),
+            ("a.xhtml", "<p>Second<br/>line</p><script>var x;</script>"),
+        ]);
+        let path = Path::new("a.epub");
+        let c = chunks(path, &book).unwrap();
+        assert_eq!(
+            c,
+            vec![
+                (1, "Two\nFish\u{a0}& chips\n".to_owned()),
+                (2, "Second\nline\n".to_owned())
+            ]
+        );
+        assert_eq!(unit(path), "chapter");
+        assert_eq!(join(path, c), "Two\nFish\u{a0}& chips\n\nSecond\nline\n");
+    }
+
+    #[test]
+    fn office_variants_read_like_their_base_format() {
+        let word = zipped(&[(
+            "word/document.xml",
+            "<w:document><w:body><w:p><w:r><w:t>macro doc</w:t></w:r></w:p></w:body></w:document>",
+        )]);
+        for e in ["docm", "dotx", "dotm"] {
+            let c = chunks(Path::new(&format!("a.{e}")), &word).unwrap();
+            assert_eq!(c, vec![(1, "macro doc\n".to_owned())], "{e}");
+        }
+        let slides = zipped(&[(
+            "ppt/slides/slide1.xml",
+            "<p:sld><a:p><a:r><a:t>show</a:t></a:r></a:p></p:sld>",
+        )]);
+        for e in ["pptm", "potx", "ppsx", "ppsm"] {
+            let path = format!("a.{e}");
+            assert_eq!(
+                chunks(Path::new(&path), &slides).unwrap(),
+                vec![(1, "show\n".to_owned())]
+            );
+            assert_eq!(unit(Path::new(&path)), "slide");
+        }
+        let odf = "<office:document-content><office:body><office:text>\
+                   <text:p>flat</text:p></office:text></office:body></office:document-content>";
+        assert_eq!(
+            chunks(Path::new("a.ott"), &zipped(&[("content.xml", odf)])).unwrap(),
+            vec![(1, "flat\n".to_owned())]
+        );
+        assert_eq!(
+            chunks(Path::new("a.fodt"), odf.as_bytes()).unwrap(),
+            vec![(1, "flat\n".to_owned())]
+        );
+        let pages = "<office:document><draw:page><text:p>one</text:p></draw:page>\
+                     <draw:page><text:p>two</text:p></draw:page></office:document>";
+        assert_eq!(
+            chunks(Path::new("a.fodp"), pages.as_bytes()).unwrap(),
+            vec![(1, "one\n".to_owned()), (2, "two\n".to_owned())]
+        );
+        assert_eq!(
+            chunks(Path::new("a.otp"), &zipped(&[("content.xml", pages)])).unwrap(),
+            vec![(1, "one\n".to_owned()), (2, "two\n".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_ods_template_is_a_spreadsheet() {
+        let content = r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet>
+<table:table table:name="Budget"><table:table-row><table:table-cell office:value-type="string"><text:p>payee</text:p></table:table-cell></table:table-row>
+<table:table-row><table:table-cell office:value-type="string"><text:p>rent</text:p></table:table-cell></table:table-row></table:table>
+</office:spreadsheet></office:body></office:document-content>"#;
+        let ots = zipped(&[
+            (
+                "mimetype",
+                "application/vnd.oasis.opendocument.spreadsheet-template",
+            ),
+            ("META-INF/manifest.xml", "<manifest:manifest/>"),
+            ("content.xml", content),
+        ]);
+        let c = chunks(Path::new("a.ots"), &ots).unwrap();
+        assert_eq!(c.len(), 1);
+        assert!(c[0].1.contains("payee") && c[0].1.contains("rent"), "{c:?}");
+        assert_eq!(unit(Path::new("a.ots")), "row");
+    }
+
+    #[test]
+    fn subtitles_keep_only_what_is_said() {
+        let srt = "\u{feff}1\n00:00:01,000 --> 00:00:02,500\n<i>Where were you</i>\nlast night?\n\n\
+                   2\n00:00:03,000 --> 00:00:04,000\n{\\an8}At the restaurant.\n";
+        assert_eq!(
+            subtitles(srt),
+            "Where were you\nlast night?\nAt the restaurant.\n"
+        );
+        let vtt = "WEBVTT - a title\n\nNOTE written by hand\nstill the note\n\n\
+                   STYLE\n::cue { color: red }\n\nintro\n00:01.000 --> 00:02.000 align:start\n\
+                   <v Roger>Hello there.\n\n00:03.000 --> 00:04.000\nGoodbye.\n";
+        assert_eq!(subtitles(vtt), "Hello there.\nGoodbye.\n");
+        assert_eq!(unit(Path::new("a.vtt")), "line");
+    }
+
+    #[test]
+    fn every_document_extension_has_a_unit_and_a_parser() {
+        for e in EXTENSIONS {
+            let path = format!("a.{e}");
+            assert!(is_document(Path::new(&path)));
+            // Garbage in: an error or nothing, never a panic.
+            let _ = chunks(Path::new(&path), b"not a document");
+        }
     }
 
     #[test]
