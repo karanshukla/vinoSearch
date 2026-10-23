@@ -401,6 +401,29 @@ fn reduced_motion_stops_the_spinner() {
 }
 
 #[test]
+fn large_text_clips_nothing_at_either_width() {
+    for size in [WIDE, NARROW] {
+        for page in Page::ALL {
+            let (w, _requests) = window(page, "large");
+            let mut h = harness(w, size, Theme::Light);
+            h.ctx.set_zoom_factor(1.5);
+            settle(&mut h);
+            let right = h.ctx.content_rect().right();
+            let clipped: Vec<_> = h
+                .query_all_by(|node| CONTROLS.contains(&node.role()) && !node.is_hidden())
+                .filter(|node| node.rect().max.x > right + 0.5)
+                .map(|node| format!("{node:?} at {:?}", node.rect()))
+                .collect();
+            assert!(
+                clipped.is_empty(),
+                "{} at {size:?}: past the right edge {clipped:#?}",
+                page.title()
+            );
+        }
+    }
+}
+
+#[test]
 fn zoom_keeps_every_page_usable() {
     for page in Page::ALL {
         let (w, _requests) = window(page, "zoom");
