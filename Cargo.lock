@@ -3331,6 +3331,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbook"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c06ea43dbcd4f4e6e4573bc3741e6c39750b7202fd5366d834b00a420b3120e"
+dependencies = [
+ "indexmap",
+ "percent-encoding",
+ "quick-xml 0.42.0",
+ "thiserror 2.0.21",
+ "zip",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4254,6 +4267,7 @@ dependencies = [
  "openvino-sys",
  "ovfetch",
  "quick-xml 0.42.0",
+ "rbook",
  "rusqlite",
  "serde",
  "serde_json",
