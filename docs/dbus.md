@@ -14,9 +14,9 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 
 | Method | What it does |
 |---|---|
-| `Actions() → a(sss)` | `open-folder` (Open containing folder) and `read-aloud` (Read aloud). |
-| `Match(s query)` | The search below. Each match sets `subtext`, `urls`, `category`, and `actions`, the action ids KRunner shows for it: both for a text file or document, `open-folder` alone for an image. |
-| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action `xdg-open`s the file, `open-folder` its directory. `read-aloud` runs `vinospeak --file <path>` for a text file ([vinoSpeak](https://github.com/karanshukla/vinoSpeak), from `PATH` or else `~/.local/bin`), so vinoSpeak cleans markdown up by its suffix; for a document it extracts the text as `FileText` does, on a thread of its own, and pipes it to `vinospeak --file -`. Either stops a read still playing; without vinoSpeak it logs a line and does nothing. |
+| `Actions() → a(sss)` | `open-folder` (Open containing folder). |
+| `Match(s query)` | The search below. Each match sets `subtext`, `urls` and `category`. |
+| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action `xdg-open`s the file, `open-folder` its directory. |
 
 ## `org.gnome.Shell.SearchProvider2`
 
