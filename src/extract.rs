@@ -1161,7 +1161,8 @@ mod tests {
             let _ = html(page);
         }
         assert_eq!(html("<a title=don't>it</a>s"), "its");
-        // Each of these once scanned to the end of the page per occurrence.
+        // Each of these once scanned to the end of the page per occurrence:
+        // minutes at this size. Linear is about 1 s on CI in a debug build.
         for unit in ["&", "<script>a</script>"] {
             let page = unit.repeat((1 << 20) / unit.len());
             let t0 = std::time::Instant::now();
