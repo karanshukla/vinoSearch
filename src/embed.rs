@@ -41,6 +41,9 @@ struct Stage {
     len: usize,
     _compiled: CompiledModel,
     requests: Vec<InferRequest>,
+    /// Compiled now rather than loaded from the cache.
+    fresh: bool,
+    cache: PathBuf,
 }
 
 /// The vision encoder and the text model taking its output.
@@ -51,6 +54,8 @@ struct ImageStage {
     text: InferRequest,
     /// `<bos>`, `<|image>`, `<|image|>`, `<image|>`, `<eos>`.
     ids: [i64; 5],
+    fresh: bool,
+    cache: PathBuf,
 }
 
 /// Query stage up front; the document and image stages compile on first
@@ -172,13 +177,13 @@ fn blobs(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Compile with this stage's cache directory, then drop the blobs a cache
-/// miss left stale.
+/// miss left stale. True when it was a miss.
 fn compile_cached(
     core: &mut Core,
     device: &str,
     cache: &Path,
     compile: impl FnOnce(&mut Core) -> Result<CompiledModel>,
-) -> Result<CompiledModel> {
+) -> Result<(CompiledModel, bool)> {
     std::fs::create_dir_all(cache)?;
     core.set_property(
         &DeviceType::from(device),
@@ -190,12 +195,13 @@ fn compile_cached(
     let compiled = compile(core)?;
     // A new blob means a cache miss (a new OpenVINO, say), so the older
     // ones in this directory are for a build that no longer loads them.
-    if blobs(cache).iter().any(|b| !before.contains(b)) {
+    let fresh = blobs(cache).iter().any(|b| !before.contains(b));
+    if fresh {
         for old in before {
             let _ = std::fs::remove_file(old);
         }
     }
-    Ok(compiled)
+    Ok((compiled, fresh))
 }
 
 /// Straight from the path: on a cache hit OpenVINO loads the blob without
@@ -218,7 +224,7 @@ impl Stage {
         in_flight: usize,
     ) -> Result<Self> {
         let cache = cache_root.join(cache_key(device, len));
-        let mut compiled =
+        let (mut compiled, fresh) =
             compile_cached(
                 core,
                 device,
@@ -251,6 +257,8 @@ impl Stage {
             len,
             _compiled: compiled,
             requests,
+            fresh,
+            cache,
         })
     }
 
@@ -338,7 +346,7 @@ impl ImageStage {
             &format!("vision{tokens}"),
         ));
         let path = crate::model::vision_path(vision_dir);
-        let mut vision = compile_cached(core, device, &cache, |core| {
+        let (mut vision, vision_fresh) = compile_cached(core, device, &cache, |core| {
             compile_file(core, &path, device)
         })?;
         let cache = cache_root.join(stage_key(
@@ -347,7 +355,7 @@ impl ImageStage {
             &format!("image{tokens}"),
         ));
         let path = crate::model::image_text_path(model_dir);
-        let mut text = compile_cached(core, device, &cache, |core| {
+        let (mut text, text_fresh) = compile_cached(core, device, &cache, |core| {
             compile_file(core, &path, device)
         })?;
         let id = |t: &str| {
@@ -367,6 +375,8 @@ impl ImageStage {
                 id("<image|>")?,
                 id("<eos>")?,
             ],
+            fresh: vision_fresh || text_fresh,
+            cache,
         })
     }
 
@@ -411,6 +421,87 @@ impl ImageStage {
     }
 }
 
+/// A compiled stage, as `checked` sees it.
+trait Compiled {
+    fn fresh(&self) -> bool;
+    fn cache(&self) -> &Path;
+}
+
+impl Compiled for Stage {
+    fn fresh(&self) -> bool {
+        self.fresh
+    }
+    fn cache(&self) -> &Path {
+        &self.cache
+    }
+}
+
+impl Compiled for ImageStage {
+    fn fresh(&self) -> bool {
+        self.fresh
+    }
+    fn cache(&self) -> &Path {
+        &self.cache
+    }
+}
+
+/// `build` the stage on `device`, then hold it to the CPU's answer for the same input
+/// (#76): checked when compiled fresh or never checked under this OpenVINO, otherwise
+/// the recorded cosine stands. Below `parity::MIN_COSINE`, it's built on the CPU instead.
+fn checked<S: Compiled>(
+    name: &str,
+    device: &str,
+    mut build: impl FnMut(&str) -> Result<S>,
+    probe: impl FnOnce(&mut S) -> Result<Vec<f32>>,
+) -> Result<S> {
+    let mut stage = build(device)?;
+    let Some(reference) = crate::parity::reference(name).filter(|_| device != "CPU") else {
+        return Ok(stage);
+    };
+    let build_id = openvino::version().build_number;
+    let cosine = match crate::parity::recorded(stage.cache()) {
+        Some((checked, cosine)) if checked == build_id && !stage.fresh() => cosine,
+        _ => {
+            let cosine = crate::parity::cosine(&probe(&mut stage)?, &reference);
+            crate::parity::record(stage.cache(), &build_id, cosine)?;
+            eprintln!("{name} stage on {device}: cosine {cosine:.5} to the CPU reference");
+            cosine
+        }
+    };
+    if cosine >= crate::parity::MIN_COSINE {
+        return Ok(stage);
+    }
+    eprintln!(
+        "{name} stage on {device} is off the CPU reference (cosine {cosine:.4}); running it on CPU"
+    );
+    drop(stage);
+    build("CPU")
+}
+
+/// What each stage's last check on `device` found, as doctor reports it: None for not
+/// checked yet.
+pub fn parity(cache_root: &Path, device: &str) -> Vec<(&'static str, Option<f32>)> {
+    let tokens = crate::vision::SOFT_TOKENS;
+    let dirs = [
+        cache_key(device, QUERY_LEN),
+        cache_key(device, DOC_LEN),
+        stage_key(crate::model::REVISION, device, &format!("image{tokens}")),
+    ];
+    crate::parity::STAGES
+        .iter()
+        .zip(dirs)
+        .map(|((name, _), dir)| {
+            let cosine = crate::parity::recorded(&cache_root.join(dir)).map(|(_, c)| c);
+            (*name, cosine)
+        })
+        .collect()
+}
+
+fn query_probe(stage: &mut Stage, tok: &Tokenizer) -> Result<Vec<f32>> {
+    let text = format!("{QUERY_PREFIX}{}", crate::parity::QUERY);
+    Ok(stage.run(tok, &[text], 1.0)?.remove(0))
+}
+
 impl Embedder {
     pub fn new(
         mut core: Core,
@@ -424,7 +515,12 @@ impl Embedder {
         let tok_path = crate::model::tokenizer_path(model_dir);
         let tok =
             Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{}: {e}", tok_path.display()))?;
-        let query = Stage::new(&mut core, model_dir, device, cache_dir, QUERY_LEN, 1)?;
+        let query = checked(
+            "query",
+            device,
+            |device| Stage::new(&mut core, model_dir, device, cache_dir, QUERY_LEN, 1),
+            |stage| query_probe(stage, &tok),
+        )?;
         Ok(Self {
             core,
             model_dir: model_dir.to_owned(),
@@ -455,13 +551,25 @@ impl Embedder {
     /// Compile the document stage now, if it is not already.
     pub fn prepare_documents(&mut self) -> Result<()> {
         if self.docs.is_none() {
-            self.docs = Some(Stage::new(
-                &mut self.core,
-                &self.model_dir,
+            let (core, tok) = (&mut self.core, &self.tok);
+            self.docs = Some(checked(
+                "document",
                 &self.device,
-                &self.cache,
-                DOC_LEN,
-                IN_FLIGHT,
+                |device| {
+                    Stage::new(
+                        core,
+                        &self.model_dir,
+                        device,
+                        &self.cache,
+                        DOC_LEN,
+                        IN_FLIGHT,
+                    )
+                },
+                |stage| {
+                    let text =
+                        document_text(crate::parity::DOCUMENT_TITLE, crate::parity::DOCUMENT);
+                    Ok(stage.run(tok, &[text], 1.0)?.remove(0))
+                },
             )?);
         }
         Ok(())
@@ -488,13 +596,21 @@ impl Embedder {
     /// Embed an image, prepared by [`crate::vision::prepare`].
     pub fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
         if self.images.is_none() {
-            self.images = Some(ImageStage::new(
-                &mut self.core,
-                &self.model_dir,
-                &self.vision_dir,
+            let (core, tok) = (&mut self.core, &self.tok);
+            self.images = Some(checked(
+                "image",
                 &self.device,
-                &self.cache,
-                &self.tok,
+                |device| {
+                    ImageStage::new(
+                        core,
+                        &self.model_dir,
+                        &self.vision_dir,
+                        device,
+                        &self.cache,
+                        tok,
+                    )
+                },
+                |stage| stage.run(&crate::vision::prepare(&crate::parity::image())?),
             )?);
         }
         let t0 = Instant::now();
@@ -514,6 +630,42 @@ impl Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `src/parity/*.f32` from the CPU. Run after a model revision changes:
+    /// `cargo test --release write_parity_references -- --ignored`.
+    #[test]
+    #[ignore = "needs the OpenVINO runtime and the model"]
+    fn write_parity_references() {
+        let prefix = crate::runtime::default_prefix(None).unwrap();
+        crate::runtime::load(&prefix).unwrap();
+        // Not the temp dir, which is RAM here; the CPU blobs are hundreds of MB.
+        let home = std::env::var_os("HOME").unwrap();
+        let cache = Path::new(&home).join(".cache/vinosearch/parity-references");
+        let mut e = Embedder::new(
+            Core::new().unwrap(),
+            &crate::model::default_dir().unwrap(),
+            &crate::model::vision_dir().unwrap(),
+            "CPU",
+            &cache,
+        )
+        .unwrap();
+        let vectors = [
+            e.query(crate::parity::QUERY).unwrap(),
+            e.documents(&[document_text(
+                crate::parity::DOCUMENT_TITLE,
+                crate::parity::DOCUMENT,
+            )])
+            .unwrap()
+            .remove(0),
+            e.image(&crate::vision::prepare(&crate::parity::image()).unwrap())
+                .unwrap(),
+        ];
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parity");
+        for ((name, _), v) in crate::parity::STAGES.iter().zip(vectors) {
+            std::fs::write(dir.join(format!("{name}.f32")), crate::parity::encode(&v)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&cache);
+    }
 
     #[test]
     fn prune_keeps_only_this_revisions_stage_directories() {

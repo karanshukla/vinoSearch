@@ -44,7 +44,7 @@ It also serves `dev.vinosearch.Control1` at `/control` for the settings app: `St
 | Folders | The included (indexed) folders and the excluded ones | Add a folder (the desktop's own folder chooser, or a typed path), re-index or remove one, add or remove exclusions |
 | Search | What is indexed (text always, images and documents by a switch, with image file extensions), what each format holds and its share of the index, and how close a result must be to show, per kind | Turn images and documents on or off, edit image extensions, slide each kind between fewer, closer and more, looser results |
 | Model | Whether the model is downloaded and its size, download progress, whether it is loaded and on which device, the compiled-model cache size | Download, verify or delete the model, unload it now, clear the cache, pick NPU, GPU or CPU, set the idle unload time |
-| Hardware | What `vinosearch doctor` reports: NPU, driver, NPU compiler, OpenVINO, devices, and a probe run on the device picked on the Model page | Check again |
+| Hardware | What `vinosearch doctor` reports: NPU, driver, NPU compiler, OpenVINO, devices, a probe run on the device picked on the Model page, and how close each model stage came to the CPU | Check again |
 | Integration | Whether KRunner (with the Plasma launcher) and GNOME Shell search are each on, with a note for the desktop that isn't running, and whether the service is | Turn each place on or off (`vinosearch integrate kde\|gnome [--off]`), or the service with everything (`vinosearch krunner --install` / `--uninstall`), with the command's output |
 
 - **Live.** It asks the runner for `Status` once a second, from a background thread, so the counts move while indexing runs and a slow D-Bus start never freezes the window. If the runner isn't installed, the pages say so.
@@ -91,6 +91,8 @@ OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch) (0.5.0 or 
 scripts/install-runtime.sh   # Intel's openvino wheel alone: 139 MB, ~17 s, no compile
 vinosearch doctor            # NPU, driver, runtime, then compiles and runs a probe model
 ```
+
+**Parity** ([#76](https://github.com/karanshukla/vinoSearch/issues/76)). A device can run a model wrong without an error: the INT8 vision encoder gave cosine 0.67 against the CPU on the NPU. So when a stage (query, document, image) compiles fresh on anything but the CPU, or hasn't been checked under this OpenVINO, it embeds a fixed input and compares the vector with the CPU's, stored in `src/parity/`. Under 0.995 that stage runs on the CPU instead. The NPU gives 0.9995 (document) to 0.99998 (image). The result sits next to the stage's compiled blobs, and `vinosearch doctor` prints it. After a model revision changes, regenerate the references with `cargo test --release write_parity_references -- --ignored`.
 
 vinoSearch calls OpenVINO directly, without ONNX Runtime, so it uses `ovfetch install --openvino-only`. That gets the newest OpenVINO the NPU driver supports (2026.4.1 here), the same release vinoAuthFace and vinoWhisper run, which matters: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
 
