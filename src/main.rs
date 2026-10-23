@@ -4,6 +4,7 @@ mod icons;
 mod index;
 mod krunner;
 mod model;
+mod parity;
 mod proc;
 mod runtime;
 mod sched;
@@ -128,6 +129,37 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     Ok(emb)
 }
 
+/// What the runner found when it last compiled each stage on `device` (#76).
+fn print_parity(device: &str) -> Result<()> {
+    if device == "CPU" {
+        println!("parity:    CPU is the reference");
+        return Ok(());
+    }
+    let min = parity::MIN_COSINE;
+    let checks = embed::parity(&cache_dir()?, device);
+    if checks.iter().all(|(_, cosine)| cosine.is_none()) {
+        println!("parity:    not checked yet; each stage is the next time it loads on {device}");
+        return Ok(());
+    }
+    let found: Vec<String> = checks
+        .iter()
+        .map(|(stage, cosine)| match cosine {
+            Some(c) => format!("{stage} {c:.5}"),
+            None => format!("{stage} not checked yet"),
+        })
+        .collect();
+    println!(
+        "parity:    {} against the CPU (min {min})",
+        found.join(", ")
+    );
+    for (stage, cosine) in &checks {
+        if let Some(c) = cosine.filter(|c| *c < min) {
+            println!("warning:   the {stage} stage gave {c:.4} on {device}, so it runs on CPU");
+        }
+    }
+    Ok(())
+}
+
 /// Flags over the config file over defaults.
 struct Settings {
     path: PathBuf,
@@ -200,7 +232,9 @@ fn run(cli: Cli) -> Result<bool> {
     match cli.command {
         Command::Doctor => {
             let prefix = runtime::default_prefix(cli.openvino_dir)?;
-            runtime::doctor(&prefix, &s.device)
+            let ok = runtime::doctor(&prefix, &s.device)?;
+            print_parity(&s.device)?;
+            Ok(ok)
         }
         Command::FetchModel => {
             let mut last = String::new();
