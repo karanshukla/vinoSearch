@@ -3,6 +3,7 @@ mod extract;
 mod icons;
 mod index;
 mod krunner;
+mod menu;
 mod model;
 mod parity;
 mod proc;
@@ -50,7 +51,8 @@ enum Command {
     /// Serve KRunner, GNOME Shell and the settings app over D-Bus, or install/remove the service.
     Krunner {
         /// Write the service files and the running desktop's search place (KRunner on Plasma,
-        /// GNOME Shell on GNOME, both elsewhere), then exit. `integrate` adds or removes one.
+        /// GNOME Shell on GNOME, none on other desktops, both when there's no desktop session),
+        /// then exit. `integrate` adds or removes one.
         #[arg(long)]
         install: bool,
         /// Remove the service and every search place, then exit.
@@ -67,6 +69,15 @@ enum Command {
     },
     /// Keep the index current: watch every indexed root and re-index changes.
     Watch,
+    /// Search from a dmenu-style launcher (fuzzel, wofi, rofi, tofi, bemenu) and open the
+    /// pick, through the running service. For sway, Hyprland and other desktops without
+    /// KRunner or GNOME Shell: bind it to a key.
+    Menu {
+        /// A dmenu-style command to use instead (choices on stdin, the pick or typed text on
+        /// stdout), split on spaces [default: the first of fuzzel, wofi, rofi, tofi, bemenu found]
+        #[arg(long, env = "VINOSEARCH_LAUNCHER")]
+        launcher: Option<String>,
+    },
     /// Search the index.
     Search {
         query: String,
@@ -322,6 +333,10 @@ fn run(cli: Cli) -> Result<bool> {
         }
         Command::Integrate { place, off } => {
             krunner::integrate(place, !off)?;
+            Ok(true)
+        }
+        Command::Menu { launcher } => {
+            menu::run(launcher.as_deref())?;
             Ok(true)
         }
         Command::Watch => {

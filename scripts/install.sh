@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install vinoSearch for this user: the binaries, the OpenVINO runtime, the
 # model, the first indexed folder, and the running desktop's search (KRunner
-# on Plasma, GNOME Shell on GNOME, both elsewhere) with a user service. Safe
-# to re-run: each step skips what is done. `vinosearch integrate kde|gnome`
-# adds or removes a search place later.
+# on Plasma, GNOME Shell on GNOME, `vinosearch menu` elsewhere) with a user
+# service. Safe to re-run: each step skips what is done.
+# `vinosearch integrate kde|gnome` adds or removes a search place later.
 #
 # From a release download (bin/ next to scripts/) it copies the prebuilt
 # binaries into ~/.local/bin; from a source checkout it builds them with cargo.
@@ -239,6 +239,7 @@ if ! systemctl --user is-enabled --quiet vinosearch.service 2>/dev/null; then
 fi
 
 printf '\nDone. Search with: vinosearch search "..." , KRunner, or GNOME Shell (GNOME: from the next login).\n'
+echo 'On sway, Hyprland and other desktops: bind a key to vinosearch menu (needs fuzzel, wofi, rofi, tofi or bemenu).'
 echo 'Another desktop'"'"'s search: vinosearch integrate kde|gnome'
 case ":$USER_PATH:" in
     *":$BIN:"*) ;;
