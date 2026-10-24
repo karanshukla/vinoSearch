@@ -60,6 +60,17 @@ vinosearch integrate gnome                 # or kde: add the other desktop's sea
 
 </details>
 
+<details>
+<summary>Other distros, and Fedora Atomic or openSUSE Aeon</summary>
+
+The release download runs on x86_64 with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13, Arch, openSUSE Tumbleweed, and the image-based Fedora Atomic (Silverblue, Kinoite, Bazzite) and openSUSE Aeon. On anything older (Debian 12, Ubuntu 22.04, openSUSE Leap 15) `install.sh` says so; build from source there.
+
+Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from [rustup](https://rustup.rs). The C compiler is `sudo dnf install gcc` on Fedora, `sudo apt install build-essential` on Debian and Ubuntu, `sudo pacman -S --needed base-devel` on Arch and `sudo zypper install gcc` on openSUSE.
+
+**Image-based systems.** Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under `~/.local`, the service in `~/.config/systemd/user`. Nothing touches `/usr`, so the release download needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install` on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it. To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches the host: the home directory is shared, so the host runs the same binaries and index. If systemd can't be reached from the container, `install.sh` prints the one command to run on the host. `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
+
+</details>
+
 ## Use it
 
 - **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups.

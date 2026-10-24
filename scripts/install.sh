@@ -24,6 +24,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OVFETCH_MIN="0.5.0"
+# The release binaries are built on Ubuntu 24.04 (release.yml).
+GLIBC_MIN="2.39"
+# Building: the settings window's egui needs 1.95, vinosearch alone 1.89.
+RUST_MIN="1.95"
+RUST_MIN_NO_SETTINGS="1.89"
 USER_PATH="$PATH"
 CARGO_BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
 LOCAL_BIN="$HOME/.local/bin"
@@ -50,7 +55,7 @@ while [ $# -gt 0 ]; do
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -84,12 +89,54 @@ if [ "$uninstall" = 1 ]; then
 fi
 [ "$purge" = 0 ] || die "--purge only goes with --uninstall"
 
+# `a` >= `b`, as dotted versions.
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+# Image-based systems (Fedora Atomic, openSUSE Aeon) have a read-only /usr
+# and no compiler on the host. Everything vinoSearch installs lives in
+# $HOME, so the release download needs nothing from the system there.
+image_based() {
+    [ -e /run/ostree-booted ] || findmnt -no OPTIONS / 2>/dev/null | tr , '\n' | grep -qx ro
+}
+
+# The command that installs the C compiler, from /etc/os-release.
+cc_hint() {
+    local id=""
+    [ -r /etc/os-release ] && id="$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")"
+    if image_based; then
+        echo "use the release download (no build needed), or run this inside a toolbox or distrobox"
+        return
+    fi
+    case " $id " in
+        *" fedora "*|*" rhel "*) echo "sudo dnf install gcc" ;;
+        *" debian "*|*" ubuntu "*) echo "sudo apt install build-essential" ;;
+        *" arch "*) echo "sudo pacman -S --needed base-devel" ;;
+        *" suse "*|*" opensuse "*) echo "sudo zypper install gcc" ;;
+        *) echo "install gcc" ;;
+    esac
+}
+
 # Prerequisites, before anything is built or downloaded.
-if [ "$prebuilt" = 0 ]; then
+if [ "$prebuilt" = 1 ]; then
+    arch="$(uname -m)"
+    [ "$arch" = x86_64 ] ||
+        die "the release binaries are x86_64 and this is $arch: build from a source checkout instead"
+    glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
+    [ -n "$glibc" ] ||
+        die "the release binaries need glibc (not musl): build from a source checkout instead"
+    version_ge "$glibc" "$GLIBC_MIN" ||
+        die "the release binaries need glibc $GLIBC_MIN or newer and this has $glibc: build from a source checkout instead"
+else
     command -v cargo >/dev/null || [ -x "$HOME/.cargo/bin/cargo" ] ||
         die "Rust is not installed: get it from https://rustup.rs, then run this again"
     command -v cargo >/dev/null || PATH="$HOME/.cargo/bin:$PATH"
-    command -v cc >/dev/null || die "no C compiler (cc): install gcc, then run this again"
+    need="$RUST_MIN"
+    [ "$settings" = 1 ] || need="$RUST_MIN_NO_SETTINGS"
+    have="$(rustc --version 2>/dev/null | awk '{print $2}')" || true
+    if [ -n "$have" ] && ! version_ge "${have%%-*}" "$need"; then
+        die "Rust $have is too old (needs $need; distro packages often lag): get a current one from https://rustup.rs, then run this again"
+    fi
+    command -v cc >/dev/null || die "no C compiler (cc): $(cc_hint), then run this again"
 fi
 for r in "${roots[@]}"; do
     [ -d "$r" ] || die "--index $r: not a directory"
@@ -182,6 +229,13 @@ vinosearch krunner --install
 # A re-run that replaced the binary: run the new one.
 if [ "$was_running" = 1 ]; then
     systemctl --user restart vinosearch.service && echo "restarted vinosearch.service"
+fi
+# Inside a toolbox or distrobox the files land in the shared home, but the
+# host's systemd may be out of reach, so the service would only start on the
+# first search instead of at login.
+if ! systemctl --user is-enabled --quiet vinosearch.service 2>/dev/null; then
+    echo "couldn't enable vinosearch.service from here (inside a toolbox or distrobox?)."
+    echo "On the host, run: systemctl --user daemon-reload && systemctl --user enable --now vinosearch.service"
 fi
 
 printf '\nDone. Search with: vinosearch search "..." , KRunner, or GNOME Shell (GNOME: from the next login).\n'
