@@ -6,7 +6,7 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 
 | Object | Interface | For |
 |---|---|---|
-| `/runner` | `org.kde.krunner1` | KRunner (`Match`, `Actions`, `Run`, `Teardown`) |
+| `/runner` | `org.kde.krunner1` | KRunner (`Match`, `Actions`, `Run`, `Teardown`), and `vinosearch menu` (`Match`) |
 | `/gnome` | `org.gnome.Shell.SearchProvider2` | GNOME Shell's overview search |
 | `/control` | `dev.vinosearch.Control1` | the settings app |
 

@@ -753,24 +753,21 @@ impl Place {
 }
 
 /// The places for the running desktop, from XDG_CURRENT_DESKTOP (`KDE`,
-/// `ubuntu:GNOME`, ...). Both when it names neither (another desktop, a
-/// TTY, ssh), as every install did before #45.
+/// `ubuntu:GNOME`, ...). None for any other desktop (sway, Hyprland, COSMIC,
+/// XFCE...): neither KRunner nor GNOME Shell runs there, so `vinosearch menu`
+/// is the way in. Both when the variable is unset or empty (a TTY, ssh),
+/// where the desktop can't be told, as every install did before #45.
 fn places_for(desktop: Option<&str>) -> Vec<Place> {
-    let names: Vec<String> = desktop
-        .unwrap_or_default()
-        .split(':')
-        .map(str::to_ascii_uppercase)
-        .collect();
+    let desktop = desktop.unwrap_or_default();
+    if desktop.trim().is_empty() {
+        return Place::ALL.to_vec();
+    }
+    let names: Vec<String> = desktop.split(':').map(str::to_ascii_uppercase).collect();
     let has = |n: &str| names.iter().any(|d| d == n);
-    let places: Vec<Place> = [(Place::Kde, has("KDE")), (Place::Gnome, has("GNOME"))]
+    [(Place::Kde, has("KDE")), (Place::Gnome, has("GNOME"))]
         .into_iter()
         .filter_map(|(p, on)| on.then_some(p))
-        .collect();
-    if places.is_empty() {
-        Place::ALL.to_vec()
-    } else {
-        places
-    }
+        .collect()
 }
 
 pub fn current_places() -> Vec<Place> {
@@ -1009,15 +1006,23 @@ fn runner_running() -> bool {
     owned().unwrap_or(false)
 }
 
-/// Install the service and the search places for the running desktop (both
-/// when that is neither Plasma nor GNOME); `integrate` adds or removes one.
+/// Install the service and the search places for the running desktop;
+/// `integrate` adds or removes one.
 pub fn install(
     openvino_dir: Option<&Path>,
     device: Option<&str>,
     idle_unload_minutes: Option<f64>,
 ) -> Result<()> {
     install_service(openvino_dir, device, idle_unload_minutes)?;
-    for place in current_places() {
+    let places = current_places();
+    if places.is_empty() {
+        println!(
+            "no KRunner or GNOME Shell in this session ({}): search with `vinosearch menu`, \
+             bound to a key; `vinosearch integrate kde|gnome` adds either anyway",
+            std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
+        );
+    }
+    for place in places {
         match place {
             Place::Kde => install_kde()?,
             Place::Gnome => install_gnome()?,
@@ -1091,10 +1096,11 @@ fn install_service(
         if runner_running() {
             // Starting now would lose the bus name to it and fail; the unit
             // takes over from the next login.
-            systemctl(&["enable", UNIT]);
-            println!(
-                "enabled {UNIT}; a runner is already running, so it starts from the next login"
-            );
+            if systemctl(&["enable", UNIT]) {
+                println!(
+                    "enabled {UNIT}; a runner is already running, so it starts from the next login"
+                );
+            }
         } else if systemctl(&["enable", "--now", UNIT]) {
             println!("enabled and started {UNIT}");
         }
@@ -1236,7 +1242,10 @@ mod tests {
         assert_eq!(places_for(Some("KDE")), [Place::Kde]);
         assert_eq!(places_for(Some("ubuntu:GNOME")), [Place::Gnome]);
         assert_eq!(places_for(Some("GNOME-Classic:GNOME")), [Place::Gnome]);
-        assert_eq!(places_for(Some("XFCE")), Place::ALL);
+        assert_eq!(places_for(Some("sway")), []);
+        assert_eq!(places_for(Some("Hyprland")), []);
+        assert_eq!(places_for(Some("COSMIC")), []);
+        assert_eq!(places_for(Some("XFCE")), []);
         assert_eq!(places_for(None), Place::ALL);
         assert_eq!(places_for(Some("")), Place::ALL);
     }

@@ -19,7 +19,7 @@ It's early days: a working proof of concept, used daily on one laptop. Expect ro
 ## Requirements
 
 - Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU? `--device CPU` works, just slower.
-- KDE Plasma or GNOME. The settings window is Wayland only for now.
+- KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher (fuzzel, wofi, rofi, tofi or bemenu). The settings window is Wayland only.
 - Rust and a C compiler, only to build from source.
 
 ## Install
@@ -64,6 +64,7 @@ vinosearch integrate gnome                 # or kde: add the other desktop's sea
 
 - **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups.
 - **GNOME:** the overview's search, from the next login.
+- **Sway, Hyprland, COSMIC and the rest:** `vinosearch menu` asks for a query in fuzzel, wofi, rofi, tofi or bemenu (the first it finds), shows the results in it, and opens the one you pick. Bind it to a key, e.g. `bindsym $mod+s exec vinosearch menu` in sway or `bind = SUPER, S, exec, vinosearch menu` in Hyprland. `--launcher "rofi -dmenu -i"` (or `VINOSEARCH_LAUNCHER`) picks another dmenu-style command. It asks the running service, so a warm query is as quick as KRunner's.
 - **Terminal:** `vinosearch search "how do I rotate the signing key"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg` for indexed photos that look like one.
 
 Results need 3 or more characters. Enter opens the file.
@@ -72,7 +73,7 @@ Results need 3 or more characters. Enter opens the file.
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
 
 Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
 
