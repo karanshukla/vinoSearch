@@ -85,7 +85,7 @@ Warm queries started at p50 85 ms on the benchmark index. Fixed, in order of wha
 
 ## Runtime
 
-OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch) (0.5.0 or newer), installed per user into `~/.local/lib/vinosearch/openvino`:
+OpenVINO comes from [ovfetch](https://github.com/karanshukla/ovfetch) (0.6.0 or newer), installed per user into `~/.local/lib/vinosearch/openvino`:
 
 ```bash
 scripts/install-runtime.sh   # Intel's openvino wheel alone: 139 MB, ~17 s, no compile
@@ -97,6 +97,8 @@ vinosearch doctor            # NPU, driver, runtime, then compiles and runs a pr
 vinoSearch calls OpenVINO directly, without ONNX Runtime, so it uses `ovfetch install --openvino-only`. That gets the newest OpenVINO the NPU driver supports (2026.4.1 here), the same release vinoAuthFace and vinoWhisper run, which matters: an NPU fault resets the device for every process using it. `doctor --openvino-dir <prefix>` points at another ovfetch install. The runtime is loaded at startup (`openvino` crate, `runtime-linking`), so nothing links against the prefix and nothing needs an rpath.
 
 ovfetch's runtime ships OpenVINO's ONNX frontend only, so models must be ONNX.
+
+**NPU compiler.** Some distros package the NPU driver without its compiler (Fedora's `intel-npu-driver` 1.32.0 rpm): the NPU enumerates, and every compile fails with `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`. `ovfetch npu install` (0.6.0) fetches the compiler, or a whole driver, from Intel's linux-npu-driver release into `~/.local/lib/ovfetch-npu`, checked against ovfetch's ledger, no root. `scripts/install-runtime.sh` runs it when `ovfetch detect` reports a driver with no compiler. Those libraries are not on the linker path, so vinoSearch loads them itself (`runtime::preload_npu`): each line of the prefix's `ovfetch-preload.txt`, in order, with `RTLD_GLOBAL`, after OpenVINO and before anything opens the NPU. `vinosearch doctor` prints the prefix when one is in use.
 
 ## Text model benchmark
 

@@ -39,7 +39,9 @@ pub fn read_lock(prefix: &Path) -> Result<Lock> {
 }
 
 /// Load `libopenvino_c` from the prefix. Its own `$ORIGIN` RUNPATH finds the
-/// rest of OpenVINO and its plugins next to it.
+/// rest of OpenVINO and its plugins next to it. Then the NPU prefix, if
+/// `ovfetch npu install` made one: it has to be in place before OpenVINO
+/// first opens the NPU, which `Core::new` may do.
 pub fn load(prefix: &Path) -> Result<()> {
     let lib = prefix.join("libopenvino_c.so");
     if !lib.is_file() {
@@ -48,7 +50,44 @@ pub fn load(prefix: &Path) -> Result<()> {
             lib.display()
         );
     }
-    openvino_sys::library::load_from(lib).map_err(anyhow::Error::msg)
+    openvino_sys::library::load_from(lib).map_err(anyhow::Error::msg)?;
+    preload_npu(ovfetch::detect::default_npu_prefix().as_deref())?;
+    Ok(())
+}
+
+/// Load the libraries `ovfetch npu install` put in `npu_prefix`: the NPU
+/// compiler a distro's driver package lacks (Fedora's 1.32.0 rpm), or a
+/// whole driver. They are not on the linker path, so the app loads them
+/// itself, in the order `ovfetch-preload.txt` lists and with `RTLD_GLOBAL`;
+/// when the driver later asks for them by soname, the dynamic linker hands
+/// back the copies already loaded. After OpenVINO (the compiler needs its
+/// TBB) and before anything opens the NPU. Returns what was loaded; nothing
+/// when there is no prefix or no preload list.
+pub fn preload_npu(npu_prefix: Option<&Path>) -> Result<Vec<PathBuf>> {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+
+    let Some(prefix) = npu_prefix else {
+        return Ok(Vec::new());
+    };
+    let list = prefix.join(ovfetch::detect::NPU_PRELOAD);
+    let text = match fs::read_to_string(&list) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", list.display())),
+    };
+    let mut loaded = Vec::new();
+    for name in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // SAFETY: loading a library runs its initialisers. These are the
+        // files ovfetch hash-checked into the user's own prefix, or the
+        // host's Level Zero loader by soname; the same trust as the OpenVINO
+        // prefix loaded above.
+        let lib = unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
+            .map_err(|e| anyhow::anyhow!("loading {name} (from {}): {e}", list.display()))?;
+        // Stays loaded for the life of the process, like OpenVINO itself.
+        std::mem::forget(lib);
+        loaded.push(PathBuf::from(name));
+    }
+    Ok(loaded)
 }
 
 const PROBE_LEN: usize = 64;
@@ -114,9 +153,12 @@ pub fn doctor(prefix: &Path, device: &str) -> Result<bool> {
         if machine.npu_compiler {
             "present"
         } else {
-            "missing"
+            "missing (`ovfetch npu install` fetches Intel's)"
         }
     );
+    if let Some(p) = &machine.npu_prefix {
+        println!("npu prefix: {p} (from `ovfetch npu install`, preloaded)");
+    }
     if let Some(c) = &status.openvino_ceiling {
         println!("ceiling:   OpenVINO {c}");
     }

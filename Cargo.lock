@@ -2933,9 +2933,9 @@ dependencies = [
 
 [[package]]
 name = "ovfetch"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a277f799dae5acbc333b863799eadbcb6a1ed393634d08b04ecbc62ada488854"
+checksum = "db09cc22f48baa96bd5d4cef3d2a53646e11db5ffc568bdf9ec0d2725649f2af"
 dependencies = [
  "anyhow",
  "serde",
@@ -4261,6 +4261,7 @@ dependencies = [
  "hex",
  "image",
  "libc",
+ "libloading",
  "lopdf",
  "notify",
  "openvino",
