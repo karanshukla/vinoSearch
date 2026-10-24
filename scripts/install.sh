@@ -23,7 +23,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-OVFETCH_MIN="0.5.0"
+OVFETCH_MIN="0.6.0"
 # The release binaries are built on Ubuntu 24.04 (release.yml).
 GLIBC_MIN="2.39"
 # Building: the settings window's egui needs 1.95, vinosearch alone 1.89.

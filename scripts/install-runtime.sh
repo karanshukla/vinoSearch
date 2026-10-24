@@ -8,10 +8,14 @@
 # (`ovfetch install --openvino-only`): the newest OpenVINO the NPU driver
 # supports, hash-checked, in seconds, with no ONNX Runtime and no compile.
 # ovfetch skips the work when the prefix already holds the resolved build.
+#
+# When the NPU driver has no compiler (Fedora's 1.32.0 rpm), `ovfetch npu
+# install` (0.6.0) fetches Intel's into ~/.local/lib/ovfetch-npu, which
+# vinosearch preloads; see docs/how-it-works.md.
 set -euo pipefail
 
 PREFIX="${VINOSEARCH_OPENVINO_DIR:-$HOME/.local/lib/vinosearch/openvino}"
-OVFETCH_MIN="0.5.0"
+OVFETCH_MIN="0.6.0"
 
 for arg in "$@"; do
     case "$arg" in
@@ -43,4 +47,14 @@ fi
 mkdir -p "$(dirname "$PREFIX")"
 "$OVFETCH" install --openvino-only --prefix "$PREFIX"
 "$OVFETCH" verify --prefix "$PREFIX"
+
+# An NPU whose driver is installed but cannot compile: every compile would
+# fail with ZE_RESULT_ERROR_UNSUPPORTED_FEATURE. detect already counts a
+# compiler in ~/.local/lib/ovfetch-npu, so this runs once.
+detected="$("$OVFETCH" detect)"
+if grep -q '"kind": "npu"' <<<"$detected" && ! grep -q '"npu_driver": null' <<<"$detected" \
+   && grep -q '"npu_compiler": false' <<<"$detected"; then
+    echo "the NPU driver has no compiler library; fetching Intel's with ovfetch npu install"
+    "$OVFETCH" npu install
+fi
 echo "installed into $PREFIX; check it with: vinosearch doctor"
