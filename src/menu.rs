@@ -2,8 +2,8 @@
 //! neither KRunner nor GNOME Shell (sway, Hyprland, niri, COSMIC...). The
 //! launcher asks for the query, the running runner answers it over D-Bus
 //! (the same `Match` KRunner calls, so warm queries take milliseconds rather
-//! than a model load), the launcher shows the files, and the pick opens with
-//! `xdg-open` from here, in the session's environment.
+//! than a model load), the launcher shows the files, and the pick opens at
+//! its line or page from here, in the session's environment.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use zbus::zvariant::OwnedValue;
 
+use crate::open::At;
 use vinosearch_shared::dbus::{RUNNER_PATH, SERVICE};
 
 /// Launchers tried in order when none is given: each speaks dmenu (choices
@@ -95,6 +96,8 @@ fn ask(cmd: &[String], choices: &[String]) -> Result<Option<String>> {
 struct Row {
     path: String,
     line: String,
+    /// Where it matched, from the match's `line` or `page`.
+    at: Option<At>,
 }
 
 type Match = (
@@ -140,7 +143,16 @@ fn rows(mut matches: Vec<Match>, home: Option<&str>) -> Vec<Row> {
             } else {
                 format!("{name}   {sub}")
             };
-            Row { path, line }
+            let number = |key: &str| {
+                props
+                    .get(key)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&n| n > 0)
+            };
+            let at = number("line")
+                .map(At::Line)
+                .or_else(|| number("page").map(At::Page));
+            Row { path, line, at }
         })
         .collect()
 }
@@ -166,7 +178,7 @@ fn search(query: &str) -> Result<Vec<Match>> {
     }
 }
 
-pub fn run(given: Option<&str>) -> Result<()> {
+pub fn run(given: Option<&str>, editor: Option<&str>) -> Result<()> {
     let cmd = launcher(given, on_path)?;
     let Some(query) = ask(&cmd, &[])? else {
         return Ok(());
@@ -185,10 +197,7 @@ pub fn run(given: Option<&str>) -> Result<()> {
     let Some(row) = rows.iter().find(|r| r.line == picked) else {
         return Ok(());
     };
-    Command::new("xdg-open")
-        .arg(Path::new(&row.path))
-        .spawn()
-        .with_context(|| format!("xdg-open {}", row.path))?;
+    crate::open::open(Path::new(&row.path), row.at, editor);
     Ok(())
 }
 
@@ -238,6 +247,23 @@ mod tests {
         let lines: Vec<&str> = r.iter().map(|r| r.line.as_str()).collect();
         assert_eq!(lines, ["c.jpg   ~/b", "d.txt", "a.md   ~:3 some text"]);
         assert_eq!(r[0].path, "/home/u/b/c.jpg");
+    }
+
+    #[test]
+    fn rows_carry_the_line_or_page() {
+        let mut text = m("/a.rs", "a.rs", 0.5, "/:12  x");
+        text.5.insert(
+            "line".to_owned(),
+            OwnedValue::try_from(Value::from(12u32)).unwrap(),
+        );
+        let mut pdf = m("/b.pdf", "b.pdf", 0.4, "/, page 3  x");
+        pdf.5.insert(
+            "page".to_owned(),
+            OwnedValue::try_from(Value::from(3u32)).unwrap(),
+        );
+        let r = rows(vec![text, pdf, m("/c.png", "c.png", 0.3, "/")], None);
+        let at: Vec<Option<At>> = r.iter().map(|r| r.at).collect();
+        assert_eq!(at, [Some(At::Line(12)), Some(At::Page(3)), None]);
     }
 
     #[test]

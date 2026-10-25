@@ -7,6 +7,7 @@
 //! device = "NPU"
 //! idle_unload_minutes = 5
 //! index_busy_percent = 50
+//! editor = "code"
 //!
 //! [formats.text]
 //! min_score = 0.65
@@ -97,6 +98,12 @@ pub struct Config {
     /// half that on battery [default: 50].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_busy_percent: Option<u8>,
+    /// What opens a text result at its line (#105): a known editor (`code`,
+    /// `kate`, `zed`, a JetBrains IDE...), or any command with `{file}` and
+    /// `{line}` in it, split on spaces and run without a shell
+    /// [default: the default app for the file's type].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
     /// What kinds of file are indexed, and how close a result must be (#73).
     pub formats: Formats,
 }
@@ -146,6 +153,7 @@ impl Default for Config {
             device: None,
             idle_unload_minutes: None,
             index_busy_percent: None,
+            editor: None,
             formats: Formats::default(),
         }
     }
@@ -269,6 +277,10 @@ impl Config {
         match self.index_busy_percent {
             Some(p) => doc["index_busy_percent"] = toml_edit::value(i64::from(p)),
             None => drop(doc.remove("index_busy_percent")),
+        }
+        match self.editor.as_deref().map(str::trim) {
+            Some(e) if !e.is_empty() => doc["editor"] = toml_edit::value(e),
+            _ => drop(doc.remove("editor")),
         }
         let f = &self.formats;
         // Through its shortest decimal, so 0.7 is written as 0.7, not 0.699999988.
@@ -498,6 +510,7 @@ mod tests {
         c.exclude.push("~/b".into());
         c.device = None;
         c.idle_unload_minutes = Some(0.0);
+        c.editor = Some("foot -e nvim +{line} {file}".into());
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(
@@ -510,7 +523,9 @@ mod tests {
 
         c.exclude.clear();
         c.idle_unload_minutes = Some(2.5);
+        c.editor = None;
         c.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("editor"));
         assert_eq!(Config::load(&path).unwrap(), c);
         fs::remove_dir_all(&dir).unwrap();
     }

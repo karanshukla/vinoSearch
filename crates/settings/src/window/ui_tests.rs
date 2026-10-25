@@ -287,6 +287,22 @@ fn search_page_controls_are_named_by_their_row_labels() {
 }
 
 #[test]
+fn the_editor_is_saved_when_the_field_is_left() {
+    let (w, _requests) = window(Page::Search, "editor");
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_role_and_label(Role::TextInput, "Editor:").focus();
+    settle(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Editor:")
+        .type_text("kate");
+    settle(&mut h);
+    h.key_press(Key::Enter);
+    settle(&mut h);
+    assert_eq!(h.state().config.editor.as_deref(), Some("kate"));
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(saved.contains("editor = \"kate\""), "{saved}");
+}
+
+#[test]
 fn a_score_slider_moves_from_the_keyboard() {
     let (w, _requests) = window(Page::Search, "slider");
     let mut h = harness(w, WIDE, Theme::Light);

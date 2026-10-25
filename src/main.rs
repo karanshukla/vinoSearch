@@ -5,6 +5,7 @@ mod index;
 mod krunner;
 mod menu;
 mod model;
+mod open;
 mod parity;
 mod proc;
 mod runtime;
@@ -336,7 +337,7 @@ fn run(cli: Cli) -> Result<bool> {
             Ok(true)
         }
         Command::Menu { launcher } => {
-            menu::run(launcher.as_deref())?;
+            menu::run(launcher.as_deref(), s.file.editor.as_deref())?;
             Ok(true)
         }
         Command::Watch => {

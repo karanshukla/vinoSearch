@@ -10,6 +10,7 @@
 use crate::config::Config;
 use crate::index::{self, Hit, Kind};
 use crate::model;
+use crate::open::At;
 use crate::watch;
 use crate::worker::{self, Job, Options, Status};
 use anyhow::{Context, Result, bail};
@@ -48,6 +49,7 @@ struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
     config: PathBuf,
+    places: Places,
 }
 
 /// How close a result must be, per kind (`formats.*.min_score`).
@@ -140,6 +142,13 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
     };
     props.insert("category".into(), owned(Value::from(category)));
+    // For vinosearch menu, which opens the pick itself; KRunner ignores keys
+    // it doesn't know.
+    match at(&h) {
+        Some(At::Line(l)) => drop(props.insert("line".into(), owned(Value::from(l)))),
+        Some(At::Page(p)) => drop(props.insert("page".into(), owned(Value::from(p)))),
+        None => {}
+    }
     let floor = floors.of(h.kind);
     let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0));
@@ -183,20 +192,30 @@ fn indexed(db: &Db, id: &str, doing: &str) -> bool {
     }
 }
 
-/// Open the indexed file `id`, or its folder.
-fn open(db: &Db, id: &str, folder: bool) {
+/// Open the indexed file `id` at `at`, or its folder, on a thread of its
+/// own: finding the default app runs `xdg-mime`.
+fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     if !indexed(db, id, "opening") {
         return;
     }
-    let path = Path::new(id);
-    let target = if folder {
-        path.parent().unwrap_or(path)
-    } else {
-        path
-    };
-    if let Err(e) = std::process::Command::new("xdg-open").arg(target).spawn() {
-        eprintln!("xdg-open {}: {e}", target.display());
+    let path = PathBuf::from(id);
+    if folder {
+        crate::open::xdg_open(path.parent().unwrap_or(&path));
+        return;
     }
+    let editor = Config::load(config).ok().and_then(|c| c.editor);
+    std::thread::spawn(move || crate::open::open(&path, at, editor.as_deref()));
+}
+
+/// The last search's places, by result id, for opening a result there.
+type Places = Mutex<HashMap<String, Option<At>>>;
+
+fn remember(places: &Places, hits: &[Hit]) {
+    *places.lock().unwrap() = hits.iter().map(|h| (h.path.clone(), at(h))).collect();
+}
+
+fn at(h: &Hit) -> Option<At> {
+    At::of(h.kind, Path::new(&h.path), h.line)
 }
 
 /// The text of the indexed file `id`, for Control1.FileText: a text file's
@@ -244,16 +263,29 @@ impl Runner {
     #[zbus(name = "Match")]
     async fn find(&self, query: String) -> Vec<Match> {
         let floors = Floors::load(&self.config);
-        search(&self.jobs, floors, query)
-            .await
-            .into_iter()
-            .map(|h| to_match(h, floors))
-            .collect()
+        let hits = search(&self.jobs, floors, query).await;
+        remember(&self.places, &hits);
+        hits.into_iter().map(|h| to_match(h, floors)).collect()
     }
 
+    /// At the match's line or page when it is from the last search; at the
+    /// top otherwise.
     #[zbus(name = "Run")]
     fn run(&self, match_id: String, action_id: String) {
-        open(&self.db, &match_id, action_id == "open-folder");
+        let at = self
+            .places
+            .lock()
+            .unwrap()
+            .get(&match_id)
+            .copied()
+            .flatten();
+        open(
+            &self.db,
+            &self.config,
+            &match_id,
+            at,
+            action_id == "open-folder",
+        );
     }
 
     #[zbus(name = "Teardown")]
@@ -334,7 +366,8 @@ impl Gnome {
 
     #[zbus(name = "ActivateResult")]
     fn activate(&self, id: String, _terms: Vec<String>, _timestamp: u32) {
-        open(&self.db, &id, false);
+        let at = self.last.lock().unwrap().get(&id).and_then(at);
+        open(&self.db, &self.config, &id, at, false);
     }
 
     /// Clicking the provider's icon: the settings window, when it is
@@ -708,6 +741,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 jobs: Mutex::new(tx.clone()),
                 db: db.clone(),
                 config: config.clone(),
+                places: Mutex::default(),
             },
         )?
         .serve_at(
