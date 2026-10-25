@@ -261,7 +261,69 @@ pub fn open(path: &Path) -> Result<Connection> {
                AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
          END;",
     )?;
+    words_table(&conn)?;
     Ok(conn)
+}
+
+/// A chunk's file name, from `files f`: what follows the last `/`.
+const FILE_NAME: &str = "substr(f.path, length(rtrim(f.path, replace(f.path, '/', ''))) + 1)";
+
+/// The word index (#104): FTS5 over each chunk's text and its file's name,
+/// rowid = chunk id, for the exact strings embeddings lose (invoice numbers,
+/// error codes, names). Contentless, so the text is not stored a second time;
+/// `contentless_delete` lets the triggers drop a row by its id alone. A chunk
+/// handed to a copy (files_hand_over) is reindexed under the copy's name. An
+/// index from before it is filled once, in the transaction that creates it.
+fn words_table(conn: &Connection) -> Result<()> {
+    let has = |c: &Connection| -> rusqlite::Result<bool> {
+        c.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'chunk_words'",
+            [],
+            |r| r.get(0),
+        )
+    };
+    // The table and its triggers come into being together, so with one
+    // there is nothing to do, and no write lock to wait for.
+    if has(conn)? {
+        return Ok(());
+    }
+    // Immediate, so two connections opening an old index at once can't both
+    // fill it; the second waits out the first's fill (16 s for 113k chunks
+    // in the VM) rather than the usual 5 s.
+    conn.busy_timeout(std::time::Duration::from_secs(300))?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let had = has(&tx)?;
+    tx.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_words USING fts5(
+             name, text, content = '', contentless_delete = 1,
+             tokenize = 'unicode61 remove_diacritics 2'
+         );
+         CREATE TRIGGER IF NOT EXISTS chunk_words_insert AFTER INSERT ON chunks
+         BEGIN
+             INSERT INTO chunk_words (rowid, name, text)
+             SELECT NEW.id, {FILE_NAME}, NEW.text FROM files f WHERE f.id = NEW.file_id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS chunk_words_delete AFTER DELETE ON chunks
+         BEGIN DELETE FROM chunk_words WHERE rowid = OLD.id; END;
+         CREATE TRIGGER IF NOT EXISTS chunk_words_update AFTER UPDATE OF file_id, text ON chunks
+         BEGIN
+             DELETE FROM chunk_words WHERE rowid = OLD.id;
+             INSERT INTO chunk_words (rowid, name, text)
+             SELECT NEW.id, {FILE_NAME}, NEW.text FROM files f WHERE f.id = NEW.file_id;
+         END;"
+    ))?;
+    if !had {
+        tx.execute(
+            &format!(
+                "INSERT INTO chunk_words (rowid, name, text)
+                 SELECT c.id, {FILE_NAME}, c.text FROM chunks c JOIN files f ON f.id = c.file_id"
+            ),
+            [],
+        )?;
+    }
+    tx.commit()?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
 }
 
 /// Whether `path` is indexed, as `types` takes it.
@@ -1491,16 +1553,135 @@ fn dot(a: &[i8; DIM], b: &[i8; DIM]) -> i32 {
     acc.iter().sum()
 }
 
-/// Cosine against every chunk of `kind` (embeddings are unit length), best `k`.
+/// The chunks holding every word of a query (#104), best (bm25) first,
+/// looked up once per query for every kind.
+pub struct Words {
+    ids: Vec<i64>,
+    /// The query is one identifier-like word (`INV-20431`, `E0502`, `TODO`)
+    /// or wholly quoted: exact matches lead instead of nudging.
+    exact: bool,
+}
+
+/// Added to the cosine of a chunk holding every word of the query. About the
+/// gap between a good result and the next few, so exact words reorder near
+/// ties and lift a chunk just under its kind's `min_score` over it, without
+/// carrying an unrelated chunk past a related one.
+const WORDS_BOOST: f32 = 0.05;
+/// A word in more chunks than this is no exact string to find, and ranking
+/// it costs more than the vectors: bm25 over 2,856 chunks took 14 ms, and
+/// "the" (81k of 113k chunks) 250 ms. Such words are left out of the lookup,
+/// and counting up to this stops early.
+const WORDS_MAX_CHUNKS: usize = 2000;
+/// Chunks taken from the word index, across every kind.
+const WORDS_TAKE: usize = 200;
+
+impl Words {
+    /// None for a query with no words, or only words in too many chunks.
+    /// A failed lookup is None too: exact words add to a search, they never
+    /// stop one.
+    pub fn find(conn: &Connection, query: &str) -> Option<Self> {
+        let (terms, exact) = expression(query)?;
+        match ranked(conn, &terms) {
+            Ok(ids) => ids.map(|ids| Self { ids, exact }),
+            Err(e) => {
+                eprintln!("words {terms:?}: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// `query`'s terms as FTS5 strings: every word, or each quoted part as a
+/// phrase. With whether exact matches should lead.
+fn expression(query: &str) -> Option<(Vec<String>, bool)> {
+    let query = query.trim();
+    let mut terms = Vec::new();
+    let mut rest = query;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            rest = &rest[c.len_utf8()..];
+        } else if c == '"' {
+            // A phrase, to the closing quote or the end.
+            let body = &rest[1..];
+            let end = body.find('"').unwrap_or(body.len());
+            terms.push(&body[..end]);
+            rest = body.get(end + 1..).unwrap_or("");
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"')
+                .unwrap_or(rest.len());
+            terms.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    // Everything is quoted, so no word is read as an operator (AND, NEAR),
+    // a column filter (`:`), a prefix (`*`) or a syntax error; the tokenizer
+    // then splits each on punctuation as it split the chunks. A term with no
+    // letters or digits would be an empty phrase.
+    let expr: Vec<String> = terms
+        .iter()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if expr.is_empty() {
+        return None;
+    }
+    let quoted =
+        query.len() > 1 && query.starts_with('"') && query[1..].find('"') == Some(query.len() - 2);
+    Some((expr, quoted || (terms.len() == 1 && identifier(query))))
+}
+
+/// A word an embedding has no sense of: one with a digit, inner punctuation
+/// (`foo_bar`, `v2.1`, `INV-20431`) or all capitals (`TODO`, `ENOENT`).
+fn identifier(word: &str) -> bool {
+    let inner = word.trim_matches(|c: char| !c.is_alphanumeric());
+    let letters = inner.chars().filter(|c| c.is_alphabetic()).count();
+    inner.chars().any(|c| c.is_ascii_digit())
+        || inner.contains(|c: char| !c.is_alphanumeric() && c != '\'')
+        || (letters >= 2 && !inner.chars().any(char::is_lowercase))
+}
+
+/// Chunks holding every term in no more than WORDS_MAX_CHUNKS chunks, best
+/// first, at most WORDS_TAKE; None if every term is in more. Without the
+/// common ones a long query costs little more than a short one: "how is the
+/// NPU driver version checked" took 30 ms with them.
+fn ranked(conn: &Connection, terms: &[String]) -> rusqlite::Result<Option<Vec<i64>>> {
+    let mut count = conn.prepare(
+        "SELECT count(*) FROM (SELECT 1 FROM chunk_words WHERE chunk_words MATCH ?1 LIMIT ?2)",
+    )?;
+    let mut rare = Vec::new();
+    for t in terms {
+        let n: i64 = count.query_row(params![t, WORDS_MAX_CHUNKS as i64 + 1], |r| r.get(0))?;
+        if n as usize <= WORDS_MAX_CHUNKS {
+            rare.push(t.as_str());
+        }
+    }
+    if rare.is_empty() {
+        return Ok(None);
+    }
+    conn.prepare("SELECT rowid FROM chunk_words WHERE chunk_words MATCH ?1 ORDER BY rank LIMIT ?2")?
+        .query_map(params![rare.join(" "), WORDS_TAKE as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .map(Some)
+}
+
+/// Cosine against every chunk of `kind` (embeddings are unit length), best
+/// `k`. With `words`, chunks holding them score higher too (#104): by
+/// WORDS_BOOST, or for an identifier ahead of everything, best match first.
+/// Scores stay on the cosine's scale, so each kind's `min_score` still means
+/// what it did.
 pub fn search(
     conn: &Connection,
     vectors: &Vectors,
     query: &[f32],
+    words: Option<&Words>,
     kind: Kind,
     k: usize,
 ) -> Result<Vec<Hit>> {
     let query: &[f32; DIM] = query.try_into().context("query is not DIM long")?;
     let (q, qs) = quantize(query);
+    let score =
+        |p: usize| dot(&vectors.data.as_chunks::<DIM>().0[p], &q) as f32 * vectors.scales[p] * qs;
     let mut scored: Vec<(f32, i64)> = vectors
         .data
         .as_chunks::<DIM>()
@@ -1516,6 +1697,27 @@ pub fn search(
     if scored.len() > k && k > 0 {
         scored.select_nth_unstable_by(k - 1, by_score);
         scored.truncate(k);
+    }
+    if let Some(words) = words {
+        // Not loaded yet: it shows once the vectors catch up.
+        let of_kind = words
+            .ids
+            .iter()
+            .filter_map(|id| Some((id, *vectors.pos.get(id)?)))
+            .filter(|(_, p)| vectors.kinds[*p] == kind)
+            .take(k);
+        for (rank, (id, p)) in of_kind.enumerate() {
+            let s = if words.exact {
+                // Just under a perfect cosine, in bm25's order.
+                1.0 - 0.001 * (rank + 1) as f32
+            } else {
+                (score(p) + WORDS_BOOST).min(1.0)
+            };
+            match scored.iter_mut().find(|(_, i)| i == id) {
+                Some(hit) => hit.0 = hit.0.max(s),
+                None => scored.push((s, *id)),
+            }
+        }
     }
     scored.sort_by(by_score);
     scored.truncate(k);
@@ -1782,7 +1984,15 @@ mod tests {
         assert_eq!(holder_of(&conn, b"same", "/a/x.md").unwrap(), None);
 
         // One hit for the content, naming the copy.
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
+        let hits = search(
+            &conn,
+            &Vectors::load(&conn).unwrap(),
+            &v,
+            None,
+            Kind::Text,
+            5,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/a/x.md");
         assert_eq!(hits[0].copies, ["/b/x.md"]);
@@ -1793,7 +2003,15 @@ mod tests {
             .query_row("SELECT file_id FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(owner, b);
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
+        let hits = search(
+            &conn,
+            &Vectors::load(&conn).unwrap(),
+            &v,
+            None,
+            Kind::Text,
+            5,
+        )
+        .unwrap();
         assert_eq!(
             (hits[0].path.as_str(), hits[0].copies.len()),
             ("/b/x.md", 0)
@@ -1832,8 +2050,12 @@ mod tests {
             .query_row("SELECT kind FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kind, Kind::Text as i64);
+        // Its chunks are in the word index, under their file's name too.
+        assert_eq!(matching(&conn, "x"), [1]);
+        assert_eq!(matching(&conn, "old"), [1]);
         drop(conn);
         open(&db).unwrap(); // and opening it again is a no-op
+        assert_eq!(matching(&open(&db).unwrap(), "x"), [1]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2085,7 +2307,7 @@ mod tests {
         let vectors = Vectors::load(&conn).unwrap();
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
-        let lines: Vec<i64> = search(&conn, &vectors, &q, Kind::Text, 3)
+        let lines: Vec<i64> = search(&conn, &vectors, &q, None, Kind::Text, 3)
             .unwrap()
             .iter()
             .map(|h| h.line)
@@ -2136,7 +2358,7 @@ mod tests {
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
         let paths = |kind| -> Vec<String> {
-            search(&conn, &v, &q, kind, 5)
+            search(&conn, &v, &q, None, kind, 5)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.path)
@@ -2182,7 +2404,7 @@ mod tests {
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
         let paths = |v: &Vectors, kind| -> Vec<String> {
-            search(&conn, v, &q, kind, 5)
+            search(&conn, v, &q, None, kind, 5)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.path)
@@ -2377,6 +2599,179 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// Chunk ids whose name or text hold `query`'s words, in id order.
+    fn matching(conn: &Connection, query: &str) -> Vec<i64> {
+        let (terms, _) = expression(query).unwrap();
+        let mut ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM chunk_words WHERE chunk_words MATCH ?1")
+            .unwrap()
+            .query_map([terms.join(" ")], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn no_query_can_break_the_word_lookup() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-fts-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes/a.md", &[0]);
+        conn.execute("UPDATE chunks SET text = 'near the end, or not'", [])
+            .unwrap();
+        for q in [
+            "foo AND bar",
+            "NEAR(a b)",
+            "NEAR",
+            "text:near",
+            "pre*",
+            "\"unbalanced",
+            "a\"b",
+            "\"\" \"\"",
+            "-x",
+            "^start",
+            "(a OR b",
+            "col : val + 1",
+            "{name text}: x",
+            "C++",
+            "don't",
+            "café 日本語 🙂",
+            "OR",
+            "NOT",
+        ] {
+            if let Some((terms, _)) = expression(q) {
+                assert!(ranked(&conn, &terms).is_ok(), "{q} -> {terms:?}");
+            }
+        }
+        // Operators are words like any other.
+        assert_eq!(matching(&conn, "near or not"), [1]);
+        assert_eq!(matching(&conn, "end NOT near"), [1]);
+        assert!(matching(&conn, "text:end").is_empty());
+        for q in ["", "  ", "***", "\"\"", "- : ()"] {
+            assert!(expression(q).is_none(), "{q}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn identifiers_and_quotes_lean_on_exact_words() {
+        for q in [
+            "INV-20431",
+            "E0502",
+            "TODO",
+            "foo_bar",
+            "v2.1",
+            "\"lunch with sam\"",
+        ] {
+            assert!(expression(q).unwrap().1, "{q}");
+        }
+        for q in [
+            "invoice",
+            "Karan",
+            "don't",
+            "invoice INV-20431",
+            "\"a\" b \"c\"",
+            "photos from 2019",
+        ] {
+            assert!(!expression(q).unwrap().1, "{q}");
+        }
+    }
+
+    #[test]
+    fn exact_words_find_what_vectors_miss() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-hybrid-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        // Axis 0 is "invoices in general"; the one with the number is off it.
+        let general = add_file(&conn, "/inv/general.md", &[0])[0];
+        let near = add_file(&conn, "/inv/near.md", &[0])[0];
+        let numbered = add_file(&conn, "/inv/march.md", &[1])[0];
+        let set = |id: i64, text: &str, v: &[f32]| {
+            let mut e = vec![0f32; DIM];
+            e[..v.len()].copy_from_slice(v);
+            conn.execute(
+                "UPDATE chunks SET text = ?1, embedding = ?2 WHERE id = ?3",
+                params![text, to_blob(&e), id],
+            )
+            .unwrap();
+        };
+        set(general, "Invoices are due in 30 days.", &[0.8, 0.6]);
+        set(near, "The march invoice total.", &[0.78, 0.6257]);
+        set(numbered, "Invoice INV-20431, total 120 EUR", &[0.2, 0.98]);
+        let vectors = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let paths = |words: Option<&Words>, k: usize| -> Vec<String> {
+            search(&conn, &vectors, &q, words, Kind::Text, k)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(paths(None, 1), ["/inv/general.md"]);
+        // An identifier leads, whatever its cosine.
+        let id = Words::find(&conn, "INV-20431").unwrap();
+        assert_eq!(paths(Some(&id), 1), ["/inv/march.md"]);
+        assert_eq!(
+            paths(Some(&id), 3),
+            ["/inv/march.md", "/inv/general.md", "/inv/near.md"]
+        );
+        // Plain words nudge a near tie, but don't lift a far chunk.
+        let plain = Words::find(&conn, "march invoice").unwrap();
+        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
+        let plain = Words::find(&conn, "invoice total").unwrap();
+        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
+        // File names count as words: an image has no text but its name.
+        let name = Words::find(&conn, "march.md").unwrap();
+        assert!(name.ids.contains(&numbered));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn words_in_too_many_chunks_are_not_looked_up() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-common-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/f.md", &[]);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..=WORDS_MAX_CHUNKS {
+            let text = if i == 7 { "common rare" } else { "common" };
+            tx.execute(
+                "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, ?1, x'')",
+                [text],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(Words::find(&conn, "common").is_none());
+        // The common word is left out; the rare one still has to be there.
+        assert_eq!(Words::find(&conn, "common rare").unwrap().ids.len(), 1);
+        assert_eq!(Words::find(&conn, "rare common").unwrap().ids.len(), 1);
+        assert!(Words::find(&conn, "absent").unwrap().ids.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_word_index_follows_chunks() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-words-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/a/first.md', 0, 0, x'01');
+             INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, 'zebra', x'');
+             INSERT INTO files (path, mtime, size, sha256) VALUES ('/b/second.md', 0, 0, x'01');",
+        )
+        .unwrap();
+        assert_eq!(matching(&conn, "zebra"), [1]);
+        assert_eq!(matching(&conn, "first"), [1]);
+        // The holder goes: its chunk is found under the copy's name instead.
+        remove(&conn, Path::new("/a")).unwrap();
+        assert_eq!(matching(&conn, "zebra second"), [1]);
+        assert!(matching(&conn, "first").is_empty());
+        // The last copy goes, and the chunk with it.
+        remove(&conn, Path::new("/b")).unwrap();
+        assert!(matching(&conn, "zebra").is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

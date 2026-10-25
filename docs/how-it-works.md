@@ -16,6 +16,14 @@ The details behind the [README](../README.md): what gets indexed, how the index 
 
 A running runner applies changes to `exclude`, `[formats]` and the device within 30 seconds, unless a flag or environment variable sets that one (see [dbus.md](dbus.md#settings)).
 
+## Exact words
+
+Embeddings don't keep exact strings: the vector for `INV-20431` looks like any other invoice's. So each chunk's text and its file's name also go into an FTS5 table in `index.sqlite`, which triggers on `chunks` keep in step, including chunks handed to a copy ([#104](https://github.com/karanshukla/vinoSearch/issues/104)). It's contentless, so the text isn't stored twice: it adds 10 to 13% to the file, since the vectors are most of it. An index from before it is filled once when it's opened (16 s for 113k chunks in a 2-vCPU VM).
+
+Each query runs both lookups. A chunk holding every word of the query gets 0.05 added to its cosine: enough to reorder near ties and lift a chunk just under `min_score`, not enough to carry an unrelated chunk past a related one. A query that is a single identifier-like word (with a digit, inner punctuation or all capitals: `INV-20431`, `E0502`, `TODO`) or wholly in quotes puts its exact matches first instead, in bm25 order. Scores stay on the cosine scale, so `min_score` and the Text/Documents/Images groups work as before. A word in more than 2,000 chunks is left out of the lookup: it's no exact string, and ranking it costs more than the vectors (250 ms for "the" on 113k chunks). With that, the word lookup adds 0 to 5 ms to a query on 113k chunks. Every word is quoted before it reaches FTS5, so `AND`, `NEAR`, `*` and `:` are plain words.
+
+The tokenizer is `unicode61`, which splits on spaces and punctuation. Chinese, Japanese and Thai have no spaces, so a run of them is one token, and only a query matching the whole run finds it.
+
 ## OCR
 
 Images and scanned PDF pages are read with PaddleOCR's PP-OCRv6 small, a text detector and a recogniser, from [arankays/pp-ocrv6-small-onnx](https://huggingface.co/arankays/pp-ocrv6-small-onnx) (RapidOCR 3.10.0's ONNX byte for byte, 31 MB, fetched with the text model) ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). Both graphs take dynamic shapes, which the NPU can't compile, so `src/ocr.rs` compiles five static ones: the detector at 1088x1920 and 1920x1088, the recogniser at 48x320, 48x640 and 48x1280. An image is scaled, aspect kept, into the detector shape that matches its orientation (up to 4x for a small one) and padded with black. Each region of the detector's map is a line: turned to its principal axis when it's elongated, grown by DB's unclip distance, sampled out bilinearly, and padded to the narrowest recogniser width that holds it. Lines under 0.5 confidence are dropped. The text becomes chunks of the document kind on the image's own path, beside its pixel vector, so a hit can come from either and the result list shows the file once.

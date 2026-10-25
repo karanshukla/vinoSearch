@@ -269,9 +269,10 @@ fn answer(
     reply: oneshot::Sender<Vec<Hit>>,
 ) {
     let hits = emb.query(query).and_then(|q| {
+        let words = index::Words::find(conn, query);
         let mut hits = Vec::new();
         for kind in [Kind::Text, Kind::Document, Kind::Image] {
-            hits.extend(index::search(conn, vectors, &q, kind, k)?);
+            hits.extend(index::search(conn, vectors, &q, words.as_ref(), kind, k)?);
         }
         Ok(hits)
     });

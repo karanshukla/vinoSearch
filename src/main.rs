@@ -509,9 +509,10 @@ fn run(cli: Cli) -> Result<bool> {
             let q = emb.query(&query)?;
             let t1 = Instant::now();
             let vectors = index::Vectors::load(&conn)?;
+            let words = index::Words::find(&conn, &query);
             let mut hits = Vec::new();
             for kind in [index::Kind::Text, index::Kind::Document, index::Kind::Image] {
-                hits.extend(index::search(&conn, &vectors, &q, kind, n)?);
+                hits.extend(index::search(&conn, &vectors, &q, words.as_ref(), kind, n)?);
             }
             eprintln!(
                 "query {:.1} ms, search {:.1} ms",
@@ -607,7 +608,7 @@ fn run(cli: Cli) -> Result<bool> {
             let t1 = Instant::now();
             let vectors = index::Vectors::load(&conn)?;
             // One more than asked, for the image itself.
-            let hits = index::search(&conn, &vectors, &q, index::Kind::Image, n + 1)?;
+            let hits = index::search(&conn, &vectors, &q, None, index::Kind::Image, n + 1)?;
             eprintln!(
                 "vector {:.1} ms, search {:.1} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
