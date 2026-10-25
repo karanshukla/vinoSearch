@@ -26,7 +26,13 @@ openvino-sys = { version = "0.11", features = ["runtime-linking"] }
 # 0.6.0: `detect` counts an `ovfetch npu install` prefix, whose libraries
 # runtime.rs preloads.
 ovfetch = { version = "0.6.0", default-features = false }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLCipher in place of SQLite (#4), against the system's libcrypto (OpenSSL
+# 3): security fixes come with the distro's updates, and building needs
+# libssl-dev / openssl-devel rather than OpenSSL's Perl build. Without a key
+# a database is plain SQLite, as before.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
+# Wipes the index key from memory when it's dropped.
+zeroize = "1.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

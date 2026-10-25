@@ -1,9 +1,9 @@
 //! Files -> chunks -> embeddings in SQLite, and brute-force search over them.
 //! A text file is many chunks; an image is one, embedded from its pixels.
 //!
-//! Plaintext on disk for now. Embeddings can be partly inverted back to their
-//! text, so this needs encrypting at rest (TPM-sealed key) before it holds
-//! anything a user would not leave readable.
+//! Embeddings can be partly inverted back to their text, so the index is as
+//! sensitive as the files it covers: encrypted at rest when `encryption` is
+//! on (encryption.rs, #4), plaintext readable only by the user otherwise.
 
 use crate::config::{Excludes, Formats};
 use crate::embed::{DIM, Embed, Embedder, document_text};
@@ -30,7 +30,7 @@ const PROSE: &[&str] = &["txt", "md", "rst", "org", "tex"];
 /// Prose and markup. Code is a kind of its own, in `code::EXTENSIONS` (#110).
 pub(crate) const TEXT_EXTENSIONS: &[&str] = &["md", "txt", "rst", "org", "tex", "html", "htm"];
 // No config formats (toml, yaml, json, ini, conf, ...): they are where
-// credentials live, and the index is not encrypted yet (#4).
+// credentials live, and the index is plaintext unless encryption is on (#4).
 /// Directories that are always build output, caches, generated reports or
 /// vendored dependencies. Generic names a person might use for their own
 /// files (`bin`, `out`, `lib`) are left out.
@@ -199,8 +199,11 @@ pub fn default_db() -> Result<PathBuf> {
 
 /// The index holds copies of file contents, so only the user may read it:
 /// the directory 0700, the database 0600 (SQLite gives its -wal and -shm
-/// files the database's mode).
+/// files the database's mode). Keyed with its sealed key when it has one; a
+/// key that won't unseal is an error (`encryption::Unusable`), never an
+/// empty or plaintext index.
 pub fn open(path: &Path) -> Result<Connection> {
+    let key = crate::encryption::key_for(path)?;
     if let Some(dir) = path.parent() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -216,6 +219,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         .with_context(|| path.display().to_string())?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let conn = Connection::open(path)?;
+    crate::encryption::unlock(&conn, key.as_deref())?;
     conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;

@@ -24,6 +24,9 @@
 //! [formats.code]
 //! enabled = true
 //! min_score = 0.72
+//!
+//! [encryption]
+//! enabled = true
 //! ```
 //!
 //! A missing file is the defaults, and a missing `exclude` is
@@ -120,6 +123,33 @@ pub struct Config {
     pub editor: Option<String>,
     /// What kinds of file are indexed, and how close a result must be (#73).
     pub formats: Formats,
+    /// Encrypting the index at rest (#4).
+    pub encryption: Encryption,
+}
+
+/// The index encrypted with SQLCipher, its key sealed by `systemd-creds` to
+/// this machine's TPM and this user.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Encryption {
+    /// Encrypt the index. Turning it on or off converts the index as it is
+    /// [default: false].
+    pub enabled: Option<bool>,
+    /// Without a TPM, seal the key with systemd's host key instead of
+    /// refusing. Weaker: root, or anyone with a copy of the disk, can unseal
+    /// it; it still keeps the index unreadable in a copy of the home folder
+    /// alone [default: false].
+    pub allow_host_key: Option<bool>,
+}
+
+impl Encryption {
+    pub fn on(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn host_key_allowed(&self) -> bool {
+        self.allow_host_key.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -158,7 +188,8 @@ pub struct ImageFormat {
 #[serde(default, deny_unknown_fields)]
 pub struct DocumentFormat {
     /// Index documents' text. Off by default: statements, tax forms and
-    /// exports end up in an index that isn't encrypted yet (#4) [default: false].
+    /// exports end up in the index, which is plaintext unless `encryption`
+    /// is on (#4) [default: false].
     pub enabled: Option<bool>,
 }
 
@@ -185,6 +216,7 @@ impl Default for Config {
             index_on_battery: None,
             editor: None,
             formats: Formats::default(),
+            encryption: Encryption::default(),
         }
     }
 }
@@ -361,6 +393,19 @@ impl Config {
             f.code.enabled.map(toml_edit::value),
         );
         set(&mut doc, "code", "min_score", f.code.min_score.map(score));
+        let e = &self.encryption;
+        set_table(
+            &mut doc,
+            "encryption",
+            "enabled",
+            e.enabled.map(toml_edit::value),
+        );
+        set_table(
+            &mut doc,
+            "encryption",
+            "allow_host_key",
+            e.allow_host_key.map(toml_edit::value),
+        );
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
         let tmp = path.with_extension("toml.tmp");
@@ -379,6 +424,40 @@ impl Config {
 
     pub fn index_on_battery(&self) -> bool {
         self.index_on_battery.unwrap_or(true)
+    }
+}
+
+/// Set or remove `<table>.<key>`, dropping the table once it is empty.
+fn set_table(
+    doc: &mut toml_edit::DocumentMut,
+    table: &str,
+    key: &str,
+    value: Option<toml_edit::Item>,
+) {
+    let Some(value) = value else {
+        if let Some(t) = doc.get_mut(table).and_then(|i| i.as_table_like_mut()) {
+            t.remove(key);
+            if t.is_empty() {
+                doc.remove(table);
+            }
+        }
+        return;
+    };
+    let t = doc
+        .entry(table)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .expect("a table");
+    // A whole value, keeping any comment beside it.
+    match t.get_mut(key) {
+        Some(old) if old.is_value() => {
+            let decor = old.as_value().unwrap().decor().clone();
+            *old = value;
+            *old.as_value_mut().unwrap().decor_mut() = decor;
+        }
+        _ => {
+            t.insert(key, value);
+        }
     }
 }
 
@@ -698,6 +777,34 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("formats"), "{text}");
         assert_eq!(Config::load(&path).unwrap(), c);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encryption_is_off_by_default_and_saves_in_its_own_table() {
+        let c = Config::default();
+        assert!(!c.encryption.on());
+        assert!(!c.encryption.host_key_allowed());
+        let c: Config = toml::from_str("[encryption]\nenabled = true\n").unwrap();
+        assert!(c.encryption.on());
+        assert!(toml::from_str::<Config>("[encryption]\nkey = \"tpm\"\n").is_err());
+
+        let dir = std::env::temp_dir().join(format!("vinosearch-enc-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "[encryption]\nenabled = false # not yet\n").unwrap();
+        let mut c = Config::load(&path).unwrap();
+        c.encryption.enabled = Some(true);
+        c.encryption.allow_host_key = Some(true);
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enabled = true # not yet"), "{text}");
+        assert!(text.contains("allow_host_key = true"), "{text}");
+        assert_eq!(Config::load(&path).unwrap(), c);
+        c.encryption = Encryption::default();
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("encryption"), "{text}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

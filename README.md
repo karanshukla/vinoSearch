@@ -20,7 +20,7 @@ It's early days: a working proof of concept, used daily on one laptop. Expect ro
 
 - Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU? `--device CPU` works, just slower.
 - KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher (fuzzel, wofi, rofi, tofi or bemenu). The settings window is Wayland only.
-- Rust and a C compiler, only to build from source.
+- Rust, a C compiler and OpenSSL's headers, only to build from source.
 
 ## Install
 
@@ -66,7 +66,7 @@ vinosearch integrate gnome                 # or kde: add the other desktop's sea
 
 The release download runs on x86_64 with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13, Arch, openSUSE Tumbleweed, and the image-based Fedora Atomic (Silverblue, Kinoite, Bazzite) and openSUSE Aeon. On anything older (Debian 12, Ubuntu 22.04, openSUSE Leap 15) `install.sh` says so; build from source there.
 
-Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from [rustup](https://rustup.rs). The C compiler is `sudo dnf install gcc` on Fedora, `sudo apt install build-essential` on Debian and Ubuntu, `sudo pacman -S --needed base-devel` on Arch and `sudo zypper install gcc` on openSUSE.
+Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from [rustup](https://rustup.rs). The C compiler and OpenSSL's headers (SQLCipher links the system's libcrypto) are `sudo dnf install gcc openssl-devel` on Fedora, `sudo apt install build-essential libssl-dev` on Debian and Ubuntu, `sudo pacman -S --needed base-devel openssl` on Arch and `sudo zypper install gcc libopenssl-devel` on openSUSE.
 
 **Image-based systems.** Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under `~/.local`, the service in `~/.config/systemd/user`. Nothing touches `/usr`, so the release download needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install` on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it. To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches the host: the home directory is shared, so the host runs the same binaries and index. If systemd can't be reached from the container, `install.sh` prints the one command to run on the host. `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
 
@@ -146,7 +146,9 @@ Text in images and scanned PDFs is read by PaddleOCR's PP-OCRv6 small detector a
 
 ## Privacy
 
-The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat the index like the files it covers. Encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
+The index is SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat the index like the files it covers.
+
+It can be encrypted at rest ([#4](https://github.com/karanshukla/vinoSearch/issues/4)): the settings window's Security page, or `enabled = true` under `[encryption]` in the config file. Off by default. The whole database is SQLCipher (AES-256), so text, vectors, file names and the word index are all covered, and its random key is sealed by `systemd-creds` to this machine's TPM and your user. Turning it on or off converts the index in place; nothing is indexed again, and search is unchanged. Without a TPM it's refused unless you allow systemd's host key, which root can read. If the key stops unsealing (TPM cleared, board replaced), the index is rebuilt from your files, never left readable. Needs systemd 256 or newer. Details in [How it works](docs/how-it-works.md#encryption-at-rest).
 
 ## More
 
