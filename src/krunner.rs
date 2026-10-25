@@ -44,7 +44,8 @@ type Match = (
 );
 
 /// One connection for the handlers that read the index; queries are short.
-type Db = Arc<Mutex<rusqlite::Connection>>;
+/// Closed and opened again under it when encryption changes (#4).
+type Db = Arc<crate::encryption::Live>;
 
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
@@ -216,7 +217,7 @@ fn file_url(path: &str) -> String {
 /// Whether `id` is an indexed file. Ids come from callers on the session
 /// bus, so anything this runner could not have returned is refused.
 fn indexed(db: &Db, id: &str, doing: &str) -> bool {
-    match index::is_indexed(&db.lock().unwrap(), id) {
+    match db.lock().and_then(|c| index::is_indexed(&c, id)) {
         Ok(true) => true,
         Ok(false) => {
             eprintln!("not {doing} {id}: not an indexed file");
@@ -260,7 +261,7 @@ fn at(h: &Hit) -> Option<At> {
 /// extractor child (seconds for a big PDF). Err for anything else, an image
 /// included.
 fn file_text(db: &Db, id: &str) -> Result<String> {
-    if !index::is_indexed(&db.lock().unwrap(), id)? {
+    if !index::is_indexed(&*db.lock()?, id)? {
         bail!("{id} is not an indexed file");
     }
     let path = Path::new(id);
@@ -470,7 +471,7 @@ impl Control {
     }
 
     fn is_indexed(&self, path: &str) -> zbus::fdo::Result<()> {
-        match index::is_indexed(&self.db.lock().unwrap(), path) {
+        match self.db.lock().and_then(|c| index::is_indexed(&c, path)) {
             Ok(true) => Ok(()),
             Ok(false) => Err(failed(format!("{path} is not an indexed file"))),
             Err(e) => Err(failed(format!("{e:#}"))),
@@ -498,7 +499,7 @@ impl Control {
     /// State, storage and progress; keys in vinosearch_shared::dbus::status,
     /// described in docs/dbus.md.
     fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().map_err(failed)?;
         let (files, chunks) = index::counts(&db).map_err(failed)?;
         let roots: Vec<String> = index::roots(&db)
             .map_err(failed)?
@@ -622,6 +623,15 @@ impl Control {
             key::CACHE_BYTES.into(),
             owned(Value::from(disk_bytes(&cache))),
         );
+        let enc = st.encryption.lock().unwrap().clone();
+        out.insert(key::ENCRYPTED.into(), owned(Value::from(enc.encrypted)));
+        out.insert(key::SEAL.into(), owned(Value::from(enc.seal)));
+        out.insert(
+            key::TPM.into(),
+            owned(Value::from(st.tpm.load(Ordering::Relaxed))),
+        );
+        out.insert(key::ENCRYPTION_ERROR.into(), owned(Value::from(enc.error)));
+        out.insert(key::SEAL_BROKEN.into(), owned(Value::from(enc.broken)));
         Ok(out)
     }
 
@@ -643,7 +653,7 @@ impl Control {
     /// The folders holding most of the index, biggest first, with their
     /// chunk counts: at most `limit`, none inside another (index::largest_folders).
     fn largest_folders(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, u64)>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().map_err(failed)?;
         Ok(index::largest_folders(&db, limit as usize)
             .map_err(failed)?
             .into_iter()
@@ -676,7 +686,7 @@ impl Control {
     /// time, as (path, kind, unix seconds): at most `limit`, capped at
     /// recent::MAX. Files gone since they were indexed are left out.
     fn recent_files(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, String, i64)>> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock().map_err(failed)?;
         let files = index::recent_files(&db, limit.min(recent::MAX) as usize, Path::exists)
             .map_err(failed)?;
         Ok(files
@@ -791,6 +801,26 @@ impl Control {
     fn clear_cache(&self) -> zbus::fdo::Result<()> {
         self.send(Job::ClearCache)
     }
+
+    /// Encrypt or decrypt the index as the config file's `encryption` says,
+    /// now rather than at the next read of it; again after a refusal. Queued:
+    /// `encrypted`, `seal` and `encryption_error` in Status say how it went.
+    fn apply_encryption(&self) -> zbus::fdo::Result<()> {
+        let file = Config::load(&self.config).map_err(|e| failed(format!("{e:#}")))?;
+        // The watcher too, or it would take the file it next reads for
+        // unchanged and pass nothing on.
+        self.status.reload_config.store(true, Ordering::Relaxed);
+        self.send(Job::Encryption(crate::encryption::Want::of(&file)))
+    }
+
+    /// Encrypt the index again under a new key, sealed afresh. Fails while
+    /// it isn't encrypted.
+    fn rekey(&self) -> zbus::fdo::Result<()> {
+        if !self.status.encryption.lock().unwrap().encrypted {
+            return Err(failed("the index isn't encrypted"));
+        }
+        self.send(Job::Rekey)
+    }
 }
 
 /// Bytes under `path`, a file or a directory; 0 if it is missing.
@@ -842,7 +872,7 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    worker::prepare(&opts.status)?;
+    worker::prepare(&opts.status, &opts.file)?;
     crate::power::spawn(tx.clone(), opts.status.clone());
     let _watcher = watch::spawn(
         tx.clone(),
@@ -850,7 +880,7 @@ pub fn serve(opts: Options) -> Result<()> {
         opts.file.clone(),
         opts.status.clone(),
     )?;
-    let db: Db = Arc::new(Mutex::new(index::open(&index::default_db()?)?));
+    let db: Db = crate::encryption::Live::open(&index::default_db()?)?;
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
@@ -1508,7 +1538,8 @@ mod tests {
             )
             .unwrap();
         }
-        let db: Db = Arc::new(Mutex::new(conn));
+        drop(conn);
+        let db: Db = crate::encryption::Live::open(&dir.join("i.sqlite")).unwrap();
         assert_eq!(file_text(&db, note.to_str().unwrap()).unwrap(), "# Hello\n");
         let e = file_text(&db, photo.to_str().unwrap()).unwrap_err();
         assert!(

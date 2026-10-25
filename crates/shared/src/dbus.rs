@@ -77,6 +77,30 @@ pub mod status {
     pub const MODEL_CHANGED: &str = "model_changed";
     /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
     pub const NO_DECODER: &str = "no_decoder";
+    /// The index on disk is encrypted (#4).
+    pub const ENCRYPTED: &str = "encrypted";
+    /// What its key is sealed with: a `seal` value, empty while it isn't
+    /// encrypted.
+    pub const SEAL: &str = "seal";
+    /// systemd can seal a key to this machine's TPM.
+    pub const TPM: &str = "tpm";
+    /// Why the last change to encryption was refused or failed; empty
+    /// otherwise.
+    pub const ENCRYPTION_ERROR: &str = "encryption_error";
+    /// Why this start found the index's key unusable and rebuilt the index
+    /// from the files; empty otherwise.
+    pub const SEAL_BROKEN: &str = "seal_broken";
+}
+
+/// Values of `status::SEAL`.
+pub mod seal {
+    /// This machine's TPM, with systemd's host key.
+    pub const TPM: &str = "tpm";
+    /// systemd's host key alone (`/var/lib/systemd/credential.secret`).
+    pub const HOST: &str = "host";
+    /// Nothing could seal it: a key held in memory only, so the index is
+    /// rebuilt at the next start.
+    pub const MEMORY: &str = "memory";
 }
 
 /// Values of `status::POWER_HOLD`.

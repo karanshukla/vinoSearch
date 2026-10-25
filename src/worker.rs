@@ -8,6 +8,7 @@
 
 use crate::config::{self, Config, Excludes};
 use crate::embed::Embedder;
+use crate::encryption::{self, Want};
 use crate::index::{self, FileTypes, Hit, Kind, Outcome, Vectors};
 use crate::sched;
 use anyhow::Result;
@@ -55,6 +56,11 @@ pub enum Job {
     /// The next run of parts of a long document (#108). The worker makes
     /// these itself, when nothing else is queued.
     Rest,
+    /// Bring the index to the config file's `encryption` now, rather than
+    /// at the watcher's next read of it, or try again after a refusal.
+    Encryption(Want),
+    /// Encrypt the index again under a new key.
+    Rekey,
 }
 
 /// What the runner is doing, for status queries. The worker owns the model
@@ -84,6 +90,9 @@ pub struct Status {
     pub last_indexed: AtomicU64,
     /// Set by CheckNow; the watcher takes it.
     pub check_now: AtomicBool,
+    /// Set by ApplyEncryption: the watcher takes it and reads the config
+    /// file now, rather than at its next 30-second read.
+    pub reload_config: AtomicBool,
     /// Indexing is paused: a running job stops after its current chunk, and
     /// new ones wait until Retry.
     pub paused: AtomicBool,
@@ -92,6 +101,10 @@ pub struct Status {
     /// Why this start dropped part of the index to be indexed again (a model
     /// changed, #80), until that indexing is done; empty otherwise.
     pub model_changed: std::sync::Mutex<String>,
+    /// Whether the index is encrypted, and why a change to that failed (#4).
+    pub encryption: std::sync::Mutex<encryption::State>,
+    /// systemd can seal a key to a TPM here, as of this start.
+    pub tpm: AtomicBool,
 }
 
 /// An indexing job stopped part way, to be run again.
@@ -131,14 +144,20 @@ impl Status {
     }
 }
 
-/// Before the watcher compares the roots with the index: drop what must be
-/// indexed again (vectors from another model, #80; photos skipped for want
-/// of a decoder that is installed now, #79; scans OCR can read now, #106;
-/// files of a format read differently now, #97), so that first comparison
-/// finds it, and say so in
-/// `status` for the Index page.
-pub fn prepare(status: &Status) -> Result<()> {
-    let conn = index::open(&index::default_db()?)?;
+/// Before the watcher compares the roots with the index: encrypt or
+/// decrypt it as the config file asks, or rebuild it if its key is lost
+/// (#4); drop what must be indexed again (vectors from another model, #80;
+/// photos skipped for want of a decoder that is installed now, #79; scans
+/// OCR can read now, #106; files of a format read differently now, #97), so
+/// that first comparison finds it, and say so in `status` for the Index page.
+pub fn prepare(status: &Status, file: &Config) -> Result<()> {
+    let db = index::default_db()?;
+    encryption::hold_shared(&db)?;
+    status
+        .tpm
+        .store(crate::seal::tpm_available(), Ordering::Relaxed);
+    apply_encryption(status, &db, Want::of(file), false);
+    let conn = index::open(&db)?;
     let purged = index::purge_other_models(&conn)?;
     if let Some(why) = model_changed(&purged) {
         eprintln!("{why}");
@@ -158,6 +177,22 @@ pub fn prepare(status: &Status) -> Result<()> {
         eprintln!("{reread} files are read differently now and will be indexed again");
     }
     Ok(())
+}
+
+/// `encryption::apply`, its outcome logged and kept for Status. A rebuild
+/// reported earlier stays until a later one replaces it.
+fn apply_encryption(status: &Status, db: &std::path::Path, want: Want, rekey: bool) {
+    let st = encryption::apply(db, want, rekey, &crate::seal::Sealer::default());
+    if !st.error.is_empty() {
+        eprintln!("encryption: {}", st.error);
+    }
+    let mut kept = status.encryption.lock().unwrap();
+    let broken = if st.broken.is_empty() {
+        std::mem::take(&mut kept.broken)
+    } else {
+        st.broken.clone()
+    };
+    *kept = encryption::State { broken, ..st };
 }
 
 /// One sentence on what `purge_other_models` dropped, for the Index page;
@@ -301,7 +336,9 @@ fn answer(
 }
 
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
-    let mut conn = index::open(&index::default_db()?)?;
+    let db = index::default_db()?;
+    let mut conn = index::open(&db)?;
+    let mut want = Want::of(&opts.file);
     let mut excludes = opts.excludes.clone();
     let mut types = opts.types.clone();
     let mut device = opts.device.clone();
@@ -330,6 +367,21 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         Ok(Loaded { emb, vectors })
     };
     let status = &opts.status;
+    // Encrypt, decrypt or re-key (#4): the worker's connection closed while
+    // the file is replaced, and the vector cache read again from the new one.
+    let reencrypt = |conn: &mut rusqlite::Connection,
+                     loaded: &mut Option<Loaded>,
+                     want: Want,
+                     rekey: bool|
+     -> Result<()> {
+        *conn = rusqlite::Connection::open_in_memory()?;
+        apply_encryption(status, &db, want, rekey);
+        *conn = index::open(&db)?;
+        if let Some(l) = loaded.as_mut() {
+            l.vectors = Vectors::load(conn)?;
+        }
+        Ok(())
+    };
     let mut loaded: Option<Loaded> = None;
     // Jobs that arrived while indexing and were not queries, run after it.
     let mut deferred: VecDeque<Job> = VecDeque::new();
@@ -459,6 +511,10 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 if status.power.set_index_on_battery(file.index_on_battery()) {
                     replay(&mut waiting, &mut waiting_roots, &mut deferred);
                 }
+                if Want::of(&file) != want {
+                    want = Want::of(&file);
+                    reencrypt(&mut conn, &mut loaded, want, false)?;
+                }
                 if !opts.pinned.idle_unload {
                     let m = file
                         .idle_unload_minutes
@@ -498,6 +554,18 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
                     Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
                 }
+                if let Err(e) = encryption::save_roots(&db, &conn) {
+                    eprintln!("saving the folder list: {e:#}");
+                }
+                continue;
+            }
+            Job::Encryption(w) => {
+                want = w;
+                reencrypt(&mut conn, &mut loaded, want, false)?;
+                continue;
+            }
+            Job::Rekey => {
+                reencrypt(&mut conn, &mut loaded, want, true)?;
                 continue;
             }
             Job::Unload => {
@@ -614,12 +682,14 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                             deferred.push_back(Job::Retry);
                         }
                         restart |= file.excludes().is_ok_and(|ex| ex != excludes)
-                            || FileTypes::new(&file.formats).is_ok_and(|t| t != types);
+                            || FileTypes::new(&file.formats).is_ok_and(|t| t != types)
+                            || Want::of(&file) != want;
                         deferred.push_back(Job::Config(file));
                     }
-                    Job::Forget(root) => {
+                    // Converting the index waits for no indexing job.
+                    job @ (Job::Forget(_) | Job::Encryption(_) | Job::Rekey) => {
                         restart = true;
-                        deferred.push_back(Job::Forget(root));
+                        deferred.push_back(job);
                     }
                     other => deferred.push_back(other),
                 }
@@ -665,6 +735,9 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     }
                     Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
                 }
+                if let Err(e) = encryption::save_roots(&db, &conn) {
+                    eprintln!("saving the folder list: {e:#}");
+                }
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
                 status.indexing.store(false, Ordering::Relaxed);
             }
@@ -702,6 +775,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             | Job::Unload
             | Job::DeleteModel
             | Job::ClearCache
+            | Job::Encryption(_)
+            | Job::Rekey
             | Job::Retry => {
                 unreachable!("handled before loading")
             }

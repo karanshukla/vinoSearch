@@ -12,7 +12,7 @@ use vinosearch_shared::config::{
     DEFAULT_TEXT_MIN_SCORE,
 };
 
-use vinosearch_shared::dbus::hold;
+use vinosearch_shared::dbus::{hold, seal};
 
 use crate::control::{Link, Partial, Request, Status};
 use crate::{doctor, integration, portal, theme};
@@ -22,16 +22,18 @@ enum Page {
     Index,
     Folders,
     Search,
+    Security,
     Model,
     Hardware,
     Integration,
 }
 
 impl Page {
-    const ALL: [Page; 6] = [
+    const ALL: [Page; 7] = [
         Page::Index,
         Page::Folders,
         Page::Search,
+        Page::Security,
         Page::Model,
         Page::Hardware,
         Page::Integration,
@@ -48,6 +50,7 @@ impl Page {
             Page::Index => "Index",
             Page::Folders => "Folders",
             Page::Search => "Search",
+            Page::Security => "Security",
             Page::Model => "Model",
             Page::Hardware => "Hardware",
             Page::Integration => "Integration",
@@ -102,6 +105,7 @@ type Picked = (Target, Result<Option<PathBuf>, String>);
 enum Confirm {
     Forget(String),
     DeleteModel,
+    Rekey,
 }
 
 struct SettingsWindow {
@@ -904,25 +908,26 @@ impl SettingsWindow {
             );
         }
 
-        row(
-            ui,
-            "Documents:",
-            "PDF, Office, RTF, EPUB, subtitles and CSV. Their text is stored unencrypted.",
-            |ui| {
-                let mut on = self.config.formats.documents_enabled();
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut on, "Index documents").changed() {
-                        self.config.formats.documents.enabled = on.then_some(true);
-                        changed = true;
-                    }
-                    if let Some(s) = s
-                        && let Some(text) = share(s.document_files, Some(s.document_chunks))
-                    {
-                        ui.label(RichText::new(text).color(p.muted));
-                    }
-                });
-            },
-        );
+        let documents = if self.config.encryption.on() {
+            "PDF, Office, RTF, EPUB, subtitles and CSV."
+        } else {
+            "PDF, Office, RTF, EPUB, subtitles and CSV. Their text is stored unencrypted \
+             unless the index is encrypted (Security)."
+        };
+        row(ui, "Documents:", documents, |ui| {
+            let mut on = self.config.formats.documents_enabled();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut on, "Index documents").changed() {
+                    self.config.formats.documents.enabled = on.then_some(true);
+                    changed = true;
+                }
+                if let Some(s) = s
+                    && let Some(text) = share(s.document_files, Some(s.document_chunks))
+                {
+                    ui.label(RichText::new(text).color(p.muted));
+                }
+            });
+        });
 
         row(
             ui,
@@ -1002,6 +1007,162 @@ impl SettingsWindow {
         }
         if changed {
             self.save_config();
+        }
+    }
+
+    /// Encrypting the index at rest (#4): the switch, what the key is sealed with, and a new
+    /// key on demand.
+    fn security(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        let p = theme::palette(ui.ctx());
+        let s = match status {
+            Some(Ok(s)) => Some(s),
+            Some(Err(why)) => {
+                ui.add_space(10.0);
+                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                None
+            }
+            None => None,
+        };
+        section(ui, "Encryption at rest");
+        help_line(
+            ui,
+            "The index holds the text of what it covers, and its vectors can be turned back \
+             into much of that text. Encrypted, it reads only on this machine, as you: not \
+             from a backup or a copy of your home folder, or a disk taken out.",
+        );
+        if let Some(why) = &self.config_broken {
+            help_line(
+                ui,
+                &format!("The settings file doesn't parse, so it isn't changed from here: {why}"),
+            );
+            return;
+        }
+        let no_tpm = s.is_some_and(|s| !s.tpm);
+        let mut changed = false;
+        row(
+            ui,
+            "Encryption:",
+            "SQLCipher, its key sealed to this machine's TPM by systemd. Turning it on or off \
+             converts the index as it is; nothing is indexed again.",
+            |ui| {
+                let mut on = self.config.encryption.on();
+                if ui.checkbox(&mut on, "Encrypt the index").changed() {
+                    if on && no_tpm && !self.config.encryption.host_key_allowed() {
+                        // Refused here as the runner would refuse it: never weaker than asked.
+                        self.notice = Some(
+                            "This machine has no TPM that systemd can use, so the key can't be \
+                             sealed to it. Allow the host key below, or leave encryption off."
+                                .into(),
+                        );
+                    } else {
+                        self.config.encryption.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                }
+            },
+        );
+        if no_tpm || self.config.encryption.host_key_allowed() {
+            row(
+                ui,
+                "Without a TPM:",
+                "Seals the key with systemd's host key, which root can read. It still keeps the \
+                 index unreadable in a backup or copy of your home folder, but not on a disk \
+                 taken out with the rest of the system.",
+                |ui| {
+                    let mut allow = self.config.encryption.host_key_allowed();
+                    if ui
+                        .checkbox(&mut allow, "Use the host key instead (weaker)")
+                        .changed()
+                    {
+                        self.config.encryption.allow_host_key = allow.then_some(true);
+                        changed = true;
+                    }
+                },
+            );
+        }
+        if let Some(s) = s {
+            row(ui, "Now:", "", |ui| {
+                let (text, color) = match (s.encrypted, s.seal.as_str()) {
+                    (true, seal::TPM) => ("Encrypted, the key sealed to this machine's TPM", None),
+                    (true, seal::HOST) => {
+                        ("Encrypted, the key sealed with systemd's host key", None)
+                    }
+                    (true, _) => (
+                        "Encrypted with a key held in memory only: nothing could seal it, so the \
+                         index is rebuilt at the next start",
+                        Some(ui.visuals().warn_fg_color),
+                    ),
+                    (false, _) if self.config.encryption.on() && s.encryption_error.is_empty() => {
+                        ("Encrypting…", None)
+                    }
+                    (false, _) => ("Not encrypted", Some(p.muted)),
+                };
+                let text = RichText::new(text);
+                ui.add(
+                    egui::Label::new(match color {
+                        Some(c) => text.color(c),
+                        None => text,
+                    })
+                    .wrap(),
+                );
+                if !s.encryption_error.is_empty() {
+                    let color = ui.visuals().error_fg_color;
+                    ui.add(
+                        egui::Label::new(RichText::new(&s.encryption_error).color(color)).wrap(),
+                    );
+                }
+            });
+            if !s.seal_broken.is_empty() {
+                row(ui, "Rebuilt:", "", |ui| {
+                    let color = ui.visuals().warn_fg_color;
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "The index's key stopped working ({}), so the index is being \
+                                 built again from your files.",
+                                s.seal_broken
+                            ))
+                            .color(color),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+            if s.encrypted {
+                row(
+                    ui,
+                    "Key:",
+                    "Seals a new key and encrypts the index again under it: after moving to a \
+                     machine with a TPM, or to retire the old key.",
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if self.confirm == Some(Confirm::Rekey) {
+                                if self.cancel_button(ui).clicked() {
+                                    self.confirm = None;
+                                }
+                                if ui.button("Replace the key").clicked() {
+                                    self.link.send(Request::Rekey);
+                                    self.confirm = None;
+                                }
+                            } else if ui.button("New key…").clicked() {
+                                self.confirm = Some(Confirm::Rekey);
+                                self.focus_cancel = true;
+                            }
+                        });
+                    },
+                );
+            }
+        }
+        help_line(
+            ui,
+            "Turning it on leaves the old plaintext in free disk space until it is overwritten \
+             (or trimmed, on an SSD). Full-disk encryption covers that, and swap.",
+        );
+        if changed {
+            self.save_config();
+            if self.config_broken.is_none() {
+                self.link.send(Request::ApplyEncryption);
+            }
         }
     }
 
@@ -1748,7 +1909,7 @@ impl SettingsWindow {
                         );
                         heading(ui, &title, self.page.title(), 1);
                     } else {
-                        // Five tabs: wrap rather than clip at the narrowest widths.
+                        // Seven tabs: wrap rather than clip at the narrowest widths.
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(18.0, 6.0);
                             tab_list(ui);
@@ -1823,6 +1984,7 @@ impl SettingsWindow {
                             Page::Index => self.index(ui, status, shared.largest.as_ref()),
                             Page::Folders => self.folders(ui, status),
                             Page::Search => self.search(ui, status),
+                            Page::Security => self.security(ui, status),
                             Page::Model => self.model(ui, status),
                             Page::Hardware => self.hardware(ui),
                             Page::Integration => self.integration(ui),
@@ -1935,6 +2097,7 @@ mod tests {
         assert!(Page::parse("Hardware") == Some(Page::Hardware));
         assert!(Page::parse("folders") == Some(Page::Folders));
         assert!(Page::parse("search") == Some(Page::Search));
+        assert!(Page::parse("Security") == Some(Page::Security));
         assert!(Page::parse("nope").is_none());
     }
 }

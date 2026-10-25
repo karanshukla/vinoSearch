@@ -598,3 +598,78 @@ fn zoom_keeps_every_page_usable() {
         assert!(unnamed_controls(&h).is_empty(), "{}", page.title());
     }
 }
+
+/// The Security page over a runner that says whether there's a TPM, and how the index is
+/// encrypted.
+fn security(name: &str, edit: impl FnOnce(&mut Status)) -> (SettingsWindow, Receiver<Request>) {
+    let (w, requests) = window(Page::Security, name);
+    if let Some(Ok(s)) = w.link.shared.lock().unwrap().status.as_mut() {
+        edit(s);
+    }
+    (w, requests)
+}
+
+#[test]
+fn encryption_is_saved_and_applied_at_once() {
+    let (w, requests) = security("encrypt", |s| s.tpm = true);
+    let path = w.config_path.clone();
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Not encrypted");
+    // A TPM: nothing to say about doing without one.
+    assert!(
+        h.query_by_label("Use the host key instead (weaker)")
+            .is_none()
+    );
+    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+        .click();
+    settle(&mut h);
+    assert!(h.state().config.encryption.on());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[encryption]\nenabled = true"), "{text}");
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::ApplyEncryption))
+    );
+    h.get_by_label("Encrypting…");
+}
+
+#[test]
+fn without_a_tpm_turning_it_on_is_refused_until_the_host_key_is_allowed() {
+    let (w, requests) = security("notpm", |_| {});
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+        .click();
+    settle(&mut h);
+    assert!(!h.state().config.encryption.on());
+    assert!(h.state().notice.as_ref().unwrap().contains("no TPM"));
+    assert!(sent(&requests).is_empty());
+    h.get_by_role_and_label(Role::CheckBox, "Use the host key instead (weaker)")
+        .click();
+    settle(&mut h);
+    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+        .click();
+    settle(&mut h);
+    let c = &h.state().config.encryption;
+    assert!(c.on() && c.host_key_allowed());
+}
+
+#[test]
+fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
+    let (w, requests) = security("rekey", |s| {
+        s.tpm = true;
+        s.encrypted = true;
+        s.seal = "tpm".into();
+        s.seal_broken = "Failed to unseal secret using TPM2".into();
+    });
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Encrypted, the key sealed to this machine's TPM");
+    h.get_by_label_contains("so the index is being built again from your files");
+    h.get_by_role_and_label(Role::Button, "New key…").click();
+    settle(&mut h);
+    assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused());
+    h.get_by_role_and_label(Role::Button, "Replace the key")
+        .click();
+    settle(&mut h);
+    assert!(sent(&requests).iter().any(|r| matches!(r, Request::Rekey)));
+}

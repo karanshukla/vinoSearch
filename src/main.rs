@@ -1,5 +1,6 @@
 mod code;
 mod embed;
+mod encryption;
 mod estimate;
 mod eval;
 mod extract;
@@ -16,6 +17,7 @@ mod proc;
 mod results;
 mod runtime;
 mod sched;
+mod seal;
 mod vision;
 mod watch;
 mod worker;
@@ -133,6 +135,10 @@ enum Command {
         /// One JSON object instead of the table.
         #[arg(long)]
         json: bool,
+        /// Encrypt the throwaway index (SQLCipher, a key held in memory), to
+        /// see what encryption costs.
+        #[arg(long)]
+        encrypted: bool,
         /// Lowest recall@1 that passes [default: the queries file's]
         #[arg(long)]
         min_recall_at_1: Option<f64>,
@@ -300,10 +306,7 @@ fn estimates(paths: &[PathBuf], s: &Settings) -> Result<Vec<estimate::Estimate>>
     // Read-only, and not created just to look: an estimate must not write
     // to the index or leave an empty one behind.
     let conn = if db.exists() {
-        Some(rusqlite::Connection::open_with_flags(
-            &db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?)
+        Some(encryption::open_read_only(&db)?)
     } else {
         None
     };
@@ -425,7 +428,22 @@ fn run(cli: Cli) -> Result<bool> {
                 return Ok(true);
             }
             let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
-            let mut conn = index::open(&index::default_db()?)?;
+            let db = index::default_db()?;
+            // As the config file asks before anything is written (#4); held
+            // meanwhile, so the runner doesn't convert it underneath.
+            let enc = encryption::apply(
+                &db,
+                encryption::Want::of(&s.file),
+                false,
+                &seal::Sealer::default(),
+            );
+            for msg in [&enc.broken, &enc.error] {
+                if !msg.is_empty() {
+                    eprintln!("encryption: {msg}");
+                }
+            }
+            encryption::hold_shared(&db)?;
+            let mut conn = index::open(&db)?;
             if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
                 eprintln!("{why}");
             }
@@ -473,6 +491,7 @@ fn run(cli: Cli) -> Result<bool> {
                     );
                 }
             }
+            encryption::save_roots(&db, &conn)?;
             // Then the rest of long documents (#108), which the service
             // leaves until nothing else is waiting.
             let t0 = Instant::now();
@@ -547,7 +566,7 @@ fn run(cli: Cli) -> Result<bool> {
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
-            worker::prepare(&opts.status)?;
+            worker::prepare(&opts.status, &opts.file)?;
             power::spawn(tx.clone(), opts.status.clone());
             let _watcher = watch::spawn(
                 tx,
@@ -617,6 +636,7 @@ fn run(cli: Cli) -> Result<bool> {
             queries,
             images,
             json,
+            encrypted,
             min_recall_at_1,
             min_recall_at_5,
             min_mrr,
@@ -630,6 +650,7 @@ fn run(cli: Cli) -> Result<bool> {
                 testbed,
                 images,
                 json,
+                encrypted,
                 thresholds: eval::Thresholds {
                     recall_at_1: min_recall_at_1.unwrap_or(t.recall_at_1),
                     recall_at_5: min_recall_at_5.unwrap_or(t.recall_at_5),

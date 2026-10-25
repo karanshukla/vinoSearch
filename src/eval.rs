@@ -185,6 +185,8 @@ pub struct Options {
     pub testbed: PathBuf,
     pub images: bool,
     pub json: bool,
+    /// The index encrypted, with a key held in memory (#4).
+    pub encrypted: bool,
     pub thresholds: Thresholds,
 }
 
@@ -214,7 +216,11 @@ pub fn run(
     )));
     // create_dir, not create_dir_all: never reuse an index that's there.
     fs::create_dir(&scratch.0).with_context(|| scratch.0.display().to_string())?;
-    let mut conn = index::open(&scratch.0.join("index.sqlite"))?;
+    let db = scratch.0.join("index.sqlite");
+    if opts.encrypted {
+        crate::encryption::hold_in_memory(&db)?;
+    }
+    let mut conn = index::open(&db)?;
 
     let mut formats = config::Formats::default();
     formats.documents.enabled = Some(true);
@@ -273,6 +279,7 @@ pub fn run(
     if opts.json {
         let report = serde_json::json!({
             "device": device,
+            "encrypted": opts.encrypted,
             "files": st.files_embedded,
             "chunks": chunks,
             "index_seconds": index_secs,
@@ -323,7 +330,12 @@ pub fn run(
                 located.len()
             );
         }
-        println!("{query_ms:.0} ms a query on {device}");
+        let enc = if opts.encrypted {
+            ", index encrypted"
+        } else {
+            ""
+        };
+        println!("{query_ms:.0} ms a query on {device}{enc}");
         if skipped > 0 {
             println!("{skipped} image queries skipped; --images runs them");
         }

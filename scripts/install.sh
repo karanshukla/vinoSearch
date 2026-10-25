@@ -109,11 +109,11 @@ cc_hint() {
         return
     fi
     case " $id " in
-        *" fedora "*|*" rhel "*) echo "sudo dnf install gcc" ;;
-        *" debian "*|*" ubuntu "*) echo "sudo apt install build-essential" ;;
-        *" arch "*) echo "sudo pacman -S --needed base-devel" ;;
-        *" suse "*|*" opensuse "*) echo "sudo zypper install gcc" ;;
-        *) echo "install gcc" ;;
+        *" fedora "*|*" rhel "*) echo "sudo dnf install gcc openssl-devel" ;;
+        *" debian "*|*" ubuntu "*) echo "sudo apt install build-essential libssl-dev" ;;
+        *" arch "*) echo "sudo pacman -S --needed base-devel openssl" ;;
+        *" suse "*|*" opensuse "*) echo "sudo zypper install gcc libopenssl-devel" ;;
+        *) echo "install gcc and OpenSSL's headers" ;;
     esac
 }
 
@@ -138,6 +138,9 @@ else
         die "Rust $have is too old (needs $need; distro packages often lag): get a current one from https://rustup.rs, then run this again"
     fi
     command -v cc >/dev/null || die "no C compiler (cc): $(cc_hint), then run this again"
+    # SQLCipher, which encrypts the index (#4), builds against libcrypto.
+    [ -e /usr/include/openssl/evp.h ] || pkg-config --exists libcrypto 2>/dev/null ||
+        die "no OpenSSL headers: $(cc_hint), then run this again"
 fi
 for r in "${roots[@]}"; do
     [ -d "$r" ] || die "--index $r: not a directory"

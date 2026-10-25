@@ -52,6 +52,8 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (340 MB with the OCR model, plus the 671 MB vision encoder while images are on; every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
+| `ApplyEncryption` | `() → ()` | Read `[encryption]` from the config file now and encrypt or decrypt the index to match, rather than at the next 30-second read; after a refusal, try again ([#4](https://github.com/karanshukla/vinoSearch/issues/4)). Queued behind an indexing job, which it stops. `encrypted`, `seal` and `encryption_error` say how it went. Fails if the config file doesn't parse. |
+| `Rekey` | `() → ()` | Seal a new key and encrypt the index again under it. Fails while it isn't encrypted. |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 | `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
 | `Search` | `(s query, u limit) → a(ssdssux)` | Every file the query finds, for the search window ([#111](https://github.com/karanshukla/vinoSearch/issues/111)): the best chunk of each, at or above its kind's `min_score` as KRunner's are, at most `limit` (capped at 100, `dbus::results::MAX`) of each kind: text, then documents, then images, best first within each. Each is (path, kind, score, snippet, unit, at, mtime): kind `text`, `document` or `image` (`dbus::results`; text OCR read in an image is an `image`, as KRunner lists it), or `code` alone for a query starting `code:` ([#110](https://github.com/karanshukla/vinoSearch/issues/110)), the cosine score, up to 140 characters of the matching text (empty for a photo), `at`'s unit (`line`, `page`, `slide`, `chapter`, `row`, `paragraph`, or empty when the match has no place to name), the match's number in it from 1 (0 for none), and the file's mtime in Unix seconds. Files gone since they were indexed are left out. Loads the model as `Match` does. |
@@ -86,6 +88,11 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `last_indexed` | `t` | Unix seconds when an indexing job last embedded or removed a file; 0 for not since the runner started. |
 | `no_decoder` | `x` | HEIC, HEIF and AVIF files skipped because no HEIF decoder (libheif's `heif-convert`) is installed ([#79](https://github.com/karanshukla/vinoSearch/issues/79)); 0 once one is. |
 | `model_changed` | `s` | Why part of the index was dropped at this start to be indexed again: the text or image model is not the one that made those vectors ([#80](https://github.com/karanshukla/vinoSearch/issues/80)). Empty otherwise, and again once that indexing has finished. |
+| `encrypted` | `b` | The index on disk is encrypted ([#4](https://github.com/karanshukla/vinoSearch/issues/4)). |
+| `seal` | `s` | What the key is sealed with (`dbus::seal`): `tpm` (this machine's TPM, with systemd's host key), `host` (the host key alone, only with `allow_host_key`), `memory` (nothing could seal it: the key is in memory only and the index is rebuilt at the next start), or empty while not encrypted. |
+| `tpm` | `b` | systemd can seal a key to a TPM here (`systemd-analyze has-tpm2`), as of the runner's start. |
+| `encryption_error` | `s` | Why the last change to encryption was refused or failed (no TPM, systemd too old for `--user`, another process holding the index); empty otherwise. The index stays as it was. |
+| `seal_broken` | `s` | Why the key stopped working at this start (it didn't unseal, or didn't open the index), so the index was emptied and its folders are being indexed again. Empty otherwise. |
 
 ## Settings
 
@@ -109,6 +116,10 @@ min_score = 0.63
 [formats.code]
 enabled = true
 min_score = 0.72
+
+[encryption]
+enabled = true
+allow_host_key = false
 ```
 
 A running runner re-reads the file every 30 seconds and applies what changed:
@@ -123,6 +134,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, heif, avif |
 | `formats.code.enabled` | as `formats.images.enabled`: code no longer wanted is dropped, and every root is checked for code once it's on. Default off |
 | `formats.text.min_score`, `formats.images.min_score`, `formats.code.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65, 0.63 and 0.72) |
+| `encryption.enabled`, `encryption.allow_host_key` | at once (`ApplyEncryption` makes it straight away), stopping an indexing job: the index is converted in place, encrypted or decrypted, nothing indexed again. Default off. Without a TPM, turning it on is refused unless `allow_host_key = true` |
 
 A setting given as a flag or environment variable (`--device`, `--idle-unload-minutes`, `VINOSEARCH_IDLE_UNLOAD_MINUTES`, or baked into the service by `krunner --install --device ...`) wins over the file, so file changes to it are ignored until the runner restarts without the flag. A file that fails to parse, or has an invalid `exclude`, changes nothing; an invalid `idle_unload_minutes` keeps the current timeout.
 

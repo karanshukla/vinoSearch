@@ -52,6 +52,16 @@ pub struct Status {
     pub indexing_rest: bool,
     /// Documents indexed in part so far, the next in line first.
     pub partial: Vec<Partial>,
+    /// The index on disk is encrypted (#4).
+    pub encrypted: bool,
+    /// What its key is sealed with: a `dbus::seal` value, or empty.
+    pub seal: String,
+    /// systemd can seal a key to a TPM here.
+    pub tpm: bool,
+    /// Why the last change to encryption was refused or failed.
+    pub encryption_error: String,
+    /// Why the index was rebuilt from the files at the runner's start.
+    pub seal_broken: String,
 }
 
 /// A long document with only some of its parts indexed so far (#108).
@@ -144,6 +154,11 @@ impl Status {
             no_decoder: signed(status::NO_DECODER),
             indexing_rest: flag(status::INDEXING_REST),
             partial,
+            encrypted: flag(status::ENCRYPTED),
+            seal: text(status::SEAL),
+            tpm: flag(status::TPM),
+            encryption_error: text(status::ENCRYPTION_ERROR),
+            seal_broken: text(status::SEAL_BROKEN),
         }
     }
 }
@@ -161,6 +176,9 @@ pub enum Request {
     ResumeIndexing,
     /// Answered in `Shared::largest`.
     LargestFolders(u32),
+    /// Apply the config file's `encryption` now.
+    ApplyEncryption,
+    Rekey,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -271,6 +289,8 @@ fn call(conn: &mut Option<zbus::blocking::Connection>, request: &Request) -> Res
         Request::CheckNow => p.call("CheckNow", &()),
         Request::PauseIndexing => p.call("PauseIndexing", &()),
         Request::ResumeIndexing => p.call("ResumeIndexing", &()),
+        Request::ApplyEncryption => p.call("ApplyEncryption", &()),
+        Request::Rekey => p.call("Rekey", &()),
         Request::LargestFolders(_) => unreachable!("answered in the loop"),
     });
     result.map_err(|e| explain(conn, e))
@@ -322,6 +342,26 @@ mod tests {
         assert_eq!(s.image_files, 12);
         assert_eq!(s.text_files, 0);
         assert!(s.partial.is_empty());
+        assert!(!s.encrypted && !s.tpm);
+        assert_eq!(s.seal, "");
+    }
+
+    #[test]
+    fn status_reads_encryption() {
+        let mut map = HashMap::new();
+        map.insert(status::ENCRYPTED.to_owned(), OwnedValue::from(true));
+        map.insert(status::TPM.to_owned(), OwnedValue::from(true));
+        for (k, v) in [
+            (status::SEAL, "tpm"),
+            (status::ENCRYPTION_ERROR, ""),
+            (status::SEAL_BROKEN, "the TPM was cleared"),
+        ] {
+            map.insert(k.to_owned(), OwnedValue::try_from(Value::from(v)).unwrap());
+        }
+        let s = Status::parse(&map);
+        assert!(s.encrypted && s.tpm);
+        assert_eq!(s.seal, "tpm");
+        assert_eq!(s.seal_broken, "the TPM was cleared");
     }
 
     #[test]

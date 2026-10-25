@@ -240,7 +240,8 @@ pub fn spawn(
 ) -> Result<std::thread::JoinHandle<()>> {
     let excludes = file.excludes()?;
     let types = FileTypes::new(&file.formats)?;
-    let conn = index::open(&index::default_db()?)?;
+    // Closed and opened again under it when encryption changes (#4).
+    let db = crate::encryption::Live::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
     Ok(std::thread::spawn(move || {
@@ -252,7 +253,9 @@ pub fn spawn(
             excludes,
             types,
         };
-        st.sync_roots(&conn, &jobs);
+        if let Ok(conn) = db.lock() {
+            st.sync_roots(&conn, &jobs);
+        }
         status.last_checked.store(unix_now(), Ordering::Relaxed);
         let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut last_event = Instant::now();
@@ -300,7 +303,9 @@ pub fn spawn(
             {
                 break;
             }
-            if last_roots.elapsed() >= ROOTS_EVERY {
+            if last_roots.elapsed() >= ROOTS_EVERY
+                || status.reload_config.swap(false, Ordering::Relaxed)
+            {
                 // A file that fails to parse, or has a bad exclusion or file
                 // type, changes nothing: better the last good exclusions than
                 // index what a typo un-excluded.
@@ -332,7 +337,10 @@ pub fn spawn(
                     Ok(_) => {}
                     Err(e) => eprintln!("reading config: {e:#}"),
                 }
-                st.sync_roots(&conn, &jobs);
+                match db.lock() {
+                    Ok(conn) => st.sync_roots(&conn, &jobs),
+                    Err(e) => eprintln!("watch: {e:#}"),
+                }
                 last_roots = Instant::now();
             }
             if clock.slept() {
@@ -351,7 +359,10 @@ pub fn spawn(
                 && !status.indexing.load(Ordering::Relaxed)
                 && status.queued_reindex.load(Ordering::Relaxed) == 0
             {
-                st.catch_up(&conn, &jobs, why);
+                match db.lock() {
+                    Ok(conn) => st.catch_up(&conn, &jobs, why),
+                    Err(e) => eprintln!("watch: {e:#}"),
+                }
                 status.last_checked.store(unix_now(), Ordering::Relaxed);
                 last_check = Instant::now();
                 due = None;
