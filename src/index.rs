@@ -704,9 +704,27 @@ fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>
 }
 
 /// (mtime, size) as the index records them.
-fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
+pub(crate) fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some((mtime.as_secs() as i64, meta.len() as i64))
+}
+
+/// The (mtime, size) recorded for every indexed file under `root`, by path.
+pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
+    let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a file `walk` found is indexed as, with its metadata: None if it
+/// isn't a wanted type or is over its kind's size cap. Reads no contents.
+pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
+    let kind = types.kind(entry.path())?;
+    let meta = entry.metadata().ok()?;
+    (meta.len() <= kind.max_bytes()).then_some((kind, meta))
 }
 
 /// Paths under `root` the index is behind on: wanted files that are new or
@@ -718,30 +736,20 @@ pub fn stale(
     ex: &Excludes,
     types: &FileTypes,
 ) -> Result<Vec<PathBuf>> {
-    let mut known: std::collections::HashMap<String, (i64, i64)> = {
-        let mut stmt =
-            conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let mut known = stamps_under(conn, root)?;
     let mut out = Vec::new();
     for entry in walk(root, ex).filter(|e| e.file_type().is_file()) {
         let path = entry.path();
         let Some(key) = path.to_str() else { continue };
         let was = known.remove(key);
-        let wanted_now = types
-            .kind(path)
-            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes()));
-        if !wanted_now {
+        let Some((_, meta)) = indexable(&entry, types) else {
             // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
                 out.push(path.to_path_buf());
             }
             continue;
-        }
-        if was != entry.metadata().ok().as_ref().and_then(stamp_of) {
+        };
+        if was != stamp_of(&meta) {
             out.push(path.to_path_buf());
         }
     }
@@ -970,6 +978,18 @@ pub fn compact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `root` as `index` walks it: canonical, and an error if it is excluded.
+pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
+    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    if ex.contains(&root) {
+        bail!(
+            "{} is excluded; remove it from `exclude` in the config to index it",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
 /// Called after each file `index` looks at, with the connection and model
 /// lent back: for progress, and for the runner to answer queries mid-index.
 /// An error from it stops indexing; every file finished so far is kept.
@@ -986,13 +1006,7 @@ pub fn index(
     types: &FileTypes,
     after: &mut AfterFile,
 ) -> Result<Stats> {
-    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
-    if ex.contains(&root) {
-        bail!(
-            "{} is excluded; remove it from `exclude` in the config to index it",
-            root.display()
-        );
-    }
+    let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
@@ -1216,14 +1230,22 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             *chunks.entry(dir.to_owned()).or_default() += n as u64;
         }
     }
+    Ok(biggest(&chunks, limit))
+}
+
+/// The heaviest folders in `weights` (each folder's total, its subfolders'
+/// included), biggest first: at most `limit`, none inside another. A folder
+/// gives way to a subfolder holding 3/4 of its weight, so what's named is
+/// where the bulk actually is.
+pub fn biggest(weights: &HashMap<PathBuf, u64>, limit: usize) -> Vec<(PathBuf, u64)> {
     let mut biggest_child: HashMap<&Path, u64> = HashMap::new();
-    for (dir, n) in &chunks {
+    for (dir, n) in weights {
         if let Some(parent) = dir.parent() {
             let m = biggest_child.entry(parent).or_default();
             *m = (*m).max(*n);
         }
     }
-    let mut dirs: Vec<(&PathBuf, u64)> = chunks.iter().map(|(d, n)| (d, *n)).collect();
+    let mut dirs: Vec<(&PathBuf, u64)> = weights.iter().map(|(d, n)| (d, *n)).collect();
     // Of equal folders, the deeper says more.
     dirs.sort_by(|a, b| {
         b.1.cmp(&a.1)
@@ -1245,7 +1267,7 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             picked.push((dir.clone(), n));
         }
     }
-    Ok(picked)
+    picked
 }
 
 pub struct Hit {

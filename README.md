@@ -51,6 +51,7 @@ cargo install --path crates/settings       # vinosearch-settings, the settings w
 cargo install ovfetch                      # 0.6.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch
 vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
+vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch krunner --install               # the systemd user service, the app menu entry and the running desktop's search
 vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
