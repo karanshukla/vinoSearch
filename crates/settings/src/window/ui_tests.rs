@@ -379,9 +379,10 @@ fn a_score_slider_moves_from_the_keyboard() {
     settle(&mut h);
     h.key_press(Key::ArrowRight);
     settle(&mut h);
+    // Right is closer: the bar the score has to clear goes up.
     let moved = h.state().config.formats.text.min_score;
     assert!(
-        moved.is_some_and(|v| (v - DEFAULT_TEXT_MIN_SCORE).abs() > 0.001),
+        moved.is_some_and(|v| v > DEFAULT_TEXT_MIN_SCORE + 0.001),
         "{moved:?}"
     );
 }

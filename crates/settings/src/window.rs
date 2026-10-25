@@ -926,9 +926,12 @@ impl SettingsWindow {
         );
 
         section(ui, "How close results must be");
-        help_line(ui, "Right for more results, left for fewer, closer ones.");
+        help_line(
+            ui,
+            "The higher the number, the closer a match has to be: fewer results, better ones.",
+        );
         let text = self.config.formats.text.min_score;
-        if let Some(v) = score_row(ui, "Text:", "", text, DEFAULT_TEXT_MIN_SCORE, 0.85..=0.45) {
+        if let Some(v) = score_row(ui, "Text:", "", text, DEFAULT_TEXT_MIN_SCORE, 0.45..=0.85) {
             self.config.formats.text.min_score = v;
             self.idle_dirty = true;
         }
@@ -939,7 +942,7 @@ impl SettingsWindow {
             "",
             image,
             DEFAULT_IMAGE_MIN_SCORE,
-            0.75..=0.45,
+            0.45..=0.75,
         ) {
             self.config.formats.images.min_score = v;
             self.idle_dirty = true;
@@ -1327,11 +1330,38 @@ fn score_row(
     let mut out = None;
     labelled_row(ui, label, help, |ui, named| {
         ui.horizontal_wrapped(|ui| {
+            // Left to right as the number rises, so dragging, the number and
+            // the end labels all agree: further right, closer matches only.
             let p = theme::palette(ui.ctx());
-            ui.label(RichText::new("Fewer").color(p.muted));
             let mut v = current.unwrap_or(default);
-            let response = slider(ui, named, &mut v, range, 0.01, 2, "");
-            ui.label(RichText::new("More").color(p.muted));
+            let text = |ui: &egui::Ui, t: &str| {
+                egui::WidgetText::from(RichText::new(t).color(p.muted)).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Body,
+                )
+            };
+            ui.label(text(ui, "Looser"));
+            // The bar takes what "Closer" and the number leave of the visible
+            // width (the row's own can run past a narrow window), so the row
+            // fits one at large text.
+            let closer = text(ui, "Closer");
+            let number_width = text(ui, "0.00").size().x + 2.0 * ui.spacing().button_padding.x;
+            let gaps = 2.0 * ui.spacing().item_spacing.x;
+            let visible = ui.clip_rect().right().min(ui.max_rect().right()) - ui.cursor().min.x;
+            let room = visible - closer.size().x - number_width - gaps;
+            ui.spacing_mut().slider_width = room.clamp(48.0, ui.spacing().slider_width);
+            let bar = egui::Slider::new(&mut v, range.clone())
+                .show_value(false)
+                .step_by(0.01);
+            let bar = named(ui.add(bar));
+            ui.label(closer);
+            let number = egui::DragValue::new(&mut v)
+                .range(range)
+                .speed(0.01)
+                .fixed_decimals(2);
+            let response = bar | named(ui.add(number));
             if response.changed() {
                 // Stored rounded, as the slider shows it; the default is left unwritten.
                 let v = (v * 100.0).round() / 100.0;
