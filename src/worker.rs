@@ -265,6 +265,24 @@ fn touched(status: &Status, st: &index::Stats) {
     }
 }
 
+/// Best `k` chunks of each kind for `query`, text first: what a Match job
+/// answers, and what `vinosearch eval` ranks (#107).
+pub(crate) fn matches(
+    conn: &rusqlite::Connection,
+    emb: &mut Embedder,
+    vectors: &Vectors,
+    query: &str,
+    k: usize,
+) -> Result<Vec<Hit>> {
+    let q = emb.query(query)?;
+    let words = index::Words::find(conn, query);
+    let mut hits = Vec::new();
+    for kind in [Kind::Text, Kind::Document, Kind::Image] {
+        hits.extend(index::search(conn, vectors, &q, words.as_ref(), kind, k)?);
+    }
+    Ok(hits)
+}
+
 fn answer(
     conn: &rusqlite::Connection,
     emb: &mut Embedder,
@@ -273,15 +291,7 @@ fn answer(
     k: usize,
     reply: oneshot::Sender<Vec<Hit>>,
 ) {
-    let hits = emb.query(query).and_then(|q| {
-        let words = index::Words::find(conn, query);
-        let mut hits = Vec::new();
-        for kind in [Kind::Text, Kind::Document, Kind::Image] {
-            hits.extend(index::search(conn, vectors, &q, words.as_ref(), kind, k)?);
-        }
-        Ok(hits)
-    });
-    let _ = reply.send(hits.unwrap_or_else(|e| {
+    let _ = reply.send(matches(conn, emb, vectors, query, k).unwrap_or_else(|e| {
         eprintln!("match {query:?}: {e:#}");
         Vec::new()
     }));
