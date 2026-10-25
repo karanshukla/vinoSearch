@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 /// in 66 min indexing `~/Development` (README's Performance table, Core 5
 /// 320, 2026-10-18). Other devices differ, the CPU by a lot.
 pub const CHUNKS_PER_SEC: f64 = 28.6;
-/// Seconds per image on the NPU, both vision stages (README, `vision.rs`).
-pub const SECS_PER_IMAGE: f64 = 1.3;
+/// Seconds per image on the NPU: 1.3 for both vision stages (README,
+/// `vision.rs`), and OCR's 0.1 for a photo to 0.4 for a screenshot (#106).
+pub const SECS_PER_IMAGE: f64 = 1.5;
 /// Index bytes per chunk: the same run's 470 MB for 113,341 chunks. That is
 /// the 768-float vector (3 KB), the chunk's text and SQLite's overhead. An
 /// image's chunk keeps no text but is priced the same.
