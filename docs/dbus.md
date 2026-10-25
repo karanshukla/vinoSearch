@@ -49,12 +49,12 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `PauseIndexing` | `() → ()` | Stop indexing after the chunk in progress (~35 ms on the NPU) and hold new indexing work until `ResumeIndexing`. Every file finished so far stays in the index; queries keep working. Not kept across a runner restart, which indexes as usual. |
 | `ResumeIndexing` | `() → ()` | Run the indexing held since `PauseIndexing`. Unchanged files are skipped by mtime and size, so it carries on where it stopped. |
 | `Unload` | `() → ()` | Free the model now instead of after the idle timeout. |
-| `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (308 MB, plus the 671 MB vision encoder while images are on; every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
+| `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (340 MB with the OCR model, plus the 671 MB vision encoder while images are on; every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 | `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
-| `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string. |
+| `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string: its OCR text is in the index, not read again here. |
 
 ### `Status` keys
 
@@ -68,7 +68,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
 | `chunks` | `x` | Chunks in the index. |
-| `text_files`, `text_chunks`, `document_files`, `document_chunks`, `image_files` | `x` | The same per format ([#73](https://github.com/karanshukla/vinoSearch/issues/73)); a file counts under the kind of its chunks, so one recorded with none (a scan, a photo with no decoder) is in `files` only. An image is one chunk. |
+| `text_files`, `text_chunks`, `document_files`, `document_chunks`, `image_files` | `x` | The same per format ([#73](https://github.com/karanshukla/vinoSearch/issues/73)); a file counts under the kind of its chunks, so one recorded with none (a photo with no decoder) is in `files` only. An image is one chunk, plus a chunk for each run of text OCR read in it, counted under images ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). |
 | `roots` | `as` | Indexed roots, canonical paths. |
 | `model_present` | `b` | Every model file is on disk, the vision encoder's included while images are on. |
 | `fetching` | `b` | A `FetchModel` download is running. |

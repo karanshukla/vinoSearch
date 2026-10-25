@@ -797,7 +797,7 @@ impl SettingsWindow {
         row(
             ui,
             "Images:",
-            "Found by what's in them. A 671 MB download.",
+            "Found by what's in them and the text they show. A 671 MB download.",
             |ui| {
                 let mut on = self.config.formats.images_enabled();
                 ui.horizontal(|ui| {

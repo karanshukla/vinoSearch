@@ -1,6 +1,7 @@
 //! The embedding model: EmbeddingGemma 2's text model, rotary-fixed and INT8,
-//! and for images its vision encoder with static shapes, each pinned by
-//! Hugging Face commit and SHA-256.
+//! and for images its vision encoder with static shapes; and the OCR model
+//! for the text in images and scans (#106). Each is pinned by Hugging Face
+//! commit and SHA-256.
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,8 @@ const REPO: &str = "arankays/embeddinggemma-2-text-int8-cw-onnx";
 pub(crate) const REVISION: &str = "88aed926c26344fa2ffed5f44d016fb36e2fcce3";
 const VISION_REPO: &str = "arankays/embeddinggemma-2-vision-static-onnx";
 pub(crate) const VISION_REVISION: &str = "16414206c27ee4bc435a7c03467155063fee1d9f";
+const OCR_REPO: &str = "arankays/pp-ocrv6-small-onnx";
+pub(crate) const OCR_REVISION: &str = "5bc17817a3879e7e494cd71b43d66b7b608abfac";
 
 /// (path in the repo, sha256, size in bytes)
 const FILES: &[(&str, &str, u64)] = &[
@@ -68,11 +71,31 @@ const VISION_FILES: &[(&str, &str, u64)] = &[
     ),
 ];
 
+/// PP-OCRv6 small, as RapidOCR 3.10.0 publishes it, and its dict. Small, so
+/// fetched whether or not images are on: scanned PDFs need it too.
+const OCR_FILES: &[(&str, &str, u64)] = &[
+    (
+        "onnx/PP-OCRv6_det_small.onnx",
+        "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f",
+        9_929_594,
+    ),
+    (
+        "onnx/PP-OCRv6_rec_small.onnx",
+        "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
+        21_234_383,
+    ),
+    (
+        "ppocrv6_dict.txt",
+        "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+        74_947,
+    ),
+];
+
 /// Bytes the model takes on disk once fetched, the vision encoder included
 /// if `images`.
 pub fn total_bytes(images: bool) -> u64 {
     let size = |files: &[(&str, &str, u64)]| files.iter().map(|(_, _, size)| size).sum::<u64>();
-    size(FILES) + if images { size(VISION_FILES) } else { 0 }
+    size(FILES) + size(OCR_FILES) + if images { size(VISION_FILES) } else { 0 }
 }
 
 fn models_dir() -> Result<PathBuf> {
@@ -89,6 +112,29 @@ pub fn default_dir() -> Result<PathBuf> {
 
 pub fn vision_dir() -> Result<PathBuf> {
     Ok(models_dir()?.join("embeddinggemma-2-vision-static-onnx"))
+}
+
+pub fn ocr_dir() -> Result<PathBuf> {
+    Ok(models_dir()?.join("pp-ocrv6-small-onnx"))
+}
+
+pub fn ocr_det_path(dir: &Path) -> PathBuf {
+    dir.join(OCR_FILES[0].0)
+}
+
+pub fn ocr_rec_path(dir: &Path) -> PathBuf {
+    dir.join(OCR_FILES[1].0)
+}
+
+pub fn ocr_dict_path(dir: &Path) -> PathBuf {
+    dir.join(OCR_FILES[2].0)
+}
+
+/// Every file reading text from pixels needs is in `dir`.
+pub fn ocr_present(dir: &Path) -> bool {
+    OCR_FILES
+        .iter()
+        .all(|(name, _, _)| dir.join(name).is_file())
 }
 
 /// The vision encoder, in `vision_dir()`.
@@ -146,6 +192,15 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
         REVISION,
         FILES,
         &default_dir()?,
+        &mut done,
+        total,
+        progress,
+    )?;
+    fetch_files(
+        OCR_REPO,
+        OCR_REVISION,
+        OCR_FILES,
+        &ocr_dir()?,
         &mut done,
         total,
         progress,
@@ -230,17 +285,23 @@ pub fn present(dir: &Path) -> bool {
 }
 
 /// What embedding an image needs, besides the text model, is present.
-pub fn images_present(dir: &Path, vision_dir: &Path) -> bool {
+pub fn vision_present(dir: &Path, vision_dir: &Path) -> bool {
     image_text_path(dir).is_file()
         && VISION_FILES
             .iter()
             .all(|(name, _, _)| vision_dir.join(name).is_file())
 }
 
-/// Remove the model's files, the vision encoder's included. The caller makes
-/// sure nothing has them loaded.
+/// What indexing an image needs, besides the text model, is present: the
+/// vision encoder, and the OCR model for its text.
+pub fn images_present(dir: &Path, vision_dir: &Path, ocr_dir: &Path) -> bool {
+    vision_present(dir, vision_dir) && ocr_present(ocr_dir)
+}
+
+/// Remove the model's files, the vision encoder's and OCR's included. The
+/// caller makes sure nothing has them loaded.
 pub fn delete() -> Result<()> {
-    for dir in [default_dir()?, vision_dir()?] {
+    for dir in [default_dir()?, vision_dir()?, ocr_dir()?] {
         match fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

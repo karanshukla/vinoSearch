@@ -29,7 +29,7 @@ curl -L https://github.com/karanshukla/vinoSearch/releases/latest/download/vinos
 vinosearch/scripts/install.sh --index ~/Documents
 ```
 
-That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 308 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
+That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
 
 `vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
 
@@ -50,7 +50,7 @@ cargo install --path .                     # vinosearch into ~/.cargo/bin
 cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
 cargo install ovfetch                      # 0.6.0 or newer
 scripts/install-runtime.sh                 # OpenVINO via ovfetch
-vinosearch fetch-model                     # 308 MB, every file checked against a pinned SHA-256
+vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
 vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
 vinosearch krunner --install               # the systemd user service, the app menu entry and the running desktop's search
@@ -136,6 +136,8 @@ Images use its vision encoder, rewritten with static shapes so the NPU can compi
 | **140 (used)** | **84.5 / 96.9 / 98.6** | **1311** | **4.4** |
 | 70 | 81.1 / 95.4 / 97.9 | 653 | 2.2 |
 
+Text in images and scanned PDFs is read by PaddleOCR's PP-OCRv6 small detector and recogniser, as RapidOCR publishes them, at [arankays/pp-ocrv6-small-onnx](https://huggingface.co/arankays/pp-ocrv6-small-onnx) (31 MB), compiled at static shapes so the NPU runs both ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). On 1920x1080 browser screenshots it finds 96-98% of the words shown in about 0.5 s, where RapidOCR's own pipeline on the CPU finds 86-94% in 1.4-2.1 s (`bench/ocr_static.py`). It reads Chinese, Japanese, English and Latin-script languages; not Cyrillic, Arabic or Korean.
+
 ## Privacy
 
 The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat the index like the files it covers. Encryption at rest is [#4](https://github.com/karanshukla/vinoSearch/issues/4).
@@ -147,4 +149,4 @@ The index is plaintext SQLite in `~/.local/share/vinosearch/index.sqlite`, reada
 
 ## License
 
-MIT. The models are Apache 2.0, by Google DeepMind.
+MIT. The models are Apache 2.0: EmbeddingGemma by Google DeepMind, PP-OCRv6 by Baidu's PaddleOCR.

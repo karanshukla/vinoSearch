@@ -6,6 +6,7 @@ mod index;
 mod krunner;
 mod menu;
 mod model;
+mod ocr;
 mod open;
 mod parity;
 mod power;
@@ -114,6 +115,9 @@ enum Command {
         #[arg(long)]
         min_score: Option<f32>,
     },
+    /// Print the text OCR reads in an image, or a PDF's rendered pages, as
+    /// indexing reads it (#106).
+    ReadText { path: PathBuf },
     /// Parse the document on stdin as PATH's type and write its chunks to
     /// stdout as JSON, under memory and CPU limits. The indexer runs this on
     /// itself for every document (#84).
@@ -147,6 +151,7 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
         openvino::Core::new()?,
         &dir,
         &model::vision_dir()?,
+        &model::ocr_dir()?,
         device,
         &cache,
     )?;
@@ -519,6 +524,9 @@ fn run(cli: Cli) -> Result<bool> {
                     continue;
                 }
                 let at = match h.kind {
+                    index::Kind::Document if !extract::is_document(Path::new(&h.path)) => {
+                        " (text in the image)".to_owned()
+                    }
                     index::Kind::Document => {
                         format!(", {} {}", extract::unit(Path::new(&h.path)), h.line)
                     }
@@ -532,6 +540,48 @@ fn run(cli: Cli) -> Result<bool> {
                 );
                 if !h.copies.is_empty() {
                     println!("       same as: {}", h.copies.join(", "));
+                }
+            }
+            Ok(true)
+        }
+        Command::ReadText { path } => {
+            let prefix = runtime::default_prefix(cli.openvino_dir)?;
+            runtime::load(&prefix)?;
+            let mut core = openvino::Core::new()?;
+            let t0 = Instant::now();
+            let mut ocr = ocr::Ocr::new(&mut core, &model::ocr_dir()?, &s.device, &cache_dir()?)?;
+            eprintln!(
+                "ocr ready on {} in {:.1} s",
+                ocr.device,
+                t0.elapsed().as_secs_f64()
+            );
+            let bytes = std::fs::read(&path)?;
+            let deadline = Instant::now() + ocr::SCAN_WALL;
+            let pages = if extract::is_document(&path) {
+                ocr::pdf_pages(&bytes, deadline)?.min(ocr::MAX_SCAN_PAGES)
+            } else {
+                1
+            };
+            for page in 1..=pages {
+                let img = if extract::is_document(&path) {
+                    ocr::render_page(&bytes, page, deadline)?
+                } else {
+                    vision::load(&bytes)?
+                };
+                let t = Instant::now();
+                let lines = ocr.read(&img, 1.0)?;
+                eprintln!(
+                    "{}x{}: {} lines in {:.0} ms",
+                    img.width(),
+                    img.height(),
+                    lines.len(),
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+                if pages > 1 {
+                    println!("--- page {page}");
+                }
+                for l in lines {
+                    println!("{l}");
                 }
             }
             Ok(true)
