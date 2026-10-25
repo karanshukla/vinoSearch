@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+const HUB: &str = "https://huggingface.co";
 const REPO: &str = "arankays/embeddinggemma-2-text-int8-cw-onnx";
 pub(crate) const REVISION: &str = "88aed926c26344fa2ffed5f44d016fb36e2fcce3";
 const VISION_REPO: &str = "arankays/embeddinggemma-2-vision-static-onnx";
@@ -179,6 +180,11 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Where Hugging Face serves `repo`'s files at `revision`.
+fn hub(repo: &str, revision: &str) -> String {
+    format!("{HUB}/{repo}/resolve/{revision}")
+}
+
 /// Download whatever is missing or does not match its pinned hash, the vision
 /// encoder too if `images`. Files are hashed as they stream and only renamed
 /// into place once they match; one larger than its pinned size is abandoned
@@ -188,8 +194,7 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
     let total = total_bytes(images);
     let mut done = 0;
     fetch_files(
-        REPO,
-        REVISION,
+        &hub(REPO, REVISION),
         FILES,
         &default_dir()?,
         &mut done,
@@ -197,8 +202,7 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
         progress,
     )?;
     fetch_files(
-        OCR_REPO,
-        OCR_REVISION,
+        &hub(OCR_REPO, OCR_REVISION),
         OCR_FILES,
         &ocr_dir()?,
         &mut done,
@@ -207,8 +211,7 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
     )?;
     if images {
         fetch_files(
-            VISION_REPO,
-            VISION_REVISION,
+            &hub(VISION_REPO, VISION_REVISION),
             VISION_FILES,
             &vision_dir()?,
             &mut done,
@@ -219,9 +222,9 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
     Ok(())
 }
 
+/// `files` from `source`, the URL their paths are under.
 fn fetch_files(
-    repo: &str,
-    revision: &str,
+    source: &str,
     files: &[(&str, &str, u64)],
     dir: &Path,
     done: &mut u64,
@@ -236,39 +239,59 @@ fn fetch_files(
             continue;
         }
         fs::create_dir_all(dest.parent().unwrap())?;
-        let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{name}");
-        let mut resp = ureq::get(&url)
-            .call()
-            .with_context(|| format!("GET {url}"))?;
-        let mut body = resp.body_mut().as_reader();
+        let url = format!("{source}/{name}");
         let part = dest.with_extension("part");
-        let mut out = fs::File::create(&part)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut got_bytes = 0;
-        loop {
-            let n = body.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            got_bytes += n as u64;
-            if got_bytes > *size {
-                drop(out);
-                let _ = fs::remove_file(&part);
-                bail!("{name}: more than the pinned {size} bytes");
-            }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])?;
-            progress(name, *done + got_bytes, total);
-        }
+        let at = *done;
+        let got = download(&url, &part, name, want, *size, &mut |got| {
+            progress(name, at + got, total);
+        });
         *done += size;
-        out.sync_all()?;
-        let got = hex::encode(hasher.finalize());
-        if got != *want {
+        if let Err(e) = got {
+            // However it stopped (a dropped connection, a full disk), a
+            // half-written file of up to the file's size is not left behind.
             let _ = fs::remove_file(&part);
-            bail!("{name}: sha256 {got}, expected {want}");
+            return Err(e);
         }
         fs::rename(&part, &dest)?;
+    }
+    Ok(())
+}
+
+/// `url` into `part`, hashed as it streams; Err if it runs past `size`
+/// bytes or doesn't hash to `want`. `progress` gets the bytes so far.
+fn download(
+    url: &str,
+    part: &Path,
+    name: &str,
+    want: &str,
+    size: u64,
+    progress: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let mut resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    let mut body = resp.body_mut().as_reader();
+    let mut out = fs::File::create(part)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got_bytes = 0;
+    loop {
+        let n = body.read(&mut buf).with_context(|| format!("GET {url}"))?;
+        if n == 0 {
+            break;
+        }
+        got_bytes += n as u64;
+        if got_bytes > size {
+            bail!("{name}: more than the pinned {size} bytes");
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        progress(got_bytes);
+    }
+    out.sync_all()?;
+    let got = hex::encode(hasher.finalize());
+    if got != want {
+        bail!("{name}: sha256 {got}, expected {want}");
     }
     Ok(())
 }
@@ -309,4 +332,199 @@ pub fn delete() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// What the test server sends for a path: a Content-Length, and a body
+    /// that may be shorter (a dropped connection) or longer.
+    struct Reply {
+        length: usize,
+        body: Vec<u8>,
+    }
+
+    impl Reply {
+        fn whole(body: &[u8]) -> Self {
+            Reply {
+                length: body.len(),
+                body: body.to_vec(),
+            }
+        }
+    }
+
+    /// An HTTP server on localhost serving `replies` by path, 404 for any
+    /// other. Returns its URL and the paths asked for.
+    fn serve(replies: Vec<(&'static str, Reply)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap() <= 2 {
+                        break;
+                    }
+                }
+                log.lock().unwrap().push(path.clone());
+                let _ = match replies.iter().find(|(p, _)| *p == path) {
+                    Some((_, r)) => write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        r.length
+                    )
+                    .and_then(|()| stream.write_all(&r.body)),
+                    None => write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                };
+            }
+        });
+        (url, asked)
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vinosearch-model-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// `fetch_files` for one file pinned to `want` and `size`, from `url`.
+    fn fetch_one(url: &str, dir: &Path, want: &str, size: u64) -> Result<u64> {
+        let mut done = 0;
+        let mut last = 0;
+        fetch_files(
+            url,
+            &[("onnx/m.onnx", want, size)],
+            dir,
+            &mut done,
+            size,
+            &mut |_, d, _| last = d,
+        )?;
+        assert_eq!(last, done);
+        Ok(done)
+    }
+
+    /// Every file under `dir`, relative to it.
+    fn files(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = walkdir::WalkDir::new(dir)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().strip_prefix(dir).unwrap().display().to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    const BODY: &[u8] = b"weights weights weights";
+
+    #[test]
+    fn a_good_file_lands_and_is_not_fetched_again() {
+        let (url, asked) = serve(vec![("/onnx/m.onnx", Reply::whole(BODY))]);
+        let dir = temp("good");
+        let size = BODY.len() as u64;
+        assert_eq!(fetch_one(&url, &dir, &sha(BODY), size).unwrap(), size);
+        assert_eq!(fs::read(dir.join("onnx/m.onnx")).unwrap(), BODY);
+        assert_eq!(files(&dir), ["onnx/m.onnx"]);
+        // In place and matching: counted, not asked for.
+        assert_eq!(fetch_one(&url, &dir, &sha(BODY), size).unwrap(), size);
+        assert_eq!(*asked.lock().unwrap(), ["/onnx/m.onnx"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_file_in_place_is_replaced() {
+        let (url, asked) = serve(vec![("/onnx/m.onnx", Reply::whole(BODY))]);
+        let dir = temp("corrupt");
+        fs::create_dir_all(dir.join("onnx")).unwrap();
+        fs::write(dir.join("onnx/m.onnx"), b"bit rot").unwrap();
+        // A stale part from an earlier try is overwritten, not appended to.
+        fs::write(dir.join("onnx/m.part"), b"stale stale stale stale stale").unwrap();
+        fetch_one(&url, &dir, &sha(BODY), BODY.len() as u64).unwrap();
+        assert_eq!(fs::read(dir.join("onnx/m.onnx")).unwrap(), BODY);
+        assert_eq!(files(&dir), ["onnx/m.onnx"]);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_hash_leaves_nothing() {
+        let (url, _) = serve(vec![("/onnx/m.onnx", Reply::whole(BODY))]);
+        let dir = temp("hash");
+        let err = fetch_one(&url, &dir, &sha(b"other"), BODY.len() as u64).unwrap_err();
+        assert!(err.to_string().contains("sha256"), "{err:#}");
+        assert!(files(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_over_its_pinned_size_is_abandoned() {
+        let (url, _) = serve(vec![("/onnx/m.onnx", Reply::whole(BODY))]);
+        let dir = temp("size");
+        let err = fetch_one(&url, &dir, &sha(BODY), 4).unwrap_err();
+        assert!(
+            err.to_string().contains("more than the pinned 4"),
+            "{err:#}"
+        );
+        assert!(files(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_download_leaves_no_part_file() {
+        let (url, _) = serve(vec![(
+            "/onnx/m.onnx",
+            Reply {
+                length: 1000,
+                body: BODY.to_vec(),
+            },
+        )]);
+        let dir = temp("dropped");
+        let err = fetch_one(&url, &dir, &sha(BODY), 1000).unwrap_err();
+        assert!(err.to_string().starts_with("GET "), "{err:#}");
+        assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error() {
+        let (url, _) = serve(vec![]);
+        let dir = temp("missing");
+        let err = fetch_one(&url, &dir, &sha(BODY), 10).unwrap_err();
+        assert!(format!("{err:#}").contains("404"), "{err:#}");
+        assert!(files(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pinned_files_have_hashes_and_sizes() {
+        for (name, sha, size) in FILES.iter().chain(VISION_FILES).chain(OCR_FILES) {
+            assert_eq!(sha.len(), 64, "{name}");
+            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+            assert!(*size > 0, "{name}");
+        }
+        assert_eq!(
+            hub(REPO, REVISION),
+            format!("https://huggingface.co/{REPO}/resolve/{REVISION}")
+        );
+        assert!(total_bytes(true) > total_bytes(false));
+    }
 }
