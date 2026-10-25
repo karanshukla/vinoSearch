@@ -558,7 +558,13 @@ pub fn index_file(
             let v = emb.image(&pixels)?;
             drop(pixels);
             between(conn, emb)?;
-            let text = chunk(&emb.read_text(&img)?.join("\n"));
+            let lines = emb.read_text(&img)?;
+            let lines = if crate::ocr::text_size(&lines) >= crate::ocr::MIN_IMAGE_TEXT {
+                lines
+            } else {
+                Vec::new()
+            };
+            let text = chunk(&lines.join("\n"));
             drop(img);
             between(conn, emb)?;
             let mut chunks = vec![(0, String::new())];

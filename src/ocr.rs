@@ -24,8 +24,14 @@ use std::time::Instant;
 
 /// What this build keeps of what the model reads, in the image model tag:
 /// raised when it changes, so images are read again. 2 drops texture read
-/// as a letter or two.
-pub const READING: u32 = 2;
+/// as a letter or two; 3, images with under `MIN_IMAGE_TEXT` in all.
+pub const READING: u32 = 3;
+/// An image's lines are indexed only when they hold this many letters or
+/// digits between them. A dog photo read as five short "words" (14) matched
+/// "girl" at 0.657, over the text floor: a few characters embed close to a
+/// one-word query whatever they say. Screenshots and pages hold hundreds;
+/// a picture under this is still found by what it looks like.
+pub const MIN_IMAGE_TEXT: usize = 20;
 
 /// The detector's shapes, as (height, width): landscape, then portrait.
 /// 1088x1920 holds a 1080p screenshot unscaled; 64 ms on the NPU.
@@ -426,15 +432,23 @@ pub fn render_page(bytes: &[u8], page: usize, deadline: Instant) -> Result<RgbIm
     )
 }
 
+/// Letters and digits in `lines`, CJK counting double, as `is_text` counts.
+pub fn text_size(lines: &[String]) -> usize {
+    lines.iter().map(|l| alnum(l)).sum()
+}
+
+fn alnum(line: &str) -> usize {
+    let cjk = |c: char| matches!(c as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff);
+    line.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| if cjk(c) { 2 } else { 1 })
+        .sum()
+}
+
 /// Whether a recognised line, with its mean probability, is worth indexing.
 /// Two CJK characters make a word, so they count double.
 fn is_text(line: &str, score: f32) -> bool {
-    let cjk = |c: char| matches!(c as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff);
-    let n: usize = line
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .map(|c| if cjk(c) { 2 } else { 1 })
-        .sum();
+    let n = alnum(line);
     score >= MIN_SCORE && n >= MIN_ALNUM && (n >= SHORT || score >= SHORT_SCORE)
 }
 
@@ -844,6 +858,14 @@ mod tests {
         assert!(is_text("Request ID 7f3a9c21", 0.55));
         // Two CJK characters are a word.
         assert!(is_text("出口", 0.9));
+    }
+
+    #[test]
+    fn an_image_needs_more_than_a_few_words_of_text() {
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(text_size(&lines(&["Ooo abc", "Ill nnm", "ww"])) < MIN_IMAGE_TEXT);
+        assert!(text_size(&lines(&["Could not connect to db-prod-07"])) >= MIN_IMAGE_TEXT);
+        assert_eq!(text_size(&lines(&["出口", "a1"])), 6);
     }
 
     #[test]
