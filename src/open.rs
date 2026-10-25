@@ -31,6 +31,7 @@ impl At {
         let n = u32::try_from(line).ok().filter(|&n| n > 0)?;
         match kind {
             Kind::Text if !crate::extract::is_html(path) => Some(At::Line(n)),
+            Kind::Code => Some(At::Line(n)),
             Kind::Document if crate::extract::unit(path) == "page" => Some(At::Page(n)),
             _ => None,
         }

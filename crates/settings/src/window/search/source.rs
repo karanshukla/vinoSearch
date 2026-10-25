@@ -234,7 +234,8 @@ impl Source for Runner {
             .map(|(path, kind, score, snippet, unit, at, mtime)| Found {
                 path,
                 kind: match kind.as_str() {
-                    results::TEXT => Kind::Text,
+                    // Code comes alone, for `code:` (#110), and reads as text.
+                    results::TEXT | results::CODE => Kind::Text,
                     results::DOCUMENT => Kind::Document,
                     _ => Kind::Image,
                 },

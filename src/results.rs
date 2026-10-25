@@ -18,6 +18,7 @@ pub type Found = (String, String, f64, String, String, u32, i64);
 fn kind(h: &Hit) -> &'static str {
     match h.kind {
         Kind::Text => results::TEXT,
+        Kind::Code => results::CODE,
         Kind::Document if crate::extract::is_document(Path::new(&h.path)) => results::DOCUMENT,
         Kind::Document | Kind::Image => results::IMAGE,
     }
@@ -28,7 +29,7 @@ fn kind(h: &Hit) -> &'static str {
 /// images, best first within each.
 pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 3] = Default::default();
+    let mut groups: [Vec<Hit>; 4] = Default::default();
     for h in hits {
         if h.score < floor(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -36,7 +37,8 @@ pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> 
         let group = &mut groups[match kind(&h) {
             results::TEXT => 0,
             results::DOCUMENT => 1,
-            _ => 2,
+            results::IMAGE => 2,
+            _ => 3,
         }];
         group.push(h);
     }
@@ -60,6 +62,7 @@ pub fn found(h: Hit) -> Option<Found> {
     let unit = match kind {
         // An HTML page's lines are of its extracted text: no use to a reader.
         results::TEXT if !crate::extract::is_html(path) => "line",
+        results::CODE => "line",
         results::DOCUMENT => crate::extract::unit(path),
         _ => "",
     };

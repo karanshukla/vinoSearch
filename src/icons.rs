@@ -17,6 +17,7 @@ pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
         Kind::Text => "text-x-generic",
         Kind::Image => "image-x-generic",
         Kind::Document => "x-office-document",
+        Kind::Code => "text-x-script",
     };
     let specific = path
         .extension()

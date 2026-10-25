@@ -42,6 +42,9 @@ pub mod status {
     pub const DOCUMENT_CHUNKS: &str = "document_chunks";
     /// One chunk per image, so no chunk count.
     pub const IMAGE_FILES: &str = "image_files";
+    /// Source code (#110).
+    pub const CODE_FILES: &str = "code_files";
+    pub const CODE_CHUNKS: &str = "code_chunks";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current indexing job.
     pub const INDEXED_FILES: &str = "indexed_files";
@@ -97,5 +100,7 @@ pub mod results {
     pub const TEXT: &str = "text";
     pub const DOCUMENT: &str = "document";
     pub const IMAGE: &str = "image";
+    /// Source code, only ever alone, for a query starting `code:` (#110).
+    pub const CODE: &str = "code";
     pub const MAX: u32 = 100;
 }

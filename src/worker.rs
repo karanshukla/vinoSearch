@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 const DOCS_HOLD: Duration = Duration::from_secs(60);
 
 pub enum Job {
-    /// Best `k` chunks of each kind for a query, text first.
+    /// Best `k` chunks of each kind for a query, text first; of code alone
+    /// for one starting `code:` (#110).
     Match {
         query: String,
         k: usize,
@@ -164,10 +165,10 @@ pub fn prepare(status: &Status) -> Result<()> {
 pub fn model_changed(purged: &[(Kind, usize)]) -> Option<String> {
     let dropped = |kind: Kind| purged.iter().any(|(k, _)| *k == kind);
     let files: usize = purged.iter().map(|(_, n)| n).sum();
-    let text = dropped(Kind::Text) || dropped(Kind::Document);
+    let text = dropped(Kind::Text) || dropped(Kind::Document) || dropped(Kind::Code);
     let what = match (text, dropped(Kind::Image)) {
         (true, true) => "The models changed, so everything",
-        (true, false) => "The text model changed, so text and documents",
+        (true, false) => "The text model changed, so text, documents and code",
         (false, true) => "The image model changed, so images",
         (false, false) => return None,
     };
@@ -265,8 +266,9 @@ fn touched(status: &Status, st: &index::Stats) {
     }
 }
 
-/// Best `k` chunks of each kind for `query`, text first: what a Match job
-/// answers, and what `vinosearch eval` ranks (#107).
+/// Best `k` chunks of each kind for `query`, text first, or of code alone
+/// for one starting `code:` (#110): what a Match job answers, and what
+/// `vinosearch eval` ranks (#107).
 pub(crate) fn matches(
     conn: &rusqlite::Connection,
     emb: &mut Embedder,
@@ -274,11 +276,12 @@ pub(crate) fn matches(
     query: &str,
     k: usize,
 ) -> Result<Vec<Hit>> {
-    let q = emb.query(query)?;
-    let words = index::Words::find(conn, query);
+    let (text, kinds) = index::scope(query);
+    let q = emb.query_for(text, kinds)?;
+    let words = index::Words::find(conn, text);
     let mut hits = Vec::new();
-    for kind in [Kind::Text, Kind::Document, Kind::Image] {
-        hits.extend(index::search(conn, vectors, &q, words.as_ref(), kind, k)?);
+    for kind in kinds {
+        hits.extend(index::search(conn, vectors, &q, words.as_ref(), *kind, k)?);
     }
     Ok(hits)
 }

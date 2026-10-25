@@ -25,13 +25,10 @@ pub(crate) const MAX_FILE_BYTES: u64 = 1 << 20;
 /// about 5,000 printed pages, ~18,000 chunks.
 pub(crate) const MAX_TEXT_BYTES: u64 = 16 << 20;
 /// Text files that may be books, held to MAX_TEXT_BYTES instead of
-/// MAX_FILE_BYTES. Code that size is generated.
+/// MAX_FILE_BYTES.
 const PROSE: &[&str] = &["txt", "md", "rst", "org", "tex"];
-const EXTENSIONS: &[&str] = &[
-    "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
-    "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "htm", "css", "scss",
-    "sql", "lua", "zig", "nix", "cs", "php",
-];
+/// Prose and markup. Code is a kind of its own, in `code::EXTENSIONS` (#110).
+pub(crate) const TEXT_EXTENSIONS: &[&str] = &["md", "txt", "rst", "org", "tex", "html", "htm"];
 // No config formats (toml, yaml, json, ini, conf, ...): they are where
 // credentials live, and the index is not encrypted yet (#4).
 /// Directories that are always build output, caches, generated reports or
@@ -70,9 +67,6 @@ const SKIP_DIRS: &[&str] = &[
 ];
 /// Directory name prefixes with the same meaning (`cmake-build-debug`, ...).
 const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
-/// Minified or bundled files: generated, one enormous line, never what a
-/// search is for.
-const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
 use vinosearch_shared::limits::MAX_IMAGE_BYTES;
 /// Documents are parsed whole in memory too, once for each run of parts.
@@ -88,15 +82,19 @@ pub enum Kind {
     /// from an image or scanned page by OCR (#106). Scored like text, but
     /// searched apart so neither crowds the other out.
     Document = 2,
+    /// Source code (#110): on only when asked for, and searched only by
+    /// queries starting `code:`.
+    Code = 3,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Text, Kind::Document, Kind::Image];
+    pub const ALL: [Kind; 4] = [Kind::Text, Kind::Document, Kind::Image, Kind::Code];
 
     fn from_db(v: i64) -> Self {
         match v {
             1 => Kind::Image,
             2 => Kind::Document,
+            3 => Kind::Code,
             _ => Kind::Text,
         }
     }
@@ -105,7 +103,7 @@ impl Kind {
     fn max_bytes(self, path: &Path) -> u64 {
         match self {
             Kind::Text if is_prose(path) => MAX_TEXT_BYTES,
-            Kind::Text => MAX_FILE_BYTES,
+            Kind::Text | Kind::Code => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document => MAX_DOCUMENT_BYTES,
         }
@@ -117,7 +115,7 @@ impl Kind {
     /// build's queries without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
-            Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
+            Kind::Text | Kind::Document | Kind::Code => crate::model::REVISION.to_owned(),
             Kind::Image => format!(
                 "{}+{}/{}+ocr:{}/{}",
                 crate::model::REVISION,
@@ -134,16 +132,30 @@ impl Kind {
             Kind::Text => "model.text",
             Kind::Document => "model.document",
             Kind::Image => "model.image",
+            Kind::Code => "model.code",
         }
     }
 }
 
-/// The file types indexed: text always, images by extension and documents
-/// while they are on (#73, #55).
+/// The file types indexed: text always, images by extension, documents and
+/// code while they are on (#73, #55, #110).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileTypes {
     images: Vec<String>,
     documents: bool,
+    code: bool,
+    ignores: SharedIgnores,
+}
+
+/// The ignore files read, shared by a `FileTypes` and its clones; no part
+/// of what makes two equal.
+#[derive(Debug, Clone, Default)]
+struct SharedIgnores(std::sync::Arc<crate::code::Ignores>);
+
+impl PartialEq for SharedIgnores {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl FileTypes {
@@ -151,13 +163,19 @@ impl FileTypes {
         Ok(Self {
             images: formats.image_extensions()?,
             documents: formats.documents_enabled(),
+            code: formats.code_enabled(),
+            ignores: SharedIgnores::default(),
         })
     }
 
-    /// The kind `path` is indexed as, by its name; None if it is not.
+    /// The kind `path` is indexed as, by its name (and for code, the ignore
+    /// files above it); None if it is not.
     pub fn kind(&self, path: &Path) -> Option<Kind> {
         if text_file(path) {
             return Some(Kind::Text);
+        }
+        if crate::code::is_code(path) {
+            return (self.code && !self.ignores.0.left_out(path)).then_some(Kind::Code);
         }
         if self.documents && crate::extract::is_document(path) {
             return Some(Kind::Document);
@@ -287,7 +305,77 @@ pub fn open(path: &Path) -> Result<Connection> {
          END;",
     )?;
     words_table(&conn)?;
+    code_apart(&conn)?;
     Ok(conn)
+}
+
+/// Code indexed as text before it was a kind of its own (#110), moved over
+/// once: relabelled, not embedded again, since the model and the text it
+/// embedded are the same. What indexing code leaves out now goes, though:
+/// files git ignores or named as generated go at the next check of their
+/// root, as anything no longer wanted does; those holding a key or token,
+/// or generated or minified by their content, go here, since nothing reads
+/// an unchanged file again. With code off (the default) the rest go at the
+/// next `purge_types`, as images do when turned off.
+fn code_apart(conn: &Connection) -> Result<()> {
+    const KEY: &str = "kind.code";
+    let done = |c: &Connection| -> rusqlite::Result<bool> {
+        c.query_row("SELECT count(*) FROM meta WHERE key = ?1", [KEY], |r| {
+            r.get(0)
+        })
+    };
+    if done(conn)? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if done(&tx)? {
+        return Ok(());
+    }
+    // Files with text chunks, of a code extension.
+    let mut files: Vec<(i64, String)> = tx
+        .prepare(
+            "SELECT DISTINCT f.id, f.path FROM files f JOIN chunks c ON c.file_id = f.id
+             WHERE c.kind = ?1",
+        )?
+        .query_map([Kind::Text as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    files.retain(|(_, p)| crate::code::is_code(Path::new(p)));
+    let mut text = tx.prepare("SELECT text FROM chunks WHERE file_id = ?1 ORDER BY id")?;
+    let mut relabel = tx.prepare("UPDATE chunks SET kind = ?1 WHERE file_id = ?2")?;
+    // So loaded Vectors read these chunks' new kind (`Vectors::catch_up`).
+    let mut log =
+        tx.prepare("INSERT INTO chunk_log (chunk_id) SELECT id FROM chunks WHERE file_id = ?1")?;
+    let mut dropped = Vec::new();
+    for (id, path) in &files {
+        let all: String = text
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if let Some(why) = crate::code::unwanted(&all) {
+            eprintln!("dropping {path} from the index: {why}");
+            dropped.push(*id);
+            continue;
+        }
+        relabel.execute(params![Kind::Code as i64, id])?;
+        log.execute([id])?;
+    }
+    drop((text, relabel, log));
+    for id in &dropped {
+        // Its chunks first, so they aren't handed to a copy, then the copies.
+        tx.execute("DELETE FROM chunks WHERE file_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM files WHERE sha256 = (SELECT sha256 FROM files WHERE id = ?1) OR id = ?1",
+            [id],
+        )?;
+    }
+    tx.execute("INSERT INTO meta (key, value) VALUES (?1, '1')", [KEY])?;
+    tx.commit()?;
+    if !files.is_empty() {
+        eprintln!(
+            "{} code files are a kind of their own now (#110): searched with code: while code is on, dropped while it's off",
+            files.len() - dropped.len()
+        );
+    }
+    Ok(())
 }
 
 /// A chunk's file name, from `files f`: what follows the last `/`.
@@ -363,15 +451,9 @@ fn is_prose(path: &Path) -> bool {
 }
 
 fn text_file(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    !SKIP_FILE_SUFFIXES.iter().any(|s| name.ends_with(s))
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| TEXT_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 pub(crate) fn skipped_dir(name: &str) -> bool {
@@ -548,7 +630,7 @@ pub fn index_file<E: Embed>(
         return Ok(Outcome::Unchanged);
     }
     let read = match kind {
-        Kind::Text => fs::read_to_string(path).map(String::into_bytes),
+        Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
         Kind::Image | Kind::Document => fs::read(path),
     };
     let Ok(bytes) = read else {
@@ -596,8 +678,18 @@ pub fn index_file<E: Embed>(
     }
     let title = title_of(path);
     let (first, vectors, kinds) = match kind {
-        Kind::Text => {
+        Kind::Text | Kind::Code => {
             let text = String::from_utf8(bytes).expect("read as a string");
+            // Kept as a row with no chunks, so it isn't read again until it
+            // changes.
+            if let Some(why) = (kind == Kind::Code)
+                .then(|| crate::code::unwanted(&text))
+                .flatten()
+            {
+                eprintln!("skip {}: {why}", path.display());
+                record(conn)?;
+                return Ok(Outcome::Unreadable { no_decoder: false });
+            }
             let first = text_parts(path, &text, 0, PARTS_AT_ONCE);
             let vectors = embed_chunks(conn, emb, &title, &first.chunks, between)?;
             let kinds = vec![kind; first.chunks.len()];
@@ -794,6 +886,8 @@ fn title_of(path: &Path) -> String {
 fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
     let chunks = if crate::extract::is_html(path) {
         chunk(&crate::extract::html(text))
+    } else if crate::code::is_code(path) {
+        crate::code::chunk(text)
     } else {
         chunk(text)
     };
@@ -940,7 +1034,7 @@ pub fn index_rest<E: Embed>(
     let hash: Option<Vec<u8>> =
         conn.query_row("SELECT sha256 FROM files WHERE id = ?1", [id], |r| r.get(0))?;
     let (kind, bytes) = match (types.kind(path), fs::read(path)) {
-        (Some(kind @ (Kind::Text | Kind::Document)), Ok(bytes))
+        (Some(kind @ (Kind::Text | Kind::Document | Kind::Code)), Ok(bytes))
             if hash.as_deref() == Some(&Sha256::digest(&bytes)[..]) =>
         {
             (kind, bytes)
@@ -1467,11 +1561,13 @@ pub fn is_indexed(conn: &Connection, path: &str) -> Result<bool> {
         .is_some())
 }
 
-/// The kind `path` is read aloud as, by its name: text or a document,
-/// never an image. None for anything else.
+/// The kind `path` is read aloud as, by its name: text, code or a
+/// document, never an image. None for anything else.
 pub fn readable_kind(path: &Path) -> Option<Kind> {
     if text_file(path) {
         Some(Kind::Text)
+    } else if crate::code::is_code(path) {
+        Some(Kind::Code)
     } else if crate::extract::is_document(path) {
         Some(Kind::Document)
     } else {
@@ -1514,8 +1610,8 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
 /// A file counts under the kind of its chunks, an image's text (#106) under
 /// images, so one recorded without any (a photo with no decoder) counts
 /// under none.
-pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 3]> {
-    let mut out = [(0, 0); 3];
+pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 4]> {
+    let mut out = [(0, 0); 4];
     let mut stmt = conn.prepare(
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM chunks i WHERE i.file_id = c.file_id AND i.kind = ?1)
                 THEN ?1 ELSE c.kind END AS k,
@@ -1941,6 +2037,16 @@ fn ranked(conn: &Connection, terms: &[String]) -> rusqlite::Result<Option<Vec<i6
         .map(Some)
 }
 
+/// What `query` searches: code alone, for a query starting `code:` (#110),
+/// or everything but code, text first; with the query to embed and look up,
+/// less its `code:`.
+pub fn scope(query: &str) -> (&str, &'static [Kind]) {
+    match crate::code::code_query(query) {
+        Some(q) => (q, &[Kind::Code]),
+        None => (query, &[Kind::Text, Kind::Document, Kind::Image]),
+    }
+}
+
 /// Cosine against every chunk of `kind` (embeddings are unit length), best
 /// `k`. With `words`, chunks holding them score higher too (#104): by
 /// WORDS_BOOST, or for an identifier ahead of everything, best match first.
@@ -2147,7 +2253,7 @@ mod tests {
         file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
         let counts = counts_by_kind(&conn).unwrap();
         // Kind::ALL's order: text, documents, images.
-        assert_eq!(counts, [(1, 1), (1, 2), (1, 3)]);
+        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0)]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2492,10 +2598,16 @@ mod tests {
         for d in ["src", "bin", "out", "docs", "covered"] {
             assert!(!skipped_dir(d), "{d}");
         }
-        assert!(!text_file(Path::new("app.min.js")));
-        assert!(!text_file(Path::new("vendor.bundle.js")));
-        assert!(text_file(Path::new("app.js")));
-        assert!(text_file(Path::new("README.md")));
+        let code = FileTypes {
+            code: true,
+            ..FileTypes::default()
+        };
+        assert_eq!(code.kind(Path::new("/p/app.min.js")), None);
+        assert_eq!(code.kind(Path::new("/p/vendor.bundle.js")), None);
+        assert_eq!(code.kind(Path::new("/p/app.js")), Some(Kind::Code));
+        assert_eq!(code.kind(Path::new("/p/README.md")), Some(Kind::Text));
+        // Code is off unless turned on (#110).
+        assert_eq!(FileTypes::default().kind(Path::new("/p/app.js")), None);
     }
 
     #[test]
@@ -2853,7 +2965,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(counts_by_kind(&conn).unwrap(), [(2, 3), (0, 0), (1, 1)]);
+        assert_eq!(
+            counts_by_kind(&conn).unwrap(),
+            [(2, 3), (0, 0), (1, 1), (0, 0)]
+        );
         assert_eq!(counts(&conn).unwrap(), (4, 4));
         fs::remove_dir_all(&dir).unwrap();
     }

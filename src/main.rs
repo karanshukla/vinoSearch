@@ -1,3 +1,4 @@
+mod code;
 mod embed;
 mod estimate;
 mod eval;
@@ -564,13 +565,21 @@ fn run(cli: Cli) -> Result<bool> {
             index::purge_types(&conn, &s.types)?;
             index::purge_other_models(&conn)?;
             let t0 = Instant::now();
-            let q = emb.query(&query)?;
+            let (text, kinds) = index::scope(&query);
+            let q = emb.query_for(text, kinds)?;
             let t1 = Instant::now();
             let vectors = index::Vectors::load(&conn)?;
-            let words = index::Words::find(&conn, &query);
+            let words = index::Words::find(&conn, text);
             let mut hits = Vec::new();
-            for kind in [index::Kind::Text, index::Kind::Document, index::Kind::Image] {
-                hits.extend(index::search(&conn, &vectors, &q, words.as_ref(), kind, n)?);
+            for kind in kinds {
+                hits.extend(index::search(
+                    &conn,
+                    &vectors,
+                    &q,
+                    words.as_ref(),
+                    *kind,
+                    n,
+                )?);
             }
             eprintln!(
                 "query {:.1} ms, search {:.1} ms",

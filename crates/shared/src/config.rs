@@ -20,6 +20,10 @@
 //!
 //! [formats.documents]
 //! enabled = true
+//!
+//! [formats.code]
+//! enabled = true
+//! min_score = 0.72
 //! ```
 //!
 //! A missing file is the defaults, and a missing `exclude` is
@@ -53,6 +57,11 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
 /// Text results scoring below this are left out. An off-topic query against a
 /// code index topped out at 0.60; real matches scored 0.72 to 0.83.
 pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
+/// Code results (queries starting `code:`, #110) scoring below this are
+/// left out. The code retrieval prompt scores higher than the search one:
+/// on ovfetch's source (251 chunks), the right function for 12 queries
+/// scored 0.76 to 0.92 and the best match for 4 unrelated ones 0.64 to 0.70.
+pub const DEFAULT_CODE_MIN_SCORE: f32 = 0.72;
 /// Images score lower against a text query than text does. On Flickr30k's 1k
 /// test images, 0.60 showed images for 85% of off-topic queries ("bills",
 /// "tax return") and 0.63 for 38%, while 99.8% of captions still found their
@@ -119,6 +128,7 @@ pub struct Formats {
     pub text: TextFormat,
     pub images: ImageFormat,
     pub documents: DocumentFormat,
+    pub code: CodeFormat,
 }
 
 /// Text is always indexed for now.
@@ -152,6 +162,19 @@ pub struct DocumentFormat {
     pub enabled: Option<bool>,
 }
 
+/// Source code (#110), searched apart from everything else: only queries
+/// starting `code:` find it, and they find nothing else. Files git ignores,
+/// vendored and generated code, and code holding a key or token are left out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodeFormat {
+    /// Index source code. Off by default: on a developer's home folder code
+    /// is most of the index, and it's searched only with `code:` [default: false].
+    pub enabled: Option<bool>,
+    /// Results scoring below this are left out [default: 0.72].
+    pub min_score: Option<f32>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -182,6 +205,14 @@ impl Formats {
 
     pub fn documents_enabled(&self) -> bool {
         self.documents.enabled.unwrap_or(false)
+    }
+
+    pub fn code_enabled(&self) -> bool {
+        self.code.enabled.unwrap_or(false)
+    }
+
+    pub fn code_min_score(&self) -> Result<f32> {
+        min_score(self.code.min_score, DEFAULT_CODE_MIN_SCORE)
     }
 
     pub fn text_min_score(&self) -> Result<f32> {
@@ -323,6 +354,13 @@ impl Config {
             "enabled",
             f.documents.enabled.map(toml_edit::value),
         );
+        set(
+            &mut doc,
+            "code",
+            "enabled",
+            f.code.enabled.map(toml_edit::value),
+        );
+        set(&mut doc, "code", "min_score", f.code.min_score.map(score));
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
         let tmp = path.with_extension("toml.tmp");
@@ -612,6 +650,18 @@ mod tests {
         assert!(c.formats.text_min_score().is_err());
         // Text can't be turned off yet.
         assert!(toml::from_str::<Config>("[formats.text]\nenabled = false\n").is_err());
+        // Code is opt-in (#110).
+        assert!(!Config::default().formats.code_enabled());
+        assert_eq!(
+            Config::default().formats.code_min_score().unwrap(),
+            DEFAULT_CODE_MIN_SCORE
+        );
+        let c: Config =
+            toml::from_str("[formats.code]\nenabled = true\nmin_score = 0.7\n").unwrap();
+        assert!(c.formats.code_enabled());
+        assert_eq!(c.formats.code_min_score().unwrap(), 0.7);
+        let c: Config = toml::from_str("[formats.code]\nmin_score = -2\n").unwrap();
+        assert!(c.formats.code_min_score().is_err());
     }
 
     #[test]
@@ -628,12 +678,18 @@ mod tests {
         c.formats.images.enabled = Some(true);
         c.formats.text.min_score = Some(0.7);
         c.formats.documents.enabled = Some(true);
+        c.formats.code.enabled = Some(true);
+        c.formats.code.min_score = Some(0.6);
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("enabled = true # big download"), "{text}");
         assert!(text.contains("min_score = 0.7\n"), "{text}");
         assert!(
             text.contains("[formats.documents]\nenabled = true"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[formats.code]\nenabled = true\nmin_score = 0.6"),
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), c);

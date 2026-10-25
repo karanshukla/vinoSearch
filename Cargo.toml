@@ -33,6 +33,8 @@ sha2 = "0.10"
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ureq = "3"
 walkdir = "2.5"
+# .gitignore and .ignore files, for code (#110).
+ignore = "0.4"
 zbus = "5"
 toml = "1.1"
 futures-channel = "0.3"
