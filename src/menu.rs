@@ -51,7 +51,7 @@ fn launcher(given: Option<&str>, on_path: impl Fn(&str) -> bool) -> Result<Vec<S
         )
 }
 
-fn on_path(name: &str) -> bool {
+pub(crate) fn on_path(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| {
         std::env::split_paths(&p).any(|d| {
             use std::os::unix::fs::PermissionsExt;

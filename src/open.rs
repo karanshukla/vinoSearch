@@ -314,7 +314,32 @@ fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
     app_argv(&default_entry(file, at)?, file, at)
 }
 
-fn spawn(argv: &[String]) -> std::io::Result<()> {
+/// `argv` in a scope of its own when this runs as a systemd unit, so the app
+/// isn't in the service's cgroup and killed when the service restarts.
+fn detached(argv: Vec<String>, in_unit: bool) -> Vec<String> {
+    if !in_unit {
+        return argv;
+    }
+    [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--",
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain(argv)
+    .collect()
+}
+
+fn in_unit() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some() && crate::menu::on_path("systemd-run")
+}
+
+fn spawn(argv: Vec<String>) -> std::io::Result<()> {
+    let argv = detached(argv, in_unit());
     Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
@@ -326,16 +351,17 @@ fn spawn(argv: &[String]) -> std::io::Result<()> {
 /// Looking up the default app runs `xdg-mime`, so call this off the bus.
 pub fn open(file: &Path, at: Option<At>, editor: Option<&str>) {
     if let Some(argv) = at.and_then(|at| argv_at(file, at, editor)) {
-        match spawn(&argv) {
+        let program = argv[0].clone();
+        match spawn(argv) {
             Ok(()) => return,
-            Err(e) => eprintln!("{}: {e}; opening with xdg-open", argv[0]),
+            Err(e) => eprintln!("{program}: {e}; opening with xdg-open"),
         }
     }
     xdg_open(file);
 }
 
 pub fn xdg_open(target: &Path) {
-    if let Err(e) = Command::new("xdg-open").arg(target).spawn() {
+    if let Err(e) = spawn(vec!["xdg-open".into(), target.display().to_string()]) {
         eprintln!("xdg-open {}: {e}", target.display());
     }
 }
@@ -457,6 +483,32 @@ mod tests {
         );
         assert_eq!(unescape(r"a\sb\\c"), r"a b\c");
         assert!(exec_words("\"unterminated %U").is_none());
+    }
+
+    #[test]
+    fn a_service_opens_apps_in_a_scope_of_their_own() {
+        let argv = vec![
+            "kwrite".to_owned(),
+            "--line".into(),
+            "42".into(),
+            "/a b.md".into(),
+        ];
+        assert_eq!(detached(argv.clone(), false), argv);
+        assert_eq!(
+            detached(argv, true),
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--collect",
+                "--quiet",
+                "--",
+                "kwrite",
+                "--line",
+                "42",
+                "/a b.md"
+            ]
+        );
     }
 
     #[test]
