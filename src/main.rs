@@ -1,10 +1,12 @@
 mod embed;
+mod estimate;
 mod extract;
 mod icons;
 mod index;
 mod krunner;
 mod menu;
 mod model;
+mod ocr;
 mod open;
 mod parity;
 mod power;
@@ -48,8 +50,22 @@ enum Command {
     Doctor,
     /// Download the embedding model, checking every file against its pinned SHA-256.
     FetchModel,
-    /// Index text files under each path. Unchanged files are skipped.
-    Index { paths: Vec<PathBuf> },
+    /// Index text files under each path. Unchanged files are skipped. Says first how long it
+    /// will take and, at a terminal, asks.
+    Index {
+        paths: Vec<PathBuf>,
+        /// Don't ask before indexing.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Say how long indexing each path would take and how much index it would make, from a
+    /// walk that reads no file contents, and which subfolders take longest.
+    Estimate {
+        paths: Vec<PathBuf>,
+        /// One JSON object per path, for the settings window.
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve KRunner, GNOME Shell and the settings app over D-Bus, or install/remove the service.
     Krunner {
         /// Write the service files and the running desktop's search place (KRunner on Plasma,
@@ -99,6 +115,9 @@ enum Command {
         #[arg(long)]
         min_score: Option<f32>,
     },
+    /// Print the text OCR reads in an image, or a PDF's rendered pages, as
+    /// indexing reads it (#106).
+    ReadText { path: PathBuf },
     /// Parse the document on stdin as PATH's type and write its chunks to
     /// stdout as JSON, under memory and CPU limits. The indexer runs this on
     /// itself for every document (#84).
@@ -132,6 +151,7 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
         openvino::Core::new()?,
         &dir,
         &model::vision_dir()?,
+        &model::ocr_dir()?,
         device,
         &cache,
     )?;
@@ -235,6 +255,101 @@ pub(crate) fn snippet(text: &str) -> String {
     }
 }
 
+/// Subfolders `estimate` names as taking longest.
+const BIGGEST_FOLDERS: usize = 5;
+
+/// What indexing each of `paths` would cost, leaving out files the index
+/// already has unchanged.
+fn estimates(paths: &[PathBuf], s: &Settings) -> Result<Vec<estimate::Estimate>> {
+    let db = index::default_db()?;
+    // Read-only, and not created just to look: an estimate must not write
+    // to the index or leave an empty one behind.
+    let conn = if db.exists() {
+        Some(rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?)
+    } else {
+        None
+    };
+    paths
+        .iter()
+        .map(|p| {
+            let root = index::resolve_root(p, &s.excludes)?;
+            let known = match &conn {
+                Some(c) => index::stamps_under(c, &root)?,
+                None => Default::default(),
+            };
+            estimate::estimate(&root, &s.excludes, &s.types, &known, BIGGEST_FOLDERS)
+        })
+        .collect()
+}
+
+fn print_rates_note(device: &str) {
+    if let Some(note) = estimate::rates_note(device) {
+        eprintln!("{note}");
+    }
+}
+
+/// Say what indexing `paths` will cost and, at a terminal and without
+/// `yes`, ask. False if the answer was no.
+fn confirm_index(paths: &[PathBuf], s: &Settings, yes: bool) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let ests = estimates(paths, s)?;
+    let ask = !yes && std::io::stdin().is_terminal();
+    let mut total = estimate::Estimate::default();
+    for est in &ests {
+        for (t, add) in total.kinds.iter_mut().zip(&est.kinds) {
+            t.files += add.files;
+            t.bytes += add.bytes;
+            t.chunks += add.chunks;
+        }
+        total.up_to_date += est.up_to_date;
+    }
+    if ask && total.secs() >= 60.0 {
+        for est in &ests {
+            if !est.folders.is_empty() {
+                eprintln!("Longest to index under {}:", est.root.display());
+            }
+            for (dir, secs, files) in &est.folders {
+                eprintln!(
+                    "  {}  {}",
+                    dir.display(),
+                    estimate::folder_summary(*secs, *files)
+                );
+            }
+        }
+        eprintln!(
+            "Leave one out with `exclude` in config.toml or the settings window's Folders page."
+        );
+        print_rates_note(&s.device);
+    }
+    let line = match ests.as_slice() {
+        [one] => format!("{}: {}", one.root.display(), one.summary()),
+        _ => {
+            for est in &ests {
+                eprintln!("{}: {}", est.root.display(), est.summary());
+            }
+            format!("All together: {}", total.summary())
+        }
+    };
+    if !ask || total.files() == 0 {
+        eprintln!("{line}");
+        return Ok(true);
+    }
+    eprint!("{line}. Continue? [Y/n] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
+        eprintln!();
+        return Ok(false);
+    }
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ))
+}
+
 fn run(cli: Cli) -> Result<bool> {
     // Before the settings: a broken config file must not stop every document.
     if let Command::Extract { path } = &cli.command {
@@ -264,9 +379,15 @@ fn run(cli: Cli) -> Result<bool> {
             eprintln!("model ready: {}", model::default_dir()?.display());
             Ok(true)
         }
-        Command::Index { paths } => {
+        Command::Index { paths, yes } => {
             if paths.is_empty() {
                 bail!("give at least one path to index");
+            }
+            if !confirm_index(&paths, &s, yes)? {
+                eprintln!(
+                    "Nothing indexed. Add folders later with vinosearch index DIR or the settings window."
+                );
+                return Ok(true);
             }
             let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
             let mut conn = index::open(&index::default_db()?)?;
@@ -316,6 +437,29 @@ fn run(cli: Cli) -> Result<bool> {
                         config::HEIF_CONVERT_PACKAGES
                     );
                 }
+            }
+            Ok(true)
+        }
+        Command::Estimate { paths, json } => {
+            if paths.is_empty() {
+                bail!("give at least one path to estimate");
+            }
+            for est in estimates(&paths, &s)? {
+                if json {
+                    println!("{}", est.to_json(&s.device));
+                    continue;
+                }
+                println!("{}: {}", est.root.display(), est.summary());
+                for (dir, secs, files) in &est.folders {
+                    println!(
+                        "  {}  {}",
+                        dir.display(),
+                        estimate::folder_summary(*secs, *files)
+                    );
+                }
+            }
+            if !json {
+                print_rates_note(&s.device);
             }
             Ok(true)
         }
@@ -381,6 +525,9 @@ fn run(cli: Cli) -> Result<bool> {
                     continue;
                 }
                 let at = match h.kind {
+                    index::Kind::Document if !extract::is_document(Path::new(&h.path)) => {
+                        " (text in the image)".to_owned()
+                    }
                     index::Kind::Document => {
                         format!(", {} {}", extract::unit(Path::new(&h.path)), h.line)
                     }
@@ -394,6 +541,48 @@ fn run(cli: Cli) -> Result<bool> {
                 );
                 if !h.copies.is_empty() {
                     println!("       same as: {}", h.copies.join(", "));
+                }
+            }
+            Ok(true)
+        }
+        Command::ReadText { path } => {
+            let prefix = runtime::default_prefix(cli.openvino_dir)?;
+            runtime::load(&prefix)?;
+            let mut core = openvino::Core::new()?;
+            let t0 = Instant::now();
+            let mut ocr = ocr::Ocr::new(&mut core, &model::ocr_dir()?, &s.device, &cache_dir()?)?;
+            eprintln!(
+                "ocr ready on {} in {:.1} s",
+                ocr.device,
+                t0.elapsed().as_secs_f64()
+            );
+            let bytes = std::fs::read(&path)?;
+            let deadline = Instant::now() + ocr::SCAN_WALL;
+            let pages = if extract::is_document(&path) {
+                ocr::pdf_pages(&bytes, deadline)?.min(ocr::MAX_SCAN_PAGES)
+            } else {
+                1
+            };
+            for page in 1..=pages {
+                let img = if extract::is_document(&path) {
+                    ocr::render_page(&bytes, page, deadline)?
+                } else {
+                    vision::load(&bytes)?
+                };
+                let t = Instant::now();
+                let lines = ocr.read(&img, 1.0)?;
+                eprintln!(
+                    "{}x{}: {} lines in {:.0} ms",
+                    img.width(),
+                    img.height(),
+                    lines.len(),
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+                if pages > 1 {
+                    println!("--- page {page}");
+                }
+                for l in lines {
+                    println!("{l}");
                 }
             }
             Ok(true)

@@ -4304,6 +4304,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui_kittest",
+ "serde_json",
  "vinosearch-shared",
  "zbus",
 ]

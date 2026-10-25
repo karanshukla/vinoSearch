@@ -78,8 +78,9 @@ pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 pub enum Kind {
     Text = 0,
     Image = 1,
-    /// Text extracted from a PDF, Office file or spreadsheet (#55). Scored
-    /// like text, but searched apart so neither crowds the other out.
+    /// Text extracted from a PDF, Office file or spreadsheet (#55), or read
+    /// from an image or scanned page by OCR (#106). Scored like text, but
+    /// searched apart so neither crowds the other out.
     Document = 2,
 }
 
@@ -103,17 +104,19 @@ impl Kind {
     }
 
     /// What made this kind's vectors, as `meta` records it (#80): the text
-    /// model's revision, and for images the vision encoder's and the
-    /// soft-token count too. Vectors with another tag score against this
+    /// model's revision, and for images the vision encoder's, the soft-token
+    /// count and the OCR model's, which reads their text (#106). Vectors with another tag score against this
     /// build's queries without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
             Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
             Kind::Image => format!(
-                "{}+{}/{}",
+                "{}+{}/{}+ocr:{}/{}",
                 crate::model::REVISION,
                 crate::model::VISION_REVISION,
-                crate::vision::SOFT_TOKENS
+                crate::vision::SOFT_TOKENS,
+                crate::model::OCR_REVISION,
+                crate::ocr::READING,
             ),
         }
     }
@@ -559,7 +562,11 @@ pub fn index_file(
         record(conn)?;
         return Ok(Outcome::Duplicate);
     }
-    let (chunks, vectors) = match kind {
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (chunks, vectors, kinds) = match kind {
         Kind::Text => {
             let text = String::from_utf8(bytes).expect("read as a string");
             let chunks = if crate::extract::is_html(path) {
@@ -567,16 +574,9 @@ pub fn index_file(
             } else {
                 chunk(&text)
             };
-            let title = path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for (_, c) in &chunks {
-                vectors.extend(emb.documents(&[document_text(&title, c)])?);
-                between(conn, emb)?;
-            }
-            (chunks, vectors)
+            let vectors = embed_chunks(conn, emb, &title, &chunks, between)?;
+            let kinds = vec![kind; chunks.len()];
+            (chunks, vectors, kinds)
         }
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
@@ -586,40 +586,56 @@ pub fn index_file(
             // restart, and a stop while embedding must leave it to be indexed
             // next time, so the record goes once it parses.
             record(conn)?;
-            let chunks = document_chunks(path, &bytes, crate::extract::chunks_in_child);
-            if !chunks.is_empty() {
+            let mut chunks = document_chunks(path, &bytes, crate::extract::chunks_in_child);
+            // No text layer: a scan, read by OCR when it can be (#106).
+            let scan = chunks.is_empty() && is_scannable(path) && emb.can_read_text();
+            if !chunks.is_empty() || scan {
                 conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
             }
-            let title = path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for (_, c) in &chunks {
-                vectors.extend(emb.documents(&[document_text(&title, c)])?);
-                between(conn, emb)?;
+            if scan {
+                chunks = scan_chunks(conn, emb, path, &bytes, between)?;
             }
-            (chunks, vectors)
+            let vectors = embed_chunks(conn, emb, &title, &chunks, between)?;
+            let kinds = vec![kind; chunks.len()];
+            (chunks, vectors, kinds)
         }
-        // One chunk, with no text and line 0, from the pixels alone. One that
-        // doesn't decode keeps a row with no chunks, like a document with no
-        // text, so it isn't decoded again at every check.
+        // A chunk with no text and line 0 from the pixels, then the text OCR
+        // reads in them as document chunks (#106). One that doesn't decode
+        // keeps a row with no chunks, like a document with no text, so it
+        // isn't decoded again at every check.
         Kind::Image => {
-            let pixels =
-                // From the bytes hashed, so the file can't change in between.
-                match crate::vision::load(&bytes).and_then(|img| crate::vision::prepare(&img)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("skip {}: {e:#}", path.display());
-                        record(conn)?;
-                        return Ok(Outcome::Unreadable {
-                            no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
-                        });
-                    }
-                };
+            // From the bytes hashed, so the file can't change in between.
+            let decoded = crate::vision::load(&bytes)
+                .and_then(|img| Ok((crate::vision::prepare(&img)?, img)));
+            let (pixels, img) = match decoded {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("skip {}: {e:#}", path.display());
+                    record(conn)?;
+                    return Ok(Outcome::Unreadable {
+                        no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
+                    });
+                }
+            };
             let v = emb.image(&pixels)?;
+            drop(pixels);
             between(conn, emb)?;
-            (vec![(0, String::new())], vec![v])
+            let lines = emb.read_text(&img)?;
+            let lines = if crate::ocr::text_size(&lines) >= crate::ocr::MIN_IMAGE_TEXT {
+                lines
+            } else {
+                Vec::new()
+            };
+            let text = chunk(&lines.join("\n"));
+            drop(img);
+            between(conn, emb)?;
+            let mut chunks = vec![(0, String::new())];
+            let mut vectors = vec![v];
+            vectors.extend(embed_chunks(conn, emb, &title, &text, between)?);
+            let mut kinds = vec![Kind::Image];
+            kinds.extend(std::iter::repeat_n(Kind::Document, text.len()));
+            chunks.extend(text);
+            (chunks, vectors, kinds)
         }
     };
 
@@ -630,14 +646,89 @@ pub fn index_file(
         params![key, mtime, size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
-    for ((line, text), v) in chunks.iter().zip(&vectors) {
+    for (((line, text), v), kind) in chunks.iter().zip(&vectors).zip(&kinds) {
         tx.execute(
             "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, *line as i64, text, to_blob(v), kind as i64],
+            params![file_id, *line as i64, text, to_blob(v), *kind as i64],
         )?;
     }
     tx.commit()?;
     Ok(Outcome::Embedded(chunks.len()))
+}
+
+/// Each of `chunks` embedded as a document titled `title`, letting `between`
+/// run after each.
+fn embed_chunks(
+    conn: &Connection,
+    emb: &mut Embedder,
+    title: &str,
+    chunks: &[(usize, String)],
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut vectors = Vec::with_capacity(chunks.len());
+    for (_, c) in chunks {
+        vectors.extend(emb.documents(&[document_text(title, c)])?);
+        between(conn, emb)?;
+    }
+    Ok(vectors)
+}
+
+/// A document with no text layer that OCR can read: a PDF, with poppler there
+/// to render its pages.
+fn is_scannable(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        && crate::ocr::poppler()
+}
+
+/// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
+/// up to `ocr::MAX_SCAN_PAGES` and within `ocr::SCAN_WALL` of rendering.
+/// The first page that won't render ends the scan with the pages read so
+/// far: a file that stalls one page likely stalls them all.
+fn scan_chunks(
+    conn: &Connection,
+    emb: &mut Embedder,
+    path: &Path,
+    bytes: &[u8],
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+) -> Result<Vec<(usize, String)>> {
+    // Rendering only: OCR and embedding are the runner's own work, paced by
+    // `between`.
+    let mut deadline = std::time::Instant::now() + crate::ocr::SCAN_WALL;
+    let pages = match crate::ocr::pdf_pages(bytes, deadline) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("skip {}: {e:#}", path.display());
+            return Ok(Vec::new());
+        }
+    };
+    if pages > crate::ocr::MAX_SCAN_PAGES {
+        eprintln!(
+            "{}: reading the first {} of {pages} scanned pages",
+            path.display(),
+            crate::ocr::MAX_SCAN_PAGES
+        );
+    }
+    let mut out = Vec::new();
+    for page in 1..=pages.min(crate::ocr::MAX_SCAN_PAGES) {
+        let started = std::time::Instant::now();
+        let img = match crate::ocr::render_page(bytes, page, deadline) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("{} page {page}: {e:#}; stopping there", path.display());
+                break;
+            }
+        };
+        let rendered = started.elapsed();
+        let text = emb.read_text(&img)?.join("\n");
+        between(conn, emb)?;
+        // The deadline counts poppler's time, not the OCR's or a query's.
+        deadline += started.elapsed() - rendered;
+        if !text.trim().is_empty() {
+            out.push((page, text));
+        }
+    }
+    Ok(out)
 }
 
 /// `path`'s chunks through `parse` (the child process, #84), or none if it
@@ -675,9 +766,27 @@ fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>
 }
 
 /// (mtime, size) as the index records them.
-fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
+pub(crate) fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some((mtime.as_secs() as i64, meta.len() as i64))
+}
+
+/// The (mtime, size) recorded for every indexed file under `root`, by path.
+pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
+    let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a file `walk` found is indexed as, with its metadata: None if it
+/// isn't a wanted type or is over its kind's size cap. Reads no contents.
+pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
+    let kind = types.kind(entry.path())?;
+    let meta = entry.metadata().ok()?;
+    (meta.len() <= kind.max_bytes()).then_some((kind, meta))
 }
 
 /// Paths under `root` the index is behind on: wanted files that are new or
@@ -689,30 +798,20 @@ pub fn stale(
     ex: &Excludes,
     types: &FileTypes,
 ) -> Result<Vec<PathBuf>> {
-    let mut known: std::collections::HashMap<String, (i64, i64)> = {
-        let mut stmt =
-            conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let mut known = stamps_under(conn, root)?;
     let mut out = Vec::new();
     for entry in walk(root, ex).filter(|e| e.file_type().is_file()) {
         let path = entry.path();
         let Some(key) = path.to_str() else { continue };
         let was = known.remove(key);
-        let wanted_now = types
-            .kind(path)
-            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes()));
-        if !wanted_now {
+        let Some((_, meta)) = indexable(&entry, types) else {
             // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
                 out.push(path.to_path_buf());
             }
             continue;
-        }
-        if was != entry.metadata().ok().as_ref().and_then(stamp_of) {
+        };
+        if was != stamp_of(&meta) {
             out.push(path.to_path_buf());
         }
     }
@@ -857,6 +956,38 @@ pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// Forget the PDFs recorded with no text once OCR could read them as scans
+/// (#106): with this OCR model, and poppler installed. Recorded in `meta`, so
+/// it happens once for each, not at every start. Returns files dropped.
+pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
+    if !ocr || !crate::ocr::poppler() {
+        return Ok(0);
+    }
+    let key = "reading.scans";
+    let now = format!("{}/{}", crate::model::OCR_REVISION, crate::ocr::READING);
+    let now = now.as_str();
+    let was: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?;
+    if was.as_deref() == Some(now) {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "DELETE FROM files WHERE lower(path) LIKE '%.pdf'
+           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
+           AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                           WHERE g.sha256 = files.sha256)",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, now],
+    )?;
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Formats whose text is read differently now, with the reading's version:
 /// HTML through `extract::html` since 1 (#97). Mtime and size don't show the
 /// change, so files read the old way are dropped once instead.
@@ -909,6 +1040,18 @@ pub fn compact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `root` as `index` walks it: canonical, and an error if it is excluded.
+pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
+    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    if ex.contains(&root) {
+        bail!(
+            "{} is excluded; remove it from `exclude` in the config to index it",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
 /// Called after each file `index` looks at, with the connection and model
 /// lent back: for progress, and for the runner to answer queries mid-index.
 /// An error from it stops indexing; every file finished so far is kept.
@@ -925,13 +1068,7 @@ pub fn index(
     types: &FileTypes,
     after: &mut AfterFile,
 ) -> Result<Stats> {
-    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
-    if ex.contains(&root) {
-        bail!(
-            "{} is excluded; remove it from `exclude` in the config to index it",
-            root.display()
-        );
-    }
+    let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
@@ -1098,13 +1235,18 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
 }
 
 /// (files, chunks) of each kind in the index, in `Kind::ALL`'s order (#73).
-/// A file counts under the kind of its chunks, so one recorded without any
-/// (a scan, a photo with no decoder) counts under none.
+/// A file counts under the kind of its chunks, an image's text (#106) under
+/// images, so one recorded without any (a photo with no decoder) counts
+/// under none.
 pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 3]> {
     let mut out = [(0, 0); 3];
-    let mut stmt =
-        conn.prepare("SELECT kind, count(DISTINCT file_id), count(*) FROM chunks GROUP BY kind")?;
-    let rows = stmt.query_map([], |r| {
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM chunks i WHERE i.file_id = c.file_id AND i.kind = ?1)
+                THEN ?1 ELSE c.kind END AS k,
+                count(DISTINCT c.file_id), count(*)
+         FROM chunks c GROUP BY k",
+    )?;
+    let rows = stmt.query_map([Kind::Image as i64], |r| {
         Ok((
             Kind::from_db(r.get(0)?),
             r.get::<_, i64>(1)?,
@@ -1150,14 +1292,22 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             *chunks.entry(dir.to_owned()).or_default() += n as u64;
         }
     }
+    Ok(biggest(&chunks, limit))
+}
+
+/// The heaviest folders in `weights` (each folder's total, its subfolders'
+/// included), biggest first: at most `limit`, none inside another. A folder
+/// gives way to a subfolder holding 3/4 of its weight, so what's named is
+/// where the bulk actually is.
+pub fn biggest(weights: &HashMap<PathBuf, u64>, limit: usize) -> Vec<(PathBuf, u64)> {
     let mut biggest_child: HashMap<&Path, u64> = HashMap::new();
-    for (dir, n) in &chunks {
+    for (dir, n) in weights {
         if let Some(parent) = dir.parent() {
             let m = biggest_child.entry(parent).or_default();
             *m = (*m).max(*n);
         }
     }
-    let mut dirs: Vec<(&PathBuf, u64)> = chunks.iter().map(|(d, n)| (d, *n)).collect();
+    let mut dirs: Vec<(&PathBuf, u64)> = weights.iter().map(|(d, n)| (d, *n)).collect();
     // Of equal folders, the deeper says more.
     dirs.sort_by(|a, b| {
         b.1.cmp(&a.1)
@@ -1179,7 +1329,7 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             picked.push((dir.clone(), n));
         }
     }
-    Ok(picked)
+    picked
 }
 
 pub struct Hit {
@@ -1682,6 +1832,70 @@ mod tests {
             Path::new("/home/u/.notes"),
             Path::new("/home/u/.notes/a.md")
         ));
+    }
+
+    /// `chunks` as (kind, line) on a new file at `path`.
+    fn file_with(conn: &Connection, path: &str, chunks: &[(Kind, i64)]) {
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?1)",
+            [path],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        for (kind, line) in chunks {
+            conn.execute(
+                "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, '', x'00', ?3)",
+                params![id, line, *kind as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_images_text_counts_under_images() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-ocrcount-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        file_with(
+            &conn,
+            "/shot.png",
+            &[(Kind::Image, 0), (Kind::Document, 1), (Kind::Document, 9)],
+        );
+        file_with(
+            &conn,
+            "/report.pdf",
+            &[(Kind::Document, 1), (Kind::Document, 2)],
+        );
+        file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
+        let counts = counts_by_kind(&conn).unwrap();
+        // Kind::ALL's order: text, documents, images.
+        assert_eq!(counts, [(1, 1), (1, 2), (1, 3)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pdfs_with_no_text_are_read_again_once_ocr_can() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-scans-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        file_with(&conn, "/scan.PDF", &[]);
+        file_with(&conn, "/text.pdf", &[(Kind::Document, 1)]);
+        file_with(&conn, "/broken.jpg", &[]);
+        let paths = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT path FROM files ORDER BY path")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(retry_scans(&conn, false).unwrap(), 0);
+        if crate::ocr::poppler() {
+            assert_eq!(retry_scans(&conn, true).unwrap(), 1);
+            assert_eq!(paths(&conn), ["/broken.jpg", "/text.pdf"]);
+            // Once per OCR model: a scan recorded again isn't dropped at every start.
+            file_with(&conn, "/scan.PDF", &[]);
+            assert_eq!(retry_scans(&conn, true).unwrap(), 0);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
