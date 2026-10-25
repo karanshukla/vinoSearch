@@ -45,6 +45,13 @@ pub mod status {
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current indexing job.
     pub const INDEXED_FILES: &str = "indexed_files";
+    /// The indexing job is the rest of a long document (#108).
+    pub const INDEXING_REST: &str = "indexing_rest";
+    /// Documents indexed in part so far (#108), next in line first, at most
+    /// PARTIAL_MAX: `a(sstt)` of (path, unit, parts in, parts in all), the
+    /// unit "page", "slide", "chapter" or "part".
+    pub const PARTIAL: &str = "partial";
+    pub const PARTIAL_MAX: usize = 100;
     /// PauseIndexing was called and ResumeIndexing not since.
     pub const PAUSED: &str = "paused";
     /// Why indexing is held for power (#109): a `hold` value, or empty.

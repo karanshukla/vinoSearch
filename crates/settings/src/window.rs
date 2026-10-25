@@ -13,7 +13,7 @@ use vinosearch_shared::config::{
 
 use vinosearch_shared::dbus::hold;
 
-use crate::control::{Link, Request, Status};
+use crate::control::{Link, Partial, Request, Status};
 use crate::{doctor, integration, portal, theme};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,10 +297,14 @@ impl SettingsWindow {
                         ui.label(why);
                     } else if s.indexing {
                         spinner(ui);
-                        ui.label(format!(
-                            "Indexing, {} files so far",
-                            count(s.indexed_files as i64)
-                        ));
+                        if s.indexing_rest {
+                            ui.label("Indexing the rest of long documents");
+                        } else {
+                            ui.label(format!(
+                                "Indexing, {} files so far",
+                                count(s.indexed_files as i64)
+                            ));
+                        }
                         if ui.button("Stop").clicked() {
                             self.link.send(Request::PauseIndexing);
                         }
@@ -345,6 +349,28 @@ impl SettingsWindow {
                             ))
                             .color(color),
                         );
+                    },
+                );
+            }
+            if !s.partial.is_empty() {
+                row(
+                    ui,
+                    "In part:",
+                    "Long documents get their first 30 pages with everything else, and the rest after.",
+                    |ui| {
+                        ui.vertical(|ui| {
+                            for d in s.partial.iter().take(PARTIAL_SHOWN) {
+                                value(ui, partial_line(d));
+                            }
+                            let more = s.partial.len().saturating_sub(PARTIAL_SHOWN);
+                            if more > 0 {
+                                value(
+                                    ui,
+                                    RichText::new(format!("and {} more", count(more as i64)))
+                                        .color(p.muted),
+                                );
+                            }
+                        });
                     },
                 );
             }
@@ -1146,6 +1172,26 @@ fn count(n: i64) -> String {
         out.push(c);
     }
     if n < 0 { format!("-{out}") } else { out }
+}
+
+/// Documents indexed in part listed by name on the Index page; the rest are counted.
+const PARTIAL_SHOWN: usize = 3;
+
+/// "book.pdf, 120 of 640 pages".
+fn partial_line(d: &Partial) -> String {
+    let name = Path::new(&d.path)
+        .file_name()
+        .map_or_else(|| d.path.clone(), |n| n.to_string_lossy().into_owned());
+    let unit = if d.total == 1 {
+        d.unit.clone()
+    } else {
+        format!("{}s", d.unit)
+    };
+    format!(
+        "{name}, {} of {} {unit}",
+        count(d.done as i64),
+        count(d.total as i64)
+    )
 }
 
 /// Decimal units, as the README and `fetch-model` give sizes.

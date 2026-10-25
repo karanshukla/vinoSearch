@@ -342,7 +342,7 @@ mod tests {
         put(&dir.join(".git/x.md"), 5000); // hidden
         put(&dir.join("app.min.js"), 5000); // minified
         put(&dir.join("cfg.toml"), 5000); // config
-        put(&dir.join("big.txt"), (index::MAX_FILE_BYTES + 1) as usize); // over the cap
+        put(&dir.join("big.rs"), (index::MAX_FILE_BYTES + 1) as usize); // over the cap for code
         put(&dir.join("photo.jpg"), 5000); // images off
         put(&dir.join("private/secret.md"), 5000); // excluded
         let ex = excluding(&dir.join("private"));

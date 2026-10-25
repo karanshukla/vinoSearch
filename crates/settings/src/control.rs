@@ -46,6 +46,20 @@ pub struct Status {
     pub model_changed: String,
     /// Photos skipped because no HEIF decoder is installed.
     pub no_decoder: i64,
+    /// The indexing job is the rest of a long document.
+    pub indexing_rest: bool,
+    /// Documents indexed in part so far, the next in line first.
+    pub partial: Vec<Partial>,
+}
+
+/// A long document with only some of its parts indexed so far (#108).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Partial {
+    pub path: String,
+    /// "page", "slide", "chapter" or "part".
+    pub unit: String,
+    pub done: u64,
+    pub total: u64,
 }
 
 impl Status {
@@ -69,6 +83,29 @@ impl Status {
                 .iter()
                 .filter_map(|v| match v {
                     Value::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let partial = match get(status::PARTIAL) {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Structure(s) => match s.fields() {
+                        [
+                            Value::Str(path),
+                            Value::Str(unit),
+                            Value::U64(done),
+                            Value::U64(total),
+                        ] => Some(Partial {
+                            path: path.to_string(),
+                            unit: unit.to_string(),
+                            done: *done,
+                            total: *total,
+                        }),
+                        _ => None,
+                    },
                     _ => None,
                 })
                 .collect(),
@@ -101,6 +138,8 @@ impl Status {
             last_indexed: unsigned(status::LAST_INDEXED),
             model_changed: text(status::MODEL_CHANGED),
             no_decoder: signed(status::NO_DECODER),
+            indexing_rest: flag(status::INDEXING_REST),
+            partial,
         }
     }
 }
@@ -278,5 +317,39 @@ mod tests {
         assert_eq!(s.chunks, 0);
         assert_eq!(s.image_files, 12);
         assert_eq!(s.text_files, 0);
+        assert!(s.partial.is_empty());
+    }
+
+    #[test]
+    fn status_reads_documents_indexed_in_part() {
+        let partial = vec![
+            ("/b/book.pdf".to_owned(), "page".to_owned(), 120u64, 640u64),
+            ("/b/notes.txt".to_owned(), "part".to_owned(), 30, 400),
+        ];
+        let mut map = HashMap::new();
+        map.insert(
+            status::PARTIAL.to_owned(),
+            OwnedValue::try_from(Value::from(partial)).unwrap(),
+        );
+        map.insert(status::INDEXING_REST.to_owned(), OwnedValue::from(true));
+        let s = Status::parse(&map);
+        assert!(s.indexing_rest);
+        assert_eq!(
+            s.partial,
+            [
+                Partial {
+                    path: "/b/book.pdf".into(),
+                    unit: "page".into(),
+                    done: 120,
+                    total: 640,
+                },
+                Partial {
+                    path: "/b/notes.txt".into(),
+                    unit: "part".into(),
+                    done: 30,
+                    total: 400,
+                },
+            ]
+        );
     }
 }

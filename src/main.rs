@@ -118,11 +118,18 @@ enum Command {
     /// Print the text OCR reads in an image, or a PDF's rendered pages, as
     /// indexing reads it (#106).
     ReadText { path: PathBuf },
-    /// Parse the document on stdin as PATH's type and write its chunks to
-    /// stdout as JSON, under memory and CPU limits. The indexer runs this on
-    /// itself for every document (#84).
+    /// Parse the document on stdin as PATH's type and write the chunks of
+    /// parts FROM..FROM+COUNT (pages, say) to stdout as JSON, under memory
+    /// and CPU limits. The indexer runs this on itself for every document
+    /// (#84), a run of parts at a time (#108).
     #[command(hide = true)]
-    Extract { path: PathBuf },
+    Extract {
+        path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        #[arg(long, default_value_t = usize::MAX)]
+        count: usize,
+    },
 }
 
 /// OpenVINO's compiled-model cache.
@@ -352,8 +359,8 @@ fn confirm_index(paths: &[PathBuf], s: &Settings, yes: bool) -> Result<bool> {
 
 fn run(cli: Cli) -> Result<bool> {
     // Before the settings: a broken config file must not stop every document.
-    if let Command::Extract { path } = &cli.command {
-        extract::child_main(path)?;
+    if let Command::Extract { path, from, count } = &cli.command {
+        extract::child_main(path, *from, *count)?;
         return Ok(true);
     }
     let s = settings(&cli)?;
@@ -436,6 +443,30 @@ fn run(cli: Cli) -> Result<bool> {
                         st.no_decoder,
                         config::HEIF_CONVERT_PACKAGES
                     );
+                }
+            }
+            // Then the rest of long documents (#108), which the service
+            // leaves until nothing else is waiting.
+            let t0 = Instant::now();
+            let mut chunks = 0;
+            while let Some(rest) =
+                index::index_rest(&mut conn, &mut emb, &s.types, &mut |_, _| Ok(()))?
+            {
+                if let index::Rest::Parts {
+                    path,
+                    done,
+                    total,
+                    chunks: n,
+                } = rest
+                {
+                    chunks += n;
+                    eprint!(
+                        "\r{path}: {done} of {total} parts, {:.1} chunks/s   ",
+                        chunks as f64 / t0.elapsed().as_secs_f64()
+                    );
+                    if done >= total {
+                        eprintln!();
+                    }
                 }
             }
             Ok(true)
