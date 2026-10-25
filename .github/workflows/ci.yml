@@ -40,7 +40,7 @@ jobs:
 
   # Line coverage of the workspace's tests, as lcov (artifact) and a summary
   # table on the run page. The floor sits a few points under what CI
-  # measured when it was set; raise it as tests land.
+  # measured when it was set (66.2% of lines); raise it as tests land.
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -67,7 +67,7 @@ jobs:
         with:
           name: lcov
           path: lcov.info
-      - run: cargo llvm-cov report --summary-only --fail-under-lines 0
+      - run: cargo llvm-cov report --summary-only --fail-under-lines 63
 
   # The oldest Rust install.sh accepts: 1.89 for vinosearch alone, 1.95 with
   # the settings window (egui). Matches rust-version in the Cargo.tomls.
