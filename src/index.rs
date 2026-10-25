@@ -613,7 +613,9 @@ fn is_scannable(path: &Path) -> bool {
 }
 
 /// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
-/// up to `ocr::MAX_SCAN_PAGES`. A page that won't render is left out.
+/// up to `ocr::MAX_SCAN_PAGES` and within `ocr::SCAN_WALL` of rendering.
+/// The first page that won't render ends the scan with the pages read so
+/// far: a file that stalls one page likely stalls them all.
 fn scan_chunks(
     conn: &Connection,
     emb: &mut Embedder,
@@ -621,7 +623,10 @@ fn scan_chunks(
     bytes: &[u8],
     between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
 ) -> Result<Vec<(usize, String)>> {
-    let pages = match crate::ocr::pdf_pages(bytes) {
+    // Rendering only: OCR and embedding are the runner's own work, paced by
+    // `between`.
+    let mut deadline = std::time::Instant::now() + crate::ocr::SCAN_WALL;
+    let pages = match crate::ocr::pdf_pages(bytes, deadline) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
@@ -637,15 +642,19 @@ fn scan_chunks(
     }
     let mut out = Vec::new();
     for page in 1..=pages.min(crate::ocr::MAX_SCAN_PAGES) {
-        let img = match crate::ocr::render_page(bytes, page) {
+        let started = std::time::Instant::now();
+        let img = match crate::ocr::render_page(bytes, page, deadline) {
             Ok(img) => img,
             Err(e) => {
-                eprintln!("{} page {page}: {e:#}", path.display());
-                continue;
+                eprintln!("{} page {page}: {e:#}; stopping there", path.display());
+                break;
             }
         };
+        let rendered = started.elapsed();
         let text = emb.read_text(&img)?.join("\n");
         between(conn, emb)?;
+        // The deadline counts poppler's time, not the OCR's or a query's.
+        deadline += started.elapsed() - rendered;
         if !text.trim().is_empty() {
             out.push((page, text));
         }

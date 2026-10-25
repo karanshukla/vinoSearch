@@ -417,14 +417,15 @@ fn run(cli: Cli) -> Result<bool> {
                 t0.elapsed().as_secs_f64()
             );
             let bytes = std::fs::read(&path)?;
+            let deadline = Instant::now() + ocr::SCAN_WALL;
             let pages = if extract::is_document(&path) {
-                ocr::pdf_pages(&bytes)?.min(ocr::MAX_SCAN_PAGES)
+                ocr::pdf_pages(&bytes, deadline)?.min(ocr::MAX_SCAN_PAGES)
             } else {
                 1
             };
             for page in 1..=pages {
                 let img = if extract::is_document(&path) {
-                    ocr::render_page(&bytes, page)?
+                    ocr::render_page(&bytes, page, deadline)?
                 } else {
                     vision::load(&bytes)?
                 };

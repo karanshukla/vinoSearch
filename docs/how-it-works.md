@@ -33,7 +33,7 @@ Turning boxes to the line's slope matters for scans: on a page scanned 0.8° off
 
 The browser screenshots' truth is the page's visible DOM text, which includes text drawn as icons and splits lines differently than they're drawn, so their character scores are low for both. On the NPU the detector takes 64-130 ms and the recogniser 3-12 ms a line; the first compile of all five is about 20 s, then 0.2 s from the cache. As with the embedding stages, a fresh compile on the NPU is checked against the CPU on a fixed input (cosine 0.9997) and falls back to the CPU below 0.995.
 
-A scanned PDF's pages are rendered one at a time by `pdftoppm` with their longer side at 1920 pixels (164 dpi for A4), from the bytes indexing hashed, on stdin, under the same 1 GiB, 30 CPU seconds and 60-second limits as the document parser. Up to 100 pages are read, about 0.6 s each. A PDF with a text layer on any page is taken as text, not OCR'd.
+A scanned PDF's pages are rendered one at a time by `pdftoppm` with their longer side at 1920 pixels (164 dpi for A4), from the bytes indexing hashed, on stdin, under the document parser's 1 GiB and 30 CPU seconds a run, and 5 minutes of rendering for the whole file; the first page that fails ends the scan with what was read. Up to 100 pages are read, about 0.6 s each. A PDF with a text layer on any page is taken as text, not OCR'd.
 
 The image vectors' model tag includes the OCR model's revision, so the first start of a build with OCR, or with a new OCR model, indexes every image again once. PDFs recorded with no text are read again once too, and again whenever poppler or the OCR model arrives. `vinosearch read-text <image or PDF>` prints what indexing reads.
 

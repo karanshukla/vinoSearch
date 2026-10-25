@@ -337,11 +337,12 @@ fn ctc(probs: &[f32], classes: usize, chars: &[String]) -> (String, f32) {
 /// Pages past this in a scanned PDF are left unread: at ~0.5 s a page, a
 /// 100-page scan takes under a minute.
 pub const MAX_SCAN_PAGES: usize = 100;
-/// pdfinfo and pdftoppm get what the document parser does (#84): memory, CPU
-/// seconds and a deadline.
+/// pdfinfo and pdftoppm get what the document parser does (#84): memory and
+/// CPU seconds a run, and one deadline for the whole scan, so a crafted PDF
+/// that stalls every page holds indexing minutes, not a minute a page.
 const POPPLER_ADDRESS_SPACE: u64 = 1 << 30;
 const POPPLER_CPU_SECONDS: u64 = 30;
-const POPPLER_WALL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const SCAN_WALL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Poppler's pdfinfo and pdftoppm, if both are on PATH (poppler-utils, or
 /// poppler on Arch). Looked up once.
@@ -375,11 +376,22 @@ fn poppler_command(tool: &str) -> std::process::Command {
     cmd
 }
 
-/// The page count of the PDF `bytes`.
-pub fn pdf_pages(bytes: &[u8]) -> Result<usize> {
+/// The time left before `deadline`, or an error once it has passed.
+fn left(deadline: Instant) -> Result<std::time::Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    ensure!(
+        !left.is_zero(),
+        "over {} s reading the scan",
+        SCAN_WALL.as_secs()
+    );
+    Ok(left)
+}
+
+/// The page count of the PDF `bytes`, by `deadline`.
+pub fn pdf_pages(bytes: &[u8], deadline: Instant) -> Result<usize> {
     let mut cmd = poppler_command("pdfinfo");
     cmd.arg("-");
-    let out = crate::proc::run(cmd, bytes, POPPLER_WALL).context("pdfinfo")?;
+    let out = crate::proc::run(cmd, bytes, left(deadline)?).context("pdfinfo")?;
     String::from_utf8_lossy(&out)
         .lines()
         .find_map(|l| l.strip_prefix("Pages:")?.trim().parse().ok())
@@ -387,13 +399,13 @@ pub fn pdf_pages(bytes: &[u8]) -> Result<usize> {
 }
 
 /// Page `page` (from 1) of the PDF `bytes`, rendered with its longer side at
-/// the detector's: no more pixels than it reads.
-pub fn render_page(bytes: &[u8], page: usize) -> Result<RgbImage> {
+/// the detector's (no more pixels than it reads), by `deadline`.
+pub fn render_page(bytes: &[u8], page: usize, deadline: Instant) -> Result<RgbImage> {
     let longest = DET_SHAPES[0].1.to_string();
     let page = page.to_string();
     let mut cmd = poppler_command("pdftoppm");
     cmd.args(["-scale-to", &longest, "-f", &page, "-l", &page, "-"]);
-    let ppm = crate::proc::run(cmd, bytes, POPPLER_WALL).context("pdftoppm")?;
+    let ppm = crate::proc::run(cmd, bytes, left(deadline)?).context("pdftoppm")?;
     Ok(
         image::load_from_memory_with_format(&ppm, image::ImageFormat::Pnm)
             .context("reading pdftoppm's page")?
@@ -785,6 +797,14 @@ mod tests {
         assert_eq!(line.dimensions(), (30, 10));
         assert_eq!(line.get_pixel(15, 5)[0], 255);
         assert_eq!(line.get_pixel(0, 5)[0], 0);
+    }
+
+    #[test]
+    fn no_page_is_rendered_past_the_scans_deadline() {
+        let past = Instant::now() - std::time::Duration::from_secs(1);
+        let e = render_page(b"%PDF-1.4", 1, past).unwrap_err().to_string();
+        assert!(e.contains("reading the scan"), "{e}");
+        assert!(left(Instant::now() + SCAN_WALL).unwrap() > std::time::Duration::from_secs(299));
     }
 
     #[test]
