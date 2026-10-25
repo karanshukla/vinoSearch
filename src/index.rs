@@ -1908,7 +1908,7 @@ mod tests {
         assert_eq!(on.kind(doc), Some(Kind::Document));
         assert_eq!(on.kind(Path::new("/p/a.csv")), Some(Kind::Document));
         assert_eq!(on.kind(Path::new("/p/a.md")), Some(Kind::Text));
-        assert_eq!(on.kind(Path::new("/p/a.doc")), None);
+        assert_eq!(on.kind(Path::new("/p/a.mobi")), None);
     }
 
     #[test]

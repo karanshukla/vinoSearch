@@ -133,8 +133,8 @@ pub struct ImageFormat {
     pub min_score: Option<f32>,
 }
 
-/// PDF, Office and OpenDocument files, spreadsheets, CSV (#55), EPUB and
-/// subtitles (#97). Searched
+/// PDF, Office and OpenDocument files, spreadsheets, CSV (#55), EPUB,
+/// subtitles, `.doc`, `.ppt` and RTF (#97). Searched
 /// with text, so they share its `min_score`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
