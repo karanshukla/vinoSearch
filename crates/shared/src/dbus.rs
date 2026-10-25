@@ -90,3 +90,12 @@ pub mod recent {
     pub const DOCUMENT: &str = "document";
     pub const MAX: u32 = 50;
 }
+
+/// `Control1.Search`: the kinds a result is, and the most files of each kind
+/// it returns. Text read in an image (#106) is an `IMAGE`, as KRunner lists it.
+pub mod results {
+    pub const TEXT: &str = "text";
+    pub const DOCUMENT: &str = "document";
+    pub const IMAGE: &str = "image";
+    pub const MAX: u32 = 100;
+}

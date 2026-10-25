@@ -1865,6 +1865,7 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
 }
 
 mod estimate;
+pub mod search;
 #[cfg(test)]
 mod ui_tests;
 

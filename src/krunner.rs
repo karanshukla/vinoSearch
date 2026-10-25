@@ -26,7 +26,8 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
-    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, recent, status as key,
+    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, recent, results,
+    status as key,
 };
 /// Files of each kind shown.
 const RESULTS: usize = 5;
@@ -50,6 +51,8 @@ struct Runner {
     db: Db,
     config: PathBuf,
     places: Places,
+    /// The last search's query, for Show all results.
+    query: Mutex<String>,
 }
 
 /// How close a result must be, per kind (`formats.*.min_score`).
@@ -86,16 +89,21 @@ impl Floors {
 /// documents, then images, as KRunner and GNOME Shell both show them. Empty if the worker
 /// has stopped.
 async fn search(jobs: &Mutex<mpsc::Sender<Job>>, floors: Floors, query: String) -> Vec<Hit> {
+    per_file(chunks(jobs, query, RESULTS * 8).await, floors)
+}
+
+/// The best `k` chunks of each kind for `query`; empty if the worker has stopped.
+async fn chunks(jobs: &Mutex<mpsc::Sender<Job>>, query: String, k: usize) -> Vec<Hit> {
     let (tx, rx) = oneshot::channel();
     let job = Job::Match {
         query,
-        k: RESULTS * 8,
+        k,
         reply: tx,
     };
     if jobs.lock().unwrap().send(job).is_err() {
         return Vec::new();
     }
-    per_file(rx.await.unwrap_or_default(), floors)
+    rx.await.unwrap_or_default()
 }
 
 /// `path`'s file name, and its directory with the hit's line and a snippet.
@@ -259,16 +267,24 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
 impl Runner {
     #[zbus(name = "Actions")]
     fn actions(&self) -> Vec<(String, String, String)> {
-        vec![(
-            "open-folder".into(),
-            "Open containing folder".into(),
-            "document-open-folder".into(),
-        )]
+        vec![
+            (
+                "open-folder".into(),
+                "Open containing folder".into(),
+                "document-open-folder".into(),
+            ),
+            (
+                SHOW_ALL.into(),
+                "Show all results".into(),
+                "view-list-icons".into(),
+            ),
+        ]
     }
 
     #[zbus(name = "Match")]
     async fn find(&self, query: String) -> Vec<Match> {
         let floors = Floors::load(&self.config);
+        query.clone_into(&mut self.query.lock().unwrap());
         let hits = search(&self.jobs, floors, query).await;
         remember(&self.places, &hits);
         hits.into_iter().map(|h| to_match(h, floors)).collect()
@@ -278,6 +294,11 @@ impl Runner {
     /// top otherwise.
     #[zbus(name = "Run")]
     fn run(&self, match_id: String, action_id: String) {
+        if action_id == SHOW_ALL {
+            let query = self.query.lock().unwrap().clone();
+            launch_settings(&["--search", &query]);
+            return;
+        }
         let at = self
             .places
             .lock()
@@ -376,19 +397,27 @@ impl Gnome {
         open(&self.db, &self.config, &id, at, false);
     }
 
-    /// Clicking the provider's icon: the settings window, when it is
-    /// installed beside us.
+    /// Clicking the provider's icon: the search window with the query
+    /// (#111), when vinosearch-settings is installed beside us.
     #[zbus(name = "LaunchSearch")]
-    fn launch(&self, _terms: Vec<String>, _timestamp: u32) {
-        let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
-        match settings {
-            Ok(s) if s.is_file() => {
-                if let Err(e) = std::process::Command::new(&s).spawn() {
-                    eprintln!("{}: {e}", s.display());
-                }
+    fn launch(&self, terms: Vec<String>, _timestamp: u32) {
+        launch_settings(&["--search", &terms.join(" ")]);
+    }
+}
+
+/// KRunner's action for opening the query in the search window.
+const SHOW_ALL: &str = "show-all";
+
+/// Start vinosearch-settings with `args`, when it is installed beside us.
+fn launch_settings(args: &[&str]) {
+    let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
+    match settings {
+        Ok(s) if s.is_file() => {
+            if let Err(e) = std::process::Command::new(&s).args(args).spawn() {
+                eprintln!("{}: {e}", s.display());
             }
-            _ => eprintln!("LaunchSearch: vinosearch-settings is not installed beside vinosearch"),
         }
+        _ => eprintln!("vinosearch-settings is not installed beside vinosearch"),
     }
 }
 
@@ -415,6 +444,14 @@ impl Control {
             .unwrap()
             .send(job)
             .map_err(|_| failed("the worker has stopped"))
+    }
+
+    fn is_indexed(&self, path: &str) -> zbus::fdo::Result<()> {
+        match index::is_indexed(&self.db.lock().unwrap(), path) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(failed(format!("{path} is not an indexed file"))),
+            Err(e) => Err(failed(format!("{e:#}"))),
+        }
     }
 
     /// An existing directory, canonical, not excluded.
@@ -643,6 +680,41 @@ impl Control {
             .map_err(|e| failed(format!("{e:#}")))
     }
 
+    /// Every file `query` finds, for the search window (#111): the best
+    /// chunk of each, at or above its kind's min_score, at most `limit`
+    /// (capped at results::MAX) of each kind. See crate::results::Found.
+    async fn search(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> zbus::fdo::Result<Vec<crate::results::Found>> {
+        let limit = limit.min(results::MAX) as usize;
+        let floors = Floors::load(&self.config);
+        let hits = chunks(&self.jobs, query, limit * 4).await;
+        Ok(crate::results::every_file(hits, |k| floors.of(k), limit)
+            .into_iter()
+            .filter_map(crate::results::found)
+            .collect())
+    }
+
+    /// Open an indexed file at `line`, a number from Search's results, as
+    /// KRunner's Run opens a match.
+    #[zbus(name = "Open")]
+    fn open_file(&self, path: String, line: u32) -> zbus::fdo::Result<()> {
+        self.is_indexed(&path)?;
+        let at = index::readable_kind(Path::new(&path))
+            .and_then(|kind| At::of(kind, Path::new(&path), i64::from(line)));
+        open(&self.db, &self.config, &path, at, false);
+        Ok(())
+    }
+
+    /// Open the folder an indexed file is in.
+    fn open_folder(&self, path: String) -> zbus::fdo::Result<()> {
+        self.is_indexed(&path)?;
+        open(&self.db, &self.config, &path, None, true);
+        Ok(())
+    }
+
     /// Free the model now.
     fn unload(&self) -> zbus::fdo::Result<()> {
         self.send(Job::Unload)
@@ -769,6 +841,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 db: db.clone(),
                 config: config.clone(),
                 places: Mutex::default(),
+                query: Mutex::default(),
             },
         )?
         .serve_at(

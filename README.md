@@ -81,6 +81,8 @@ Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn
 
 Results need 3 or more characters. Enter opens the file: a text file at the matching line in your editor, a PDF at the matching page in Okular, Evince, Papers or Zathura. Other files, and apps that can't be told where, open at the top.
 
+**All results.** KRunner's **Show all results** on any match, or the vinoSearch icon beside GNOME's results, opens the query in a search window (needs `vinosearch-settings`): up to 100 files of each kind, photos as a grid of thumbnails, text and documents with their snippet and line or page, filtered by kind, folder, date and file type. Enter or a double click opens a result at its match; **Open folder** and **Copy file** (pastes as the file in a file manager; needs `wl-copy`) are below. `vinosearch-settings --search "query"` opens it from a key binding.
+
 ## Settings
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
