@@ -384,4 +384,70 @@ mod tests {
         };
         assert_eq!(stepped_back.ahead_of(&before), Duration::ZERO);
     }
+
+    #[test]
+    fn relevant_follows_the_indexing_rules() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["root/src", "root/target", "root/.git", "root/private"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let root = std::fs::canonicalize(dir.join("root")).unwrap();
+        let config: Config =
+            toml::from_str(&format!("exclude = [{:?}]", root.join("private"))).unwrap();
+        let ex = config.excludes().unwrap();
+        let types = FileTypes::default();
+        let yes = |p: &str| relevant(&root, &root.join(p), &ex, &types);
+
+        assert!(yes("notes.md"));
+        assert!(yes("src"));
+        // Gone: it may have been indexed, so removal sorts it out.
+        assert!(yes("gone.xcf"));
+        std::fs::write(root.join("photo.xcf"), b"").unwrap();
+        assert!(!yes("photo.xcf"));
+        assert!(!yes("target"));
+        assert!(!yes(".git"));
+        assert!(!yes("target/debug/out.rs"));
+        assert!(!yes(".git/HEAD"));
+        assert!(!yes("private"));
+        assert!(!yes("private/diary.md"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gone_and_interesting_read_the_event_kind() {
+        use notify::event::{CreateKind, MetadataKind, RemoveKind};
+        let event = |kind, paths: &[&str]| Event {
+            kind,
+            paths: paths.iter().map(PathBuf::from).collect(),
+            attrs: Default::default(),
+        };
+        let rename = |mode| EventKind::Modify(ModifyKind::Name(mode));
+
+        let removed = event(EventKind::Remove(RemoveKind::File), &["/a"]);
+        assert_eq!(gone(&removed), [PathBuf::from("/a")]);
+        assert_eq!(
+            gone(&event(rename(RenameMode::From), &["/a"])),
+            [PathBuf::from("/a")]
+        );
+        // [from, to]: only the old name went.
+        let both = event(rename(RenameMode::Both), &["/a", "/b"]);
+        assert_eq!(gone(&both), [PathBuf::from("/a")]);
+        assert!(gone(&event(rename(RenameMode::Both), &[])).is_empty());
+        assert!(gone(&event(rename(RenameMode::To), &["/b"])).is_empty());
+        assert!(gone(&event(EventKind::Create(CreateKind::File), &["/c"])).is_empty());
+
+        assert!(interesting(&EventKind::Create(CreateKind::File)));
+        assert!(interesting(&EventKind::Remove(RemoveKind::Any)));
+        assert!(interesting(&rename(RenameMode::Both)));
+        assert!(interesting(&EventKind::Modify(ModifyKind::Any)));
+        // chmod and atime don't change what is indexed.
+        assert!(!interesting(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Permissions
+        ))));
+        assert!(!interesting(&EventKind::Access(
+            notify::event::AccessKind::Any
+        )));
+        assert!(!interesting(&EventKind::Other));
+    }
 }

@@ -657,6 +657,92 @@ impl Embedder {
     }
 }
 
+/// What indexing asks of the model. `Embedder` on the device; tests index
+/// through a stand-in, with no OpenVINO.
+pub trait Embed {
+    /// Embed documents already formatted with [`document_text`].
+    fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// Embed an image, prepared by [`crate::vision::prepare`].
+    fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>>;
+    /// The OCR model's files are fetched.
+    fn can_read_text(&self) -> bool;
+    /// The lines of text in `img`.
+    fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>>;
+}
+
+impl Embed for Embedder {
+    fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Embedder::documents(self, texts)
+    }
+
+    fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+        Embedder::image(self, px)
+    }
+
+    fn can_read_text(&self) -> bool {
+        Embedder::can_read_text(self)
+    }
+
+    fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
+        Embedder::read_text(self, img)
+    }
+}
+
+/// A stand-in model for tests: each word of the text (the title included)
+/// adds to one of DIM buckets by its hash, normalised, so texts sharing words
+/// score above texts that share none. Counts what it was asked to embed.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeEmbed {
+    pub documents: usize,
+    pub images: usize,
+}
+
+#[cfg(test)]
+impl FakeEmbed {
+    pub fn vector(text: &str) -> Vec<f32> {
+        use std::hash::{Hash, Hasher};
+        let mut v = vec![0f32; DIM];
+        for word in text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+        {
+            let mut h = std::hash::DefaultHasher::new();
+            word.to_lowercase().hash(&mut h);
+            v[(h.finish() % DIM as u64) as usize] += 1.0;
+        }
+        let norm = v
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
+            .max(f32::MIN_POSITIVE);
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+}
+
+#[cfg(test)]
+impl Embed for FakeEmbed {
+    fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.documents += texts.len();
+        Ok(texts.iter().map(|t| Self::vector(t)).collect())
+    }
+
+    fn image(&mut self, _px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+        self.images += 1;
+        Ok(Self::vector("image"))
+    }
+
+    fn can_read_text(&self) -> bool {
+        false
+    }
+
+    fn read_text(&mut self, _img: &image::RgbImage) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

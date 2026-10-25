@@ -202,3 +202,92 @@ pub fn doctor(prefix: &Path, device: &str) -> Result<bool> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix(name: &str, lock: Option<&str>) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vinosearch-runtime-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = lock {
+            fs::write(dir.join("ovfetch.lock.json"), text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_lock_file_gives_the_version_and_artifact() {
+        let dir = prefix(
+            "ok",
+            Some(
+                r#"{"openvino": "2026.4.1", "artifact": {"id": "ubuntu24-x86_64", "sha256": "ab"}, "extra": 1}"#,
+            ),
+        );
+        let lock = read_lock(&dir).unwrap();
+        assert_eq!(lock.openvino, "2026.4.1");
+        assert_eq!(lock.artifact.id, "ubuntu24-x86_64");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_or_malformed_lock_file_is_an_error_not_a_panic() {
+        let dir = prefix("missing", None);
+        let err = read_lock(&dir).err().unwrap();
+        assert!(err.to_string().contains("install-runtime.sh"), "{err:#}");
+        for (name, text) in [
+            ("empty", ""),
+            ("truncated", r#"{"openvino": "2026"#),
+            ("no-artifact", r#"{"openvino": "2026.4.1"}"#),
+            (
+                "wrong-type",
+                r#"{"openvino": 2026, "artifact": {"id": "x"}}"#,
+            ),
+        ] {
+            let dir = prefix(name, Some(text));
+            let err = read_lock(&dir).err().unwrap();
+            assert!(err.to_string().starts_with("parsing "), "{name}: {err:#}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_npu_prefix_or_preload_list_loads_nothing() {
+        assert!(preload_npu(None).unwrap().is_empty());
+        let dir = prefix("npu", None);
+        assert!(preload_npu(Some(&dir)).unwrap().is_empty());
+        // An empty list loads nothing either.
+        fs::write(dir.join(ovfetch::detect::NPU_PRELOAD), "\n  \n").unwrap();
+        assert!(preload_npu(Some(&dir)).unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_library_that_wont_load_names_the_list() {
+        let dir = prefix("npu-bad", None);
+        fs::write(
+            dir.join(ovfetch::detect::NPU_PRELOAD),
+            "/nonexistent/libvinosearch-test.so\n",
+        )
+        .unwrap();
+        let err = preload_npu(Some(&dir)).err().unwrap().to_string();
+        assert!(err.contains("libvinosearch-test.so"), "{err}");
+        assert!(err.contains(ovfetch::detect::NPU_PRELOAD), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_default_prefix_is_under_home_unless_given() {
+        let given = PathBuf::from("/opt/ov");
+        assert_eq!(default_prefix(Some(given.clone())).unwrap(), given);
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                default_prefix(None).unwrap(),
+                Path::new(&home).join(".local/lib/vinosearch/openvino")
+            );
+        }
+    }
+}

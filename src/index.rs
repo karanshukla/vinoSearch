@@ -6,7 +6,7 @@
 //! anything a user would not leave readable.
 
 use crate::config::{Excludes, Formats};
-use crate::embed::{DIM, Embedder, document_text};
+use crate::embed::{DIM, Embed, Embedder, document_text};
 use crate::extract::{Extract, MAX_PARTS, PARTS_AT_ONCE, Parser};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -517,12 +517,12 @@ pub enum Outcome {
 /// rest from `index_rest` once everything else is in (#108). `between` runs
 /// after each chunk is embedded, so a waiting query is not held for the
 /// whole run. An error from it stops the file unwritten.
-pub fn index_file(
+pub fn index_file<E: Embed>(
     conn: &mut Connection,
-    emb: &mut Embedder,
+    emb: &mut E,
     path: &Path,
     types: &FileTypes,
-    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Outcome> {
     let kind = types.kind(path);
     let (meta, kind) = match (fs::symlink_metadata(path), kind) {
@@ -711,12 +711,12 @@ fn insert_chunks(
 
 /// Each of `chunks` embedded as a document titled `title`, letting `between`
 /// run after each.
-fn embed_chunks(
+fn embed_chunks<E: Embed>(
     conn: &Connection,
-    emb: &mut Embedder,
+    emb: &mut E,
     title: &str,
     chunks: &[(usize, String)],
-    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Vec<Vec<f32>>> {
     let mut vectors = Vec::with_capacity(chunks.len());
     for (_, c) in chunks {
@@ -738,12 +738,12 @@ fn is_scannable(path: &Path) -> bool {
 /// up to `ocr::MAX_SCAN_PAGES` and within `ocr::SCAN_WALL` of rendering.
 /// The first page that won't render ends the scan with the pages read so
 /// far: a file that stalls one page likely stalls them all.
-fn scan_chunks(
+fn scan_chunks<E: Embed>(
     conn: &Connection,
-    emb: &mut Embedder,
+    emb: &mut E,
     path: &Path,
     bytes: &[u8],
-    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Vec<(usize, String)>> {
     // Rendering only: OCR and embedding are the runner's own work, paced by
     // `between`.
@@ -909,19 +909,19 @@ pub enum Rest {
 /// The next run of parts of the long document indexed in part longest ago
 /// (#108), or None when every document is in whole. The parser's limits
 /// apply to the run, as in `index_file`, and `between` after each chunk.
-pub fn index_rest(
+pub fn index_rest<E: Embed>(
     conn: &mut Connection,
-    emb: &mut Embedder,
+    emb: &mut E,
     types: &FileTypes,
-    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Option<Rest>> {
     let Some(next) = next_rest(conn)? else {
         return Ok(None);
     };
     let again = |conn: &mut Connection,
-                 emb: &mut Embedder,
+                 emb: &mut E,
                  path: String,
-                 between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>|
+                 between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>|
      -> Result<Option<Rest>> {
         // Whatever the stamp says, index_file must take it as changed.
         conn.execute("UPDATE files SET mtime = -1 WHERE path = ?1", [&path])?;
@@ -1332,18 +1332,18 @@ pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
 /// Called after each file `index` looks at, with the connection and model
 /// lent back: for progress, and for the runner to answer queries mid-index.
 /// An error from it stops indexing; every file finished so far is kept.
-pub type AfterFile<'a> = dyn FnMut(&Stats, &Connection, &mut Embedder) -> Result<()> + 'a;
+pub type AfterFile<'a, E = Embedder> = dyn FnMut(&Stats, &Connection, &mut E) -> Result<()> + 'a;
 
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
 /// that are gone are removed.
-pub fn index(
+pub fn index<E: Embed>(
     conn: &mut Connection,
-    emb: &mut Embedder,
+    emb: &mut E,
     root: &Path,
     ex: &Excludes,
     types: &FileTypes,
-    after: &mut AfterFile,
+    after: &mut AfterFile<E>,
 ) -> Result<Stats> {
     let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
@@ -2035,6 +2035,9 @@ pub fn search(
     }
     Ok(hits)
 }
+
+#[cfg(test)]
+mod pipeline_tests;
 
 #[cfg(test)]
 mod tests {
