@@ -2,6 +2,7 @@
 name = "vinosearch-shared"
 version = "4.0.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 description = "What vinoSearch's daemon, CLI and settings app agree on: the config file and the D-Bus names"
 publish = false
