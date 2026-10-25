@@ -47,6 +47,8 @@ pub mod status {
     pub const INDEXED_FILES: &str = "indexed_files";
     /// PauseIndexing was called and ResumeIndexing not since.
     pub const PAUSED: &str = "paused";
+    /// Why indexing is held for power (#109): a `hold` value, or empty.
+    pub const POWER_HOLD: &str = "power_hold";
     pub const MODEL_PRESENT: &str = "model_present";
     pub const FETCHING: &str = "fetching";
     pub const FETCH_DONE: &str = "fetch_done";
@@ -65,6 +67,14 @@ pub mod status {
     pub const MODEL_CHANGED: &str = "model_changed";
     /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
     pub const NO_DECODER: &str = "no_decoder";
+}
+
+/// Values of `status::POWER_HOLD`.
+pub mod hold {
+    /// On battery with `index_on_battery = false`.
+    pub const CHARGER: &str = "charger";
+    /// power-profiles-daemon (or tuned-ppd) has the power-saver profile on.
+    pub const POWER_SAVER: &str = "power_saver";
 }
 
 /// `Control1.RecentFiles`: the kinds it returns, and the most it returns.

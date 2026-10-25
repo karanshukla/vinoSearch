@@ -7,6 +7,7 @@
 //! device = "NPU"
 //! idle_unload_minutes = 5
 //! index_busy_percent = 50
+//! index_on_battery = true
 //! editor = "code"
 //!
 //! [formats.text]
@@ -98,6 +99,10 @@ pub struct Config {
     /// half that on battery [default: 50].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_busy_percent: Option<u8>,
+    /// Index while on battery; false holds indexing until a charger is
+    /// plugged in (#109) [default: true].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_on_battery: Option<bool>,
     /// What opens a text result at its line (#105): a known editor (`code`,
     /// `kate`, `zed`, a JetBrains IDE...), or any command with `{file}` and
     /// `{line}` in it, split on spaces and run without a shell
@@ -135,8 +140,8 @@ pub struct ImageFormat {
     pub min_score: Option<f32>,
 }
 
-/// PDF, Office and OpenDocument files, spreadsheets, CSV (#55), EPUB and
-/// subtitles (#97). Searched
+/// PDF, Office and OpenDocument files, spreadsheets, CSV (#55), EPUB,
+/// subtitles, `.doc`, `.ppt` and RTF (#97). Searched
 /// with text, so they share its `min_score`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -153,6 +158,7 @@ impl Default for Config {
             device: None,
             idle_unload_minutes: None,
             index_busy_percent: None,
+            index_on_battery: None,
             editor: None,
             formats: Formats::default(),
         }
@@ -278,6 +284,10 @@ impl Config {
             Some(p) => doc["index_busy_percent"] = toml_edit::value(i64::from(p)),
             None => drop(doc.remove("index_busy_percent")),
         }
+        match self.index_on_battery {
+            Some(on) => doc["index_on_battery"] = toml_edit::value(on),
+            None => drop(doc.remove("index_on_battery")),
+        }
         match self.editor.as_deref().map(str::trim) {
             Some(e) if !e.is_empty() => doc["editor"] = toml_edit::value(e),
             _ => drop(doc.remove("editor")),
@@ -326,6 +336,10 @@ impl Config {
             .map(|e| resolve(e, &home))
             .collect::<Result<_>>()
             .map(Excludes)
+    }
+
+    pub fn index_on_battery(&self) -> bool {
+        self.index_on_battery.unwrap_or(true)
     }
 }
 
@@ -441,6 +455,9 @@ mod tests {
         assert_eq!(c.idle_unload_minutes, Some(0.0));
         assert_eq!(c.device, None);
         assert_eq!(c.index_busy_percent, None);
+        assert!(c.index_on_battery());
+        let c: Config = toml::from_str("index_on_battery = false\n").unwrap();
+        assert!(!c.index_on_battery());
         let c: Config = toml::from_str("index_busy_percent = 25\n").unwrap();
         assert_eq!(index_share(c.index_busy_percent.unwrap()).unwrap(), 0.25);
         assert!(index_share(0).is_err());
@@ -510,9 +527,11 @@ mod tests {
         c.exclude.push("~/b".into());
         c.device = None;
         c.idle_unload_minutes = Some(0.0);
+        c.index_on_battery = Some(false);
         c.editor = Some("foot -e nvim +{line} {file}".into());
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("index_on_battery = false\n"), "{text}");
         assert!(
             text.starts_with("# Never indexed or watched.\nexclude = [\n"),
             "{text}"
@@ -523,6 +542,13 @@ mod tests {
 
         c.exclude.clear();
         c.idle_unload_minutes = Some(2.5);
+        c.index_on_battery = None;
+        c.save(&path).unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("index_on_battery")
+        );
         c.editor = None;
         c.save(&path).unwrap();
         assert!(!fs::read_to_string(&path).unwrap().contains("editor"));

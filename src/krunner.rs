@@ -456,6 +456,12 @@ impl Control {
             owned(Value::from(self.status.paused.load(Ordering::Relaxed))),
         );
         out.insert(
+            key::POWER_HOLD.into(),
+            owned(Value::from(
+                self.status.power.hold().map_or("", crate::power::Hold::key),
+            )),
+        );
+        out.insert(
             key::DEVICE.into(),
             owned(Value::from(self.status.device.lock().unwrap().clone())),
         );
@@ -718,6 +724,7 @@ fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     worker::prepare(&opts.status)?;
+    crate::power::spawn(tx.clone(), opts.status.clone());
     let _watcher = watch::spawn(
         tx.clone(),
         opts.config.clone(),

@@ -363,6 +363,47 @@ fn a_failed_probe_says_so_in_words() {
 }
 
 #[test]
+fn index_on_battery_is_a_checkbox_saved_only_when_off() {
+    let (w, _requests) = window(Page::Hardware, "battery");
+    let path = w.config_path.clone();
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_role_and_label(Role::Heading, "Power");
+    let battery = h.get_by_role_and_label(Role::CheckBox, "Index on battery");
+    assert_eq!(
+        battery.accesskit_node().toggled(),
+        Some(accesskit::Toggled::True)
+    );
+    battery.click();
+    settle(&mut h);
+    assert!(!h.state().config.index_on_battery());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("index_on_battery = false"), "{text}");
+    h.get_by_role_and_label(Role::CheckBox, "Index on battery")
+        .click();
+    settle(&mut h);
+    assert_eq!(h.state().config.index_on_battery, None);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("index_on_battery"), "{text}");
+}
+
+#[test]
+fn the_index_page_says_why_power_holds_indexing() {
+    for (key, says) in [
+        (hold::CHARGER, "Waiting for a charger"),
+        (hold::POWER_SAVER, "Paused: power saver"),
+    ] {
+        let (w, _requests) = window(Page::Index, key);
+        if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+            s.indexing = false;
+            s.power_hold = key.into();
+        }
+        let h = harness(w, WIDE, Theme::Light);
+        h.get_by_label(says);
+        assert!(h.query_by_role_and_label(Role::Button, "Stop").is_none());
+    }
+}
+
+#[test]
 fn integration_switches_say_their_state_in_words() {
     let (w, _requests) = window(Page::Integration, "integration");
     let h = harness(w, WIDE, Theme::Dark);

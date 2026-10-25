@@ -63,6 +63,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `model_loaded` | `b` | The model is in memory. |
 | `indexing` | `b` | A `Reindex` is queued or running, or the worker is embedding changes the watcher found. True from the moment `Reindex` returns. |
 | `paused` | `b` | `PauseIndexing` was called and `ResumeIndexing` not since. `indexing` is false while paused. |
+| `power_hold` | `s` | Why indexing is held for power ([#109](https://github.com/karanshukla/vinoSearch/issues/109)): `charger` (on battery with `index_on_battery = false`), `power_saver` (power-profiles-daemon or tuned-ppd reports the `power-saver` profile), or empty. Held as `PauseIndexing` holds it, apart from `paused`: changes found meanwhile wait, queries keep working, and it resumes by itself once the reason goes. `indexing` is false while held. |
 | `indexed_files` | `t` | Files embedded so far by the current indexing job. |
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
@@ -90,6 +91,7 @@ exclude = ["~/Downloads"]
 device = "NPU"
 idle_unload_minutes = 5
 index_busy_percent = 50
+index_on_battery = true
 
 [formats.text]
 min_score = 0.65
@@ -108,6 +110,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `device` | the model is unloaded, then loaded on the new device by the next query or indexing job; `Status` reports the new device straight away |
 | `idle_unload_minutes` | from the next wait for a job (0 keeps the model loaded) |
 | `index_busy_percent` | at once, mid-index included: most of the device's time background indexing takes, 1 to 100, default 50, half that on battery |
+| `index_on_battery` | at once, mid-index included: `false` holds indexing while on battery (the battery is read every 10 s) and `power_hold` in `Status` says `charger`. Default `true` |
 | `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, heif, avif |
 | `formats.text.min_score`, `formats.images.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65 and 0.6) |
 

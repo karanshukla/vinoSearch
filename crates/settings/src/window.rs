@@ -11,6 +11,8 @@ use vinosearch_shared::config::{
     DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT, DEFAULT_TEXT_MIN_SCORE,
 };
 
+use vinosearch_shared::dbus::hold;
+
 use crate::control::{Link, Request, Status};
 use crate::{doctor, integration, portal, theme};
 
@@ -55,6 +57,15 @@ impl Page {
 const TITLE: &str = "vinoSearch settings";
 
 const DEVICES: [&str; 3] = ["NPU", "GPU", "CPU"];
+
+/// What the Index page says while indexing is held for power (#109).
+fn power_hold(key: &str) -> Option<&'static str> {
+    match key {
+        hold::CHARGER => Some("Waiting for a charger"),
+        hold::POWER_SAVER => Some("Paused: power saver"),
+        _ => None,
+    }
+}
 
 fn device_label(device: &'static str) -> &'static str {
     match device {
@@ -277,6 +288,8 @@ impl SettingsWindow {
                         if ui.button("Resume").clicked() {
                             self.link.send(Request::ResumeIndexing);
                         }
+                    } else if let Some(why) = power_hold(&s.power_hold) {
+                        ui.label(why);
                     } else if s.indexing {
                         spinner(ui);
                         ui.label(format!(
@@ -861,7 +874,7 @@ impl SettingsWindow {
         row(
             ui,
             "Documents:",
-            "PDF, Office, EPUB, subtitles and CSV. Their text is stored unencrypted.",
+            "PDF, Office, RTF, EPUB, subtitles and CSV. Their text is stored unencrypted.",
             |ui| {
                 let mut on = self.config.formats.documents_enabled();
                 ui.horizontal(|ui| {
@@ -973,6 +986,24 @@ impl SettingsWindow {
                 }
             });
         });
+
+        section(ui, "Power");
+        if self.config_broken.is_some() {
+            help_line(ui, "The settings file doesn't parse; see the Folders page.");
+            return;
+        }
+        row(
+            ui,
+            "Battery:",
+            "Off holds indexing until a charger is plugged in. Indexing also pauses while power saver is on.",
+            |ui| {
+                let mut on = self.config.index_on_battery();
+                if ui.checkbox(&mut on, "Index on battery").changed() {
+                    self.config.index_on_battery = (!on).then_some(false);
+                    self.save_config();
+                }
+            },
+        );
     }
 
     fn integration(&mut self, ui: &mut egui::Ui) {
