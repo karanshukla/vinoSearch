@@ -65,12 +65,14 @@ pub struct Embedder {
     core: Core,
     model_dir: PathBuf,
     vision_dir: PathBuf,
+    ocr_dir: PathBuf,
     device: String,
     cache: PathBuf,
     tok: Tokenizer,
     query: Stage,
     docs: Option<Stage>,
     images: Option<ImageStage>,
+    ocr: Option<crate::ocr::Ocr>,
     docs_share: f64,
 }
 
@@ -120,7 +122,7 @@ fn cache_key(device: &str, len: usize) -> String {
     stage_key(crate::model::REVISION, device, &len.to_string())
 }
 
-fn stage_key(revision: &str, device: &str, stage: &str) -> String {
+pub(crate) fn stage_key(revision: &str, device: &str, stage: &str) -> String {
     let dev: String = device
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -129,14 +131,20 @@ fn stage_key(revision: &str, device: &str, stage: &str) -> String {
 }
 
 /// The stages this build compiles, as (model revision, stage).
-fn stages() -> [(&'static str, String); 4] {
+fn stages() -> Vec<(&'static str, String)> {
     let tokens = crate::vision::SOFT_TOKENS;
-    [
+    let mut out = vec![
         (crate::model::REVISION, QUERY_LEN.to_string()),
         (crate::model::REVISION, DOC_LEN.to_string()),
         (crate::model::REVISION, format!("image{tokens}")),
         (crate::model::VISION_REVISION, format!("vision{tokens}")),
-    ]
+    ];
+    out.extend(
+        crate::ocr::stages()
+            .into_iter()
+            .map(|s| (crate::model::OCR_REVISION, s)),
+    );
+    out
 }
 
 /// Drop everything under `root` but this build's stage directories (for
@@ -178,7 +186,7 @@ fn blobs(dir: &Path) -> Vec<PathBuf> {
 
 /// Compile with this stage's cache directory, then drop the blobs a cache
 /// miss left stale. True when it was a miss.
-fn compile_cached(
+pub(crate) fn compile_cached(
     core: &mut Core,
     device: &str,
     cache: &Path,
@@ -313,7 +321,7 @@ impl Stage {
 
 /// After work that started at `t0`, leave the device to other programs for
 /// long enough that this work takes `share` of its time.
-fn yield_device(t0: Instant, share: f64) {
+pub(crate) fn yield_device(t0: Instant, share: f64) {
     if share < 1.0 {
         std::thread::sleep(t0.elapsed().mul_f64((1.0 - share) / share));
     }
@@ -335,7 +343,7 @@ impl ImageStage {
         tok: &Tokenizer,
     ) -> Result<Self> {
         ensure!(
-            crate::model::images_present(model_dir, vision_dir),
+            crate::model::vision_present(model_dir, vision_dir),
             "the vision encoder is not in {}; run: vinosearch fetch-model",
             vision_dir.display()
         );
@@ -507,6 +515,7 @@ impl Embedder {
         mut core: Core,
         model_dir: &Path,
         vision_dir: &Path,
+        ocr_dir: &Path,
         device: &str,
         cache_dir: &Path,
     ) -> Result<Self> {
@@ -525,12 +534,14 @@ impl Embedder {
             core,
             model_dir: model_dir.to_owned(),
             vision_dir: vision_dir.to_owned(),
+            ocr_dir: ocr_dir.to_owned(),
             device: device.to_owned(),
             cache: cache_dir.to_owned(),
             tok,
             query,
             docs: None,
             images: None,
+            ocr: None,
             docs_share: 1.0,
         })
     }
@@ -585,12 +596,31 @@ impl Embedder {
     /// query) or image compiles them again, from the cache.
     pub fn release_documents(&mut self) -> bool {
         let images = self.images.take().is_some();
-        self.docs.take().is_some() || images
+        let ocr = self.ocr.take().is_some();
+        self.docs.take().is_some() || images || ocr
     }
 
     /// The document or image stage is compiled.
     pub fn has_documents(&self) -> bool {
-        self.docs.is_some() || self.images.is_some()
+        self.docs.is_some() || self.images.is_some() || self.ocr.is_some()
+    }
+
+    /// The OCR model's files are fetched.
+    pub fn can_read_text(&self) -> bool {
+        crate::model::ocr_present(&self.ocr_dir)
+    }
+
+    /// The lines of text in `img` (#106), at the document share of the device.
+    pub fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
+        if self.ocr.is_none() {
+            self.ocr = Some(crate::ocr::Ocr::new(
+                &mut self.core,
+                &self.ocr_dir,
+                &self.device,
+                &self.cache,
+            )?);
+        }
+        self.ocr.as_mut().unwrap().read(img, self.docs_share)
     }
 
     /// Embed an image, prepared by [`crate::vision::prepare`].
@@ -645,6 +675,7 @@ mod tests {
             Core::new().unwrap(),
             &crate::model::default_dir().unwrap(),
             &crate::model::vision_dir().unwrap(),
+            &crate::model::ocr_dir().unwrap(),
             "CPU",
             &cache,
         )

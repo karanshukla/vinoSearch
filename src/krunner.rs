@@ -116,6 +116,10 @@ fn describe(h: &Hit) -> (String, String) {
     let description = match h.kind {
         Kind::Text => format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
         Kind::Image => format!("{dir}{copies}"),
+        // Text OCR read in an image (#106) has no page or slide to name.
+        Kind::Document if !crate::extract::is_document(path) => {
+            format!("{dir}{copies}  {}", crate::snippet(&h.text))
+        }
         Kind::Document => format!(
             "{dir}, {} {}{copies}  {}",
             crate::extract::unit(path),
@@ -502,9 +506,10 @@ impl Control {
         );
         let model_dir = model::default_dir().map_err(failed)?;
         let vision_dir = model::vision_dir().map_err(failed)?;
-        // The vision encoder counts while images are on.
+        let ocr_dir = model::ocr_dir().map_err(failed)?;
+        // The vision encoder and OCR count while images are on.
         let present = model::present(&model_dir)
-            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir));
+            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir, &ocr_dir));
         out.insert(key::MODEL_PRESENT.into(), owned(Value::from(present)));
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
@@ -1239,6 +1244,21 @@ mod tests {
             text: String::new(),
             copies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn text_read_in_an_image_has_no_page_to_name() {
+        let mut shot = hit(Kind::Document, 0.8, "/home/u/Pictures/Screenshots/a.png");
+        shot.text = "Invoice INV-2026-004817".into();
+        let (name, description) = describe(&shot);
+        assert_eq!(name, "a.png");
+        assert_eq!(
+            description,
+            "/home/u/Pictures/Screenshots  Invoice INV-2026-004817"
+        );
+        let mut scan = hit(Kind::Document, 0.8, "/d/scan.pdf");
+        scan.line = 3;
+        assert!(describe(&scan).1.starts_with("/d, page 3"));
     }
 
     const FLOORS: Floors = Floors {

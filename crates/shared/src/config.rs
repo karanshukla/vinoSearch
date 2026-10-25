@@ -132,7 +132,8 @@ pub struct TextFormat {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImageFormat {
-    /// Index images. Needs the vision encoder, a 671 MB download [default: false].
+    /// Index images, by what's in them and the text OCR reads in them (#106).
+    /// Needs the vision encoder, a 671 MB download [default: false].
     pub enabled: Option<bool>,
     /// File extensions taken for images [default: DEFAULT_IMAGE_EXTENSIONS].
     pub extensions: Option<Vec<String>>,
