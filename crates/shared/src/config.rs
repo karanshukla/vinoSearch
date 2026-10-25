@@ -8,6 +8,7 @@
 //! idle_unload_minutes = 5
 //! index_busy_percent = 50
 //! index_on_battery = true
+//! editor = "code"
 //!
 //! [formats.text]
 //! min_score = 0.65
@@ -102,6 +103,12 @@ pub struct Config {
     /// plugged in (#109) [default: true].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_on_battery: Option<bool>,
+    /// What opens a text result at its line (#105): a known editor (`code`,
+    /// `kate`, `zed`, a JetBrains IDE...), or any command with `{file}` and
+    /// `{line}` in it, split on spaces and run without a shell
+    /// [default: the default app for the file's type].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
     /// What kinds of file are indexed, and how close a result must be (#73).
     pub formats: Formats,
 }
@@ -152,6 +159,7 @@ impl Default for Config {
             idle_unload_minutes: None,
             index_busy_percent: None,
             index_on_battery: None,
+            editor: None,
             formats: Formats::default(),
         }
     }
@@ -279,6 +287,10 @@ impl Config {
         match self.index_on_battery {
             Some(on) => doc["index_on_battery"] = toml_edit::value(on),
             None => drop(doc.remove("index_on_battery")),
+        }
+        match self.editor.as_deref().map(str::trim) {
+            Some(e) if !e.is_empty() => doc["editor"] = toml_edit::value(e),
+            _ => drop(doc.remove("editor")),
         }
         let f = &self.formats;
         // Through its shortest decimal, so 0.7 is written as 0.7, not 0.699999988.
@@ -516,6 +528,7 @@ mod tests {
         c.device = None;
         c.idle_unload_minutes = Some(0.0);
         c.index_on_battery = Some(false);
+        c.editor = Some("foot -e nvim +{line} {file}".into());
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("index_on_battery = false\n"), "{text}");
@@ -536,6 +549,9 @@ mod tests {
                 .unwrap()
                 .contains("index_on_battery")
         );
+        c.editor = None;
+        c.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("editor"));
         assert_eq!(Config::load(&path).unwrap(), c);
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -115,6 +115,8 @@ struct SettingsWindow {
     new_exclude: String,
     /// The image extensions as typed, until Enter or leaving the field.
     image_extensions: Option<String>,
+    /// The editor as typed, until Enter or leaving the field.
+    editor: Option<String>,
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
@@ -165,6 +167,7 @@ impl SettingsWindow {
             new_root: String::new(),
             new_exclude: String::new(),
             image_extensions: None,
+            editor: None,
             picked: Arc::new(Mutex::new(None)),
             picking: false,
             confirm: None,
@@ -885,6 +888,34 @@ impl SettingsWindow {
                         ui.label(RichText::new(text).color(p.muted));
                     }
                 });
+            },
+        );
+
+        section(ui, "Opening results");
+        labelled_row(
+            ui,
+            "Editor:",
+            "Opens text at the matching line: code, kate, zed, a JetBrains IDE, or any command \
+             with {file} and {line}. Empty uses the default app.",
+            |ui, named| {
+                let current = self.config.editor.clone().unwrap_or_default();
+                let text = self.editor.get_or_insert(current);
+                let response = named(
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .hint_text("Default app")
+                            .desired_width((ui.available_width() - 60.0).clamp(120.0, 300.0)),
+                    ),
+                );
+                if response.lost_focus() {
+                    let typed = text.trim();
+                    let next = (!typed.is_empty()).then(|| typed.to_owned());
+                    if next != self.config.editor {
+                        self.config.editor = next;
+                        changed = true;
+                    }
+                    self.editor = None;
+                }
             },
         );
 
