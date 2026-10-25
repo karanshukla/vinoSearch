@@ -1,6 +1,6 @@
 //! Text out of documents (#55): PDF pages, the XML inside Office and
 //! OpenDocument zips, spreadsheets, CSV with its header on every chunk, EPUB
-//! chapters and subtitles (#97).
+//! chapters, subtitles, and Word 97, PowerPoint 97 and RTF files (#97).
 //! What comes out is chunked like any text file, numbered by page, slide or
 //! row instead of line. The indexer runs it in a child process with limits
 //! (#84), since the files come from anywhere.
@@ -12,6 +12,9 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
+
+mod ole;
+mod rtf;
 
 /// Address space the extracting child may map (#84). The runner's own share
 /// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
@@ -154,7 +157,7 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<()> {
 pub const EXTENSIONS: &[&str] = &[
     "pdf", "docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "pptx", "pptm", "potx", "ppsx",
     "ppsm", "odp", "otp", "fodp", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "ods", "ots",
-    "csv", "tsv", "epub", "srt", "vtt",
+    "csv", "tsv", "epub", "srt", "vtt", "doc", "dot", "ppt", "pot", "pps", "rtf",
 ];
 
 /// Word's macro and template files keep the text where a .docx does.
@@ -179,7 +182,7 @@ pub fn is_document(path: &Path) -> bool {
 pub fn unit(path: &Path) -> &'static str {
     match ext(path).as_str() {
         "pdf" => "page",
-        "odp" | "otp" | "fodp" => "slide",
+        "odp" | "otp" | "fodp" | "ppt" | "pot" | "pps" => "slide",
         e if SLIDES.contains(&e) => "slide",
         "csv" | "tsv" => "row",
         e if SHEETS.contains(&e) => "row",
@@ -209,6 +212,14 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
         )),
         "fodp" => Ok(numbered(xml_text(utf8(bytes)?, &Tags::ODF).split('\u{c}'))),
         "epub" => epub(bytes),
+        // Older Words saved RTF under .doc, and a renamed .docx or .pptx is
+        // still one.
+        "doc" | "dot" if bytes.starts_with(b"{\\rtf") => Ok(chunk(&rtf::rtf(bytes)?)),
+        "doc" | "dot" if bytes.starts_with(b"PK") => chunks(Path::new("a.docx"), bytes),
+        "doc" | "dot" => Ok(chunk(&ole::doc(bytes)?)),
+        "ppt" | "pot" | "pps" if bytes.starts_with(b"PK") => chunks(Path::new("a.pptx"), bytes),
+        "ppt" | "pot" | "pps" => Ok(numbered(ole::ppt(bytes)?.iter())),
+        "rtf" => Ok(chunk(&rtf::rtf(bytes)?)),
         "srt" | "vtt" => Ok(chunk(&subtitles(&String::from_utf8_lossy(bytes)))),
         "csv" | "tsv" => {
             let text = std::str::from_utf8(bytes).context("not UTF-8")?;
@@ -1176,6 +1187,308 @@ mod tests {
         assert!(is_html(Path::new("A.HTM")) && !is_html(Path::new("a.md")));
     }
 
+    /// A compound file holding `streams`.
+    fn ole_of(streams: &[(&str, &[u8])]) -> Vec<u8> {
+        // Version 3, 512-byte sectors, as Office writes them.
+        let mut file =
+            cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
+                .unwrap();
+        for (name, body) in streams {
+            file.create_stream(name).unwrap().write_all(body).unwrap();
+        }
+        file.flush().unwrap();
+        file.into_inner().into_inner()
+    }
+
+    /// A Word 97 file whose text is `pieces`, each stored as 8-bit
+    /// Windows-1252 (true) or UTF-16, the main document being the first
+    /// `main` characters.
+    fn doc_of(pieces: &[(&str, bool)], main: u32) -> Vec<u8> {
+        let mut word = vec![0u8; 1024];
+        word[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes());
+        word[2..4].copy_from_slice(&0xC1u16.to_le_bytes());
+        // fWhichTblStm: the table is 1Table.
+        word[0x0A..0x0C].copy_from_slice(&0x0200u16.to_le_bytes());
+        word[32..34].copy_from_slice(&14u16.to_le_bytes());
+        let lw = 34 + 28;
+        word[lw..lw + 2].copy_from_slice(&22u16.to_le_bytes());
+        word[lw + 2 + 12..lw + 2 + 16].copy_from_slice(&main.to_le_bytes());
+        let fc_lcb = lw + 2 + 88;
+        word[fc_lcb..fc_lcb + 2].copy_from_slice(&93u16.to_le_bytes());
+        let mut cps = vec![0u32];
+        let mut pcds = Vec::new();
+        for (text, compressed) in pieces {
+            let fc = word.len() as u32;
+            let chars: Vec<u16> = text.encode_utf16().collect();
+            if *compressed {
+                let (bytes, _, bad) = encoding_rs::WINDOWS_1252.encode(text);
+                assert!(!bad);
+                word.extend_from_slice(&bytes);
+                pcds.push((fc * 2) | 0x4000_0000);
+            } else {
+                word.extend(chars.iter().flat_map(|c| c.to_le_bytes()));
+                pcds.push(fc);
+            }
+            cps.push(cps.last().unwrap() + chars.len() as u32);
+        }
+        let mut plc: Vec<u8> = cps.iter().flat_map(|c| c.to_le_bytes()).collect();
+        for fc in pcds {
+            plc.extend([0, 0]);
+            plc.extend(fc.to_le_bytes());
+            plc.extend([0, 0]);
+        }
+        // A Prc to step over, then the Pcdt.
+        let mut table = vec![0u8; 16];
+        let fc_clx = table.len() as u32;
+        table.extend([1, 2, 0, 0xAA, 0xBB, 2]);
+        table.extend((plc.len() as u32).to_le_bytes());
+        table.extend(&plc);
+        let clx = fc_lcb + 2 + 33 * 8;
+        word[clx..clx + 4].copy_from_slice(&fc_clx.to_le_bytes());
+        word[clx + 4..clx + 8].copy_from_slice(&((table.len() as u32) - fc_clx).to_le_bytes());
+        ole_of(&[("WordDocument", &word), ("1Table", &table)])
+    }
+
+    #[test]
+    fn doc_reads_the_piece_table() {
+        let first = "Fish & chips €4\r\
+                     See \u{13} HYPERLINK \"http://x\" \u{14}the site\u{15} now\r";
+        let second = "Ελληνικά\u{b}line\u{1}\r\
+                      a\u{7}b\u{7}\u{7}\r\
+                      \u{13}PAGE\u{15}non\u{1e}breaking\r";
+        let main = (first.chars().count() + second.chars().count()) as u32;
+        let doc = doc_of(
+            &[(first, true), (second, false), ("a footnote\r", true)],
+            main,
+        );
+        let path = Path::new("a.doc");
+        assert_eq!(unit(path), "paragraph");
+        assert_eq!(
+            join(path, chunks(path, &doc).unwrap()),
+            "Fish & chips €4\nSee the site now\nΕλληνικά\nline\na\tb\t\t\nnon-breaking\n"
+        );
+        let c = chunks(Path::new("a.dot"), &doc).unwrap();
+        assert_eq!(c[0].0, 1);
+    }
+
+    fn ppt_record(kind: u16, instance: u16, body: &[u8]) -> Vec<u8> {
+        let mut r = (instance << 4).to_le_bytes().to_vec();
+        r.extend(kind.to_le_bytes());
+        r.extend((body.len() as u32).to_le_bytes());
+        r.extend(body);
+        r
+    }
+
+    fn ppt_container(kind: u16, instance: u16, children: &[Vec<u8>]) -> Vec<u8> {
+        let mut r = ppt_record(kind, instance, &children.concat());
+        r[0] |= 0xF;
+        r
+    }
+
+    fn chars_atom(text: &str) -> Vec<u8> {
+        let body: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        ppt_record(0x0FA0, 0, &body)
+    }
+
+    /// A slide whose drawing holds `texts` a couple of containers down, as a
+    /// text box's would be.
+    fn slide_container(texts: &[&str]) -> Vec<u8> {
+        let boxes: Vec<Vec<u8>> = texts
+            .iter()
+            .map(|t| ppt_container(0xF00D, 0, &[chars_atom(t)]))
+            .collect();
+        ppt_container(
+            0x03EE,
+            0,
+            &[ppt_container(
+                0x040C,
+                0,
+                &[ppt_container(0xF002, 0, &boxes)],
+            )],
+        )
+    }
+
+    /// `slides`' placeholder texts in the slide list, in order, and each
+    /// slide's own texts in its container. An old version of a slide sits
+    /// in the stream unreferenced, as a fast save leaves it.
+    fn ppt_of(slides: &[(&[&str], &[&str])]) -> Vec<u8> {
+        let mut stream = slide_container(&["stale"]);
+        let mut offsets = Vec::new();
+        for (_, own) in slides {
+            offsets.push(stream.len() as u32);
+            stream.extend(slide_container(own));
+        }
+        let mut list = Vec::new();
+        // The slide list in reverse of the stream's order: it decides.
+        for (i, (listed, _)) in slides.iter().enumerate().rev() {
+            let mut persist = (i as u32 + 2).to_le_bytes().to_vec();
+            persist.extend([0; 16]);
+            list.push(ppt_record(0x03F3, 0, &persist));
+            for t in *listed {
+                list.push(ppt_record(0x0F9F, 0, &[0; 4]));
+                if t.is_ascii() {
+                    list.push(ppt_record(0x0FA8, 0, t.as_bytes()));
+                } else {
+                    list.push(chars_atom(t));
+                }
+            }
+        }
+        let document_at = stream.len() as u32;
+        stream.extend(ppt_container(
+            0x03E8,
+            0,
+            &[
+                ppt_record(0x03E9, 0, &[0; 40]),
+                ppt_container(0x0FF0, 2, &[chars_atom("notes list")]),
+                ppt_container(0x0FF0, 0, &list),
+            ],
+        ));
+        let dir_at = stream.len() as u32;
+        let mut dir = (1u32 | ((slides.len() as u32 + 1) << 20))
+            .to_le_bytes()
+            .to_vec();
+        dir.extend(document_at.to_le_bytes());
+        for o in offsets {
+            dir.extend(o.to_le_bytes());
+        }
+        stream.extend(ppt_record(0x1772, 0, &dir));
+        let edit_at = stream.len() as u32;
+        let mut edit = vec![0u8; 28];
+        edit[12..16].copy_from_slice(&dir_at.to_le_bytes());
+        edit[16..20].copy_from_slice(&1u32.to_le_bytes());
+        stream.extend(ppt_record(0x0FF5, 0, &edit));
+        let mut user = ppt_record(0x0FF6, 0, &[0; 20]);
+        user[8..12].copy_from_slice(&0x14u32.to_le_bytes());
+        user[12..16].copy_from_slice(&0xE391_C05Fu32.to_le_bytes());
+        user[16..20].copy_from_slice(&edit_at.to_le_bytes());
+        ole_of(&[("PowerPoint Document", &stream), ("Current User", &user)])
+    }
+
+    #[test]
+    fn ppt_slides_follow_the_slide_list() {
+        let ppt = ppt_of(&[
+            (&["Second title"], &["Second title", "a box"]),
+            (&["First\rtitle", "Café"], &["Ünïcode box"]),
+        ]);
+        let path = Path::new("a.ppt");
+        let c = chunks(path, &ppt).unwrap();
+        assert_eq!(
+            c,
+            vec![
+                (1, "First\ntitle\nCafé\nÜnïcode box\n".to_owned()),
+                (2, "Second title\na box\n".to_owned()),
+            ]
+        );
+        assert_eq!(unit(path), "slide");
+        assert_eq!(
+            join(path, c),
+            "First\ntitle\nCafé\nÜnïcode box\n\nSecond title\na box\n"
+        );
+        for e in ["pot", "pps"] {
+            assert_eq!(unit(Path::new(&format!("a.{e}"))), "slide");
+        }
+    }
+
+    #[test]
+    fn ppt_without_an_edit_history_reads_every_slide() {
+        let ppt = ppt_of(&[(&[], &["box"])]);
+        let mut file = cfb::CompoundFile::open(Cursor::new(ppt)).unwrap();
+        let mut stream = Vec::new();
+        file.open_stream("PowerPoint Document")
+            .unwrap()
+            .read_to_end(&mut stream)
+            .unwrap();
+        let ppt = ole_of(&[("PowerPoint Document", &stream)]);
+        let c = chunks(Path::new("a.ppt"), &ppt).unwrap();
+        assert_eq!(c, vec![(1, "stale\n".to_owned()), (2, "box\n".to_owned())]);
+    }
+
+    #[test]
+    fn encrypted_ppt_is_an_error() {
+        let mut ppt = ppt_of(&[(&["x"], &[])]);
+        let mut file = cfb::CompoundFile::open(Cursor::new(&mut ppt)).unwrap();
+        let mut user = Vec::new();
+        file.open_stream("Current User")
+            .unwrap()
+            .read_to_end(&mut user)
+            .unwrap();
+        user[12..16].copy_from_slice(&0xF3D1_C4DFu32.to_le_bytes());
+        file.create_stream("Current User")
+            .unwrap()
+            .write_all(&user)
+            .unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let e = chunks(Path::new("a.ppt"), &ppt).unwrap_err();
+        assert_eq!(e.to_string(), "encrypted");
+    }
+
+    const RTF: &str = r#"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fswiss Helvetica;}}
+{\colortbl;\red255\green0\blue0;}{\*\generator Riched20 10.0;}{\info{\title Secret}}
+\pard\plain Fish \'26 chips \'80\~4\par
+{\header page header\par}
+Caf\'e9 \u233?s, \u-10179?\u-8704? and {\uc2\u8364 EU} done\par
+{\field{\*\fldinst HYPERLINK "http://x"}{\fldrslt the site}}\line next\tab col\par
+{\pict\pngblip 89504e470d0a}{\*\shppict{\pict 0102}}a\bin2 {}\b bold\b0\par
+\ldblquote q\rdblquote  \{braces\}\par
+}"#;
+
+    #[test]
+    fn rtf_keeps_the_text_and_drops_the_rest() {
+        let path = Path::new("a.rtf");
+        assert_eq!(unit(path), "paragraph");
+        assert_eq!(
+            join(path, chunks(path, RTF.as_bytes()).unwrap()),
+            "Fish & chips €\u{a0}4\nCafé és, 😀 and € done\nthe site\nnext\tcol\nabold\n“q” {braces}\n"
+        );
+        let sjis = b"{\\rtf1\\ansi\\ansicpg932 \\'82\\'a0\\'82\\'a2\\par}";
+        assert_eq!(rtf::rtf(sjis).unwrap(), "\u{3042}\u{3044}\n");
+        // The codepage from the font's charset, back to the document's after
+        // its group.
+        let fonts = br"{\rtf1\ansi{\fonttbl{\f0 Arial;}{\f1\fcharset204 Arial Cyr;}}
+{\f1 \'cf\'f0\'e8\'e2\'e5\'f2} \'e9\par}";
+        assert_eq!(rtf::rtf(fonts).unwrap(), "Привет é\n");
+        // An RTF file saved as .doc, as older Words did.
+        assert_eq!(
+            chunks(Path::new("a.doc"), RTF.as_bytes()).unwrap(),
+            chunks(path, RTF.as_bytes()).unwrap()
+        );
+        assert!(
+            rtf::rtf(
+                &b"{\\rtf1"
+                    .iter()
+                    .chain(&[b'{'; 5000])
+                    .copied()
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+    }
+
+    /// Cut short and with bytes overwritten, at many places: errors or less
+    /// text, never a panic or a hang.
+    #[test]
+    fn broken_doc_ppt_and_rtf_do_not_panic() {
+        let doc = doc_of(&[("Some text\r", true), ("more\r", false)], 15);
+        let ppt = ppt_of(&[(&["title"], &["box"]), (&["two"], &[])]);
+        for (name, file) in [
+            ("a.doc", doc),
+            ("a.ppt", ppt),
+            ("a.rtf", RTF.as_bytes().to_vec()),
+        ] {
+            let path = Path::new(name);
+            assert!(!chunks(path, &file).unwrap().is_empty(), "{name}");
+            for at in (0..file.len()).step_by(file.len() / 300 + 1) {
+                let _ = chunks(path, &file[..at]);
+                for byte in [0x00, 0xFF, 0x7F, b'{', b'\\'] {
+                    let mut broken = file.clone();
+                    broken[at] = byte;
+                    let _ = chunks(path, &broken);
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_document_extension_has_a_unit_and_a_parser() {
         for e in EXTENSIONS {
@@ -1188,7 +1501,9 @@ mod tests {
 
     #[test]
     fn broken_files_are_errors_not_panics() {
-        for name in ["a.pdf", "a.docx", "a.pptx", "a.odt", "a.xlsx", "a.ods"] {
+        for name in [
+            "a.pdf", "a.docx", "a.pptx", "a.odt", "a.xlsx", "a.ods", "a.doc", "a.ppt", "a.rtf",
+        ] {
             assert!(chunks(Path::new(name), b"%PDF-1.7 not really").is_err());
         }
     }

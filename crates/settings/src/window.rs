@@ -858,7 +858,7 @@ impl SettingsWindow {
         row(
             ui,
             "Documents:",
-            "PDF, Office, EPUB, subtitles and CSV. Their text is stored unencrypted.",
+            "PDF, Office, RTF, EPUB, subtitles and CSV. Their text is stored unencrypted.",
             |ui| {
                 let mut on = self.config.formats.documents_enabled();
                 ui.horizontal(|ui| {
