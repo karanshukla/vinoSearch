@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR supersedes its running checks; main's runs all finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # No NPU, model or OpenVINO needed: `openvino` uses runtime-linking, so
   # nothing links OpenVINO at build time, and the tests use tiny fixtures.
@@ -32,3 +37,62 @@ jobs:
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  # Line coverage of the workspace's tests, as lcov (artifact) and a summary
+  # table on the run page. The floor sits a few points under what CI
+  # measured when it was set; raise it as tests land.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --locked --workspace --no-report
+      - run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Summary
+        run: |
+          {
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lcov
+          path: lcov.info
+      - run: cargo llvm-cov report --summary-only --fail-under-lines 0
+
+  # The oldest Rust install.sh accepts: 1.89 for vinosearch alone, 1.95 with
+  # the settings window (egui). Matches rust-version in the Cargo.tomls.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.89"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo +1.89 check --locked -p vinosearch -p vinosearch-shared --all-targets
+      - run: cargo +1.95 check --locked --workspace --all-targets
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Preinstalled on the runner. Info-level notes (SC1091, SC2018/2019) are
+      # left alone.
+      - run: shellcheck -S warning scripts/*.sh

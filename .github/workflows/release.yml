@@ -30,8 +30,14 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The tag passed CI on main; this checks it again on the release image.
+      - run: cargo test --locked --workspace
       - run: cargo build --release --locked -p vinosearch -p vinosearch-settings
-      - run: cargo install --locked ovfetch --root "$RUNNER_TEMP/ovfetch"
+      # The ovfetch binary shipped is the version the runner links, from Cargo.lock.
+      - name: Install ovfetch
+        run: |
+          version=$(cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name == "ovfetch") | .version')
+          cargo install --locked ovfetch --version "=$version" --root "$RUNNER_TEMP/ovfetch"
       - name: Package
         run: |
           dir=vinosearch
@@ -41,6 +47,18 @@ jobs:
           cp README.md LICENSE "$dir/"
           tar czf vinosearch-x86_64-linux.tar.gz "$dir"
           sha256sum vinosearch-x86_64-linux.tar.gz > vinosearch-x86_64-linux.tar.gz.sha256
+      # The tarball as a user gets it: unpacked elsewhere, binaries run, the
+      # extractor parses, and install.sh at least starts.
+      - name: Smoke test
+        run: |
+          sha256sum -c vinosearch-x86_64-linux.tar.gz.sha256
+          tar xzf vinosearch-x86_64-linux.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/vinosearch"
+          bin/vinosearch --version
+          bin/ovfetch --version
+          bin/vinosearch-settings --help > /dev/null
+          printf 'a,b\n1,2\n' | bin/vinosearch extract /x/a.csv | jq -e '.parts == 1'
+          bash scripts/install.sh --help > /dev/null
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}

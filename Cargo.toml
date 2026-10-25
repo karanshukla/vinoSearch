@@ -2,6 +2,7 @@
 name = "vinosearch"
 version = "4.0.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
 description = "Semantic file search for KDE and GNOME, run on Intel NPUs through OpenVINO"
 repository = "https://github.com/karanshukla/vinoSearch"
