@@ -18,9 +18,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, Zeroizing};
 
-/// Absolute, so PATH never picks the binary.
-pub const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
-const SYSTEMD_ANALYZE: &str = "/usr/bin/systemd-analyze";
+/// Root-owned places systemd's tools live, so PATH never picks the binary:
+/// merged /usr, split /usr, NixOS.
+const SYSTEM_BIN_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/run/current-system/sw/bin"];
+
+fn system_tool(name: &str) -> PathBuf {
+    SYSTEM_BIN_DIRS
+        .iter()
+        .map(|d| Path::new(d).join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| Path::new(SYSTEM_BIN_DIRS[0]).join(name))
+}
 /// Sealed into the credential: one sealed under another name doesn't unseal
 /// as this one.
 const NAME: &str = "vinosearch-index";
@@ -104,6 +112,9 @@ impl Seal {
 const BY_HOST_SCOPED: [u8; 16] = id("55b9ed1d38594d43a8319d2ebb332ac6");
 const BY_HOST_AND_TPM2_SCOPED: [u8; 16] = id("ef4ac13679a9480ea7db68897f9f165d");
 const BY_HOST_AND_TPM2_PK_SCOPED: [u8; 16] = id("adbc4ca3efb64201ba881b6f2e4095ea");
+// systemd 262 pins TPM credentials to the TPM's SRK, under new ids.
+const BY_HOST_AND_TPM2_SCOPED_SRK: [u8; 16] = id("2a1f877a4275431ab3f9ed1f5d8f6601");
+const BY_HOST_AND_TPM2_PK_SCOPED_SRK: [u8; 16] = id("16e492949f94400286758f94b7c52bc7");
 
 const fn id(hex: &str) -> [u8; 16] {
     let h = hex.as_bytes();
@@ -129,7 +140,10 @@ const fn nibble(c: u8) -> u8 {
 pub fn sealed_with(credential: &[u8]) -> Option<Seal> {
     let head = base64_prefix(credential, 16)?;
     match <[u8; 16]>::try_from(&head[..16]).ok()? {
-        BY_HOST_AND_TPM2_SCOPED | BY_HOST_AND_TPM2_PK_SCOPED => Some(Seal::Tpm),
+        BY_HOST_AND_TPM2_SCOPED
+        | BY_HOST_AND_TPM2_PK_SCOPED
+        | BY_HOST_AND_TPM2_SCOPED_SRK
+        | BY_HOST_AND_TPM2_PK_SCOPED_SRK => Some(Seal::Tpm),
         BY_HOST_SCOPED => Some(Seal::Host),
         _ => None,
     }
@@ -165,7 +179,7 @@ fn base64_prefix(text: &[u8], n: usize) -> Option<Vec<u8>> {
 /// Whether systemd will seal with the TPM: one is there and the firmware
 /// reports it. Without that, the host key alone.
 pub fn tpm_available() -> bool {
-    Command::new(SYSTEMD_ANALYZE)
+    Command::new(system_tool("systemd-analyze"))
         .args(["has-tpm2", "--quiet"])
         .env_clear()
         .stdin(Stdio::null())
@@ -188,7 +202,7 @@ pub struct Sealer {
 impl Default for Sealer {
     fn default() -> Self {
         Sealer {
-            program: PathBuf::from(SYSTEMD_CREDS),
+            program: system_tool("systemd-creds"),
         }
     }
 }
@@ -214,7 +228,12 @@ impl Sealer {
             Some(Seal::Tpm) => Ok((out, Seal::Tpm)),
             Some(Seal::Host) if allow_host => Ok((out, Seal::Host)),
             Some(Seal::Host) => bail!("{NO_TPM}"),
-            None => bail!("systemd-creds wrote a credential of a kind vinoSearch doesn't know"),
+            None => bail!(
+                "systemd-creds wrote a credential of a kind vinoSearch doesn't know ({})",
+                base64_prefix(&out, 16)
+                    .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .unwrap_or_else(|| "not base64".into())
+            ),
         }
     }
 
@@ -356,6 +375,8 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
         let host = b"VbntHThZTUOoMZ0uuzMqxiAAAAABAAAADAAAABAAAAAHCZcL";
         assert_eq!(sealed_with(host), Some(Seal::Host));
         assert_eq!(sealed_with(TPM_HEAD.as_bytes()), Some(Seal::Tpm));
+        // systemd 262, TPM-sealed and pinned to its SRK.
+        assert_eq!(sealed_with(b"Kh+HekJ1Qxqz+e0fXY9mASAA"), Some(Seal::Tpm));
         // A system-scoped host credential, and junk.
         assert_eq!(sealed_with(b"Whxqht+dQJax1aZeCGLxmgAA"), None);
         assert_eq!(sealed_with(b"not base64!"), None);
