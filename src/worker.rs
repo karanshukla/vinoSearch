@@ -132,8 +132,9 @@ impl Status {
 
 /// Before the watcher compares the roots with the index: drop what must be
 /// indexed again (vectors from another model, #80; photos skipped for want
-/// of a decoder that is installed now, #79; files of a format read
-/// differently now, #97), so that first comparison finds it, and say so in
+/// of a decoder that is installed now, #79; scans OCR can read now, #106;
+/// files of a format read differently now, #97), so that first comparison
+/// finds it, and say so in
 /// `status` for the Index page.
 pub fn prepare(status: &Status) -> Result<()> {
     let conn = index::open(&index::default_db()?)?;
@@ -145,6 +146,11 @@ pub fn prepare(status: &Status) -> Result<()> {
     let retry = index::retry_undecodable(&conn)?;
     if retry > 0 {
         eprintln!("a HEIF decoder is installed now: {retry} photos will be indexed");
+    }
+    let ocr = crate::model::ocr_dir().is_ok_and(|d| crate::model::ocr_present(&d));
+    let scans = index::retry_scans(&conn, ocr)?;
+    if scans > 0 {
+        eprintln!("{scans} PDFs with no text will be read by OCR");
     }
     let reread = index::reread_formats(&conn)?;
     if reread > 0 {
@@ -268,9 +274,10 @@ fn answer(
     reply: oneshot::Sender<Vec<Hit>>,
 ) {
     let hits = emb.query(query).and_then(|q| {
+        let words = index::Words::find(conn, query);
         let mut hits = Vec::new();
         for kind in [Kind::Text, Kind::Document, Kind::Image] {
-            hits.extend(index::search(conn, vectors, &q, kind, k)?);
+            hits.extend(index::search(conn, vectors, &q, words.as_ref(), kind, k)?);
         }
         Ok(hits)
     });

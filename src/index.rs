@@ -85,8 +85,9 @@ pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 pub enum Kind {
     Text = 0,
     Image = 1,
-    /// Text extracted from a PDF, Office file or spreadsheet (#55). Scored
-    /// like text, but searched apart so neither crowds the other out.
+    /// Text extracted from a PDF, Office file or spreadsheet (#55), or read
+    /// from an image or scanned page by OCR (#106). Scored like text, but
+    /// searched apart so neither crowds the other out.
     Document = 2,
 }
 
@@ -112,17 +113,19 @@ impl Kind {
     }
 
     /// What made this kind's vectors, as `meta` records it (#80): the text
-    /// model's revision, and for images the vision encoder's and the
-    /// soft-token count too. Vectors with another tag score against this
+    /// model's revision, and for images the vision encoder's, the soft-token
+    /// count and the OCR model's, which reads their text (#106). Vectors with another tag score against this
     /// build's queries without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
             Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
             Kind::Image => format!(
-                "{}+{}/{}",
+                "{}+{}/{}+ocr:{}/{}",
                 crate::model::REVISION,
                 crate::model::VISION_REVISION,
-                crate::vision::SOFT_TOKENS
+                crate::vision::SOFT_TOKENS,
+                crate::model::OCR_REVISION,
+                crate::ocr::READING,
             ),
         }
     }
@@ -284,7 +287,69 @@ pub fn open(path: &Path) -> Result<Connection> {
                AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
          END;",
     )?;
+    words_table(&conn)?;
     Ok(conn)
+}
+
+/// A chunk's file name, from `files f`: what follows the last `/`.
+const FILE_NAME: &str = "substr(f.path, length(rtrim(f.path, replace(f.path, '/', ''))) + 1)";
+
+/// The word index (#104): FTS5 over each chunk's text and its file's name,
+/// rowid = chunk id, for the exact strings embeddings lose (invoice numbers,
+/// error codes, names). Contentless, so the text is not stored a second time;
+/// `contentless_delete` lets the triggers drop a row by its id alone. A chunk
+/// handed to a copy (files_hand_over) is reindexed under the copy's name. An
+/// index from before it is filled once, in the transaction that creates it.
+fn words_table(conn: &Connection) -> Result<()> {
+    let has = |c: &Connection| -> rusqlite::Result<bool> {
+        c.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'chunk_words'",
+            [],
+            |r| r.get(0),
+        )
+    };
+    // The table and its triggers come into being together, so with one
+    // there is nothing to do, and no write lock to wait for.
+    if has(conn)? {
+        return Ok(());
+    }
+    // Immediate, so two connections opening an old index at once can't both
+    // fill it; the second waits out the first's fill (16 s for 113k chunks
+    // in the VM) rather than the usual 5 s.
+    conn.busy_timeout(std::time::Duration::from_secs(300))?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let had = has(&tx)?;
+    tx.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_words USING fts5(
+             name, text, content = '', contentless_delete = 1,
+             tokenize = 'unicode61 remove_diacritics 2'
+         );
+         CREATE TRIGGER IF NOT EXISTS chunk_words_insert AFTER INSERT ON chunks
+         BEGIN
+             INSERT INTO chunk_words (rowid, name, text)
+             SELECT NEW.id, {FILE_NAME}, NEW.text FROM files f WHERE f.id = NEW.file_id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS chunk_words_delete AFTER DELETE ON chunks
+         BEGIN DELETE FROM chunk_words WHERE rowid = OLD.id; END;
+         CREATE TRIGGER IF NOT EXISTS chunk_words_update AFTER UPDATE OF file_id, text ON chunks
+         BEGIN
+             DELETE FROM chunk_words WHERE rowid = OLD.id;
+             INSERT INTO chunk_words (rowid, name, text)
+             SELECT NEW.id, {FILE_NAME}, NEW.text FROM files f WHERE f.id = NEW.file_id;
+         END;"
+    ))?;
+    if !had {
+        tx.execute(
+            &format!(
+                "INSERT INTO chunk_words (rowid, name, text)
+                 SELECT c.id, {FILE_NAME}, c.text FROM chunks c JOIN files f ON f.id = c.file_id"
+            ),
+            [],
+        )?;
+    }
+    tx.commit()?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
 }
 
 /// Whether `path` is indexed, as `types` takes it.
@@ -530,12 +595,14 @@ pub fn index_file(
         record(conn)?;
         return Ok(Outcome::Duplicate);
     }
-    let (first, vectors) = match kind {
+    let title = title_of(path);
+    let (first, vectors, kinds) = match kind {
         Kind::Text => {
             let text = String::from_utf8(bytes).expect("read as a string");
             let first = text_parts(path, &text, 0, PARTS_AT_ONCE);
-            let vectors = embed_chunks(conn, emb, path, &first.chunks, between)?;
-            (first, vectors)
+            let vectors = embed_chunks(conn, emb, &title, &first.chunks, between)?;
+            let kinds = vec![kind; first.chunks.len()];
+            (first, vectors, kinds)
         }
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
@@ -545,40 +612,64 @@ pub fn index_file(
             // restart, and a stop while embedding must leave it to be indexed
             // next time, so the record goes once it parses.
             record(conn)?;
-            let first = document_parts(path, &bytes, 0, crate::extract::parts_in_child)
+            let mut first = document_parts(path, &bytes, 0, crate::extract::parts_in_child)
                 .unwrap_or_else(|e| {
                     eprintln!("skip {}: {e:#}", path.display());
                     Extract::default()
                 });
-            if !first.chunks.is_empty() {
+            // No text layer: a scan, read by OCR when it can be (#106).
+            let scan = first.chunks.is_empty() && is_scannable(path) && emb.can_read_text();
+            if !first.chunks.is_empty() || scan {
                 conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
             }
-            let vectors = embed_chunks(conn, emb, path, &first.chunks, between)?;
-            (first, vectors)
-        }
-        // One chunk, with no text and line 0, from the pixels alone. One that
-        // doesn't decode keeps a row with no chunks, like a document with no
-        // text, so it isn't decoded again at every check.
-        Kind::Image => {
-            let pixels =
-                // From the bytes hashed, so the file can't change in between.
-                match crate::vision::load(&bytes).and_then(|img| crate::vision::prepare(&img)) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("skip {}: {e:#}", path.display());
-                        record(conn)?;
-                        return Ok(Outcome::Unreadable {
-                            no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
-                        });
-                    }
+            if scan {
+                // Read whole, up to ocr::MAX_SCAN_PAGES: never left in part.
+                first = Extract {
+                    parts: 1,
+                    chunks: scan_chunks(conn, emb, path, &bytes, between)?,
                 };
-            let v = emb.image(&pixels)?;
-            between(conn, emb)?;
-            let first = Extract {
-                parts: 1,
-                chunks: vec![(0, String::new())],
+            }
+            let vectors = embed_chunks(conn, emb, &title, &first.chunks, between)?;
+            let kinds = vec![kind; first.chunks.len()];
+            (first, vectors, kinds)
+        }
+        // A chunk with no text and line 0 from the pixels, then the text OCR
+        // reads in them as document chunks (#106). One that doesn't decode
+        // keeps a row with no chunks, like a document with no text, so it
+        // isn't decoded again at every check.
+        Kind::Image => {
+            // From the bytes hashed, so the file can't change in between.
+            let decoded = crate::vision::load(&bytes)
+                .and_then(|img| Ok((crate::vision::prepare(&img)?, img)));
+            let (pixels, img) = match decoded {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("skip {}: {e:#}", path.display());
+                    record(conn)?;
+                    return Ok(Outcome::Unreadable {
+                        no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
+                    });
+                }
             };
-            (first, vec![v])
+            let v = emb.image(&pixels)?;
+            drop(pixels);
+            between(conn, emb)?;
+            let lines = emb.read_text(&img)?;
+            let lines = if crate::ocr::text_size(&lines) >= crate::ocr::MIN_IMAGE_TEXT {
+                lines
+            } else {
+                Vec::new()
+            };
+            let text = chunk(&lines.join("\n"));
+            drop(img);
+            between(conn, emb)?;
+            let mut chunks = vec![(0, String::new())];
+            let mut vectors = vec![v];
+            vectors.extend(embed_chunks(conn, emb, &title, &text, between)?);
+            let mut kinds = vec![Kind::Image];
+            kinds.extend(std::iter::repeat_n(Kind::Document, text.len()));
+            chunks.extend(text);
+            (Extract { parts: 1, chunks }, vectors, kinds)
         }
     };
 
@@ -589,7 +680,7 @@ pub fn index_file(
         params![key, mtime, size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
-    insert_chunks(&tx, file_id, kind, &first.chunks, &vectors)?;
+    insert_chunks(&tx, file_id, &first.chunks, &vectors, &kinds)?;
     // The rest of a long one waits for `index_rest`.
     let total = first.parts.min(MAX_PARTS);
     if total > PARTS_AT_ONCE {
@@ -605,37 +696,99 @@ pub fn index_file(
 fn insert_chunks(
     tx: &Connection,
     file_id: i64,
-    kind: Kind,
     chunks: &[(usize, String)],
     vectors: &[Vec<f32>],
+    kinds: &[Kind],
 ) -> Result<()> {
-    for ((line, text), v) in chunks.iter().zip(vectors) {
+    for (((line, text), v), kind) in chunks.iter().zip(vectors).zip(kinds) {
         tx.execute(
             "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, *line as i64, text, to_blob(v), kind as i64],
+            params![file_id, *line as i64, text, to_blob(v), *kind as i64],
         )?;
     }
     Ok(())
 }
 
-/// Each chunk's vector, with `between` run after each.
+/// Each of `chunks` embedded as a document titled `title`, letting `between`
+/// run after each.
 fn embed_chunks(
     conn: &Connection,
     emb: &mut Embedder,
-    path: &Path,
+    title: &str,
     chunks: &[(usize, String)],
     between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
 ) -> Result<Vec<Vec<f32>>> {
-    let title = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
     let mut vectors = Vec::with_capacity(chunks.len());
     for (_, c) in chunks {
-        vectors.extend(emb.documents(&[document_text(&title, c)])?);
+        vectors.extend(emb.documents(&[document_text(title, c)])?);
         between(conn, emb)?;
     }
     Ok(vectors)
+}
+
+/// A document with no text layer that OCR can read: a PDF, with poppler there
+/// to render its pages.
+fn is_scannable(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        && crate::ocr::poppler()
+}
+
+/// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
+/// up to `ocr::MAX_SCAN_PAGES` and within `ocr::SCAN_WALL` of rendering.
+/// The first page that won't render ends the scan with the pages read so
+/// far: a file that stalls one page likely stalls them all.
+fn scan_chunks(
+    conn: &Connection,
+    emb: &mut Embedder,
+    path: &Path,
+    bytes: &[u8],
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+) -> Result<Vec<(usize, String)>> {
+    // Rendering only: OCR and embedding are the runner's own work, paced by
+    // `between`.
+    let mut deadline = std::time::Instant::now() + crate::ocr::SCAN_WALL;
+    let pages = match crate::ocr::pdf_pages(bytes, deadline) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("skip {}: {e:#}", path.display());
+            return Ok(Vec::new());
+        }
+    };
+    if pages > crate::ocr::MAX_SCAN_PAGES {
+        eprintln!(
+            "{}: reading the first {} of {pages} scanned pages",
+            path.display(),
+            crate::ocr::MAX_SCAN_PAGES
+        );
+    }
+    let mut out = Vec::new();
+    for page in 1..=pages.min(crate::ocr::MAX_SCAN_PAGES) {
+        let started = std::time::Instant::now();
+        let img = match crate::ocr::render_page(bytes, page, deadline) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("{} page {page}: {e:#}; stopping there", path.display());
+                break;
+            }
+        };
+        let rendered = started.elapsed();
+        let text = emb.read_text(&img)?.join("\n");
+        between(conn, emb)?;
+        // The deadline counts poppler's time, not the OCR's or a query's.
+        deadline += started.elapsed() - rendered;
+        if !text.trim().is_empty() {
+            out.push((page, text));
+        }
+    }
+    Ok(out)
+}
+
+/// The name a file's chunks are embedded under.
+fn title_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Parts `from..from + count` of a text file's chunks.
@@ -725,7 +878,7 @@ fn store_rest(
     vectors: &[Vec<f32>],
 ) -> Result<()> {
     let tx = conn.transaction()?;
-    insert_chunks(&tx, id, kind, chunks, vectors)?;
+    insert_chunks(&tx, id, chunks, vectors, &vec![kind; chunks.len()])?;
     if done >= total {
         tx.execute("DELETE FROM partial WHERE file_id = ?1", [id])?;
     } else {
@@ -832,7 +985,7 @@ pub fn index_rest(
         );
         done = total;
     }
-    let vectors = embed_chunks(conn, emb, path, &chunks, between)?;
+    let vectors = embed_chunks(conn, emb, &title_of(path), &chunks, between)?;
     store_rest(conn, id, kind, done, total, &chunks, &vectors)?;
     Ok(Some(Rest::Parts {
         path: key,
@@ -890,9 +1043,27 @@ fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>
 }
 
 /// (mtime, size) as the index records them.
-fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
+pub(crate) fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some((mtime.as_secs() as i64, meta.len() as i64))
+}
+
+/// The (mtime, size) recorded for every indexed file under `root`, by path.
+pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
+    let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a file `walk` found is indexed as, with its metadata: None if it
+/// isn't a wanted type or is over its kind's size cap. Reads no contents.
+pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
+    let kind = types.kind(entry.path())?;
+    let meta = entry.metadata().ok()?;
+    (meta.len() <= kind.max_bytes(entry.path())).then_some((kind, meta))
 }
 
 /// Paths under `root` the index is behind on: wanted files that are new or
@@ -904,30 +1075,20 @@ pub fn stale(
     ex: &Excludes,
     types: &FileTypes,
 ) -> Result<Vec<PathBuf>> {
-    let mut known: std::collections::HashMap<String, (i64, i64)> = {
-        let mut stmt =
-            conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let mut known = stamps_under(conn, root)?;
     let mut out = Vec::new();
     for entry in walk(root, ex).filter(|e| e.file_type().is_file()) {
         let path = entry.path();
         let Some(key) = path.to_str() else { continue };
         let was = known.remove(key);
-        let wanted_now = types
-            .kind(path)
-            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes(path)));
-        if !wanted_now {
+        let Some((_, meta)) = indexable(&entry, types) else {
             // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
                 out.push(path.to_path_buf());
             }
             continue;
-        }
-        if was != entry.metadata().ok().as_ref().and_then(stamp_of) {
+        };
+        if was != stamp_of(&meta) {
             out.push(path.to_path_buf());
         }
     }
@@ -1072,6 +1233,38 @@ pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// Forget the PDFs recorded with no text once OCR could read them as scans
+/// (#106): with this OCR model, and poppler installed. Recorded in `meta`, so
+/// it happens once for each, not at every start. Returns files dropped.
+pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
+    if !ocr || !crate::ocr::poppler() {
+        return Ok(0);
+    }
+    let key = "reading.scans";
+    let now = format!("{}/{}", crate::model::OCR_REVISION, crate::ocr::READING);
+    let now = now.as_str();
+    let was: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+        .optional()?;
+    if was.as_deref() == Some(now) {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "DELETE FROM files WHERE lower(path) LIKE '%.pdf'
+           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
+           AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+                           WHERE g.sha256 = files.sha256)",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, now],
+    )?;
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Formats whose text is read differently now, with the reading's version:
 /// HTML through `extract::html` since 1 (#97). Mtime and size don't show the
 /// change, so files read the old way are dropped once instead.
@@ -1124,6 +1317,18 @@ pub fn compact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `root` as `index` walks it: canonical, and an error if it is excluded.
+pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
+    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
+    if ex.contains(&root) {
+        bail!(
+            "{} is excluded; remove it from `exclude` in the config to index it",
+            root.display()
+        );
+    }
+    Ok(root)
+}
+
 /// Called after each file `index` looks at, with the connection and model
 /// lent back: for progress, and for the runner to answer queries mid-index.
 /// An error from it stops indexing; every file finished so far is kept.
@@ -1140,13 +1345,7 @@ pub fn index(
     types: &FileTypes,
     after: &mut AfterFile,
 ) -> Result<Stats> {
-    let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
-    if ex.contains(&root) {
-        bail!(
-            "{} is excluded; remove it from `exclude` in the config to index it",
-            root.display()
-        );
-    }
+    let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
@@ -1313,13 +1512,18 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
 }
 
 /// (files, chunks) of each kind in the index, in `Kind::ALL`'s order (#73).
-/// A file counts under the kind of its chunks, so one recorded without any
-/// (a scan, a photo with no decoder) counts under none.
+/// A file counts under the kind of its chunks, an image's text (#106) under
+/// images, so one recorded without any (a photo with no decoder) counts
+/// under none.
 pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 3]> {
     let mut out = [(0, 0); 3];
-    let mut stmt =
-        conn.prepare("SELECT kind, count(DISTINCT file_id), count(*) FROM chunks GROUP BY kind")?;
-    let rows = stmt.query_map([], |r| {
+    let mut stmt = conn.prepare(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM chunks i WHERE i.file_id = c.file_id AND i.kind = ?1)
+                THEN ?1 ELSE c.kind END AS k,
+                count(DISTINCT c.file_id), count(*)
+         FROM chunks c GROUP BY k",
+    )?;
+    let rows = stmt.query_map([Kind::Image as i64], |r| {
         Ok((
             Kind::from_db(r.get(0)?),
             r.get::<_, i64>(1)?,
@@ -1365,14 +1569,22 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             *chunks.entry(dir.to_owned()).or_default() += n as u64;
         }
     }
+    Ok(biggest(&chunks, limit))
+}
+
+/// The heaviest folders in `weights` (each folder's total, its subfolders'
+/// included), biggest first: at most `limit`, none inside another. A folder
+/// gives way to a subfolder holding 3/4 of its weight, so what's named is
+/// where the bulk actually is.
+pub fn biggest(weights: &HashMap<PathBuf, u64>, limit: usize) -> Vec<(PathBuf, u64)> {
     let mut biggest_child: HashMap<&Path, u64> = HashMap::new();
-    for (dir, n) in &chunks {
+    for (dir, n) in weights {
         if let Some(parent) = dir.parent() {
             let m = biggest_child.entry(parent).or_default();
             *m = (*m).max(*n);
         }
     }
-    let mut dirs: Vec<(&PathBuf, u64)> = chunks.iter().map(|(d, n)| (d, *n)).collect();
+    let mut dirs: Vec<(&PathBuf, u64)> = weights.iter().map(|(d, n)| (d, *n)).collect();
     // Of equal folders, the deeper says more.
     dirs.sort_by(|a, b| {
         b.1.cmp(&a.1)
@@ -1394,7 +1606,7 @@ pub fn largest_folders(conn: &Connection, limit: usize) -> Result<Vec<(PathBuf, 
             picked.push((dir.clone(), n));
         }
     }
-    Ok(picked)
+    picked
 }
 
 pub struct Hit {
@@ -1618,16 +1830,135 @@ fn dot(a: &[i8; DIM], b: &[i8; DIM]) -> i32 {
     acc.iter().sum()
 }
 
-/// Cosine against every chunk of `kind` (embeddings are unit length), best `k`.
+/// The chunks holding every word of a query (#104), best (bm25) first,
+/// looked up once per query for every kind.
+pub struct Words {
+    ids: Vec<i64>,
+    /// The query is one identifier-like word (`INV-20431`, `E0502`, `TODO`)
+    /// or wholly quoted: exact matches lead instead of nudging.
+    exact: bool,
+}
+
+/// Added to the cosine of a chunk holding every word of the query. About the
+/// gap between a good result and the next few, so exact words reorder near
+/// ties and lift a chunk just under its kind's `min_score` over it, without
+/// carrying an unrelated chunk past a related one.
+const WORDS_BOOST: f32 = 0.05;
+/// A word in more chunks than this is no exact string to find, and ranking
+/// it costs more than the vectors: bm25 over 2,856 chunks took 14 ms, and
+/// "the" (81k of 113k chunks) 250 ms. Such words are left out of the lookup,
+/// and counting up to this stops early.
+const WORDS_MAX_CHUNKS: usize = 2000;
+/// Chunks taken from the word index, across every kind.
+const WORDS_TAKE: usize = 200;
+
+impl Words {
+    /// None for a query with no words, or only words in too many chunks.
+    /// A failed lookup is None too: exact words add to a search, they never
+    /// stop one.
+    pub fn find(conn: &Connection, query: &str) -> Option<Self> {
+        let (terms, exact) = expression(query)?;
+        match ranked(conn, &terms) {
+            Ok(ids) => ids.map(|ids| Self { ids, exact }),
+            Err(e) => {
+                eprintln!("words {terms:?}: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// `query`'s terms as FTS5 strings: every word, or each quoted part as a
+/// phrase. With whether exact matches should lead.
+fn expression(query: &str) -> Option<(Vec<String>, bool)> {
+    let query = query.trim();
+    let mut terms = Vec::new();
+    let mut rest = query;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            rest = &rest[c.len_utf8()..];
+        } else if c == '"' {
+            // A phrase, to the closing quote or the end.
+            let body = &rest[1..];
+            let end = body.find('"').unwrap_or(body.len());
+            terms.push(&body[..end]);
+            rest = body.get(end + 1..).unwrap_or("");
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"')
+                .unwrap_or(rest.len());
+            terms.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    // Everything is quoted, so no word is read as an operator (AND, NEAR),
+    // a column filter (`:`), a prefix (`*`) or a syntax error; the tokenizer
+    // then splits each on punctuation as it split the chunks. A term with no
+    // letters or digits would be an empty phrase.
+    let expr: Vec<String> = terms
+        .iter()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if expr.is_empty() {
+        return None;
+    }
+    let quoted =
+        query.len() > 1 && query.starts_with('"') && query[1..].find('"') == Some(query.len() - 2);
+    Some((expr, quoted || (terms.len() == 1 && identifier(query))))
+}
+
+/// A word an embedding has no sense of: one with a digit, inner punctuation
+/// (`foo_bar`, `v2.1`, `INV-20431`) or all capitals (`TODO`, `ENOENT`).
+fn identifier(word: &str) -> bool {
+    let inner = word.trim_matches(|c: char| !c.is_alphanumeric());
+    let letters = inner.chars().filter(|c| c.is_alphabetic()).count();
+    inner.chars().any(|c| c.is_ascii_digit())
+        || inner.contains(|c: char| !c.is_alphanumeric() && c != '\'')
+        || (letters >= 2 && !inner.chars().any(char::is_lowercase))
+}
+
+/// Chunks holding every term in no more than WORDS_MAX_CHUNKS chunks, best
+/// first, at most WORDS_TAKE; None if every term is in more. Without the
+/// common ones a long query costs little more than a short one: "how is the
+/// NPU driver version checked" took 30 ms with them.
+fn ranked(conn: &Connection, terms: &[String]) -> rusqlite::Result<Option<Vec<i64>>> {
+    let mut count = conn.prepare(
+        "SELECT count(*) FROM (SELECT 1 FROM chunk_words WHERE chunk_words MATCH ?1 LIMIT ?2)",
+    )?;
+    let mut rare = Vec::new();
+    for t in terms {
+        let n: i64 = count.query_row(params![t, WORDS_MAX_CHUNKS as i64 + 1], |r| r.get(0))?;
+        if n as usize <= WORDS_MAX_CHUNKS {
+            rare.push(t.as_str());
+        }
+    }
+    if rare.is_empty() {
+        return Ok(None);
+    }
+    conn.prepare("SELECT rowid FROM chunk_words WHERE chunk_words MATCH ?1 ORDER BY rank LIMIT ?2")?
+        .query_map(params![rare.join(" "), WORDS_TAKE as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .map(Some)
+}
+
+/// Cosine against every chunk of `kind` (embeddings are unit length), best
+/// `k`. With `words`, chunks holding them score higher too (#104): by
+/// WORDS_BOOST, or for an identifier ahead of everything, best match first.
+/// Scores stay on the cosine's scale, so each kind's `min_score` still means
+/// what it did.
 pub fn search(
     conn: &Connection,
     vectors: &Vectors,
     query: &[f32],
+    words: Option<&Words>,
     kind: Kind,
     k: usize,
 ) -> Result<Vec<Hit>> {
     let query: &[f32; DIM] = query.try_into().context("query is not DIM long")?;
     let (q, qs) = quantize(query);
+    let score =
+        |p: usize| dot(&vectors.data.as_chunks::<DIM>().0[p], &q) as f32 * vectors.scales[p] * qs;
     let mut scored: Vec<(f32, i64)> = vectors
         .data
         .as_chunks::<DIM>()
@@ -1643,6 +1974,27 @@ pub fn search(
     if scored.len() > k && k > 0 {
         scored.select_nth_unstable_by(k - 1, by_score);
         scored.truncate(k);
+    }
+    if let Some(words) = words {
+        // Not loaded yet: it shows once the vectors catch up.
+        let of_kind = words
+            .ids
+            .iter()
+            .filter_map(|id| Some((id, *vectors.pos.get(id)?)))
+            .filter(|(_, p)| vectors.kinds[*p] == kind)
+            .take(k);
+        for (rank, (id, p)) in of_kind.enumerate() {
+            let s = if words.exact {
+                // Just under a perfect cosine, in bm25's order.
+                1.0 - 0.001 * (rank + 1) as f32
+            } else {
+                (score(p) + WORDS_BOOST).min(1.0)
+            };
+            match scored.iter_mut().find(|(_, i)| i == id) {
+                Some(hit) => hit.0 = hit.0.max(s),
+                None => scored.push((s, *id)),
+            }
+        }
     }
     scored.sort_by(by_score);
     scored.truncate(k);
@@ -1759,6 +2111,70 @@ mod tests {
         ));
     }
 
+    /// `chunks` as (kind, line) on a new file at `path`.
+    fn file_with(conn: &Connection, path: &str, chunks: &[(Kind, i64)]) {
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?1)",
+            [path],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        for (kind, line) in chunks {
+            conn.execute(
+                "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, '', x'00', ?3)",
+                params![id, line, *kind as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_images_text_counts_under_images() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-ocrcount-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        file_with(
+            &conn,
+            "/shot.png",
+            &[(Kind::Image, 0), (Kind::Document, 1), (Kind::Document, 9)],
+        );
+        file_with(
+            &conn,
+            "/report.pdf",
+            &[(Kind::Document, 1), (Kind::Document, 2)],
+        );
+        file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
+        let counts = counts_by_kind(&conn).unwrap();
+        // Kind::ALL's order: text, documents, images.
+        assert_eq!(counts, [(1, 1), (1, 2), (1, 3)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pdfs_with_no_text_are_read_again_once_ocr_can() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-scans-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        file_with(&conn, "/scan.PDF", &[]);
+        file_with(&conn, "/text.pdf", &[(Kind::Document, 1)]);
+        file_with(&conn, "/broken.jpg", &[]);
+        let paths = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT path FROM files ORDER BY path")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(retry_scans(&conn, false).unwrap(), 0);
+        if crate::ocr::poppler() {
+            assert_eq!(retry_scans(&conn, true).unwrap(), 1);
+            assert_eq!(paths(&conn), ["/broken.jpg", "/text.pdf"]);
+            // Once per OCR model: a scan recorded again isn't dropped at every start.
+            file_with(&conn, "/scan.PDF", &[]);
+            assert_eq!(retry_scans(&conn, true).unwrap(), 0);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn recent_files_are_text_and_documents_newest_first() {
         let dir = std::env::temp_dir().join(format!("vinosearch-recent-{}", std::process::id()));
@@ -1845,7 +2261,15 @@ mod tests {
         assert_eq!(holder_of(&conn, b"same", "/a/x.md").unwrap(), None);
 
         // One hit for the content, naming the copy.
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
+        let hits = search(
+            &conn,
+            &Vectors::load(&conn).unwrap(),
+            &v,
+            None,
+            Kind::Text,
+            5,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/a/x.md");
         assert_eq!(hits[0].copies, ["/b/x.md"]);
@@ -1856,7 +2280,15 @@ mod tests {
             .query_row("SELECT file_id FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(owner, b);
-        let hits = search(&conn, &Vectors::load(&conn).unwrap(), &v, Kind::Text, 5).unwrap();
+        let hits = search(
+            &conn,
+            &Vectors::load(&conn).unwrap(),
+            &v,
+            None,
+            Kind::Text,
+            5,
+        )
+        .unwrap();
         assert_eq!(
             (hits[0].path.as_str(), hits[0].copies.len()),
             ("/b/x.md", 0)
@@ -1895,8 +2327,12 @@ mod tests {
             .query_row("SELECT kind FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kind, Kind::Text as i64);
+        // Its chunks are in the word index, under their file's name too.
+        assert_eq!(matching(&conn, "x"), [1]);
+        assert_eq!(matching(&conn, "old"), [1]);
         drop(conn);
         open(&db).unwrap(); // and opening it again is a no-op
+        assert_eq!(matching(&open(&db).unwrap(), "x"), [1]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2148,7 +2584,7 @@ mod tests {
         let vectors = Vectors::load(&conn).unwrap();
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
-        let lines: Vec<i64> = search(&conn, &vectors, &q, Kind::Text, 3)
+        let lines: Vec<i64> = search(&conn, &vectors, &q, None, Kind::Text, 3)
             .unwrap()
             .iter()
             .map(|h| h.line)
@@ -2199,7 +2635,7 @@ mod tests {
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
         let paths = |kind| -> Vec<String> {
-            search(&conn, &v, &q, kind, 5)
+            search(&conn, &v, &q, None, kind, 5)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.path)
@@ -2379,7 +2815,7 @@ mod tests {
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
         let paths = |v: &Vectors, kind| -> Vec<String> {
-            search(&conn, v, &q, kind, 5)
+            search(&conn, v, &q, None, kind, 5)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.path)
@@ -2574,6 +3010,179 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// Chunk ids whose name or text hold `query`'s words, in id order.
+    fn matching(conn: &Connection, query: &str) -> Vec<i64> {
+        let (terms, _) = expression(query).unwrap();
+        let mut ids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM chunk_words WHERE chunk_words MATCH ?1")
+            .unwrap()
+            .query_map([terms.join(" ")], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn no_query_can_break_the_word_lookup() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-fts-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/notes/a.md", &[0]);
+        conn.execute("UPDATE chunks SET text = 'near the end, or not'", [])
+            .unwrap();
+        for q in [
+            "foo AND bar",
+            "NEAR(a b)",
+            "NEAR",
+            "text:near",
+            "pre*",
+            "\"unbalanced",
+            "a\"b",
+            "\"\" \"\"",
+            "-x",
+            "^start",
+            "(a OR b",
+            "col : val + 1",
+            "{name text}: x",
+            "C++",
+            "don't",
+            "café 日本語 🙂",
+            "OR",
+            "NOT",
+        ] {
+            if let Some((terms, _)) = expression(q) {
+                assert!(ranked(&conn, &terms).is_ok(), "{q} -> {terms:?}");
+            }
+        }
+        // Operators are words like any other.
+        assert_eq!(matching(&conn, "near or not"), [1]);
+        assert_eq!(matching(&conn, "end NOT near"), [1]);
+        assert!(matching(&conn, "text:end").is_empty());
+        for q in ["", "  ", "***", "\"\"", "- : ()"] {
+            assert!(expression(q).is_none(), "{q}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn identifiers_and_quotes_lean_on_exact_words() {
+        for q in [
+            "INV-20431",
+            "E0502",
+            "TODO",
+            "foo_bar",
+            "v2.1",
+            "\"lunch with sam\"",
+        ] {
+            assert!(expression(q).unwrap().1, "{q}");
+        }
+        for q in [
+            "invoice",
+            "Karan",
+            "don't",
+            "invoice INV-20431",
+            "\"a\" b \"c\"",
+            "photos from 2019",
+        ] {
+            assert!(!expression(q).unwrap().1, "{q}");
+        }
+    }
+
+    #[test]
+    fn exact_words_find_what_vectors_miss() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-hybrid-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        // Axis 0 is "invoices in general"; the one with the number is off it.
+        let general = add_file(&conn, "/inv/general.md", &[0])[0];
+        let near = add_file(&conn, "/inv/near.md", &[0])[0];
+        let numbered = add_file(&conn, "/inv/march.md", &[1])[0];
+        let set = |id: i64, text: &str, v: &[f32]| {
+            let mut e = vec![0f32; DIM];
+            e[..v.len()].copy_from_slice(v);
+            conn.execute(
+                "UPDATE chunks SET text = ?1, embedding = ?2 WHERE id = ?3",
+                params![text, to_blob(&e), id],
+            )
+            .unwrap();
+        };
+        set(general, "Invoices are due in 30 days.", &[0.8, 0.6]);
+        set(near, "The march invoice total.", &[0.78, 0.6257]);
+        set(numbered, "Invoice INV-20431, total 120 EUR", &[0.2, 0.98]);
+        let vectors = Vectors::load(&conn).unwrap();
+        let mut q = vec![0f32; DIM];
+        q[0] = 1.0;
+        let paths = |words: Option<&Words>, k: usize| -> Vec<String> {
+            search(&conn, &vectors, &q, words, Kind::Text, k)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(paths(None, 1), ["/inv/general.md"]);
+        // An identifier leads, whatever its cosine.
+        let id = Words::find(&conn, "INV-20431").unwrap();
+        assert_eq!(paths(Some(&id), 1), ["/inv/march.md"]);
+        assert_eq!(
+            paths(Some(&id), 3),
+            ["/inv/march.md", "/inv/general.md", "/inv/near.md"]
+        );
+        // Plain words nudge a near tie, but don't lift a far chunk.
+        let plain = Words::find(&conn, "march invoice").unwrap();
+        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
+        let plain = Words::find(&conn, "invoice total").unwrap();
+        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
+        // File names count as words: an image has no text but its name.
+        let name = Words::find(&conn, "march.md").unwrap();
+        assert!(name.ids.contains(&numbered));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn words_in_too_many_chunks_are_not_looked_up() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-common-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        add_file(&conn, "/f.md", &[]);
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..=WORDS_MAX_CHUNKS {
+            let text = if i == 7 { "common rare" } else { "common" };
+            tx.execute(
+                "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, ?1, x'')",
+                [text],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(Words::find(&conn, "common").is_none());
+        // The common word is left out; the rare one still has to be there.
+        assert_eq!(Words::find(&conn, "common rare").unwrap().ids.len(), 1);
+        assert_eq!(Words::find(&conn, "rare common").unwrap().ids.len(), 1);
+        assert!(Words::find(&conn, "absent").unwrap().ids.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_word_index_follows_chunks() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-words-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/a/first.md', 0, 0, x'01');
+             INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, 'zebra', x'');
+             INSERT INTO files (path, mtime, size, sha256) VALUES ('/b/second.md', 0, 0, x'01');",
+        )
+        .unwrap();
+        assert_eq!(matching(&conn, "zebra"), [1]);
+        assert_eq!(matching(&conn, "first"), [1]);
+        // The holder goes: its chunk is found under the copy's name instead.
+        remove(&conn, Path::new("/a")).unwrap();
+        assert_eq!(matching(&conn, "zebra second"), [1]);
+        assert!(matching(&conn, "first").is_empty());
+        // The last copy goes, and the chunk with it.
+        remove(&conn, Path::new("/b")).unwrap();
+        assert!(matching(&conn, "zebra").is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

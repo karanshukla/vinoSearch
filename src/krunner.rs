@@ -116,6 +116,10 @@ fn describe(h: &Hit) -> (String, String) {
     let description = match h.kind {
         Kind::Text => format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
         Kind::Image => format!("{dir}{copies}"),
+        // Text OCR read in an image (#106) has no page or slide to name.
+        Kind::Document if !crate::extract::is_document(path) => {
+            format!("{dir}{copies}  {}", crate::snippet(&h.text))
+        }
         Kind::Document => format!(
             "{dir}, {} {}{copies}  {}",
             crate::extract::unit(path),
@@ -135,8 +139,10 @@ fn to_match(h: Hit, floors: Floors) -> Match {
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Value::from(subtext)));
     props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
-    // A group per kind, named so each reads as ours (#73).
+    // A group per kind, named so each reads as ours (#73). Text read in an
+    // image (#106) is scored as a document but listed with the images.
     let category = match h.kind {
+        Kind::Document if !crate::extract::is_document(Path::new(&h.path)) => "vinoSearch Images",
         Kind::Text => "vinoSearch Text",
         Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
@@ -502,9 +508,10 @@ impl Control {
         );
         let model_dir = model::default_dir().map_err(failed)?;
         let vision_dir = model::vision_dir().map_err(failed)?;
-        // The vision encoder counts while images are on.
+        let ocr_dir = model::ocr_dir().map_err(failed)?;
+        // The vision encoder and OCR count while images are on.
         let present = model::present(&model_dir)
-            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir));
+            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir, &ocr_dir));
         out.insert(key::MODEL_PRESENT.into(), owned(Value::from(present)));
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
@@ -1252,6 +1259,38 @@ mod tests {
             text: String::new(),
             copies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn text_read_in_an_image_is_listed_with_the_images() {
+        let category = |kind, path| {
+            let m = to_match(hit(kind, 0.9, path), FLOORS);
+            match m.5.get("category").map(|v| String::try_from(v.clone())) {
+                Some(Ok(c)) => c,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(category(Kind::Document, "/p/shot.png"), "vinoSearch Images");
+        assert_eq!(
+            category(Kind::Document, "/d/scan.pdf"),
+            "vinoSearch Documents"
+        );
+        assert_eq!(category(Kind::Image, "/p/cat.jpg"), "vinoSearch Images");
+    }
+
+    #[test]
+    fn text_read_in_an_image_has_no_page_to_name() {
+        let mut shot = hit(Kind::Document, 0.8, "/home/u/Pictures/Screenshots/a.png");
+        shot.text = "Invoice INV-2026-004817".into();
+        let (name, description) = describe(&shot);
+        assert_eq!(name, "a.png");
+        assert_eq!(
+            description,
+            "/home/u/Pictures/Screenshots  Invoice INV-2026-004817"
+        );
+        let mut scan = hit(Kind::Document, 0.8, "/d/scan.pdf");
+        scan.line = 3;
+        assert!(describe(&scan).1.starts_with("/d, page 3"));
     }
 
     const FLOORS: Floors = Floors {

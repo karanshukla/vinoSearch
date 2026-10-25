@@ -12,7 +12,8 @@
 #   scripts/install.sh --uninstall [--purge]
 #
 #   --index DIR    index DIR (repeatable). Without it you're asked for one;
-#                  nothing is indexed unless you name it.
+#                  nothing is indexed unless you name it. At a terminal it
+#                  says how long indexing will take and asks first.
 #   --device D     run the model on D instead of the NPU (written to
 #                  config.toml if it doesn't set a device already)
 #   --no-settings  skip the settings window (vinosearch-settings)
@@ -55,7 +56,7 @@ while [ $# -gt 0 ]; do
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
