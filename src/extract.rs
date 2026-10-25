@@ -20,30 +20,56 @@ mod rtf;
 /// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
 /// streams, decompressed, and lopdf's objects for them fit many times over.
 const CHILD_ADDRESS_SPACE: u64 = 1 << 30;
-/// CPU seconds before the child gets SIGXCPU. Parsing is well under a second
-/// a document; a zip bomb or a quadratic parser isn't.
+/// CPU seconds before the child gets SIGXCPU, for each run of parts. Parsing
+/// is well under a second a document; a zip bomb or a quadratic parser isn't.
 const CHILD_CPU_SECONDS: u64 = 30;
 /// Wall-clock limit, for a child that hangs rather than spins. Indexing
 /// runs at idle priority, so a busy machine can stretch 30 CPU seconds out.
 const CHILD_WALL: Duration = Duration::from_secs(120);
 
-/// A document's bytes to its numbered chunks: `chunks`, or `chunks_in_child`.
-pub type Parser = fn(&Path, &[u8]) -> Result<Vec<(usize, String)>>;
+/// Long documents are read and embedded a run of parts at a time (#108):
+/// the first run with everything else, the rest after. A part is a page,
+/// slide or chapter, or for formats without them PART_CHUNKS chunks.
+pub const PARTS_AT_ONCE: usize = 30;
+/// Parts past this are left out.
+pub const MAX_PARTS: usize = 5_000;
+/// A part of a format without pages: about a printed page of text.
+pub const PART_CHUNKS: usize = 3;
 
-/// `chunks`, run in a child process (the runner executing itself as
+/// What a run of parts gave: the chunks of parts `from..from + count`, and
+/// how many parts the whole document has.
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Extract {
+    pub parts: usize,
+    pub chunks: Vec<(usize, String)>,
+}
+
+/// A document's bytes to the chunks of parts `from..from + count`:
+/// `parts`, or `parts_in_child`.
+pub type Parser = fn(&Path, &[u8], usize, usize) -> Result<Extract>;
+
+/// `parts`, run in a child process (the runner executing itself as
 /// `vinosearch extract <path>`, with `bytes` on its stdin) under memory, CPU
 /// and wall-clock limits, so a parser that aborts, overflows its stack, eats
-/// memory or hangs costs that process, not the runner (#84). Err for a
-/// parser error, a child its limits stopped, or one that failed to start.
-pub fn chunks_in_child(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+/// memory or hangs costs that process, not the runner (#84). The limits are
+/// for each run of parts, so a long document gets them afresh each run. Err
+/// for a parser error, a child its limits stopped, or one that failed to
+/// start.
+pub fn parts_in_child(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("extract").arg(path);
+    cmd.arg("extract")
+        .arg(path)
+        .arg("--from")
+        .arg(from.to_string())
+        .arg("--count")
+        .arg(count.to_string());
     let out = crate::proc::run(cmd, bytes, CHILD_WALL)?;
     serde_json::from_slice(&out).context("reading the extractor's output")
 }
 
 /// `path`'s whole text, for reading aloud: parsed in the child as indexing
-/// does, under the same limits, then joined back up.
+/// does, every part in one run, then joined back up. Still held to
+/// MAX_FILE_BYTES: past that is hours of speech.
 pub fn text(path: &Path) -> Result<String> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -52,7 +78,7 @@ pub fn text(path: &Path) -> Result<String> {
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         bail!("over {MAX_DOCUMENT_BYTES} bytes");
     }
-    let chunks = chunks_in_child(path, &bytes)?;
+    let chunks = parts_in_child(path, &bytes, 0, usize::MAX)?.chunks;
     let size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
     if size as u64 > MAX_FILE_BYTES {
         bail!("{size} bytes of text");
@@ -73,7 +99,7 @@ fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
         e if SHEETS.contains(&e) => 2,
         _ => 0,
     };
-    let by_part = matches!(unit(path), "page" | "slide" | "chapter");
+    let by_part = paged(path);
     let mut out = String::new();
     let mut last_part = None;
     let mut last_header = None;
@@ -124,8 +150,9 @@ fn pdf_pages(chunks: &[(usize, String)]) -> String {
 }
 
 /// The child's side: set the limits, read the document from stdin, write
-/// its chunks to stdout as JSON. `path` is only for its extension.
-pub fn child_main(path: &Path) -> Result<()> {
+/// the chunks of parts `from..from + count` to stdout as JSON. `path` is
+/// only for its extension.
+pub fn child_main(path: &Path, from: usize, count: usize) -> Result<()> {
     limit(libc::RLIMIT_AS, CHILD_ADDRESS_SPACE)?;
     limit(libc::RLIMIT_CPU, CHILD_CPU_SECONDS)?;
     let mut bytes = Vec::new();
@@ -136,8 +163,8 @@ pub fn child_main(path: &Path) -> Result<()> {
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         bail!("over {MAX_DOCUMENT_BYTES} bytes");
     }
-    let chunks = chunks(path, &bytes)?;
-    serde_json::to_writer(std::io::stdout().lock(), &chunks)?;
+    let out = parts(path, &bytes, from, count)?;
+    serde_json::to_writer(std::io::stdout().lock(), &out)?;
     Ok(())
 }
 
@@ -192,13 +219,63 @@ pub fn unit(path: &Path) -> &'static str {
     }
 }
 
+/// Whether `path`'s chunks are numbered by the part they came from (a page,
+/// slide or chapter) rather than a line or row.
+fn paged(path: &Path) -> bool {
+    matches!(unit(path), "page" | "slide" | "chapter")
+}
+
+/// What a part of `path` is, for "120 of 640 pages": a page, slide or
+/// chapter, or for formats without them PART_CHUNKS chunks, a "part".
+pub fn part_unit(path: &Path) -> &'static str {
+    if is_document(path) && paged(path) {
+        unit(path)
+    } else {
+        "part"
+    }
+}
+
+/// The chunks of `path`'s parts `from..from + count`, from `bytes`, and how
+/// many parts it has. Only a PDF's pages are read a run at a time; the
+/// other formats are parsed whole, which takes a fraction of the time, and
+/// the run picked out of them.
+pub fn parts(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
+    if ext(path) == "pdf" {
+        return pdf(bytes, from, count);
+    }
+    Ok(select(chunks(path, bytes)?, paged(path), from, count))
+}
+
+/// Parts `from..from + count` (counted from 0) of `chunks`, and how many
+/// parts there are. `paged` chunks are numbered by their part from 1; any
+/// others go PART_CHUNKS to a part.
+pub fn select(chunks: Vec<(usize, String)>, paged: bool, from: usize, count: usize) -> Extract {
+    let end = from.saturating_add(count);
+    if paged {
+        let parts = chunks.last().map_or(0, |(n, _)| *n);
+        let chunks = chunks
+            .into_iter()
+            .filter(|(n, _)| (from + 1..=end).contains(n))
+            .collect();
+        return Extract { parts, chunks };
+    }
+    Extract {
+        parts: chunks.len().div_ceil(PART_CHUNKS),
+        chunks: chunks
+            .into_iter()
+            .skip(from.saturating_mul(PART_CHUNKS))
+            .take(count.saturating_mul(PART_CHUNKS))
+            .collect(),
+    }
+}
+
 /// `path`'s text as numbered chunks, from `bytes`, its content.
 pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     if bytes.starts_with(b"PK") {
         check_zip(bytes)?;
     }
     match ext(path).as_str() {
-        "pdf" => pdf(bytes),
+        "pdf" => Ok(pdf(bytes, 0, usize::MAX)?.chunks),
         e if WORD.contains(&e) => Ok(chunk(&xml_text(
             &part(bytes, "word/document.xml")?,
             &Tags::DOCX,
@@ -231,23 +308,36 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     }
 }
 
-/// Each page's text layer, NFKC so ligatures like `ﬁ` read as `fi`. A scan
-/// has none and comes out empty.
-fn pdf(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+/// The text layer of pages `from..from + count`, NFKC so ligatures like `ﬁ`
+/// read as `fi`. A scan has none and comes out empty. The whole file is
+/// loaded each run, but only these pages' content is decoded, which is most
+/// of the time a page takes.
+fn pdf(bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     let mut doc = lopdf::Document::load_mem(bytes)?;
     if doc.is_encrypted() {
         bail!("encrypted");
     }
     prefer_to_unicode(&mut doc);
-    let pages = doc.get_pages().into_keys().map(|p| {
-        let text = doc
-            .extract_text(&[p])
-            .unwrap_or_default()
-            .nfkc()
-            .collect::<String>();
-        if readable(&text) { text } else { String::new() }
-    });
-    Ok(numbered(pages))
+    let pages = doc.get_pages();
+    let chunks = pages
+        .keys()
+        .enumerate()
+        .skip(from)
+        .take(count)
+        .flat_map(|(i, p)| {
+            let text = doc
+                .extract_text(&[*p])
+                .unwrap_or_default()
+                .nfkc()
+                .collect::<String>();
+            let text = if readable(&text) { text } else { String::new() };
+            chunk(&text).into_iter().map(move |(_, c)| (i + 1, c))
+        })
+        .collect();
+    Ok(Extract {
+        parts: pages.len(),
+        chunks,
+    })
 }
 
 /// lopdf decodes by a font's /Encoding whenever it has one and reads /ToUnicode only
@@ -592,7 +682,7 @@ fn cut(s: &str, max: usize) -> &str {
 }
 
 /// Zips that say they unpack past this, or hold more entries, aren't opened.
-/// Their text would be over MAX_FILE_BYTES anyway, and calamine unpacks
+/// Their text would be over MAX_TEXT_BYTES anyway, and calamine unpacks
 /// without a limit of its own. A zip can lie about its sizes, so this stops
 /// accidents and naive zip bombs, not a crafted one.
 const MAX_UNZIPPED_BYTES: u64 = 256 << 20;
@@ -901,6 +991,105 @@ mod tests {
         let mut out = Vec::new();
         doc.save_to(&mut out).unwrap();
         out
+    }
+
+    /// A PDF with a page for each of `pages`, in Helvetica.
+    fn text_pdf(pages: &[String]) -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let kids: Vec<Object> = pages
+            .iter()
+            .map(|text| {
+                let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+                let content = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+                doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "Contents" => content,
+                    "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+                    "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                })
+                .into()
+            })
+            .collect();
+        let count = kids.len() as i64;
+        doc.objects.insert(
+            pages_id,
+            dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }.into(),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_pdf_is_read_a_run_of_pages_at_a_time() {
+        let pages: Vec<String> = (1..=7).map(|i| format!("Page number {i}")).collect();
+        let pdf = text_pdf(&pages);
+        let run = parts(Path::new("a.pdf"), &pdf, 2, 3).unwrap();
+        assert_eq!(run.parts, 7);
+        let numbers: Vec<usize> = run.chunks.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [3, 4, 5]);
+        assert!(run.chunks[0].1.contains("Page number 3"), "{run:?}");
+        // Past the end there is nothing, but still the count.
+        let past = parts(Path::new("a.pdf"), &pdf, 7, 30).unwrap();
+        assert_eq!((past.parts, past.chunks.len()), (7, 0));
+        // Every page, as reading aloud takes it.
+        assert_eq!(chunks(Path::new("a.pdf"), &pdf).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn paged_parts_are_picked_by_their_number() {
+        let c = |n: usize, t: &str| (n, t.to_owned());
+        let all = vec![c(1, "a"), c(1, "b"), c(2, "c"), c(4, "d")];
+        let run = select(all.clone(), true, 1, 2);
+        assert_eq!(run.parts, 4);
+        assert_eq!(run.chunks, [c(2, "c")]);
+        assert_eq!(
+            select(all.clone(), true, 0, 1).chunks,
+            [c(1, "a"), c(1, "b")]
+        );
+        assert_eq!(select(all.clone(), true, 3, 30).chunks, [c(4, "d")]);
+        assert_eq!(select(all.clone(), true, 0, usize::MAX).chunks, all);
+        assert_eq!(select(Vec::new(), true, 0, 30), Extract::default());
+    }
+
+    #[test]
+    fn parts_without_pages_are_runs_of_chunks() {
+        // Numbered by line, as a text file's are.
+        let all: Vec<(usize, String)> = (1..=10).map(|i| (i * 4, format!("c{i}"))).collect();
+        let run = select(all.clone(), false, 1, 2);
+        assert_eq!(run.parts, 10usize.div_ceil(PART_CHUNKS));
+        assert_eq!(run.chunks, all[PART_CHUNKS..3 * PART_CHUNKS]);
+        assert_eq!(
+            select(all.clone(), false, 3, 30).chunks,
+            all[3 * PART_CHUNKS..]
+        );
+        assert_eq!(select(all.clone(), false, 0, usize::MAX).chunks, all);
+        assert!(select(all, false, 30, 30).chunks.is_empty());
+    }
+
+    #[test]
+    fn a_part_is_a_page_slide_or_chapter_where_there_are_those() {
+        for (name, unit) in [
+            ("a.pdf", "page"),
+            ("a.pptx", "slide"),
+            ("a.odp", "slide"),
+            ("a.epub", "chapter"),
+            ("a.docx", "part"),
+            ("a.csv", "part"),
+            ("a.srt", "part"),
+            ("a.txt", "part"),
+            ("a.md", "part"),
+        ] {
+            assert_eq!(part_unit(Path::new(name)), unit, "{name}");
+        }
     }
 
     #[test]

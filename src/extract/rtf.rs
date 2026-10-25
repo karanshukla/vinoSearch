@@ -1,7 +1,7 @@
 //! RTF's text (#97): control words and the groups that hold no text (fonts,
 //! styles, pictures, field codes, ...) stripped, a line per paragraph.
 
-use crate::index::MAX_FILE_BYTES;
+use crate::index::MAX_TEXT_BYTES;
 use anyhow::{Result, bail};
 use encoding_rs::{Encoding, WINDOWS_1252};
 use std::collections::HashMap;
@@ -160,8 +160,8 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
     let mut group_start = false;
     let mut i = 0;
     while i < bytes.len() {
-        if out.text.len() as u64 > MAX_FILE_BYTES {
-            bail!("over {MAX_FILE_BYTES} bytes of text");
+        if out.text.len() as u64 > MAX_TEXT_BYTES {
+            bail!("over {MAX_TEXT_BYTES} bytes of text");
         }
         let starting = std::mem::take(&mut group_start);
         match bytes[i] {
@@ -310,8 +310,8 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
         }
     }
     out.flush();
-    if out.text.len() as u64 > MAX_FILE_BYTES {
-        bail!("over {MAX_FILE_BYTES} bytes of text");
+    if out.text.len() as u64 > MAX_TEXT_BYTES {
+        bail!("over {MAX_TEXT_BYTES} bytes of text");
     }
     Ok(out.text)
 }

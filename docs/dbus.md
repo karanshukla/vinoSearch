@@ -54,7 +54,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 | `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
-| `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string. |
+| `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text: a long document indexes in parts but doesn't read aloud whole), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string. |
 
 ### `Status` keys
 
@@ -65,6 +65,8 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `paused` | `b` | `PauseIndexing` was called and `ResumeIndexing` not since. `indexing` is false while paused. |
 | `power_hold` | `s` | Why indexing is held for power ([#109](https://github.com/karanshukla/vinoSearch/issues/109)): `charger` (on battery with `index_on_battery = false`), `power_saver` (power-profiles-daemon or tuned-ppd reports the `power-saver` profile), or empty. Held as `PauseIndexing` holds it, apart from `paused`: changes found meanwhile wait, queries keep working, and it resumes by itself once the reason goes. `indexing` is false while held. |
 | `indexed_files` | `t` | Files embedded so far by the current indexing job. |
+| `indexing_rest` | `b` | The indexing job is the rest of a long document: its parts after the first 30, indexed once nothing else is waiting ([#108](https://github.com/karanshukla/vinoSearch/issues/108)). |
+| `partial` | `a(sstt)` | Documents indexed in part so far, the next in line first, at most 100: (path, unit, parts in, parts in all). The unit is `page`, `slide` or `chapter`, or `part` (3 chunks, about a printed page) for formats without them. |
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
 | `chunks` | `x` | Chunks in the index. |

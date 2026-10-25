@@ -51,6 +51,9 @@ pub enum Job {
     /// The model may load now (a download finished), or indexing was
     /// resumed: run the indexing that waited.
     Retry,
+    /// The next run of parts of a long document (#108). The worker makes
+    /// these itself, when nothing else is queued.
+    Rest,
 }
 
 /// What the runner is doing, for status queries. The worker owns the model
@@ -65,6 +68,8 @@ pub struct Status {
     pub queued_reindex: AtomicUsize,
     /// Files embedded so far by the current indexing job.
     pub indexed_files: AtomicU64,
+    /// The indexing job is the rest of a long document (#108).
+    pub indexing_rest: AtomicBool,
     pub fetching: AtomicBool,
     pub fetch_done: AtomicU64,
     pub fetch_total: AtomicU64,
@@ -329,6 +334,9 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             eprintln!("model unloaded ({why})");
         }
     };
+    // Whether the rest of long documents may run when nothing else is
+    // queued: not after it failed to, until a Retry or a load succeeds.
+    let mut rest_ready = true;
     // When the last job finished, and when to free the document stage.
     let mut last_job = Instant::now();
     let mut free_docs: Option<Instant> = None;
@@ -339,6 +347,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         }
         let job = if let Some(job) = deferred.pop_front() {
             job
+        } else if let Ok(job) = jobs.try_recv() {
+            job
+        } else if rest_ready && !status.held() && index::has_partial(&conn).unwrap_or(false) {
+            // The first pass over everything is done; the rest of long
+            // documents is what's left, a run of parts at a time.
+            Job::Rest
         } else {
             let unload_at = idle.filter(|_| loaded.is_some()).map(|d| last_job + d);
             let free_at = free_docs.filter(|_| loaded.is_some());
@@ -369,6 +383,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         // Jobs that need no model.
         let job = match job {
             Job::Retry => {
+                rest_ready = true;
                 replay(&mut waiting, &mut waiting_roots, &mut deferred);
                 continue;
             }
@@ -496,9 +511,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
             }
             job => job,
         };
-        let indexes = matches!(job, Job::Changed(_) | Job::Reindex(_));
+        let indexes = matches!(job, Job::Changed(_) | Job::Reindex(_) | Job::Rest);
         if indexes {
             status.indexed_files.store(0, Ordering::Relaxed);
+            status
+                .indexing_rest
+                .store(matches!(job, Job::Rest), Ordering::Relaxed);
             status.indexing.store(true, Ordering::Relaxed);
         }
         if loaded.is_none() {
@@ -506,6 +524,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 Ok(l) => {
                     loaded = Some(l);
                     status.loaded.store(true, Ordering::Relaxed);
+                    rest_ready = true;
                     replay(&mut waiting, &mut waiting_roots, &mut deferred);
                 }
                 Err(e) => {
@@ -519,6 +538,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                             waiting_roots.push(root);
                         }
                         Job::Changed(paths) => waiting.extend(paths),
+                        // Tried again once a load succeeds.
+                        Job::Rest => rest_ready = false,
                         _ => {}
                     }
                     status.indexing.store(false, Ordering::Relaxed);
@@ -625,6 +646,35 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
                 }
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
+                status.indexing.store(false, Ordering::Relaxed);
+            }
+            Job::Rest => {
+                let r = index::index_rest(&mut conn, emb, &types, &mut |c, e| {
+                    after(&index::Stats::default(), c, e)
+                });
+                match r {
+                    Ok(Some(rest)) => {
+                        match rest {
+                            index::Rest::Parts {
+                                path, done, total, ..
+                            } if done >= total => eprintln!("{path}: all {total} parts in"),
+                            index::Rest::Again(path) => {
+                                eprintln!("{path} changed while partly indexed, indexed again")
+                            }
+                            _ => {}
+                        }
+                        status.last_indexed.store(unix_now(), Ordering::Relaxed);
+                    }
+                    Ok(None) => {}
+                    // Held or stopped: the run goes again from where the
+                    // index has it.
+                    Err(_) if interrupted(&r) => {}
+                    Err(e) => {
+                        eprintln!("indexing the rest of a long document: {e:#}");
+                        rest_ready = false;
+                    }
+                }
+                status.indexing_rest.store(false, Ordering::Relaxed);
                 status.indexing.store(false, Ordering::Relaxed);
             }
             Job::Config(_)

@@ -404,6 +404,31 @@ fn the_index_page_says_why_power_holds_indexing() {
 }
 
 #[test]
+fn the_index_page_lists_documents_indexed_in_part() {
+    let (w, _requests) = window(Page::Index, "partial");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.indexing_rest = true;
+        s.partial = (0..5)
+            .map(|i| Partial {
+                path: format!("/srv/books/book{i}.pdf"),
+                unit: "page".into(),
+                done: 120,
+                total: 1640,
+            })
+            .collect();
+        s.partial[1].unit = "chapter".into();
+        s.partial[1].done = 30;
+        s.partial[1].total = 41;
+    }
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Indexing the rest of long documents");
+    h.get_by_label("book0.pdf, 120 of 1,640 pages");
+    h.get_by_label("book1.pdf, 30 of 41 chapters");
+    h.get_by_label("and 2 more");
+    assert!(h.query_by_label("book3.pdf, 120 of 1,640 pages").is_none());
+}
+
+#[test]
 fn integration_switches_say_their_state_in_words() {
     let (w, _requests) = window(Page::Integration, "integration");
     let h = harness(w, WIDE, Theme::Dark);

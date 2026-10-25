@@ -3,7 +3,7 @@
 //! Only what the text needs is parsed: Word's piece table, and PowerPoint's
 //! text atoms per slide.
 
-use crate::index::{MAX_DOCUMENT_BYTES, MAX_FILE_BYTES};
+use crate::index::{MAX_DOCUMENT_BYTES, MAX_TEXT_BYTES};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
@@ -44,8 +44,8 @@ fn utf16(b: &[u8]) -> String {
 }
 
 fn too_long(text: &str) -> Result<()> {
-    if text.len() as u64 > MAX_FILE_BYTES {
-        bail!("over {MAX_FILE_BYTES} bytes of text");
+    if text.len() as u64 > MAX_TEXT_BYTES {
+        bail!("over {MAX_TEXT_BYTES} bytes of text");
     }
     Ok(())
 }
@@ -299,8 +299,8 @@ pub fn ppt(bytes: &[u8]) -> Result<Vec<String>> {
         })
         .inspect(|s| total += s.len())
         .collect();
-    if total as u64 > MAX_FILE_BYTES {
-        bail!("over {MAX_FILE_BYTES} bytes of text");
+    if total as u64 > MAX_TEXT_BYTES {
+        bail!("over {MAX_TEXT_BYTES} bytes of text");
     }
     Ok(slides)
 }

@@ -525,6 +525,19 @@ impl Control {
             out.insert(k.into(), owned(Value::from(u64_of(at))));
         }
         out.insert(
+            key::INDEXING_REST.into(),
+            owned(Value::from(st.indexing_rest.load(Ordering::Relaxed))),
+        );
+        let partial: Vec<(String, String, u64, u64)> = index::partial(&db, key::PARTIAL_MAX)
+            .map_err(failed)?
+            .into_iter()
+            .map(|(path, done, total)| {
+                let unit = crate::extract::part_unit(Path::new(&path)).to_owned();
+                (path, unit, done as u64, total as u64)
+            })
+            .collect();
+        out.insert(key::PARTIAL.into(), owned(Value::from(partial)));
+        out.insert(
             key::MODEL_CHANGED.into(),
             owned(Value::from(st.model_changed.lock().unwrap().clone())),
         );

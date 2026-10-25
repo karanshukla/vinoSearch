@@ -7,6 +7,7 @@
 
 use crate::config::{Excludes, Formats};
 use crate::embed::{DIM, Embedder, document_text};
+use crate::extract::{Extract, MAX_PARTS, PARTS_AT_ONCE, Parser};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,12 @@ use walkdir::WalkDir;
 /// About 250 tokens of English, inside the 256-token document shape.
 pub(crate) const CHUNK_CHARS: usize = 900;
 pub(crate) const MAX_FILE_BYTES: u64 = 1 << 20;
+/// A document's text, or a prose file's, all its parts together (#108):
+/// about 5,000 printed pages, ~18,000 chunks.
+pub(crate) const MAX_TEXT_BYTES: u64 = 16 << 20;
+/// Text files that may be books, held to MAX_TEXT_BYTES instead of
+/// MAX_FILE_BYTES. Code that size is generated.
+const PROSE: &[&str] = &["txt", "md", "rst", "org", "tex"];
 const EXTENSIONS: &[&str] = &[
     "md", "txt", "rst", "org", "tex", "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cpp",
     "hpp", "java", "kt", "swift", "rb", "sh", "bash", "zsh", "fish", "html", "htm", "css", "scss",
@@ -69,8 +76,8 @@ const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
 /// Images past this are skipped: decoding takes several times the file in memory.
 const MAX_IMAGE_BYTES: u64 = 64 << 20;
-/// Documents are parsed whole in memory too. Their extracted text is held to
-/// MAX_FILE_BYTES like any text file.
+/// Documents are parsed whole in memory too, once for each run of parts.
+/// Their extracted text is held to MAX_TEXT_BYTES.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 
 /// What a chunk was embedded from, stored in `chunks.kind`.
@@ -94,8 +101,10 @@ impl Kind {
         }
     }
 
-    fn max_bytes(self) -> u64 {
+    /// The largest `path` of this kind that is indexed.
+    fn max_bytes(self, path: &Path) -> u64 {
         match self {
+            Kind::Text if is_prose(path) => MAX_TEXT_BYTES,
             Kind::Text => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document => MAX_DOCUMENT_BYTES,
@@ -256,6 +265,23 @@ pub fn open(path: &Path) -> Result<Connection> {
              SET file_id = (SELECT id FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id LIMIT 1)
              WHERE file_id = OLD.id
                AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
+         END;
+         -- Long documents indexed in part (#108): `done` of their `total`
+         -- parts have chunks, the rest wait for `index_rest`. Gone once the
+         -- last part is in, and with the file. A copy takes it over with
+         -- the chunks.
+         CREATE TABLE IF NOT EXISTS partial (
+             file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+             done INTEGER NOT NULL,
+             total INTEGER NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS partial_hand_over BEFORE DELETE ON files
+         WHEN OLD.sha256 IS NOT NULL
+         BEGIN
+             UPDATE partial
+             SET file_id = (SELECT id FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id LIMIT 1)
+             WHERE file_id = OLD.id
+               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
          END;",
     )?;
     Ok(conn)
@@ -264,6 +290,12 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Whether `path` is indexed, as `types` takes it.
 pub(crate) fn wanted(path: &Path, types: &FileTypes) -> bool {
     types.kind(path).is_some()
+}
+
+fn is_prose(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PROSE.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 fn text_file(path: &Path) -> bool {
@@ -416,9 +448,10 @@ pub enum Outcome {
 }
 
 /// Index one file if it is wanted and changed since it was last indexed.
-/// `between` runs after each chunk is embedded, so a 1 MiB file (~1,100
-/// chunks, ~40 s) does not hold a waiting query for its whole length. An
-/// error from it stops the file unwritten.
+/// A long file gets its first PARTS_AT_ONCE parts (pages, say) now and the
+/// rest from `index_rest` once everything else is in (#108). `between` runs
+/// after each chunk is embedded, so a waiting query is not held for the
+/// whole run. An error from it stops the file unwritten.
 pub fn index_file(
     conn: &mut Connection,
     emb: &mut Embedder,
@@ -428,7 +461,7 @@ pub fn index_file(
 ) -> Result<Outcome> {
     let kind = types.kind(path);
     let (meta, kind) = match (fs::symlink_metadata(path), kind) {
-        (Ok(m), Some(kind)) if m.is_file() && m.len() <= kind.max_bytes() => (m, kind),
+        (Ok(m), Some(kind)) if m.is_file() && m.len() <= kind.max_bytes(path) => (m, kind),
         _ => {
             remove(conn, path)?;
             return Ok(Outcome::Skipped);
@@ -497,24 +530,12 @@ pub fn index_file(
         record(conn)?;
         return Ok(Outcome::Duplicate);
     }
-    let (chunks, vectors) = match kind {
+    let (first, vectors) = match kind {
         Kind::Text => {
             let text = String::from_utf8(bytes).expect("read as a string");
-            let chunks = if crate::extract::is_html(path) {
-                chunk(&crate::extract::html(&text))
-            } else {
-                chunk(&text)
-            };
-            let title = path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for (_, c) in &chunks {
-                vectors.extend(emb.documents(&[document_text(&title, c)])?);
-                between(conn, emb)?;
-            }
-            (chunks, vectors)
+            let first = text_parts(path, &text, 0, PARTS_AT_ONCE);
+            let vectors = embed_chunks(conn, emb, path, &first.chunks, between)?;
+            (first, vectors)
         }
         // A file that can't be read, or has no text (a scan), keeps a row with
         // no chunks, so it isn't parsed again until it changes.
@@ -524,20 +545,16 @@ pub fn index_file(
             // restart, and a stop while embedding must leave it to be indexed
             // next time, so the record goes once it parses.
             record(conn)?;
-            let chunks = document_chunks(path, &bytes, crate::extract::chunks_in_child);
-            if !chunks.is_empty() {
+            let first = document_parts(path, &bytes, 0, crate::extract::parts_in_child)
+                .unwrap_or_else(|e| {
+                    eprintln!("skip {}: {e:#}", path.display());
+                    Extract::default()
+                });
+            if !first.chunks.is_empty() {
                 conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
             }
-            let title = path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for (_, c) in &chunks {
-                vectors.extend(emb.documents(&[document_text(&title, c)])?);
-                between(conn, emb)?;
-            }
-            (chunks, vectors)
+            let vectors = embed_chunks(conn, emb, path, &first.chunks, between)?;
+            (first, vectors)
         }
         // One chunk, with no text and line 0, from the pixels alone. One that
         // doesn't decode keeps a row with no chunks, like a document with no
@@ -557,7 +574,11 @@ pub fn index_file(
                 };
             let v = emb.image(&pixels)?;
             between(conn, emb)?;
-            (vec![(0, String::new())], vec![v])
+            let first = Extract {
+                parts: 1,
+                chunks: vec![(0, String::new())],
+            };
+            (first, vec![v])
         }
     };
 
@@ -568,36 +589,292 @@ pub fn index_file(
         params![key, mtime, size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
-    for ((line, text), v) in chunks.iter().zip(&vectors) {
+    insert_chunks(&tx, file_id, kind, &first.chunks, &vectors)?;
+    // The rest of a long one waits for `index_rest`.
+    let total = first.parts.min(MAX_PARTS);
+    if total > PARTS_AT_ONCE {
+        tx.execute(
+            "INSERT INTO partial (file_id, done, total) VALUES (?1, ?2, ?3)",
+            params![file_id, PARTS_AT_ONCE as i64, total as i64],
+        )?;
+    }
+    tx.commit()?;
+    Ok(Outcome::Embedded(first.chunks.len()))
+}
+
+fn insert_chunks(
+    tx: &Connection,
+    file_id: i64,
+    kind: Kind,
+    chunks: &[(usize, String)],
+    vectors: &[Vec<f32>],
+) -> Result<()> {
+    for ((line, text), v) in chunks.iter().zip(vectors) {
         tx.execute(
             "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![file_id, *line as i64, text, to_blob(v), kind as i64],
         )?;
     }
-    tx.commit()?;
-    Ok(Outcome::Embedded(chunks.len()))
+    Ok(())
 }
 
-/// `path`'s chunks through `parse` (the child process, #84), or none if it
-/// doesn't parse, the child was stopped, or its text is over MAX_FILE_BYTES.
-fn document_chunks(
+/// Each chunk's vector, with `between` run after each.
+fn embed_chunks(
+    conn: &Connection,
+    emb: &mut Embedder,
     path: &Path,
-    bytes: &[u8],
-    parse: crate::extract::Parser,
-) -> Vec<(usize, String)> {
-    let chunks = match parse(path, bytes) {
-        Ok(c) => c,
+    chunks: &[(usize, String)],
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+) -> Result<Vec<Vec<f32>>> {
+    let title = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let mut vectors = Vec::with_capacity(chunks.len());
+    for (_, c) in chunks {
+        vectors.extend(emb.documents(&[document_text(&title, c)])?);
+        between(conn, emb)?;
+    }
+    Ok(vectors)
+}
+
+/// Parts `from..from + count` of a text file's chunks.
+fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
+    let chunks = if crate::extract::is_html(path) {
+        chunk(&crate::extract::html(text))
+    } else {
+        chunk(text)
+    };
+    crate::extract::select(chunks, false, from, count)
+}
+
+/// Parts `from..from + PARTS_AT_ONCE` of `path` through `parse` (the child
+/// process, #84). Err if it doesn't parse, the child was stopped, or the
+/// run's text is over MAX_FILE_BYTES.
+fn document_parts(path: &Path, bytes: &[u8], from: usize, parse: Parser) -> Result<Extract> {
+    let run = parse(path, bytes, from, PARTS_AT_ONCE)?;
+    let size: usize = run.chunks.iter().map(|(_, c)| c.len()).sum();
+    if size as u64 > MAX_FILE_BYTES {
+        bail!("{size} bytes of text in {PARTS_AT_ONCE} parts");
+    }
+    Ok(run)
+}
+
+/// What `index_rest` does next.
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// The parts of file `id` after the first `from`, of `total`.
+    Parts {
+        id: i64,
+        path: String,
+        from: usize,
+        total: usize,
+    },
+    /// The file changed or went since its first run: index it afresh.
+    Again(String),
+}
+
+/// The long document indexed in part longest ago, and what to do with it.
+fn next_rest(conn: &Connection) -> Result<Option<Next>> {
+    let row: Option<(i64, String, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT f.id, f.path, f.mtime, f.size, p.done, p.total
+             FROM partial p JOIN files f ON f.id = p.file_id
+             ORDER BY p.file_id LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, path, mtime, size, done, total)) = row else {
+        return Ok(None);
+    };
+    let now = fs::symlink_metadata(&path)
+        .ok()
+        .filter(|m| m.is_file())
+        .as_ref()
+        .and_then(stamp_of);
+    if now != Some((mtime, size)) {
+        return Ok(Some(Next::Again(path)));
+    }
+    Ok(Some(Next::Parts {
+        id,
+        path,
+        from: done as usize,
+        total: total as usize,
+    }))
+}
+
+/// Store the chunks of parts `from..done` of file `id`, and move its partial
+/// row on to `done`, or drop it once that is all `total`.
+fn store_rest(
+    conn: &mut Connection,
+    id: i64,
+    kind: Kind,
+    done: usize,
+    total: usize,
+    chunks: &[(usize, String)],
+    vectors: &[Vec<f32>],
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    insert_chunks(&tx, id, kind, chunks, vectors)?;
+    if done >= total {
+        tx.execute("DELETE FROM partial WHERE file_id = ?1", [id])?;
+    } else {
+        tx.execute(
+            "UPDATE partial SET done = ?1 WHERE file_id = ?2",
+            params![done as i64, id],
+        )?;
+    }
+    Ok(tx.commit()?)
+}
+
+/// What one `index_rest` call did.
+#[derive(Debug)]
+pub enum Rest {
+    /// `path` has `done` of its `total` parts in now, `chunks` of them just
+    /// embedded. Stopped short when a run would not parse: `done` stays.
+    Parts {
+        path: String,
+        done: usize,
+        total: usize,
+        chunks: usize,
+    },
+    /// The file had changed or gone, and was indexed afresh (its first run)
+    /// or dropped.
+    Again(String),
+}
+
+/// The next run of parts of the long document indexed in part longest ago
+/// (#108), or None when every document is in whole. The parser's limits
+/// apply to the run, as in `index_file`, and `between` after each chunk.
+pub fn index_rest(
+    conn: &mut Connection,
+    emb: &mut Embedder,
+    types: &FileTypes,
+    between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>,
+) -> Result<Option<Rest>> {
+    let Some(next) = next_rest(conn)? else {
+        return Ok(None);
+    };
+    let again = |conn: &mut Connection,
+                 emb: &mut Embedder,
+                 path: String,
+                 between: &mut dyn FnMut(&Connection, &mut Embedder) -> Result<()>|
+     -> Result<Option<Rest>> {
+        // Whatever the stamp says, index_file must take it as changed.
+        conn.execute("UPDATE files SET mtime = -1 WHERE path = ?1", [&path])?;
+        index_file(conn, emb, Path::new(&path), types, between)?;
+        Ok(Some(Rest::Again(path)))
+    };
+    let (id, key, from, total) = match next {
+        Next::Again(path) => return again(conn, emb, path, between),
+        Next::Parts {
+            id,
+            path,
+            from,
+            total,
+        } => (id, path, from, total),
+    };
+    let path = Path::new(&key);
+    let hash: Option<Vec<u8>> =
+        conn.query_row("SELECT sha256 FROM files WHERE id = ?1", [id], |r| r.get(0))?;
+    let (kind, bytes) = match (types.kind(path), fs::read(path)) {
+        (Some(kind @ (Kind::Text | Kind::Document)), Ok(bytes))
+            if hash.as_deref() == Some(&Sha256::digest(&bytes)[..]) =>
+        {
+            (kind, bytes)
+        }
+        _ => return again(conn, emb, key, between),
+    };
+    let run = match kind {
+        Kind::Document => document_parts(path, &bytes, from, crate::extract::parts_in_child),
+        _ => match String::from_utf8(bytes) {
+            Ok(text) => Ok(text_parts(path, &text, from, PARTS_AT_ONCE)),
+            Err(_) => return again(conn, emb, key, between),
+        },
+    };
+    let mut done = (from + PARTS_AT_ONCE).min(total);
+    let mut chunks = match run {
+        Ok(run) => run.chunks,
+        // What is in stays; the rest isn't tried again until it changes.
         Err(e) => {
-            eprintln!("skip {}: {e:#}", path.display());
-            return Vec::new();
+            eprintln!(
+                "{}: stopped at part {from} of {total}: {e:#}",
+                path.display()
+            );
+            conn.execute("DELETE FROM partial WHERE file_id = ?1", [id])?;
+            return Ok(Some(Rest::Parts {
+                path: key,
+                done: from,
+                total,
+                chunks: 0,
+            }));
         }
     };
-    let size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
-    if size as u64 > MAX_FILE_BYTES {
-        eprintln!("skip {}: {size} bytes of text", path.display());
-        return Vec::new();
+    let have: i64 = conn.query_row(
+        "SELECT coalesce(sum(length(CAST(text AS BLOB))), 0) FROM chunks WHERE file_id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if text_budget(&mut chunks, have as u64) {
+        eprintln!(
+            "{}: over {MAX_TEXT_BYTES} bytes of text, the rest is left out",
+            path.display()
+        );
+        done = total;
     }
-    chunks
+    let vectors = embed_chunks(conn, emb, path, &chunks, between)?;
+    store_rest(conn, id, kind, done, total, &chunks, &vectors)?;
+    Ok(Some(Rest::Parts {
+        path: key,
+        done,
+        total,
+        chunks: chunks.len(),
+    }))
+}
+
+/// Keep what of `chunks` fits in MAX_TEXT_BYTES with `have` bytes of the
+/// document in already. True when some had to go.
+fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
+    let mut total = have;
+    let fits = chunks
+        .iter()
+        .take_while(|(_, c)| {
+            total += c.len() as u64;
+            total <= MAX_TEXT_BYTES
+        })
+        .count();
+    let cut = fits < chunks.len();
+    chunks.truncate(fits);
+    cut
+}
+
+/// Whether any document is indexed in part only.
+pub fn has_partial(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM partial LIMIT 1", [], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Documents indexed in part so far (#108), the next in line first: (path,
+/// parts in, parts in all). At most `limit`.
+pub fn partial(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, p.done, p.total FROM partial p JOIN files f ON f.id = p.file_id
+         ORDER BY p.file_id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Another file with content `hash` that holds its chunks, if there is one.
@@ -642,7 +919,7 @@ pub fn stale(
         let was = known.remove(key);
         let wanted_now = types
             .kind(path)
-            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes()));
+            .is_some_and(|k| entry.metadata().is_ok_and(|m| m.len() <= k.max_bytes(path)));
         if !wanted_now {
             // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
@@ -1936,10 +2213,144 @@ mod tests {
 
     #[test]
     fn a_document_that_does_not_parse_has_no_chunks() {
-        let parse = crate::extract::chunks;
-        assert!(document_chunks(Path::new("/p/a.pdf"), b"not a pdf", parse).is_empty());
-        let csv = format!("h\n{}", "x\n".repeat(MAX_FILE_BYTES as usize));
-        assert!(document_chunks(Path::new("/p/a.csv"), csv.as_bytes(), parse).is_empty());
+        let parse = crate::extract::parts;
+        assert!(document_parts(Path::new("/p/a.pdf"), b"not a pdf", 0, parse).is_err());
+        // A run of parts with over MAX_FILE_BYTES of text: one slide will do.
+        let slide = format!(
+            "<draw:page><text:p>{}</text:p></draw:page>",
+            "word ".repeat(250_000)
+        );
+        assert!(document_parts(Path::new("/p/a.fodp"), slide.as_bytes(), 0, parse).is_err());
+    }
+
+    /// `path` indexed as it is on disk now, with `chunks` chunks and the
+    /// first `done` of `total` parts in.
+    fn add_partial(conn: &Connection, path: &Path, done: i64, total: i64) -> i64 {
+        let (mtime, size) = stamp_of(&fs::metadata(path).unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, x'01')",
+            params![path.to_str().unwrap(), mtime, size],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (?1, 1, 'first', ?2)",
+            params![id, axis(0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO partial (file_id, done, total) VALUES (?1, ?2, ?3)",
+            params![id, done, total],
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn the_rest_of_a_long_document_resumes_where_it_stopped() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-rest-{}", std::process::id()));
+        let db = dir.join("i.sqlite");
+        let mut conn = open(&db).unwrap();
+        let book = dir.join("book.txt");
+        fs::write(&book, "a long book").unwrap();
+        let key = book.to_str().unwrap().to_owned();
+        let id = add_partial(&conn, &book, 30, 70);
+        assert!(has_partial(&conn).unwrap());
+        assert_eq!(partial(&conn, 10).unwrap(), [(key.clone(), 30, 70)]);
+        let parts = |from| Next::Parts {
+            id,
+            path: key.clone(),
+            from,
+            total: 70,
+        };
+        assert_eq!(next_rest(&conn).unwrap(), Some(parts(30)));
+        let run = [(31, "second".to_owned())];
+        store_rest(&mut conn, id, Kind::Text, 60, 70, &run, &[vec![0.0; DIM]]).unwrap();
+        // A restart picks it up from there.
+        drop(conn);
+        let mut conn = open(&db).unwrap();
+        assert_eq!(next_rest(&conn).unwrap(), Some(parts(60)));
+        let run = [(61, "third".to_owned())];
+        store_rest(&mut conn, id, Kind::Text, 70, 70, &run, &[vec![0.0; DIM]]).unwrap();
+        assert_eq!(next_rest(&conn).unwrap(), None);
+        assert!(!has_partial(&conn).unwrap());
+        // Still one file, with every run's chunks.
+        assert_eq!(counts(&conn).unwrap(), (1, 3));
+        assert_eq!(counts_by_kind(&conn).unwrap()[0], (1, 3));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_document_that_changed_or_went_is_indexed_again() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-again-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let book = dir.join("book.txt");
+        fs::write(&book, "a long book").unwrap();
+        let key = book.to_str().unwrap().to_owned();
+        let id = add_partial(&conn, &book, 30, 70);
+        fs::write(&book, "a longer book").unwrap();
+        assert_eq!(next_rest(&conn).unwrap(), Some(Next::Again(key.clone())));
+        fs::remove_file(&book).unwrap();
+        assert_eq!(next_rest(&conn).unwrap(), Some(Next::Again(key)));
+        // Indexed again, the old row and its partial row go.
+        conn.execute("DELETE FROM files WHERE id = ?1", [id])
+            .unwrap();
+        assert!(!has_partial(&conn).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copy_takes_over_a_long_document_indexed_in_part() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-hand-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let book = dir.join("book.pdf");
+        fs::write(&book, "%PDF").unwrap();
+        let id = add_partial(&conn, &book, 30, 640);
+        conn.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/copy.pdf', 0, 0, x'01')",
+            [],
+        )
+        .unwrap();
+        let copy = conn.last_insert_rowid();
+        conn.execute("DELETE FROM files WHERE id = ?1", [id])
+            .unwrap();
+        assert_eq!(
+            partial(&conn, 10).unwrap(),
+            [("/copy.pdf".to_owned(), 30, 640)]
+        );
+        assert_eq!(counts(&conn).unwrap(), (1, 1));
+        conn.execute("DELETE FROM files WHERE id = ?1", [copy])
+            .unwrap();
+        assert!(!has_partial(&conn).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn text_past_the_budget_is_left_out() {
+        let mut run = vec![(1, "x".repeat(600)), (2, "y".repeat(600))];
+        assert!(!text_budget(&mut run, 0));
+        assert_eq!(run.len(), 2);
+        assert!(text_budget(&mut run, MAX_TEXT_BYTES - 1000));
+        assert_eq!(run.len(), 1);
+        assert!(text_budget(&mut run, MAX_TEXT_BYTES));
+        assert!(run.is_empty());
+    }
+
+    #[test]
+    fn prose_may_be_a_book_but_code_may_not() {
+        assert_eq!(
+            Kind::Text.max_bytes(Path::new("/b/Moby Dick.TXT")),
+            MAX_TEXT_BYTES
+        );
+        assert_eq!(
+            Kind::Text.max_bytes(Path::new("/b/notes.md")),
+            MAX_TEXT_BYTES
+        );
+        assert_eq!(Kind::Text.max_bytes(Path::new("/b/gen.rs")), MAX_FILE_BYTES);
+        assert_eq!(
+            Kind::Text.max_bytes(Path::new("/b/page.html")),
+            MAX_FILE_BYTES
+        );
     }
 
     #[test]
