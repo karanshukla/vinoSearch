@@ -349,7 +349,18 @@ fn search_page_controls_are_named_by_their_row_labels() {
     assert!(h.state().config.formats.images_enabled());
     // Shown once images are on, named by its row label rather than only a placeholder.
     h.get_by_role_and_label(Role::TextInput, "Image types:");
-    for row in ["Text:", "Images:"] {
+    // Code is opt-in too (#110), and saved as it's turned on.
+    let code = h.get_by_role_and_label(Role::CheckBox, "Index code");
+    assert_eq!(
+        code.accesskit_node().toggled(),
+        Some(accesskit::Toggled::False)
+    );
+    code.click();
+    settle(&mut h);
+    assert!(h.state().config.formats.code_enabled());
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(saved.contains("[formats.code]\nenabled = true"), "{saved}");
+    for row in ["Text:", "Images:", "Code:"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);
     }

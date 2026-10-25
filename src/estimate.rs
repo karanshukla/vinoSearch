@@ -26,6 +26,11 @@ pub const INDEX_BYTES_PER_CHUNK: u64 = 4_150;
 /// of Rust, Python, Markdown and shell in 2,743 files made 30,733 chunks,
 /// 830 bytes each. 800 puts that estimate 8% high.
 const TEXT_BYTES_PER_CHUNK: u64 = 800;
+/// File bytes per code chunk. `code::chunk` ends chunks at definitions, so
+/// they run shorter than text's: 7.7 MiB of Rust, Python, TypeScript, Go,
+/// C and shell in 795 files made 12,550 chunks, 643 bytes each. 600 puts
+/// that estimate 7% high, as text's is.
+const CODE_BYTES_PER_CHUNK: u64 = 600;
 
 /// The share of a document's file that comes out as text. Guesses, not
 /// measured, set high so the estimate errs long: a PDF is mostly fonts,
@@ -50,6 +55,7 @@ fn document_text_share(path: &Path) -> f64 {
 fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
     let text = match kind {
         Kind::Image => return 1,
+        Kind::Code => return bytes.div_ceil(CODE_BYTES_PER_CHUNK),
         Kind::Text => bytes,
         // Text past MAX_FILE_BYTES is skipped, so a document makes at most
         // that much.
@@ -64,7 +70,7 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
 fn secs_of(kind: Kind, chunks: u64) -> f64 {
     match kind {
         Kind::Image => chunks as f64 * SECS_PER_IMAGE,
-        Kind::Text | Kind::Document => chunks as f64 / CHUNKS_PER_SEC,
+        Kind::Text | Kind::Document | Kind::Code => chunks as f64 / CHUNKS_PER_SEC,
     }
 }
 
@@ -79,8 +85,8 @@ pub struct Tally {
 #[derive(Debug, Default)]
 pub struct Estimate {
     pub root: PathBuf,
-    /// In `Kind::ALL`'s order: text, documents, images.
-    pub kinds: [Tally; 3],
+    /// In `Kind::ALL`'s order: text, documents, images, code.
+    pub kinds: [Tally; 4],
     /// Files already indexed and unchanged since, which cost nothing.
     pub up_to_date: u64,
     /// The subfolders taking longest, longest first: (folder, seconds, files).
@@ -141,6 +147,7 @@ impl Estimate {
                     Kind::Text => "text",
                     Kind::Document => "documents",
                     Kind::Image => "images",
+                    Kind::Code => "code",
                 };
                 (
                     name.to_owned(),
@@ -329,6 +336,7 @@ mod tests {
         let mut formats = crate::config::Formats::default();
         formats.images.enabled = Some(images);
         formats.documents.enabled = Some(documents);
+        formats.code.enabled = Some(true);
         FileTypes::new(&formats).unwrap()
     }
 
@@ -336,7 +344,7 @@ mod tests {
     fn counts_what_indexing_would_and_skips_the_rest() {
         let dir = tree("rules");
         put(&dir.join("notes.md"), 1600); // 2 chunks
-        put(&dir.join("a/main.rs"), 801); // 2 chunks
+        put(&dir.join("a/main.rs"), 601); // 2 chunks
         put(&dir.join("a/empty.txt"), 0); // none
         put(&dir.join("target/gen.rs"), 5000); // build output
         put(&dir.join(".git/x.md"), 5000); // hidden
@@ -350,9 +358,17 @@ mod tests {
         assert_eq!(
             est.kinds[0],
             Tally {
-                files: 3,
-                bytes: 2401,
-                chunks: 4
+                files: 2,
+                bytes: 1600,
+                chunks: 2
+            }
+        );
+        assert_eq!(
+            est.kinds[3],
+            Tally {
+                files: 1,
+                bytes: 601,
+                chunks: 2
             }
         );
         assert_eq!(est.files(), 3);
@@ -460,6 +476,7 @@ mod tests {
                 },
                 Tally::default(),
                 Tally::default(),
+                Tally::default(),
             ],
             ..Estimate::default()
         };
@@ -478,6 +495,7 @@ mod tests {
                     bytes: 0,
                     chunks: 113_341,
                 },
+                Tally::default(),
                 Tally::default(),
                 Tally::default(),
             ],

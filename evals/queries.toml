@@ -15,6 +15,9 @@
 #   document        text inside a PDF, Office file, RTF, .doc or CSV
 #   image           a picture by what's in it; needs --images, so not in CI
 #
+# Queries for code start with `code:`, as they must since code became a kind
+# of its own (#110); eval turns code on, as it does documents.
+#
 # A run fails when an overall metric (image queries left out unless
 # --images) is below its threshold; the --min-* flags override them. The CPU
 # baseline, 55 queries on 2026-10-25, was recall@1 0.909, recall@5 0.964,
@@ -83,32 +86,32 @@ expect = ["notes/bike-maintenance.md"]
 kind = "paraphrase"
 
 [[query]]
-query = "throttle how many calls we make per second"
+query = "code: throttle how many calls we make per second"
 expect = ["projects/tidepool/src/ratelimit.rs"]
 kind = "paraphrase"
 
 [[query]]
-query = "try again after a failure waiting longer each time"
+query = "code: try again after a failure waiting longer each time"
 expect = ["projects/tidepool/src/retry.go"]
 kind = "paraphrase"
 
 [[query]]
-query = "spelling suggestion from the nearest word"
+query = "code: spelling suggestion from the nearest word"
 expect = ["code/levenshtein.py"]
 kind = "paraphrase"
 
 [[query]]
-query = "wait until the user stops typing before searching"
+query = "code: wait until the user stops typing before searching"
 expect = ["code/debounce.ts"]
 kind = "paraphrase"
 
 [[query]]
-query = "copy my laptop to the network drive every night"
+query = "code: copy my laptop to the network drive every night"
 expect = ["code/backup.sh"]
 kind = "paraphrase"
 
 [[query]]
-query = "which customers haven't paid on time"
+query = "code: which customers haven't paid on time"
 expect = ["code/schema.sql"]
 kind = "paraphrase"
 
@@ -123,12 +126,12 @@ expect = ["notes/baguette.md"]
 kind = "paraphrase"
 
 [[query]]
-query = "retry with the same pause between attempts"
+query = "code: retry with the same pause between attempts"
 expect = ["code/retry.py"]
 kind = "paraphrase"
 
 [[query]]
-query = "turn a blog post title into a URL"
+query = "code: turn a blog post title into a URL"
 expect = ["code/slugify.js"]
 kind = "paraphrase"
 
@@ -187,28 +190,28 @@ at = 45
 # --- identifier
 
 [[query]]
-query = "TokenBucket"
+query = "code: TokenBucket"
 expect = ["projects/tidepool/src/ratelimit.rs"]
 kind = "identifier"
 at = 6
 
 [[query]]
-query = "try_acquire"
+query = "code: try_acquire"
 expect = ["projects/tidepool/src/ratelimit.rs"]
 kind = "identifier"
 
 [[query]]
-query = "RetryWithBackoff"
+query = "code: RetryWithBackoff"
 expect = ["projects/tidepool/src/retry.go"]
 kind = "identifier"
 
 [[query]]
-query = "parse_ini_line"
+query = "code: parse_ini_line"
 expect = ["code/ini.c"]
 kind = "identifier"
 
 [[query]]
-query = "BACKUP_TARGET"
+query = "code: BACKUP_TARGET"
 expect = ["code/backup.sh"]
 kind = "identifier"
 

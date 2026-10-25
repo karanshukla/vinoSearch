@@ -60,6 +60,7 @@ struct Runner {
 pub(crate) struct Floors {
     text: f32,
     image: f32,
+    code: f32,
 }
 
 impl Floors {
@@ -78,6 +79,9 @@ impl Floors {
             image: formats
                 .image_min_score()
                 .unwrap_or(crate::config::DEFAULT_IMAGE_MIN_SCORE),
+            code: formats
+                .code_min_score()
+                .unwrap_or(crate::config::DEFAULT_CODE_MIN_SCORE),
         }
     }
 
@@ -85,19 +89,25 @@ impl Floors {
         match kind {
             Kind::Text | Kind::Document => self.text,
             Kind::Image => self.image,
+            Kind::Code => self.code,
         }
     }
 }
 
 /// The best chunk of each of the best files for `query`, text first, then
-/// documents, then images, as KRunner and GNOME Shell both show them. Empty if the worker
-/// has stopped.
+/// documents, then images, as KRunner and GNOME Shell both show them; code
+/// alone for a query starting `code:` (#110). Empty if the worker has
+/// stopped.
 async fn search(jobs: &Mutex<mpsc::Sender<Job>>, floors: Floors, query: String) -> Vec<Hit> {
     per_file(chunks(jobs, query, RESULTS * 8).await, floors)
 }
 
 /// The best `k` chunks of each kind for `query`; empty if the worker has stopped.
 async fn chunks(jobs: &Mutex<mpsc::Sender<Job>>, query: String, k: usize) -> Vec<Hit> {
+    // KRunner counts `code:` towards its three letters.
+    if index::scope(&query).0.chars().count() < MIN_QUERY_CHARS {
+        return Vec::new();
+    }
     let (tx, rx) = oneshot::channel();
     let job = Job::Match {
         query,
@@ -126,7 +136,9 @@ fn describe(h: &Hit) -> (String, String) {
         n => format!("  (+{n} copies)"),
     };
     let description = match h.kind {
-        Kind::Text => format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text)),
+        Kind::Text | Kind::Code => {
+            format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text))
+        }
         Kind::Image => format!("{dir}{copies}"),
         // Text OCR read in an image (#106) has no page or slide to name.
         Kind::Document if !crate::extract::is_document(path) => {
@@ -158,6 +170,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Text => "vinoSearch Text",
         Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
+        Kind::Code => "vinoSearch Code",
     };
     props.insert("category".into(), owned(Value::from(category)));
     // For vinosearch menu, which opens the pick itself; KRunner ignores keys
@@ -252,7 +265,7 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
     }
     let path = Path::new(id);
     match index::readable_kind(path) {
-        Some(Kind::Text) => {
+        Some(Kind::Text | Kind::Code) => {
             let mut text = String::new();
             fs::File::open(path)?
                 .take(index::MAX_FILE_BYTES + 1)
@@ -345,7 +358,7 @@ const MIN_QUERY_CHARS: usize = 3;
 impl Gnome {
     async fn results(&self, terms: Vec<String>) -> Vec<String> {
         let query = terms.join(" ");
-        if query.trim().chars().count() < MIN_QUERY_CHARS {
+        if index::scope(&query).0.trim().chars().count() < MIN_QUERY_CHARS {
             return Vec::new();
         }
         let hits = search(&self.jobs, Floors::load(&self.config), query).await;
@@ -520,13 +533,15 @@ impl Control {
         );
         out.insert(key::FILES.into(), owned(Value::from(files)));
         out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
-        let [text, documents, images] = index::counts_by_kind(&db).map_err(failed)?;
+        let [text, documents, images, code] = index::counts_by_kind(&db).map_err(failed)?;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
             (key::TEXT_CHUNKS, text.1),
             (key::DOCUMENT_FILES, documents.0),
             (key::DOCUMENT_CHUNKS, documents.1),
             (key::IMAGE_FILES, images.0),
+            (key::CODE_FILES, code.0),
+            (key::CODE_CHUNKS, code.1),
         ] {
             out.insert(k.into(), owned(Value::from(n)));
         }
@@ -797,10 +812,11 @@ const IMAGE_GAP: f32 = 0.06;
 
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then images, less images too far
-/// below the best of the others (IMAGE_GAP).
+/// below the best of the others (IMAGE_GAP), then code (only ever on its
+/// own, for `code:`).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 3] = Default::default();
+    let mut groups: [Vec<Hit>; 4] = Default::default();
     for h in hits {
         if h.score < floors.of(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -809,6 +825,7 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
             Kind::Text => 0,
             Kind::Document => 1,
             Kind::Image => 2,
+            Kind::Code => 3,
         }];
         if group.len() < RESULTS {
             group.push(h);
@@ -1362,6 +1379,34 @@ mod tests {
     }
 
     #[test]
+    fn code_has_a_group_and_opens_at_its_line() {
+        let mut h = hit(Kind::Code, 0.7, "/src/net.rs");
+        h.line = 24;
+        h.text = "pub fn check_url(url: &str) -> Result<()> {".into();
+        let m = to_match(h, FLOORS);
+        let get = |k: &str| m.5.get(k).cloned();
+        assert_eq!(
+            get("category").map(|v| String::try_from(v).unwrap()),
+            Some("vinoSearch Code".into())
+        );
+        assert_eq!(get("line").map(|v| u32::try_from(v).unwrap()), Some(24));
+        let subtext = String::try_from(get("subtext").unwrap()).unwrap();
+        assert!(
+            subtext.starts_with("/src:24  pub fn check_url"),
+            "{subtext}"
+        );
+    }
+
+    #[test]
+    fn code_is_held_to_its_own_floor() {
+        let hits = vec![
+            hit(Kind::Code, 0.62, "/a.rs"),
+            hit(Kind::Code, 0.58, "/b.rs"),
+        ];
+        assert_eq!(paths(hits), ["/a.rs"]);
+    }
+
+    #[test]
     fn text_read_in_an_image_has_no_page_to_name() {
         let mut shot = hit(Kind::Document, 0.8, "/home/u/Pictures/Screenshots/a.png");
         shot.text = "Invoice INV-2026-004817".into();
@@ -1379,6 +1424,7 @@ mod tests {
     const FLOORS: Floors = Floors {
         text: 0.65,
         image: 0.63,
+        code: 0.6,
     };
 
     fn paths(hits: Vec<Hit>) -> Vec<String> {

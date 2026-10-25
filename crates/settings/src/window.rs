@@ -7,8 +7,9 @@ use eframe::egui::{
     self, Align, Color32, FontId, Id, Layout, RichText, Sense, Stroke, WidgetInfo, accesskit,
 };
 use vinosearch_shared::config::{
-    self, Config, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES, DEFAULT_IMAGE_EXTENSIONS,
-    DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT, DEFAULT_TEXT_MIN_SCORE,
+    self, Config, DEFAULT_CODE_MIN_SCORE, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
+    DEFAULT_IMAGE_EXTENSIONS, DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT,
+    DEFAULT_TEXT_MIN_SCORE,
 };
 
 use vinosearch_shared::dbus::hold;
@@ -809,7 +810,7 @@ impl SettingsWindow {
         };
         let p = theme::palette(ui.ctx());
         section(ui, "What to index");
-        row(ui, "Text:", "Notes, Markdown and source code.", |ui| {
+        row(ui, "Text:", "Notes, Markdown and web pages.", |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(ui.spacing().interact_size.y);
                 ui.label("On");
@@ -923,6 +924,27 @@ impl SettingsWindow {
             },
         );
 
+        row(
+            ui,
+            "Code:",
+            "Source code, found only by searches starting \"code:\". Files git ignores, \
+             vendored and generated code, and anything holding a key are left out.",
+            |ui| {
+                let mut on = self.config.formats.code_enabled();
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, "Index code").changed() {
+                        self.config.formats.code.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.code_files, Some(s.code_chunks))
+                    {
+                        ui.label(RichText::new(text).color(p.muted));
+                    }
+                });
+            },
+        );
+
         section(ui, "Opening results");
         labelled_row(
             ui,
@@ -971,6 +993,11 @@ impl SettingsWindow {
             0.45..=0.75,
         ) {
             self.config.formats.images.min_score = v;
+            self.idle_dirty = true;
+        }
+        let code = self.config.formats.code.min_score;
+        if let Some(v) = score_row(ui, "Code:", "", code, DEFAULT_CODE_MIN_SCORE, 0.45..=0.85) {
+            self.config.formats.code.min_score = v;
             self.idle_dirty = true;
         }
         if changed {

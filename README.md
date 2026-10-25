@@ -8,7 +8,7 @@
 
 Filename search finds `signing-keys.md` when you remember it's called that. vinoSearch finds it when you remember what it says. It also finds `IMG_2041.jpg` from "dog watching the sunset", because it reads the pixels, not the name.
 
-- **Text and images**, searched from one box. Markdown, plain text and source code, plus photos when you turn them on.
+- **Text and images**, searched from one box. Markdown and plain text, plus photos, documents and source code when you turn them on. Code is searched apart, with `code:` in front of the query, so it never crowds out your notes.
 - **On the NPU.** Indexing runs at ~28.6 chunks/s and 3% of one core, so it doesn't fight you for the CPU. A warm query takes 26 ms (p50).
 - **Where you already search.** KRunner and GNOME Shell's overview. A CLI too.
 - **Stays current.** inotify picks up changes within seconds, and an hourly check catches anything it missed.
@@ -74,10 +74,10 @@ Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn
 
 ## Use it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups.
+- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, and `code:` queries in **vinoSearch Code**.
 - **GNOME:** the overview's search, from the next login.
 - **Sway, Hyprland, COSMIC and the rest:** `vinosearch menu` asks for a query in fuzzel, wofi, rofi, tofi or bemenu (the first it finds), shows the results in it, and opens the one you pick. Bind it to a key, e.g. `bindsym $mod+s exec vinosearch menu` in sway or `bind = SUPER, S, exec, vinosearch menu` in Hyprland. `--launcher "rofi -dmenu -i"` (or `VINOSEARCH_LAUNCHER`) picks another dmenu-style command. It asks the running service, so a warm query is as quick as KRunner's.
-- **Terminal:** `vinosearch search "how do I rotate the signing key"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg` for indexed photos that look like one.
+- **Terminal:** `vinosearch search "how do I rotate the signing key"`, `vinosearch search "code: retry a failed download"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg` for indexed photos that look like one.
 
 Results need 3 or more characters. Enter opens the file: a text file at the matching line in your editor, a PDF at the matching page in Okular, Evince, Papers or Zathura. Other files, and apps that can't be told where, open at the top.
 
@@ -87,7 +87,7 @@ Results need 3 or more characters. Enter opens the file: a text file at the matc
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images and documents on, set how close a result has to be and which editor opens text results, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images, documents and code on, set how close a result has to be and which editor opens text results, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
 
 Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
 
@@ -104,6 +104,10 @@ min_score = 0.65            # lower it for more, looser results
 enabled = true              # off by default: the vision encoder is a 671 MB download
 extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif"]
 min_score = 0.63
+
+[formats.code]
+enabled = true              # off by default; found only by queries starting "code:"
+min_score = 0.72
 ```
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda installs are excluded by default; [how it works](docs/how-it-works.md#what-gets-indexed) has the list.

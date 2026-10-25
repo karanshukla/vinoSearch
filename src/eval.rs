@@ -218,6 +218,7 @@ pub fn run(
 
     let mut formats = config::Formats::default();
     formats.documents.enabled = Some(true);
+    formats.code.enabled = Some(true);
     formats.images.enabled = Some(opts.images);
     let types = index::FileTypes::new(&formats)?;
     let floors = Floors::of_formats(&formats);

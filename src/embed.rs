@@ -29,6 +29,9 @@ const IN_FLIGHT: usize = 1;
 const WAIT_MS: i64 = 120_000;
 
 const QUERY_PREFIX: &str = "task: search result | query: ";
+/// EmbeddingGemma's prompt for finding code from a description, for
+/// `code:` queries (#110).
+const CODE_QUERY_PREFIX: &str = "task: code retrieval | query: ";
 /// An image's prompt, `<bos> <|image> <|image|> x tokens <image|> <eos>`,
 /// padded to this: SOFT_TOKENS + 4 rounded up to 16, model_image_140's shape.
 const IMAGE_LEN: usize = 144;
@@ -546,8 +549,17 @@ impl Embedder {
         })
     }
 
-    pub fn query(&mut self, text: &str) -> Result<Vec<f32>> {
-        let text = format!("{QUERY_PREFIX}{text}");
+    /// A query for `kinds`: code alone gets the code retrieval prompt.
+    pub fn query_for(&mut self, text: &str, kinds: &[crate::index::Kind]) -> Result<Vec<f32>> {
+        let prefix = match kinds {
+            [crate::index::Kind::Code] => CODE_QUERY_PREFIX,
+            _ => QUERY_PREFIX,
+        };
+        self.query_with(prefix, text)
+    }
+
+    fn query_with(&mut self, prefix: &str, text: &str) -> Result<Vec<f32>> {
+        let text = format!("{prefix}{text}");
         let mut v = if fits(&self.tok, &text, QUERY_LEN)? {
             self.query.run(&self.tok, &[text], 1.0)?
         } else {
@@ -767,7 +779,8 @@ mod tests {
         )
         .unwrap();
         let vectors = [
-            e.query(crate::parity::QUERY).unwrap(),
+            e.query_for(crate::parity::QUERY, &[crate::index::Kind::Text])
+                .unwrap(),
             e.documents(&[document_text(
                 crate::parity::DOCUMENT_TITLE,
                 crate::parity::DOCUMENT,
