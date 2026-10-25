@@ -133,6 +133,9 @@ struct SettingsWindow {
     /// The chunk count Largest folders was last asked for at, to ask again
     /// once the index changes.
     largest_for: Option<i64>,
+    /// A folder chosen to add, shown with its estimate until confirmed (#112).
+    adding: Option<estimate::Pending>,
+    estimator: estimate::Estimator,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
     /// The desktop's text scale as last applied. Only a change is applied again, so a Ctrl +
@@ -178,6 +181,8 @@ impl SettingsWindow {
             integration: Arc::new(Mutex::new(integration::State::read())),
             doctor: Arc::default(),
             largest_for: None,
+            adding: None,
+            estimator: estimate::run,
             focused: true,
             kde_header: theme::kde_header(),
             text_scale: 1.0,
@@ -222,7 +227,7 @@ impl SettingsWindow {
 
     fn add(&mut self, target: Target, path: &Path) {
         match target {
-            Target::Root => self.link.send(Request::Reindex(path.display().to_string())),
+            Target::Root => self.propose_root(path),
             Target::Exclude => {
                 let entry = tilde(path);
                 if !self.config.exclude.contains(&entry) {
@@ -437,6 +442,7 @@ impl SettingsWindow {
                 }
             });
         }
+        self.proposed(ui);
         ui.add_enabled_ui(reachable.is_some(), |ui| {
             self.adder(ui, Target::Root);
         });
@@ -1782,6 +1788,7 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
     }
 }
 
+mod estimate;
 #[cfg(test)]
 mod ui_tests;
 

@@ -12,6 +12,7 @@ publish = false
 vinosearch-shared = { path = "../shared" }
 anyhow = "1.0"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
+serde_json = "1.0"
 zbus = "5"
 
 

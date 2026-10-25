@@ -36,6 +36,7 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     }));
     link.shared.lock().unwrap().largest = Some(vec![("/srv/notes/build".into(), 200)]);
     let mut w = SettingsWindow::with(Some(page), link, dir.join("config.toml"));
+    w.estimator = estimated;
     w.integration = Arc::new(Mutex::new(integration::State::default()));
     w.doctor = Arc::new(Mutex::new(doctor::State {
         running: false,
@@ -49,6 +50,30 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
         }),
     }));
     (w, requests)
+}
+
+/// What `vinosearch estimate` would say about any folder, without running it.
+fn estimated(path: &Path) -> Result<estimate::Answer, String> {
+    Ok(estimate::Answer {
+        summary: "~1,000 files, ~10 min, ~40 MB".into(),
+        note: Some("Times are at NPU rates; on the CPU indexing takes about 5x longer.".into()),
+        folders: vec![estimate::Folder {
+            path: path.join("raw").display().to_string(),
+            summary: "~8 min, 600 files".into(),
+        }],
+    })
+}
+
+/// Frames until the estimate, which lands from another thread, is shown.
+fn until_estimated(h: &mut Harness<'_, SettingsWindow>) {
+    for _ in 0..100 {
+        settle(h);
+        if h.query_by_label("~1,000 files, ~10 min, ~40 MB").is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the estimate never showed");
 }
 
 fn harness(w: SettingsWindow, size: [f32; 2], theme: Theme) -> Harness<'static, SettingsWindow> {
@@ -242,6 +267,11 @@ fn typed_folders_are_named_fields_that_take_enter() {
         .type_text("/srv/photos");
     settle(&mut h);
     h.key_press(Key::Enter);
+    until_estimated(&mut h);
+    // Nothing is indexed until the estimate is confirmed.
+    assert!(sent(&requests).is_empty());
+    h.get_by_role_and_label(Role::Button, "Add and index /srv/photos")
+        .click();
     settle(&mut h);
     let sent = sent(&requests);
     assert!(
@@ -249,6 +279,7 @@ fn typed_folders_are_named_fields_that_take_enter() {
             .any(|r| matches!(r, Request::Reindex(p) if p == "/srv/photos")),
         "{sent:?}"
     );
+    assert!(h.state().adding.is_none());
 
     h.get_by_role_and_label(Role::TextInput, "Folder to exclude")
         .focus();
@@ -264,6 +295,44 @@ fn typed_folders_are_named_fields_that_take_enter() {
     );
     let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
     assert!(saved.contains("/srv/notes/tmp"), "{saved}");
+}
+
+#[test]
+fn a_folder_to_add_shows_its_estimate_and_its_longest_subfolders() {
+    let (w, requests) = window(Page::Folders, "estimate");
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.state_mut().add(Target::Root, Path::new("/srv/photos"));
+    until_estimated(&mut h);
+    assert!(h.query_by_label("Add /srv/photos?").is_some());
+    assert!(h.query_by_label("~8 min, 600 files").is_some());
+    assert!(h.query_by_label_contains("at NPU rates").is_some());
+    let unnamed = unnamed_controls(&h);
+    assert!(unnamed.is_empty(), "{unnamed:#?}");
+
+    // Excluding a subfolder saves it and estimates again.
+    h.get_by_role_and_label(Role::Button, "Exclude /srv/photos/raw")
+        .click();
+    settle(&mut h);
+    assert_eq!(
+        h.state().config.exclude.last().map(String::as_str),
+        Some("/srv/photos/raw")
+    );
+    until_estimated(&mut h);
+    assert!(
+        h.get_by_role_and_label(Role::Button, "Excluded /srv/photos/raw")
+            .accesskit_node()
+            .is_disabled()
+    );
+
+    h.get_by_role_and_label(Role::Button, "Cancel adding /srv/photos")
+        .click();
+    settle(&mut h);
+    assert!(h.state().adding.is_none());
+    assert!(
+        !sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::Reindex(_)))
+    );
 }
 
 #[test]
