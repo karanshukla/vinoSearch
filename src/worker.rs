@@ -81,6 +81,8 @@ pub struct Status {
     /// Indexing is paused: a running job stops after its current chunk, and
     /// new ones wait until Retry.
     pub paused: AtomicBool,
+    /// What may hold indexing for power (#109), as `paused` does.
+    pub power: crate::power::State,
     /// Why this start dropped part of the index to be indexed again (a model
     /// changed, #80), until that indexing is done; empty otherwise.
     pub model_changed: std::sync::Mutex<String>,
@@ -115,6 +117,11 @@ impl Status {
             device: std::sync::Mutex::new(device.to_owned()),
             ..Default::default()
         }
+    }
+
+    /// Indexing waits: paused, or held for power.
+    pub fn held(&self) -> bool {
+        self.paused.load(Ordering::Relaxed) || self.power.hold().is_some()
     }
 }
 
@@ -284,6 +291,9 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         eprintln!("{e:#}");
         config::index_share(config::DEFAULT_INDEX_BUSY_PERCENT).unwrap()
     }));
+    opts.status
+        .power
+        .set_index_on_battery(opts.file.index_on_battery());
     let purged = index::purge(&conn, &excludes)? + index::purge_types(&conn, &types)?;
     if purged > 0 {
         eprintln!("removed {purged} excluded files from the index");
@@ -411,6 +421,9 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     Ok(new) => pace.set(new),
                     Err(e) => eprintln!("index_busy_percent not applied: {e:#}"),
                 }
+                if status.power.set_index_on_battery(file.index_on_battery()) {
+                    replay(&mut waiting, &mut waiting_roots, &mut deferred);
+                }
                 if !opts.pinned.idle_unload {
                     let m = file
                         .idle_unload_minutes
@@ -426,12 +439,13 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 }
                 continue;
             }
-            // Held while paused, with the work that waits for the model.
-            Job::Changed(paths) if status.paused.load(Ordering::Relaxed) => {
+            // Held while paused or held for power, with the work that waits
+            // for the model.
+            Job::Changed(paths) if status.held() => {
                 waiting.extend(paths);
                 continue;
             }
-            Job::Reindex(root) if status.paused.load(Ordering::Relaxed) => {
+            Job::Reindex(root) if status.held() => {
                 status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
                 waiting_roots.push(root);
                 continue;
@@ -531,7 +545,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         // and the job runs again after it.
         let mut restart = false;
         let mut after = |st: &index::Stats, conn: &rusqlite::Connection, emb: &mut Embedder| {
-            if status.paused.load(Ordering::Relaxed) || restart {
+            if status.held() || restart {
                 return Err(Interrupted.into());
             }
             // Plugged in or unplugged mid-job, or the setting changed.
@@ -548,11 +562,15 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                             None => serve(),
                         }
                     }
-                    // The pace applies now; new exclusions stop the job so
-                    // they apply before it runs again.
+                    // The pace and index_on_battery apply now; new
+                    // exclusions stop the job so they apply before it runs
+                    // again.
                     Job::Config(file) => {
                         if let Ok(new) = share(&file) {
                             pace.set(new);
+                        }
+                        if status.power.set_index_on_battery(file.index_on_battery()) {
+                            deferred.push_back(Job::Retry);
                         }
                         restart |= file.excludes().is_ok_and(|ex| ex != excludes)
                             || FileTypes::new(&file.formats).is_ok_and(|t| t != types);
