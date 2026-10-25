@@ -14,6 +14,10 @@ const USAGE: &str = "\
 vinosearch-settings: the vinoSearch settings window
 
 Usage: vinosearch-settings [--page index|folders|search|model|hardware|integration]
+       vinosearch-settings --search [QUERY]
+
+--search opens the search window, searching QUERY if given (its words
+need no quotes).
 ";
 
 fn main() -> ExitCode {
@@ -21,6 +25,9 @@ fn main() -> ExitCode {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, None),
         ["--page", page] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, Some(page)),
+        ["--search", ref query @ ..] => {
+            window::search::run(vinosearch_shared::dbus::SETTINGS_APP_ID, &query.join(" "))
+        }
         ["-h" | "--help"] => {
             print!("{USAGE}");
             ExitCode::SUCCESS

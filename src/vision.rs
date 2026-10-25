@@ -22,11 +22,7 @@ const PATCH: usize = 16;
 const POOL: usize = 3;
 pub const PATCHES: usize = SOFT_TOKENS * POOL * POOL;
 pub const PATCH_DIM: usize = PATCH * PATCH * 3;
-/// Decoding a huge image can take far more memory than the file. Refused
-/// past this many bytes held at once: the decoded pixels, a copy if its
-/// orientation turns it, and the 8-bit RGB copy (a 100-megapixel RGB photo
-/// is 3 x 300 MB).
-const MAX_DECODED_BYTES: u64 = 1 << 30;
+use vinosearch_shared::limits::MAX_DECODED_BYTES;
 
 /// One image, patched and padded for the vision encoder.
 pub struct Pixels {

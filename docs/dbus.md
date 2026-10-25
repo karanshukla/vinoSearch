@@ -14,9 +14,9 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 
 | Method | What it does |
 |---|---|
-| `Actions() → a(sss)` | `open-folder` (Open containing folder). |
+| `Actions() → a(sss)` | `open-folder` (Open containing folder), `show-all` (Show all results). |
 | `Match(s query)` | The search below. Each match sets `subtext`, `urls` and `category`, and `line` (u) for a text file's matching line or `page` (u) for a PDF's matching page, which `vinosearch menu` opens at. |
-| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action opens the file at the match, as below, `open-folder` `xdg-open`s its directory. |
+| `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action opens the file at the match, as below, `open-folder` `xdg-open`s its directory. `show-all` starts `vinosearch-settings --search` with the last `Match` query, when it is installed beside `vinosearch`, whatever the id. |
 
 ### Opening at the match
 
@@ -32,13 +32,13 @@ The same search KRunner's `Match` runs: the best chunk per file, files scoring a
 | `GetSubsearchResultSet(as previous, as terms)` | Searches afresh: a semantic match does not narrow as the query grows. |
 | `GetResultMetas(as ids)` | `id`, `name` (file name), `description` (directory, line and snippet; the directory alone for an image), `gicon` (the file type's icon from shared-mime-info, such as `text-markdown` or `image-png`, falling back to `text-x-generic` or `image-x-generic`). Ids from an older search get the path as description. |
 | `ActivateResult(s id, as terms, u timestamp)` | Opens the file at the match, as below. |
-| `LaunchSearch(as terms, u timestamp)` | Opens the settings window, if `vinosearch-settings` is installed beside `vinosearch`. |
+| `LaunchSearch(as terms, u timestamp)` | Opens the search window with the terms joined by spaces (`vinosearch-settings --search`), if `vinosearch-settings` is installed beside `vinosearch`. |
 
 GNOME Shell only reads search providers from the system data dirs, never `~/.local/share`, so turning the GNOME place on (`vinosearch integrate gnome`, which `krunner --install` does in a GNOME session) writes the provider file to `~/.local/share/vinosearch/xdg/gnome-shell/search-providers/` and appends that directory to `XDG_DATA_DIRS` in `~/.config/environment.d/60-vinosearch.conf`, the way Flatpak exports per-user apps. It also makes sure `~/.local/share/applications/dev.vinosearch.desktop` is there, which GNOME Shell needs to show the provider (a hidden entry disables it). Results appear from the next login; `integrate gnome --off` removes the provider and the environment.d file. The desktop entry is the app menu's on every desktop, so `krunner --install` writes it and only `krunner --uninstall` removes it.
 
 ## `dev.vinosearch.Control1`
 
-Every method returns promptly, including while the runner is indexing or downloading: `Status` reads state the worker publishes, `RecentFiles` reads the index, and the others only queue work. `FileText` is the exception: a document's text takes as long as parsing it (seconds for a big PDF), on a thread of its own, so other calls are answered meanwhile. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
+Every method returns promptly, including while the runner is indexing or downloading: `Status` reads state the worker publishes, `RecentFiles` reads the index, and the others only queue work. `Search` waits for the worker as KRunner's `Match` does: between files while indexing, after a model load when none is loaded. `FileText` is the exception: a document's text takes as long as parsing it (seconds for a big PDF), on a thread of its own, so other calls are answered meanwhile. Errors are `org.freedesktop.DBus.Error.Failed` with a human-readable message.
 
 | Method | Signature | What it does |
 |---|---|---|
@@ -54,6 +54,9 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 | `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
+| `Search` | `(s query, u limit) → a(ssdssux)` | Every file the query finds, for the search window ([#111](https://github.com/karanshukla/vinoSearch/issues/111)): the best chunk of each, at or above its kind's `min_score` as KRunner's are, at most `limit` (capped at 100, `dbus::results::MAX`) of each kind: text, then documents, then images, best first within each. Each is (path, kind, score, snippet, unit, at, mtime): kind `text`, `document` or `image` (`dbus::results`; text OCR read in an image is an `image`, as KRunner lists it), the cosine score, up to 140 characters of the matching text (empty for a photo), `at`'s unit (`line`, `page`, `slide`, `chapter`, `row`, `paragraph`, or empty when the match has no place to name), the match's number in it from 1 (0 for none), and the file's mtime in Unix seconds. Files gone since they were indexed are left out. Loads the model as `Match` does. |
+| `Open` | `(s path, u at) → ()` | Opens an indexed file at `at`, a number from `Search`, as KRunner's `Run` opens a match (below); 0 opens it at the top. Fails for a path that is not an indexed file. |
+| `OpenFolder` | `(s path) → ()` | `xdg-open`s the folder of an indexed file. Fails for a path that is not an indexed file. |
 | `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text: a long document indexes in parts but doesn't read aloud whole), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string: its OCR text is in the index, not read again here. |
 
 ### `Status` keys

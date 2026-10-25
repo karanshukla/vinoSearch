@@ -74,8 +74,7 @@ const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
 /// search is for.
 const SKIP_FILE_SUFFIXES: &[&str] = &[".min.js", ".min.css", ".bundle.js"];
 
-/// Images past this are skipped: decoding takes several times the file in memory.
-const MAX_IMAGE_BYTES: u64 = 64 << 20;
+use vinosearch_shared::limits::MAX_IMAGE_BYTES;
 /// Documents are parsed whole in memory too, once for each run of parts.
 /// Their extracted text is held to MAX_TEXT_BYTES.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
