@@ -22,6 +22,11 @@ use openvino::{CompiledModel, Core, DeviceType, InferRequest};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// What this build keeps of what the model reads, in the image model tag:
+/// raised when it changes, so images are read again. 2 drops texture read
+/// as a letter or two.
+pub const READING: u32 = 2;
+
 /// The detector's shapes, as (height, width): landscape, then portrait.
 /// 1088x1920 holds a 1080p screenshot unscaled; 64 ms on the NPU.
 pub const DET_SHAPES: [(usize, usize); 2] = [(1088, 1920), (1920, 1088)];
@@ -42,6 +47,14 @@ const UNCLIP: f32 = 1.6;
 const MIN_SIDE: usize = 3;
 /// Lines whose characters average a lower probability are dropped.
 const MIN_SCORE: f32 = 0.5;
+/// A line needs this many letters or digits, and under `SHORT` of them this
+/// probability, to be text rather than texture. Photos with no text read as
+/// one- and two-character lines at 0.3-0.8, and a chunk of one character
+/// matches any query a little; real lines in the same images had 5 or more
+/// at 0.87 or above.
+const MIN_ALNUM: usize = 3;
+const SHORT: usize = 6;
+const SHORT_SCORE: f32 = 0.8;
 /// A region turns to its principal axis only when that axis is this many
 /// times its other's spread: a word is, a lone glyph's angle means nothing.
 const MIN_ELONGATION: f32 = 2.0;
@@ -413,6 +426,18 @@ pub fn render_page(bytes: &[u8], page: usize, deadline: Instant) -> Result<RgbIm
     )
 }
 
+/// Whether a recognised line, with its mean probability, is worth indexing.
+/// Two CJK characters make a word, so they count double.
+fn is_text(line: &str, score: f32) -> bool {
+    let cjk = |c: char| matches!(c as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af | 0xf900..=0xfaff);
+    let n: usize = line
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| if cjk(c) { 2 } else { 1 })
+        .sum();
+    score >= MIN_SCORE && n >= MIN_ALNUM && (n >= SHORT || score >= SHORT_SCORE)
+}
+
 /// The recogniser's characters, one a line.
 pub fn read_dict(path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
@@ -634,7 +659,7 @@ impl Ocr {
             let (classes, chars) = (self.classes, &self.chars);
             let (text, score) = self.rec[g].run(&input, |p| ctc(p, classes, chars))?;
             let text = text.trim();
-            if score >= MIN_SCORE && !text.is_empty() {
+            if is_text(text, score) {
                 lines.push(text.to_owned());
             }
         }
@@ -805,6 +830,20 @@ mod tests {
         let e = render_page(b"%PDF-1.4", 1, past).unwrap_err().to_string();
         assert!(e.contains("reading the scan"), "{e}");
         assert!(left(Instant::now() + SCAN_WALL).unwrap() > std::time::Duration::from_secs(299));
+    }
+
+    #[test]
+    fn texture_read_as_a_letter_or_two_is_dropped() {
+        // What photos with no text gave, and lines real text gave.
+        assert!(!is_text("x", 0.54));
+        assert!(!is_text("Il", 0.80));
+        assert!(!is_text("a-1", 0.70));
+        assert!(!is_text("", 1.0));
+        assert!(is_text("Retry", 0.87));
+        assert!(!is_text("Retry", 0.6));
+        assert!(is_text("Request ID 7f3a9c21", 0.55));
+        // Two CJK characters are a word.
+        assert!(is_text("出口", 0.9));
     }
 
     #[test]

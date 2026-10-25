@@ -139,8 +139,10 @@ fn to_match(h: Hit, floors: Floors) -> Match {
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Value::from(subtext)));
     props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
-    // A group per kind, named so each reads as ours (#73).
+    // A group per kind, named so each reads as ours (#73). Text read in an
+    // image (#106) is scored as a document but listed with the images.
     let category = match h.kind {
+        Kind::Document if !crate::extract::is_document(Path::new(&h.path)) => "vinoSearch Images",
         Kind::Text => "vinoSearch Text",
         Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
@@ -1244,6 +1246,23 @@ mod tests {
             text: String::new(),
             copies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn text_read_in_an_image_is_listed_with_the_images() {
+        let category = |kind, path| {
+            let m = to_match(hit(kind, 0.9, path), FLOORS);
+            match m.5.get("category").map(|v| String::try_from(v.clone())) {
+                Some(Ok(c)) => c,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(category(Kind::Document, "/p/shot.png"), "vinoSearch Images");
+        assert_eq!(
+            category(Kind::Document, "/d/scan.pdf"),
+            "vinoSearch Documents"
+        );
+        assert_eq!(category(Kind::Image, "/p/cat.jpg"), "vinoSearch Images");
     }
 
     #[test]

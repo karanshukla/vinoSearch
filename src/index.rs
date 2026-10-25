@@ -111,11 +111,12 @@ impl Kind {
         match self {
             Kind::Text | Kind::Document => crate::model::REVISION.to_owned(),
             Kind::Image => format!(
-                "{}+{}/{}+ocr:{}",
+                "{}+{}/{}+ocr:{}/{}",
                 crate::model::REVISION,
                 crate::model::VISION_REVISION,
                 crate::vision::SOFT_TOKENS,
                 crate::model::OCR_REVISION,
+                crate::ocr::READING,
             ),
         }
     }
@@ -887,7 +888,8 @@ pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
         return Ok(0);
     }
     let key = "reading.scans";
-    let now = crate::model::OCR_REVISION;
+    let now = format!("{}/{}", crate::model::OCR_REVISION, crate::ocr::READING);
+    let now = now.as_str();
     let was: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
         .optional()?;
