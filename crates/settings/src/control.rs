@@ -18,6 +18,8 @@ pub struct Status {
     pub model_loaded: bool,
     pub indexing: bool,
     pub paused: bool,
+    /// Why indexing is held for power: a `dbus::hold` value, or empty.
+    pub power_hold: String,
     pub indexed_files: u64,
     pub device: String,
     pub files: i64,
@@ -76,6 +78,7 @@ impl Status {
             model_loaded: flag(status::MODEL_LOADED),
             indexing: flag(status::INDEXING),
             paused: flag(status::PAUSED),
+            power_hold: text(status::POWER_HOLD),
             indexed_files: unsigned(status::INDEXED_FILES),
             device: text(status::DEVICE),
             files: signed(status::FILES),

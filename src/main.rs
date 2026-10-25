@@ -6,6 +6,7 @@ mod krunner;
 mod menu;
 mod model;
 mod parity;
+mod power;
 mod proc;
 mod runtime;
 mod sched;
@@ -343,6 +344,7 @@ fn run(cli: Cli) -> Result<bool> {
             let (tx, rx) = std::sync::mpsc::channel();
             let opts = worker_options(&cli, s);
             worker::prepare(&opts.status)?;
+            power::spawn(tx.clone(), opts.status.clone());
             let _watcher = watch::spawn(
                 tx,
                 opts.config.clone(),

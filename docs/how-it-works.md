@@ -72,6 +72,7 @@ The window keeps its help to a line; the rest is here.
 | Documents | See [Documents](#what-gets-indexed) above. |
 | How close results must be | Results scoring below the line are left out; applies from the next search. For text, an unrelated query tops out around 0.60 and real matches score 0.70 and up. Images score lower: right matches about 0.61 to 0.69, the rest 0.57 to 0.60. |
 | Hardware | Runs a tiny model on the device picked on the Model page, in a separate process, as `vinosearch doctor` does. |
+| Index on battery | On by default. Off holds indexing while the machine runs on battery (checked every 10 s) and the Index page says "Waiting for a charger". Indexing also pauses while power-profiles-daemon or tuned-ppd has the power-saver profile on ("Paused: power saver"), whatever this is set to. Either way searches keep working, changes found meanwhile wait in the queue, and indexing picks up where it stopped. |
 | Search places | One switch each for KRunner (and the Plasma app launcher, which shares KRunner's plugins) and GNOME Shell. Each writes or removes its own files; GNOME shows the change from the next login, KRunner at once. The one for a desktop that isn't running says so, but still works. |
 | Search service | Starts at login, watches the folders and answers searches. Turning it on also adds the running desktop's search place; turning it off removes every place with it. The index and model stay. |
 
