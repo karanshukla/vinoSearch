@@ -153,6 +153,29 @@ From `bench/`, on BEIR SciFact (nDCG@10, documents truncated to 256 tokens), Cor
 
 The NPU indexes 4.5 to 11x faster than the CPU on every model, at roughly half the power. Raw numbers are in `bench/results/`.
 
+## Ranking evals
+
+`bench/` measures the models; the evals measure vinoSearch's ranking on top of them: chunking, the `min_score` floors, one result per file, exact words ([#107](https://github.com/karanshukla/vinoSearch/issues/107)). `scripts/make-testbed.sh` writes a testbed of 46 small files (notes, code, French and Hindi text, PDFs, `.docx`, `.xlsx`, `.pptx`, RTF, a Word 97 `.doc`, CSVs, two drawn pictures), with near misses next to the files queries expect. `vinosearch eval` indexes it into a throwaway index under the temp directory, runs each query in `evals/queries.toml` through the same search and per-file ranking KRunner gets, and prints recall@1, recall@5 and MRR overall and per kind, or `--json`:
+
+    scripts/make-testbed.sh /tmp/testbed
+    vinosearch --device CPU eval /tmp/testbed
+
+It exits non-zero when an overall metric is below the threshold in `evals/queries.toml` (or `--min-recall-at-1`, `--min-recall-at-5`, `--min-mrr`). CI runs it on the CPU. Image queries need `--images` and the vision encoder, so they run by hand.
+
+CPU baseline, 2026-10-25, 55 queries, 52 chunks:
+
+| kind | queries | recall@1 | recall@5 | MRR |
+|---|---|---|---|---|
+| keyword | 6 | 1.000 | 1.000 | 1.000 |
+| paraphrase | 18 | 0.778 | 0.889 | 0.833 |
+| section | 5 | 1.000 | 1.000 | 1.000 |
+| identifier | 6 | 1.000 | 1.000 | 1.000 |
+| cross-language | 9 | 0.889 | 1.000 | 0.944 |
+| document | 11 | 1.000 | 1.000 | 1.000 |
+| overall | 55 | 0.909 | 0.964 | 0.936 |
+
+The misses are paraphrases: two score under the 0.65 floor, two pick the other retry function, and an English query about notice periods ranks the English moving checklist over the French lease. The CPU gates PRs because what the evals are for (chunking, floors, dedup, exact words) doesn't depend on the device. The NPU's vectors are 0.9995 to 0.99998 cosine of the CPU's (`parity.rs`), which typically moves a score by about 0.001 (0.03 at the very worst); 6 of the 55 queries are within 0.01 of a rival file or the floor, so the NPU may differ from the CPU by a query or two. The thresholds leave room for two.
+
 ## NPU gotchas
 
 Found along the way, on OpenVINO 2026.4.1 and NPU driver 1.35.0:

@@ -96,3 +96,44 @@ jobs:
       # Preinstalled on the runner. Info-level notes (SC1091, SC2018/2019) are
       # left alone.
       - run: shellcheck -S warning scripts/*.sh
+
+  # Ranking evals (#107): the testbed indexed on the CPU, every query in
+  # evals/queries.toml run, failing under its thresholds. Image queries are
+  # left out: they need the 671 MB vision encoder, and run by hand.
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pins
+        id: pins
+        run: |
+          pin() { sed -n "s/.*const $1: &str = \"\([0-9a-f]*\)\";/\1/p" src/model.rs; }
+          echo "text=$(pin REVISION)" >> "$GITHUB_OUTPUT"
+          echo "ocr=$(pin OCR_REVISION)" >> "$GITHUB_OUTPUT"
+          ovfetch=$(cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name == "ovfetch") | .version')
+          echo "ovfetch=$ovfetch" >> "$GITHUB_OUTPUT"
+      # The text model (~300 MB) and OCR (~30 MB), by the Hugging Face commits
+      # src/model.rs pins. fetch-model still checks every file's SHA-256 and
+      # fetches what's missing.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/vinosearch/models
+          key: models-${{ steps.pins.outputs.text }}-ocr-${{ steps.pins.outputs.ocr }}
+      # ovfetch resolves OpenVINO from data compiled into it, so its version
+      # (Cargo.lock's, as release.yml ships) pins OpenVINO's.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/ovfetch
+            ~/.local/lib/vinosearch/openvino
+          key: ovfetch-${{ steps.pins.outputs.ovfetch }}
+      - run: command -v ovfetch || cargo install --locked ovfetch --version "=${{ steps.pins.outputs.ovfetch }}"
+      - run: scripts/install-runtime.sh
+      - run: cargo build --locked
+      - run: target/debug/vinosearch fetch-model
+      - run: scripts/make-testbed.sh "$RUNNER_TEMP/testbed"
+      - run: target/debug/vinosearch --device CPU eval "$RUNNER_TEMP/testbed"

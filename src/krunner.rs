@@ -30,7 +30,7 @@ use vinosearch_shared::dbus::{
     status as key,
 };
 /// Files of each kind shown.
-const RESULTS: usize = 5;
+pub(crate) const RESULTS: usize = 5;
 /// QueryMatch::CategoryRelevance::Moderate
 const RELEVANCE_MODERATE: i32 = 50;
 
@@ -57,7 +57,7 @@ struct Runner {
 
 /// How close a result must be, per kind (`formats.*.min_score`).
 #[derive(Clone, Copy)]
-struct Floors {
+pub(crate) struct Floors {
     text: f32,
     image: f32,
 }
@@ -66,7 +66,11 @@ impl Floors {
     /// From the config file as it is now, so a change in the settings window
     /// shows from the next keystroke; the defaults if it doesn't parse.
     fn load(config: &Path) -> Self {
-        let formats = Config::load(config).map(|c| c.formats).unwrap_or_default();
+        Self::of_formats(&Config::load(config).map(|c| c.formats).unwrap_or_default())
+    }
+
+    /// `formats`' floors, the defaults where they are unset or out of range.
+    pub(crate) fn of_formats(formats: &crate::config::Formats) -> Self {
         Self {
             text: formats
                 .text_min_score()
@@ -163,9 +167,8 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Some(At::Page(p)) => drop(props.insert("page".into(), owned(Value::from(p)))),
         None => {}
     }
-    let floor = floors.of(h.kind);
     let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
-    let relevance = f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0));
+    let relevance = relevance(&h, floors);
     (
         h.path,
         name,
@@ -174,6 +177,13 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         relevance,
         props,
     )
+}
+
+/// How far above its kind's floor `h` scores, 0 to 1: what KRunner orders
+/// matches by.
+pub(crate) fn relevance(h: &Hit, floors: Floors) -> f64 {
+    let floor = floors.of(h.kind);
+    f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0))
 }
 
 /// `path` as a file:// URL, percent-encoded so `#`, `%`, `?` and spaces
@@ -788,7 +798,7 @@ const IMAGE_GAP: f32 = 0.06;
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then images, less images too far
 /// below the best of the others (IMAGE_GAP).
-fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
+pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 3] = Default::default();
     for h in hits {

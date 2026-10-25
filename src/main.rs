@@ -1,5 +1,6 @@
 mod embed;
 mod estimate;
+mod eval;
 mod extract;
 mod icons;
 mod index;
@@ -115,6 +116,31 @@ enum Command {
         /// image scores sit well above text to image ones [default: none]
         #[arg(long)]
         min_score: Option<f32>,
+    },
+    /// Index a testbed (scripts/make-testbed.sh) into a throwaway index, run
+    /// every query in the queries file through KRunner's search, and print
+    /// recall@1, recall@5 and MRR. Fails when one is below its threshold.
+    Eval {
+        testbed: PathBuf,
+        /// Queries, expected files and thresholds.
+        #[arg(long, default_value = "evals/queries.toml")]
+        queries: PathBuf,
+        /// Index the pictures too and run the image queries. Needs the vision
+        /// encoder (fetch-model with images on).
+        #[arg(long)]
+        images: bool,
+        /// One JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Lowest recall@1 that passes [default: the queries file's]
+        #[arg(long)]
+        min_recall_at_1: Option<f64>,
+        /// Lowest recall@5 that passes [default: the queries file's]
+        #[arg(long)]
+        min_recall_at_5: Option<f64>,
+        /// Lowest MRR that passes [default: the queries file's]
+        #[arg(long)]
+        min_mrr: Option<f64>,
     },
     /// Print the text OCR reads in an image, or a PDF's rendered pages, as
     /// indexing reads it (#106).
@@ -576,6 +602,33 @@ fn run(cli: Cli) -> Result<bool> {
                 }
             }
             Ok(true)
+        }
+        Command::Eval {
+            testbed,
+            queries,
+            images,
+            json,
+            min_recall_at_1,
+            min_recall_at_5,
+            min_mrr,
+        } => {
+            let q = eval::Queries::load(&queries)?;
+            if images && !model::vision_present(&model::default_dir()?, &model::vision_dir()?) {
+                bail!("--images needs the vision encoder; run fetch-model with images on");
+            }
+            let t = q.thresholds;
+            let opts = eval::Options {
+                testbed,
+                images,
+                json,
+                thresholds: eval::Thresholds {
+                    recall_at_1: min_recall_at_1.unwrap_or(t.recall_at_1),
+                    recall_at_5: min_recall_at_5.unwrap_or(t.recall_at_5),
+                    mrr: min_mrr.unwrap_or(t.mrr),
+                },
+            };
+            let emb = embedder(cli.openvino_dir, &s.device)?;
+            eval::run(&opts, &q, &s.device, emb)
         }
         Command::ReadText { path } => {
             let prefix = runtime::default_prefix(cli.openvino_dir)?;
