@@ -1,0 +1,339 @@
+# Ranking evals (#107) over the testbed scripts/make-testbed.sh writes:
+#
+#   scripts/make-testbed.sh /tmp/testbed
+#   vinosearch --device CPU eval /tmp/testbed
+#
+# Each [[query]] lists the files (relative to the testbed) that count as
+# found; `at` is the line, or the page or slide, their best chunk should
+# cover. `kind` groups the per-kind numbers:
+#
+#   keyword         shares the file's words
+#   paraphrase      says the same thing in other words
+#   section         the right part of a longer file
+#   identifier      a name from code, a SKU, a config variable
+#   cross-language  an English query for a French or Hindi file
+#   document        text inside a PDF, Office file, RTF, .doc or CSV
+#   image           a picture by what's in it; needs --images, so not in CI
+#
+# A run fails when an overall metric (image queries left out unless
+# --images) is below its threshold; the --min-* flags override them. The CPU
+# baseline, 55 queries on 2026-10-25, was recall@1 0.909, recall@5 0.964,
+# MRR 0.936. Each threshold leaves room for two queries to drop out of first
+# place (about 0.018 each), since a few sit within 0.01 of a rival file or
+# of the floor and the NPU's vectors differ from the CPU's by about that.
+# Raise them when a change lifts the baseline.
+
+[thresholds]
+recall_at_1 = 0.87
+recall_at_5 = 0.92
+mrr = 0.90
+
+# --- keyword
+
+[[query]]
+query = "sourdough starter feeding"
+expect = ["notes/sourdough.md"]
+kind = "keyword"
+
+[[query]]
+query = "tyre pressure for the road bike"
+expect = ["notes/bike-maintenance.md"]
+kind = "keyword"
+
+[[query]]
+query = "Fushimi Inari and the bamboo grove"
+expect = ["notes/japan-trip.md"]
+kind = "keyword"
+
+[[query]]
+query = "half marathon taper week"
+expect = ["notes/running-plan.txt"]
+kind = "keyword"
+
+[[query]]
+query = "tide predictions from harmonic constituents"
+expect = ["projects/tidepool/README.md"]
+kind = "keyword"
+
+[[query]]
+query = "tyre pressure for the car"
+expect = ["notes/car-maintenance.md"]
+kind = "keyword"
+
+# --- paraphrase: few or none of the file's words
+
+[[query]]
+query = "why is my bread dense and gummy inside"
+expect = ["notes/sourdough.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "when did we push back the phone app release"
+expect = ["notes/meeting-2026-03-12.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "my plant's leaves are turning yellow"
+expect = ["notes/houseplants.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "how often should I oil the chain on my bicycle"
+expect = ["notes/bike-maintenance.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "throttle how many calls we make per second"
+expect = ["projects/tidepool/src/ratelimit.rs"]
+kind = "paraphrase"
+
+[[query]]
+query = "try again after a failure waiting longer each time"
+expect = ["projects/tidepool/src/retry.go"]
+kind = "paraphrase"
+
+[[query]]
+query = "spelling suggestion from the nearest word"
+expect = ["code/levenshtein.py"]
+kind = "paraphrase"
+
+[[query]]
+query = "wait until the user stops typing before searching"
+expect = ["code/debounce.ts"]
+kind = "paraphrase"
+
+[[query]]
+query = "copy my laptop to the network drive every night"
+expect = ["code/backup.sh"]
+kind = "paraphrase"
+
+[[query]]
+query = "which customers haven't paid on time"
+expect = ["code/schema.sql"]
+kind = "paraphrase"
+
+[[query]]
+query = "deductible expenses for working from home"
+expect = ["notes/tax-2025.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "a bread recipe that doesn't need a starter"
+expect = ["notes/baguette.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "retry with the same pause between attempts"
+expect = ["code/retry.py"]
+kind = "paraphrase"
+
+[[query]]
+query = "turn a blog post title into a URL"
+expect = ["code/slugify.js"]
+kind = "paraphrase"
+
+[[query]]
+query = "the novel about a monk and a robot"
+expect = ["notes/reading-list.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "what to keep with me for the first night after moving"
+expect = ["notes/apartment-move.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "something is eating my lettuce"
+expect = ["notes/garden-journal.md"]
+kind = "paraphrase"
+
+[[query]]
+query = "what did we decide about the Windows app"
+expect = ["notes/meeting-2026-02-03.md"]
+kind = "paraphrase"
+
+# --- section: the right part of a longer file
+
+[[query]]
+query = "where do I turn off the water to the whole house"
+expect = ["notes/home-handbook.md"]
+kind = "section"
+at = 8
+
+[[query]]
+query = "the kitchen outlets keep cutting out"
+expect = ["notes/home-handbook.md"]
+kind = "section"
+at = 18
+
+[[query]]
+query = "what size furnace filter do we buy"
+expect = ["notes/home-handbook.md"]
+kind = "section"
+at = 25
+
+[[query]]
+query = "which night does the garbage go out"
+expect = ["notes/home-handbook.md"]
+kind = "section"
+at = 32
+
+[[query]]
+query = "who has a spare key to the house"
+expect = ["notes/home-handbook.md"]
+kind = "section"
+at = 45
+
+# --- identifier
+
+[[query]]
+query = "TokenBucket"
+expect = ["projects/tidepool/src/ratelimit.rs"]
+kind = "identifier"
+at = 6
+
+[[query]]
+query = "try_acquire"
+expect = ["projects/tidepool/src/ratelimit.rs"]
+kind = "identifier"
+
+[[query]]
+query = "RetryWithBackoff"
+expect = ["projects/tidepool/src/retry.go"]
+kind = "identifier"
+
+[[query]]
+query = "parse_ini_line"
+expect = ["code/ini.c"]
+kind = "identifier"
+
+[[query]]
+query = "BACKUP_TARGET"
+expect = ["code/backup.sh"]
+kind = "identifier"
+
+[[query]]
+query = "WX-5310"
+expect = ["docs/inventory.csv"]
+kind = "identifier"
+
+# --- cross-language: English query, French or Hindi file
+
+[[query]]
+query = "vegetable stew with eggplant and zucchini"
+expect = ["fr/recette-ratatouille.md"]
+kind = "cross-language"
+
+[[query]]
+query = "how much notice to give before leaving the apartment"
+expect = ["fr/bail-appartement.txt"]
+kind = "cross-language"
+
+[[query]]
+query = "home insurance deductible for water damage"
+expect = ["docs/assurance-habitation.pdf"]
+kind = "cross-language"
+
+[[query]]
+query = "how many hours of sleep and glasses of water a day"
+expect = ["hi/swasthya.md"]
+kind = "cross-language"
+
+[[query]]
+query = "palace of the winds in Jaipur"
+expect = ["hi/jaipur-yatra.txt"]
+kind = "cross-language"
+
+[[query]]
+query = "office kitchen rules about washing dishes"
+expect = ["docs/rasoi-niyam.docx"]
+kind = "cross-language"
+
+[[query]]
+query = "leek and potato soup"
+expect = ["fr/soupe-poireaux.md"]
+kind = "cross-language"
+
+[[query]]
+query = "the condo owners voted to redo the building's facade"
+expect = ["fr/compte-rendu-ag.txt"]
+kind = "cross-language"
+
+[[query]]
+query = "lentils tempered with cumin and garlic in ghee"
+expect = ["hi/dal-recipe.md"]
+kind = "cross-language"
+
+# --- document: text inside documents, and where it is
+
+[[query]]
+query = "why did subscriber churn go up"
+expect = ["docs/quarterly-report.pdf"]
+kind = "document"
+at = 2
+
+[[query]]
+query = "how many people are we hiring next quarter"
+expect = ["docs/quarterly-report.pdf"]
+kind = "document"
+at = 3
+
+[[query]]
+query = "how long is the dishwasher covered"
+expect = ["docs/dishwasher-warranty.pdf"]
+kind = "document"
+at = 1
+
+[[query]]
+query = "set up the VPN on a new laptop"
+expect = ["docs/onboarding.docx"]
+kind = "document"
+
+[[query]]
+query = "INT8 quantization with per-channel scales"
+expect = ["docs/npu-talk.pptx"]
+kind = "document"
+at = 2
+
+[[query]]
+query = "how much do we spend on daycare each month"
+expect = ["docs/household-budget.xlsx"]
+kind = "document"
+
+[[query]]
+query = "landlord letter about the radiators being cold"
+expect = ["docs/heating-complaint.rtf"]
+kind = "document"
+
+[[query]]
+query = "community garden plot fees and waiting list"
+expect = ["docs/garden-minutes.doc"]
+kind = "document"
+
+[[query]]
+query = "hike where we saw a snake"
+expect = ["docs/trail-log.csv"]
+kind = "document"
+
+[[query]]
+query = "proofing basket stock in Mississauga"
+expect = ["docs/inventory.csv"]
+kind = "document"
+
+[[query]]
+query = "when did we stop hiring"
+expect = ["docs/q1-report.pdf"]
+kind = "document"
+at = 3
+
+# --- image: needs --images (the 671 MB vision encoder), so not in CI
+
+[[query]]
+query = "a red ball on a white table"
+expect = ["photos/red-ball.png"]
+kind = "image"
+
+[[query]]
+query = "sunset over the sea"
+expect = ["photos/sunset.png"]
+kind = "image"
