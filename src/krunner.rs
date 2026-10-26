@@ -12,7 +12,7 @@ use crate::index::{self, Hit, Kind};
 use crate::model;
 use crate::open::At;
 use crate::watch;
-use crate::worker::{self, Job, Options, Status};
+use crate::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
 use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
@@ -470,6 +470,12 @@ impl Control {
             .map_err(|_| failed("the worker has stopped"))
     }
 
+    /// For the worker's next step.
+    fn request(&self, r: Request) -> zbus::fdo::Result<()> {
+        self.status.pending.request(r);
+        self.send(Job::Wake)
+    }
+
     fn is_indexed(&self, path: &str) -> zbus::fdo::Result<()> {
         match self.db.lock().and_then(|c| index::is_indexed(&c, path)) {
             Ok(true) => Ok(()),
@@ -513,10 +519,7 @@ impl Control {
         );
         out.insert(
             key::INDEXING.into(),
-            owned(Value::from(
-                self.status.indexing.load(Ordering::Relaxed)
-                    || self.status.queued_reindex.load(Ordering::Relaxed) > 0,
-            )),
+            owned(Value::from(self.status.indexing())),
         );
         out.insert(
             key::PAUSED.into(),
@@ -638,16 +641,14 @@ impl Control {
     /// Index a directory and watch it from now on. Returns once queued.
     fn reindex(&self, path: String) -> zbus::fdo::Result<()> {
         let root = self.root(&path)?;
-        self.status.queued_reindex.fetch_add(1, Ordering::Relaxed);
-        self.send(Job::Reindex(root)).inspect_err(|_| {
-            self.status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
-        })
+        self.status.work.root(root);
+        self.send(Job::Wake)
     }
 
     /// Stop indexing a root and drop what was indexed under it.
     fn forget(&self, path: String) -> zbus::fdo::Result<()> {
         let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-        self.send(Job::Forget(root))
+        self.request(Request::Forget(root))
     }
 
     /// The folders holding most of the index, biggest first, with their
@@ -752,7 +753,7 @@ impl Control {
 
     /// Free the model now.
     fn unload(&self) -> zbus::fdo::Result<()> {
-        self.send(Job::Unload)
+        self.request(Request::Unload)
     }
 
     /// Download the model (or whatever of it is missing or corrupt) in the
@@ -794,12 +795,12 @@ impl Control {
         if self.status.fetching.load(Ordering::SeqCst) {
             return Err(failed("a download is running"));
         }
-        self.send(Job::DeleteModel)
+        self.request(Request::DeleteModel)
     }
 
     /// Delete the compiled-model cache; the next model load recompiles (seconds).
     fn clear_cache(&self) -> zbus::fdo::Result<()> {
-        self.send(Job::ClearCache)
+        self.request(Request::ClearCache)
     }
 
     /// Encrypt or decrypt the index as the config file's `encryption` says,
@@ -810,7 +811,7 @@ impl Control {
         // The watcher too, or it would take the file it next reads for
         // unchanged and pass nothing on.
         self.status.reload_config.store(true, Ordering::Relaxed);
-        self.send(Job::Encryption(crate::encryption::Want::of(&file)))
+        self.request(Request::Encryption(crate::encryption::Want::of(&file)))
     }
 
     /// Encrypt the index again under a new key, sealed afresh. Fails while
@@ -819,7 +820,7 @@ impl Control {
         if !self.status.encryption.lock().unwrap().encrypted {
             return Err(failed("the index isn't encrypted"));
         }
-        self.send(Job::Rekey)
+        self.request(Request::Rekey)
     }
 }
 

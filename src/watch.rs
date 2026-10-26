@@ -3,7 +3,8 @@
 //! One non-recursive watch per directory, added with the same skip rules as
 //! indexing, so build output and hidden trees cost no watches (a recursive
 //! watch would add one for every directory under `target/` and
-//! `node_modules/`). Events are debounced and handed to the worker as paths.
+//! `node_modules/`). Events are debounced and put to the worker's `Work` as
+//! paths to check, each once however often it comes up.
 //!
 //! inotify can still miss changes: the kernel drops events when its queue
 //! overflows, directories past the watch limit go unwatched, and nothing is
@@ -37,6 +38,7 @@ const SLEPT: Duration = Duration::from_secs(60);
 
 struct State {
     watcher: RecommendedWatcher,
+    status: Arc<Status>,
     roots: Vec<PathBuf>,
     /// Directories with a watch. Dropped when the directory is removed or
     /// renamed away, so one recreated at the same path is watched again.
@@ -120,7 +122,7 @@ impl State {
         }
     }
 
-    /// Queue whatever under `root` differs from the index.
+    /// Put whatever under `root` differs from the index to the worker.
     fn check(&self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: &Path) {
         let t0 = Instant::now();
         match index::stale(conn, root, &self.excludes, &self.types) {
@@ -131,7 +133,8 @@ impl State {
                     paths.len(),
                     t0.elapsed().as_secs_f64()
                 );
-                let _ = jobs.send(Job::Changed(paths));
+                self.status.work.found(paths);
+                let _ = jobs.send(Job::Wake);
             }
             Ok(_) => {}
             Err(e) => eprintln!("checking {}: {e:#}", root.display()),
@@ -230,8 +233,8 @@ impl Clock {
 }
 
 /// `config` is re-read every ROOTS_EVERY; when it differs from `file` (what
-/// it held at startup), the new contents go to the worker. `status` carries
-/// CheckNow requests in, and when the last check ran out.
+/// it held at startup), the new contents go to the worker's `Pending`.
+/// `status` carries CheckNow requests in, and when the last check ran out.
 pub fn spawn(
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
@@ -247,6 +250,7 @@ pub fn spawn(
     Ok(std::thread::spawn(move || {
         let mut st = State {
             watcher,
+            status: status.clone(),
             roots: Vec::new(),
             watched: HashSet::new(),
             warned_limit: false,
@@ -297,11 +301,11 @@ pub fn spawn(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if !pending.is_empty()
-                && last_event.elapsed() >= DEBOUNCE
-                && jobs.send(Job::Changed(pending.drain().collect())).is_err()
-            {
-                break;
+            if !pending.is_empty() && last_event.elapsed() >= DEBOUNCE {
+                status.work.changed(pending.drain());
+                if jobs.send(Job::Wake).is_err() {
+                    break;
+                }
             }
             if last_roots.elapsed() >= ROOTS_EVERY
                 || status.reload_config.swap(false, Ordering::Relaxed)
@@ -314,9 +318,6 @@ pub fn spawn(
                 {
                     Ok((ex, types, c)) if c != file => {
                         eprintln!("{}: changed", config.display());
-                        if ex != st.excludes || types != st.types {
-                            status.config_gen.fetch_add(1, Ordering::Relaxed);
-                        }
                         let old = std::mem::replace(&mut st.excludes, ex);
                         // Directories no longer excluded need watches now.
                         for dir in old.paths() {
@@ -333,7 +334,8 @@ pub fn spawn(
                             due.get_or_insert("file types changed");
                         }
                         file = c.clone();
-                        if jobs.send(Job::Config(c)).is_err() {
+                        status.pending.config(c);
+                        if jobs.send(Job::Wake).is_err() {
                             break;
                         }
                     }
@@ -355,12 +357,11 @@ pub fn spawn(
             if status.check_now.swap(false, Ordering::Relaxed) {
                 due.get_or_insert("asked to");
             }
-            // After a burst settles, and not mid-job: what the worker hasn't
-            // reached yet would all be queued twice.
+            // After a burst settles, and not while indexing: the walk would
+            // find what the worker hasn't reached yet, for nothing.
             if let Some(why) = due
                 && last_event.elapsed() >= DEBOUNCE
-                && !status.indexing.load(Ordering::Relaxed)
-                && status.queued_reindex.load(Ordering::Relaxed) == 0
+                && !status.indexing()
             {
                 match db.lock() {
                     Ok(conn) => st.catch_up(&conn, &jobs, why),

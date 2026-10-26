@@ -69,7 +69,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `indexing` | `b` | A `Reindex` is queued or running, or the worker is embedding changes the watcher found. True from the moment `Reindex` returns. |
 | `paused` | `b` | `PauseIndexing` was called and `ResumeIndexing` not since. `indexing` is false while paused. |
 | `power_hold` | `s` | Why indexing is held for power ([#109](https://github.com/karanshukla/vinoSearch/issues/109)): `charger` (on battery with `index_on_battery = false`), `power_saver` (power-profiles-daemon or tuned-ppd reports the `power-saver` profile), or empty. Held as `PauseIndexing` holds it, apart from `paused`: changes found meanwhile wait, queries keep working, and it resumes by itself once the reason goes. `indexing` is false while held. |
-| `indexed_files` | `t` | Files embedded so far by the current indexing job. |
+| `indexed_files` | `t` | Files embedded so far by the current run of indexing: since the worker last had nothing to do. |
 | `indexing_rest` | `b` | The indexing job is the rest of a long document: its parts after the first 30, indexed once nothing else is waiting ([#108](https://github.com/karanshukla/vinoSearch/issues/108)). |
 | `partial` | `a(sstt)` | Documents indexed in part so far, the next in line first, at most 100: (path, unit, parts in, parts in all). The unit is `page`, `slide` or `chapter`, or `part` (3 chunks, about a printed page) for formats without them. |
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |

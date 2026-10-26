@@ -46,7 +46,7 @@ pub mod status {
     pub const CODE_FILES: &str = "code_files";
     pub const CODE_CHUNKS: &str = "code_chunks";
     pub const ROOTS: &str = "roots";
-    /// Files embedded so far by the current indexing job.
+    /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";
     /// The indexing job is the rest of a long document (#108).
     pub const INDEXING_REST: &str = "indexing_rest";
