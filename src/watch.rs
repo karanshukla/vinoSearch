@@ -314,6 +314,9 @@ pub fn spawn(
                 {
                     Ok((ex, types, c)) if c != file => {
                         eprintln!("{}: changed", config.display());
+                        if ex != st.excludes || types != st.types {
+                            status.config_gen.fetch_add(1, Ordering::Relaxed);
+                        }
                         let old = std::mem::replace(&mut st.excludes, ex);
                         // Directories no longer excluded need watches now.
                         for dir in old.paths() {

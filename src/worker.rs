@@ -93,6 +93,10 @@ pub struct Status {
     /// Set by ApplyEncryption: the watcher takes it and reads the config
     /// file now, rather than at its next 30-second read.
     pub reload_config: AtomicBool,
+    /// Bumped by the watcher when the exclusions or file types it reads
+    /// change. A job started under an older count stops, wherever its config
+    /// sits in the queue, and runs again once the worker has caught up.
+    pub config_gen: AtomicU64,
     /// Indexing is paused: a running job stops after its current chunk, and
     /// new ones wait until Retry.
     pub paused: AtomicBool,
@@ -122,6 +126,18 @@ impl std::error::Error for Interrupted {}
 fn interrupted(r: &Result<impl Sized>) -> bool {
     r.as_ref()
         .is_err_and(|e| e.downcast_ref::<Interrupted>().is_some())
+}
+
+/// Queue `job` to run before any indexing already queued, after anything
+/// else (an earlier config, say). A config queued behind indexing would let
+/// that indexing walk what it now excludes, and nothing would stop it: the
+/// config has left the channel `after` watches.
+fn defer_before_indexing(deferred: &mut VecDeque<Job>, job: Job) {
+    let at = deferred
+        .iter()
+        .position(|j| matches!(j, Job::Changed(_) | Job::Reindex(_) | Job::Rest))
+        .unwrap_or(deferred.len());
+    deferred.insert(at, job);
 }
 
 pub fn unix_now() -> u64 {
@@ -340,6 +356,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let mut conn = index::open(&db)?;
     let mut want = Want::of(&opts.file);
     let mut excludes = opts.excludes.clone();
+    // The watcher's config_gen that `excludes` and `types` are current to.
+    let mut applied_gen = opts.status.config_gen.load(Ordering::Relaxed);
     let mut types = opts.types.clone();
     let mut device = opts.device.clone();
     let mut idle = opts.idle;
@@ -460,6 +478,8 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                 continue;
             }
             Job::Config(file) => {
+                // Read first: a later bump means a config still to come.
+                applied_gen = status.config_gen.load(Ordering::Relaxed);
                 match file.excludes() {
                     Ok(ex) if ex != excludes => {
                         // What is no longer excluded: index it (its files are
@@ -684,7 +704,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                         restart |= file.excludes().is_ok_and(|ex| ex != excludes)
                             || FileTypes::new(&file.formats).is_ok_and(|t| t != types)
                             || Want::of(&file) != want;
-                        deferred.push_back(Job::Config(file));
+                        defer_before_indexing(&mut deferred, Job::Config(file));
                     }
                     // Converting the index waits for no indexing job.
                     job @ (Job::Forget(_) | Job::Encryption(_) | Job::Rekey) => {
@@ -693,6 +713,12 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
                     }
                     other => deferred.push_back(other),
                 }
+            }
+            // After the drain, so the config that bumped it is queued ahead
+            // of this job rather than left in the channel behind it.
+            if status.config_gen.load(Ordering::Relaxed) != applied_gen {
+                restart = true;
+                return Err(Interrupted.into());
             }
             Ok(())
         };
@@ -798,4 +824,45 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_config_runs_before_indexing_already_queued() {
+        let mut deferred = VecDeque::from([
+            Job::Retry,
+            Job::Reindex(PathBuf::from("/home/u")),
+            Job::Changed(vec![PathBuf::from("/home/u/Development")]),
+        ]);
+        let first = Config {
+            exclude: vec!["~/Development".into()],
+            ..Config::default()
+        };
+        defer_before_indexing(&mut deferred, Job::Config(first.clone()));
+        defer_before_indexing(&mut deferred, Job::Config(Config::default()));
+        let order: Vec<_> = deferred
+            .iter()
+            .map(|j| match j {
+                Job::Retry => "retry",
+                Job::Config(c) if *c == first => "first config",
+                Job::Config(_) => "second config",
+                Job::Reindex(_) => "reindex",
+                Job::Changed(_) => "changed",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "retry",
+                "first config",
+                "second config",
+                "reindex",
+                "changed"
+            ]
+        );
+    }
 }
