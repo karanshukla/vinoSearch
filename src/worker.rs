@@ -842,7 +842,13 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            ["retry", "first config", "second config", "reindex", "changed"]
+            [
+                "retry",
+                "first config",
+                "second config",
+                "reindex",
+                "changed"
+            ]
         );
     }
 }
