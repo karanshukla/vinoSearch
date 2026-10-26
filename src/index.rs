@@ -1431,6 +1431,15 @@ pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
 /// An error from it stops indexing; every file finished so far is kept.
 pub type AfterFile<'a, E = Embedder> = dyn FnMut(&Stats, &Connection, &mut E) -> Result<()> + 'a;
 
+/// Remember `root` (canonical, from `resolve_root`) as a root to watch.
+pub fn add_root(conn: &Connection, root: &Path) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
+        [root.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
 /// that are gone are removed.
@@ -1444,10 +1453,7 @@ pub fn index<E: Embed>(
 ) -> Result<Stats> {
     let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
-        [root.to_string_lossy()],
-    )?;
+    add_root(conn, &root)?;
     let mut stats = Stats::default();
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {

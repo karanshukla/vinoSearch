@@ -669,8 +669,8 @@ impl Embedder {
     }
 }
 
-/// What indexing asks of the model. `Embedder` on the device; tests index
-/// through a stand-in, with no OpenVINO.
+/// What indexing and the worker ask of the model. `Embedder` on the
+/// device; tests index through a stand-in, with no OpenVINO.
 pub trait Embed {
     /// Embed documents already formatted with [`document_text`].
     fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -680,6 +680,16 @@ pub trait Embed {
     fn can_read_text(&self) -> bool;
     /// The lines of text in `img`.
     fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>>;
+    /// A query for `kinds`: code alone gets the code retrieval prompt.
+    fn query_for(&mut self, text: &str, kinds: &[crate::index::Kind]) -> Result<Vec<f32>>;
+    /// Compile the document stage now, if it is not already.
+    fn prepare_documents(&mut self) -> Result<()>;
+    /// Cap document and image embedding at `share` of the device's time.
+    fn set_document_share(&mut self, share: f64);
+    /// Free the document and image stages; true if any was compiled.
+    fn release_documents(&mut self) -> bool;
+    /// The document or image stage is compiled.
+    fn has_documents(&self) -> bool;
 }
 
 impl Embed for Embedder {
@@ -698,17 +708,43 @@ impl Embed for Embedder {
     fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
         Embedder::read_text(self, img)
     }
+
+    fn query_for(&mut self, text: &str, kinds: &[crate::index::Kind]) -> Result<Vec<f32>> {
+        Embedder::query_for(self, text, kinds)
+    }
+
+    fn prepare_documents(&mut self) -> Result<()> {
+        Embedder::prepare_documents(self)
+    }
+
+    fn set_document_share(&mut self, share: f64) {
+        Embedder::set_document_share(self, share)
+    }
+
+    fn release_documents(&mut self) -> bool {
+        Embedder::release_documents(self)
+    }
+
+    fn has_documents(&self) -> bool {
+        Embedder::has_documents(self)
+    }
 }
 
 /// A stand-in model for tests: each word of the text (the title included)
 /// adds to one of DIM buckets by its hash, normalised, so texts sharing words
-/// score above texts that share none. Counts what it was asked to embed.
+/// score above texts that share none. Counts what it was asked to embed, and
+/// calls `on_document` with each document's text before embedding it, for
+/// tests of what happens mid-file.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FakeEmbed {
     pub documents: usize,
     pub images: usize,
+    pub on_document: Option<OnDocument>,
 }
+
+#[cfg(test)]
+pub(crate) type OnDocument = Box<dyn FnMut(&str) + Send>;
 
 #[cfg(test)]
 impl FakeEmbed {
@@ -738,6 +774,9 @@ impl FakeEmbed {
 impl Embed for FakeEmbed {
     fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.documents += texts.len();
+        if let Some(f) = self.on_document.as_mut() {
+            texts.iter().for_each(|t| f(t));
+        }
         Ok(texts.iter().map(|t| Self::vector(t)).collect())
     }
 
@@ -752,6 +791,24 @@ impl Embed for FakeEmbed {
 
     fn read_text(&mut self, _img: &image::RgbImage) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    fn query_for(&mut self, text: &str, _kinds: &[crate::index::Kind]) -> Result<Vec<f32>> {
+        Ok(Self::vector(text))
+    }
+
+    fn prepare_documents(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_document_share(&mut self, _share: f64) {}
+
+    fn release_documents(&mut self) -> bool {
+        false
+    }
+
+    fn has_documents(&self) -> bool {
+        false
     }
 }
 

@@ -274,8 +274,8 @@ fn settings(cli: &Cli) -> Result<Settings> {
     })
 }
 
-fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
-    worker::Options {
+fn worker_options(cli: &Cli, s: Settings) -> Result<worker::Options> {
+    Ok(worker::Options {
         openvino_dir: cli.openvino_dir.clone(),
         status: std::sync::Arc::new(worker::Status::new(&s.device)),
         device: s.device,
@@ -285,7 +285,8 @@ fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
         config: s.path,
         file: s.file,
         pinned: s.pinned,
-    }
+        db: index::default_db()?,
+    })
 }
 
 pub(crate) fn snippet(text: &str) -> String {
@@ -551,7 +552,7 @@ fn run(cli: Cli) -> Result<bool> {
             } else if uninstall {
                 krunner::uninstall()?;
             } else {
-                krunner::serve(worker_options(&cli, s))?;
+                krunner::serve(worker_options(&cli, s)?)?;
             }
             Ok(true)
         }
@@ -565,7 +566,7 @@ fn run(cli: Cli) -> Result<bool> {
         }
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let opts = worker_options(&cli, s);
+            let opts = worker_options(&cli, s)?;
             worker::prepare(&opts.status, &opts.file)?;
             power::spawn(tx.clone(), opts.status.clone());
             let _watcher = watch::spawn(
