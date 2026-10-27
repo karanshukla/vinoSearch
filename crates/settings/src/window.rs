@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{
     self, Align, Color32, FontId, Id, Layout, RichText, Sense, Stroke, WidgetInfo, accesskit,
 };
+use vinosearch_shared::apps::{self, App};
 use vinosearch_shared::config::{
     self, Config, DEFAULT_CODE_MIN_SCORE, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
     DEFAULT_IMAGE_EXTENSIONS, DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT,
@@ -100,6 +101,15 @@ enum Target {
 /// What the chooser answered: None when it was cancelled.
 type Picked = (Target, Result<Option<PathBuf>, String>);
 
+/// What the Editor dropdown shows picked.
+#[derive(Clone, PartialEq)]
+enum Pick {
+    Default,
+    /// A desktop entry id.
+    App(String),
+    Custom,
+}
+
 /// A destructive action waiting for a second click.
 #[derive(Clone, PartialEq)]
 enum Confirm {
@@ -122,6 +132,10 @@ struct SettingsWindow {
     image_extensions: Option<String>,
     /// The editor as typed, until Enter or leaving the field.
     editor: Option<String>,
+    /// Custom command picked, so its field shows while still empty.
+    custom_editor: bool,
+    /// The apps the editor can be, read when the Search page first shows.
+    editors: Option<Vec<App>>,
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
@@ -176,6 +190,8 @@ impl SettingsWindow {
             new_exclude: String::new(),
             image_extensions: None,
             editor: None,
+            custom_editor: false,
+            editors: None,
             picked: Arc::new(Mutex::new(None)),
             picking: false,
             confirm: None,
@@ -951,32 +967,87 @@ impl SettingsWindow {
         );
 
         section(ui, "Opening results");
+        let editors = self.editors.get_or_insert_with(apps::editors).clone();
+        let current = self.config.editor.clone();
+        let mut pick = match &current {
+            Some(e) if apps::is_entry_id(e) && !self.custom_editor => {
+                Pick::App(e.trim().to_owned())
+            }
+            Some(_) => Pick::Custom,
+            None if self.custom_editor => Pick::Custom,
+            None => Pick::Default,
+        };
         labelled_row(
             ui,
             "Editor:",
-            "Opens text at the matching line: code, kate, zed, a JetBrains IDE, or any command \
-             with {file} and {line}. Empty uses the default app.",
+            "Opens text at the matching line where the app allows it: VS Code, Kate, \
+             GNOME Text Editor, Zed, a JetBrains IDE.",
             |ui, named| {
-                let current = self.config.editor.clone().unwrap_or_default();
-                let text = self.editor.get_or_insert(current);
-                let response = named(
-                    ui.add(
-                        egui::TextEdit::singleline(text)
-                            .hint_text("Default app")
-                            .desired_width((ui.available_width() - 60.0).clamp(120.0, 300.0)),
-                    ),
-                );
-                if response.lost_focus() {
-                    let typed = text.trim();
-                    let next = (!typed.is_empty()).then(|| typed.to_owned());
+                let before = pick.clone();
+                let label = |pick: &Pick| match pick {
+                    Pick::Default => "Default app".to_owned(),
+                    Pick::App(id) => editors
+                        .iter()
+                        .find(|a| &a.id == id)
+                        .map_or_else(|| id.clone(), |a| a.name.clone()),
+                    Pick::Custom => "Custom command…".to_owned(),
+                };
+                let combo = egui::ComboBox::from_id_salt("editor")
+                    .width((ui.available_width() - 60.0).clamp(120.0, 300.0))
+                    .selected_text(label(&pick))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pick, Pick::Default, label(&Pick::Default));
+                        for a in editors.iter() {
+                            ui.selectable_value(&mut pick, Pick::App(a.id.clone()), &a.name);
+                        }
+                        ui.separator();
+                        ui.selectable_value(&mut pick, Pick::Custom, label(&Pick::Custom));
+                    });
+                named(combo.response);
+                if pick != before {
+                    self.custom_editor = pick == Pick::Custom;
+                    self.editor = None;
+                    let next = match &pick {
+                        Pick::Default => None,
+                        Pick::App(id) => Some(id.clone()),
+                        // Kept until a command is typed, unless it was an app.
+                        Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
+                    };
                     if next != self.config.editor {
                         self.config.editor = next;
                         changed = true;
                     }
-                    self.editor = None;
                 }
             },
         );
+        if pick == Pick::Custom {
+            labelled_row(
+                ui,
+                "Command:",
+                "Any command with {file} and {line} in it, run without a shell. Empty uses the \
+             default app.",
+                |ui, named| {
+                    let current = self.config.editor.clone().unwrap_or_default();
+                    let text = self.editor.get_or_insert(current);
+                    let response = named(
+                        ui.add(
+                            egui::TextEdit::singleline(text)
+                                .hint_text("foot -e nvim +{line} {file}")
+                                .desired_width((ui.available_width() - 60.0).clamp(120.0, 300.0)),
+                        ),
+                    );
+                    if response.lost_focus() {
+                        let typed = text.trim();
+                        let next = (!typed.is_empty()).then(|| typed.to_owned());
+                        if next != self.config.editor {
+                            self.config.editor = next;
+                            changed = true;
+                        }
+                        self.editor = None;
+                    }
+                },
+            );
+        }
 
         section(ui, "How close results must be");
         help_line(

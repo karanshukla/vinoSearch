@@ -2,14 +2,15 @@
 //! editor, a PDF at its page in the viewer. KRunner, GNOME Shell and
 //! `vinosearch menu` all open through here.
 //!
-//! The app is the `editor` setting for text, else the default app for the
-//! file's type (`xdg-mime query default`), whose desktop file says what to
-//! run. Only apps known to take a line or page get one; anything else, a
+//! The app is the `editor` setting for text (a command, or an app's desktop
+//! entry id as the settings app's picker saves it), else the default app for
+//! the file's type (`xdg-mime query default`), whose desktop file says what
+//! to run. Only apps known to take a line or page get one; anything else, a
 //! terminal app or a Flatpak included, gets `xdg-open` as before. Every
 //! command is an argv, never a shell line.
 
 use crate::index::Kind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Where in its file a result matched.
@@ -245,35 +246,12 @@ fn app_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
     Some(entry.exec.iter().cloned().chain(a).collect())
 }
 
-fn data_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => dirs.push(PathBuf::from(d)),
-        _ => {
-            if let Some(h) = std::env::var_os("HOME") {
-                dirs.push(PathBuf::from(h).join(".local/share"));
-            }
-        }
-    }
-    let system = std::env::var("XDG_DATA_DIRS")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    dirs.extend(
-        system
-            .split(':')
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from),
-    );
-    dirs
-}
-
 /// The desktop entry with id `id` (`org.kde.okular.desktop`), first found.
 fn find_entry(id: &str) -> Option<Entry> {
     if id.contains('/') || !id.ends_with(".desktop") {
         return None;
     }
-    data_dirs().iter().find_map(|d| {
+    vinosearch_shared::apps::data_dirs().iter().find_map(|d| {
         let text = std::fs::read_to_string(d.join("applications").join(id)).ok()?;
         parse_entry(&text)
     })
@@ -307,9 +285,32 @@ fn default_entry(file: &Path, at: At) -> Option<Entry> {
     find_entry(&id)
 }
 
+/// The command a picked editor's entry gives: at the line when it is an app
+/// known to take one, else the file alone, as the app's own `Exec`. A
+/// Flatpak's file goes inside its `@@u ... @@`, which hands it to the
+/// sandbox. None for a terminal app.
+fn picked_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
+    if entry.terminal {
+        return None;
+    }
+    app_argv(entry, file, at).or_else(|| {
+        let mut argv = entry.exec.clone();
+        let f = file.display().to_string();
+        let opened = argv.iter().position(|w| w == "@@u" || w == "@@f");
+        match opened.and_then(|o| argv[o..].iter().position(|w| w == "@@").map(|c| o + c)) {
+            Some(close) => argv.insert(close, f),
+            None => argv.push(f),
+        }
+        Some(argv)
+    })
+}
+
 /// The command that opens `file` at `at`, if anything known can.
 fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
     if let (At::Line(l), Some(e)) = (at, editor.filter(|e| !e.trim().is_empty())) {
+        if vinosearch_shared::apps::is_entry_id(e) {
+            return picked_argv(&find_entry(e.trim())?, file, at);
+        }
         return editor_argv(e, file, l);
     }
     app_argv(&default_entry(file, at)?, file, at)
@@ -370,6 +371,7 @@ pub fn xdg_open(target: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn argv(entry: &str, file: &str, at: At) -> Option<Vec<String>> {
         app_argv(&parse_entry(entry).unwrap(), Path::new(file), at)
@@ -509,6 +511,43 @@ mod tests {
                 "42",
                 "/a b.md"
             ]
+        );
+    }
+
+    #[test]
+    fn a_picked_editor_opens_at_the_line_when_it_can() {
+        let picked = |exec: &str| {
+            picked_argv(
+                &parse_entry(&entry(exec)).unwrap(),
+                Path::new("/a.rs"),
+                At::Line(9),
+            )
+        };
+        assert_eq!(
+            picked("kate -b %U").unwrap(),
+            ["kate", "-b", "--line", "9", "/a.rs"]
+        );
+        // A Flatpak can't be told the line, but still opens the file.
+        assert_eq!(
+            picked("/usr/bin/flatpak run --command=kate org.kde.kate @@u %U @@").unwrap(),
+            [
+                "/usr/bin/flatpak",
+                "run",
+                "--command=kate",
+                "org.kde.kate",
+                "@@u",
+                "/a.rs",
+                "@@"
+            ]
+        );
+        let terminal = "[Desktop Entry]\nExec=nvim %F\nTerminal=true\n";
+        assert_eq!(
+            picked_argv(
+                &parse_entry(terminal).unwrap(),
+                Path::new("/a.rs"),
+                At::Line(9)
+            ),
+            None
         );
     }
 
