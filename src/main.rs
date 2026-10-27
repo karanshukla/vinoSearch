@@ -83,7 +83,8 @@ enum Command {
         uninstall: bool,
     },
     /// Turn one search place on (or off with --off): kde is KRunner and the Plasma launcher,
-    /// gnome is GNOME Shell's overview search, from the next login.
+    /// gnome is GNOME Shell's overview search, from the next login, menu is the search window
+    /// in the app menu.
     Integrate {
         place: krunner::Place,
         /// Remove this place's files instead of writing them. The service stays.
