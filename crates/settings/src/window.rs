@@ -1352,6 +1352,13 @@ impl SettingsWindow {
             integration::Switch::Gnome,
             (!gnome).then_some("GNOME isn't running in this session."),
         );
+        switch_row(
+            ui,
+            "App menu:",
+            "The search window as an app of its own, beside vinoSearch's settings.",
+            integration::Switch::Menu,
+            None,
+        );
         section(ui, "Service");
         switch_row(
             ui,

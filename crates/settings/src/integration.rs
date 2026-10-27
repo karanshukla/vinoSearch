@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use vinosearch_shared::dbus::{DBUS_SERVICE_FILE, GNOME_PROVIDER, KRUNNER_PLUGIN};
+use vinosearch_shared::dbus::{DBUS_SERVICE_FILE, GNOME_PROVIDER, KRUNNER_PLUGIN, SEARCH_ENTRY};
 
 /// One switch on the Integration page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +16,8 @@ pub enum Switch {
     Kde,
     /// GNOME Shell's overview search.
     Gnome,
+    /// The search window in the app menu.
+    Menu,
     /// The service, with the running desktop's place on and every place off.
     Service,
 }
@@ -24,6 +26,7 @@ pub enum Switch {
 pub struct State {
     pub kde: bool,
     pub gnome: bool,
+    pub menu: bool,
     pub service: bool,
     pub running: bool,
     /// What the last run printed.
@@ -36,6 +39,7 @@ impl State {
         State {
             kde: on(KRUNNER_PLUGIN),
             gnome: on(GNOME_PROVIDER),
+            menu: on(SEARCH_ENTRY),
             service: on(DBUS_SERVICE_FILE),
             ..State::default()
         }
@@ -45,6 +49,7 @@ impl State {
         match switch {
             Switch::Kde => self.kde,
             Switch::Gnome => self.gnome,
+            Switch::Menu => self.menu,
             Switch::Service => self.service,
         }
     }
@@ -88,6 +93,8 @@ fn args(switch: Switch, on: bool) -> Vec<&'static str> {
         (Switch::Kde, false) => vec!["integrate", "kde", "--off"],
         (Switch::Gnome, true) => vec!["integrate", "gnome"],
         (Switch::Gnome, false) => vec!["integrate", "gnome", "--off"],
+        (Switch::Menu, true) => vec!["integrate", "menu"],
+        (Switch::Menu, false) => vec!["integrate", "menu", "--off"],
         (Switch::Service, true) => vec!["krunner", "--install"],
         (Switch::Service, false) => vec!["krunner", "--uninstall"],
     }
@@ -134,6 +141,7 @@ mod tests {
     fn each_switch_runs_the_matching_command() {
         assert_eq!(args(Switch::Kde, false), ["integrate", "kde", "--off"]);
         assert_eq!(args(Switch::Gnome, true), ["integrate", "gnome"]);
+        assert_eq!(args(Switch::Menu, false), ["integrate", "menu", "--off"]);
         assert_eq!(args(Switch::Service, false), ["krunner", "--uninstall"]);
     }
 }
