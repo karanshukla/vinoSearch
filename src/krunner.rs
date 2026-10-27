@@ -26,8 +26,8 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
-    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, recent, results,
-    status as key,
+    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SEARCH_ENTRY, SERVICE, SETTINGS_APP_ID, recent,
+    results, status as key,
 };
 /// Files of each kind shown.
 pub(crate) const RESULTS: usize = 5;
@@ -931,15 +931,19 @@ pub enum Place {
     Kde,
     /// GNOME Shell's overview search, from the next login.
     Gnome,
+    /// The search window in the app menu, beside the settings window. Off
+    /// unless turned on: no desktop gets it at install.
+    Menu,
 }
 
 impl Place {
-    pub const ALL: [Place; 2] = [Place::Kde, Place::Gnome];
+    pub const ALL: [Place; 3] = [Place::Kde, Place::Gnome, Place::Menu];
 
     fn name(self) -> &'static str {
         match self {
             Place::Kde => "KRunner and the Plasma launcher",
             Place::Gnome => "GNOME Shell",
+            Place::Menu => "The search window in the app menu",
         }
     }
 }
@@ -952,7 +956,7 @@ impl Place {
 fn places_for(desktop: Option<&str>) -> Vec<Place> {
     let desktop = desktop.unwrap_or_default();
     if desktop.trim().is_empty() {
-        return Place::ALL.to_vec();
+        return vec![Place::Kde, Place::Gnome];
     }
     let names: Vec<String> = desktop.split(':').map(str::to_ascii_uppercase).collect();
     let has = |n: &str| names.iter().any(|d| d == n);
@@ -1017,6 +1021,32 @@ fn install_launcher() -> Result<PathBuf> {
         ),
     )?;
     Ok(launcher)
+}
+
+/// The search window's app menu entry. It needs vinosearch-settings beside
+/// us. No StartupWMClass: the window's app id is the settings entry's.
+fn install_search_entry() -> Result<()> {
+    let entry = data_home()?.join(SEARCH_ENTRY);
+    let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
+    if !settings.is_file() {
+        bail!("{}: not installed", settings.display());
+    }
+    let s = utf8(&settings)?;
+    if s.chars().any(char::is_control) {
+        bail!("{s:?}: cannot go in a desktop entry");
+    }
+    fs::create_dir_all(entry.parent().unwrap())?;
+    fs::write(&entry, search_entry(&desktop_quote(s)))?;
+    println!("wrote {}", entry.display());
+    Ok(())
+}
+
+fn search_entry(settings: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
+         Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
+         Icon={ICON}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n"
+    )
 }
 
 fn install_gnome() -> Result<()> {
@@ -1095,6 +1125,7 @@ pub fn install_place(place: Place) -> Result<()> {
     match place {
         Place::Kde => install_kde(),
         Place::Gnome => install_gnome(),
+        Place::Menu => install_search_entry(),
     }
 }
 
@@ -1107,6 +1138,7 @@ pub fn uninstall_place(place: Place) -> Result<()> {
             let g = gnome_files()?;
             vec![g.provider, g.environment]
         }
+        Place::Menu => vec![data_home()?.join(SEARCH_ENTRY)],
     };
     let mut removed = 0;
     for p in files {
@@ -1218,6 +1250,7 @@ pub fn install(
         match place {
             Place::Kde => install_kde()?,
             Place::Gnome => install_gnome()?,
+            Place::Menu => install_search_entry()?,
         }
     }
     Ok(())
@@ -1393,6 +1426,16 @@ mod tests {
     }
 
     #[test]
+    fn the_search_entry_opens_the_search_window() {
+        let entry = search_entry(&desktop_quote("/home/u/my bin/vinosearch-settings"));
+        assert!(
+            entry.contains("\nExec=\"/home/u/my bin/vinosearch-settings\" --search\n"),
+            "{entry}"
+        );
+        assert!(!entry.contains("StartupWMClass"), "{entry}");
+    }
+
+    #[test]
     fn text_read_in_an_image_is_listed_with_the_images() {
         let category = |kind, path| {
             let m = to_match(hit(kind, 0.9, path), FLOORS);
@@ -1499,8 +1542,8 @@ mod tests {
         assert_eq!(places_for(Some("Hyprland")), []);
         assert_eq!(places_for(Some("COSMIC")), []);
         assert_eq!(places_for(Some("XFCE")), []);
-        assert_eq!(places_for(None), Place::ALL);
-        assert_eq!(places_for(Some("")), Place::ALL);
+        assert_eq!(places_for(None), [Place::Kde, Place::Gnome]);
+        assert_eq!(places_for(Some("")), [Place::Kde, Place::Gnome]);
     }
 
     #[test]

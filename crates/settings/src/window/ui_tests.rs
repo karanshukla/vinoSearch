@@ -513,8 +513,8 @@ fn the_index_page_lists_documents_indexed_in_part() {
 fn integration_switches_say_their_state_in_words() {
     let (w, _requests) = window(Page::Integration, "integration");
     let h = harness(w, WIDE, Theme::Dark);
-    assert_eq!(h.get_all_by_label("Off").count(), 3);
-    for place in ["KRunner", "GNOME Shell", "Search service"] {
+    assert_eq!(h.get_all_by_label("Off").count(), 4);
+    for place in ["KRunner", "GNOME Shell", "App menu", "Search service"] {
         h.get_by_role_and_label(Role::Button, &format!("Turn on {place}"));
     }
     h.get_by_label("vinosearch doctor");
