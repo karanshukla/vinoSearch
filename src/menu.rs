@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 use crate::open::At;
 use vinosearch_shared::dbus::{RUNNER_PATH, SERVICE};
@@ -106,7 +106,7 @@ type Match = (
     String,
     i32,
     f64,
-    HashMap<String, OwnedValue>,
+    HashMap<String, OwnedVariant>,
 );
 
 /// `text` (a path, or KRunner's `dir:line  snippet` subtext) with a leading
@@ -159,14 +159,21 @@ fn rows(mut matches: Vec<Match>, home: Option<&str>) -> Vec<Row> {
 
 /// Ask the runner, starting it through D-Bus activation if it isn't running.
 fn search(query: &str) -> Result<Vec<Match>> {
-    let conn = zbus::blocking::Connection::session().context("no session bus")?;
-    let reply = conn.call_method(
-        Some(SERVICE),
-        RUNNER_PATH,
-        Some("org.kde.krunner1"),
-        "Match",
-        &(query,),
-    );
+    let reply = zbus::block_on(async {
+        let conn = zbus::Connection::session()
+            .await
+            .context("no session bus")?;
+        Ok::<_, anyhow::Error>(
+            conn.call_method(
+                Some(SERVICE),
+                RUNNER_PATH,
+                Some("org.kde.krunner1"),
+                "Match",
+                &(query,),
+            )
+            .await,
+        )
+    })?;
     match reply {
         Ok(m) => Ok(m.body().deserialize()?),
         Err(zbus::Error::MethodError(name, _, _))
@@ -204,7 +211,7 @@ pub fn run(given: Option<&str>, editor: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
     #[test]
     fn the_first_launcher_on_path_wins() {
@@ -222,7 +229,7 @@ mod tests {
         let mut props = HashMap::new();
         props.insert(
             "subtext".to_owned(),
-            OwnedValue::try_from(Value::from(subtext)).unwrap(),
+            OwnedVariant::try_from(Variant::from(subtext)).unwrap(),
         );
         (
             path.into(),
@@ -254,12 +261,12 @@ mod tests {
         let mut text = m("/a.rs", "a.rs", 0.5, "/:12  x");
         text.5.insert(
             "line".to_owned(),
-            OwnedValue::try_from(Value::from(12u32)).unwrap(),
+            OwnedVariant::try_from(Variant::from(12u32)).unwrap(),
         );
         let mut pdf = m("/b.pdf", "b.pdf", 0.4, "/, page 3  x");
         pdf.5.insert(
             "page".to_owned(),
-            OwnedValue::try_from(Value::from(3u32)).unwrap(),
+            OwnedVariant::try_from(Variant::from(3u32)).unwrap(),
         );
         let r = rows(vec![text, pdf, m("/c.png", "c.png", 0.3, "/")], None);
         let at: Vec<Option<At>> = r.iter().map(|r| r.at).collect();

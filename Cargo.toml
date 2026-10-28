@@ -42,6 +42,7 @@ walkdir = "2.5"
 # .gitignore and .ignore files, for code (#110).
 ignore = "0.4"
 zbus = "6"
+futures-lite = "2"
 toml = "1.1"
 futures-channel = "0.3"
 libc = "0.2"

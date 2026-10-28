@@ -13,12 +13,14 @@
 
 use crate::sched;
 use crate::worker::{Job, Status};
+use futures_lite::StreamExt;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use vinosearch_shared::dbus::hold;
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 const PPD: &str = "net.hadess.PowerProfiles";
 const PPD_PATH: &str = "/net/hadess/PowerProfiles";
@@ -143,101 +145,131 @@ fn set_power_saver(jobs: &mpsc::Sender<Job>, status: &Status, on: bool) {
 
 /// The active profile is power saver; false when it can't be read (no
 /// daemon on the bus).
-fn read_profile(conn: &zbus::blocking::Connection) -> bool {
-    conn.call_method(
-        Some(PPD),
-        PPD_PATH,
-        Some("org.freedesktop.DBus.Properties"),
-        "Get",
-        &(PPD, PROFILE),
-    )
-    .and_then(|reply| reply.body().deserialize::<OwnedValue>())
-    .ok()
-    .and_then(|v| String::try_from(v).ok())
-    .is_some_and(|p| p == POWER_SAVER)
+async fn read_profile(conn: &zbus::Connection) -> bool {
+    let reply = conn
+        .call_method(
+            Some(PPD),
+            PPD_PATH,
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &(PPD, PROFILE),
+        )
+        .await;
+    reply
+        .and_then(|reply| reply.body().deserialize::<OwnedVariant>())
+        .ok()
+        .and_then(|v| String::try_from(v).ok())
+        .is_some_and(|p| p == POWER_SAVER)
 }
 
-/// The profile in a PropertiesChanged body: Some(power saver or not) when it
-/// changed, None when the signal is about something else.
+/// What a PropertiesChanged body says about the profile.
+#[derive(Debug, PartialEq)]
+enum Change {
+    /// The signal is about something else.
+    Unrelated,
+    /// The profile, from the signal: power saver or not.
+    Now(bool),
+    /// The profile was invalidated: read it again.
+    Reread,
+}
+
 fn changed_profile(
     interface: &str,
-    changed: &HashMap<String, OwnedValue>,
+    changed: &HashMap<String, OwnedVariant>,
     invalidated: &[String],
-    read: impl FnOnce() -> bool,
-) -> Option<bool> {
+) -> Change {
     if interface != PPD {
-        return None;
+        return Change::Unrelated;
     }
     if let Some(v) = changed.get(PROFILE) {
-        return Some(
+        return Change::Now(
             v.try_clone()
                 .ok()
                 .and_then(|v| String::try_from(v).ok())
                 .is_some_and(|p| p == POWER_SAVER),
         );
     }
-    invalidated.iter().any(|p| p == PROFILE).then(read)
+    if invalidated.iter().any(|p| p == PROFILE) {
+        Change::Reread
+    } else {
+        Change::Unrelated
+    }
 }
 
 fn watch_profile(jobs: &mpsc::Sender<Job>, status: &Arc<Status>) -> zbus::Result<()> {
-    let conn = zbus::blocking::Connection::system()?;
-    // The daemon starting, stopping or restarting. Subscribed before the
-    // first read, so a change between the two isn't missed.
-    let owner = zbus::blocking::MessageIterator::for_match_rule(
-        zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .sender("org.freedesktop.DBus")?
-            .interface("org.freedesktop.DBus")?
-            .member("NameOwnerChanged")?
-            .add_arg(PPD)?
-            .build(),
-        &conn,
-        Some(8),
-    )?;
-    let changes = zbus::blocking::MessageIterator::for_match_rule(
-        zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .sender(PPD)?
-            .path(PPD_PATH)?
-            .interface("org.freedesktop.DBus.Properties")?
-            .member("PropertiesChanged")?
-            .add_arg(PPD)?
-            .build(),
-        &conn,
-        Some(8),
-    )?;
-    set_power_saver(jobs, status, read_profile(&conn));
-    {
-        let (conn, jobs, status) = (conn.clone(), jobs.clone(), status.clone());
-        std::thread::spawn(move || {
-            for msg in owner.flatten() {
-                let Ok((_, _, new)) = msg.body().deserialize::<(String, String, String)>() else {
-                    continue;
-                };
-                // Gone: no daemon, no power saver. A new owner: read what it says.
-                let on = !new.is_empty() && read_profile(&conn);
-                set_power_saver(&jobs, &status, on);
-            }
-        });
-    }
-    for msg in changes.flatten() {
-        type Body = (String, HashMap<String, OwnedValue>, Vec<String>);
-        let Ok((interface, changed, invalidated)) = msg.body().deserialize::<Body>() else {
-            continue;
-        };
-        if let Some(on) =
-            changed_profile(&interface, &changed, &invalidated, || read_profile(&conn))
+    // A connection is only driven by the thread that blocks on it, so the
+    // daemon-owner thread opens its own.
+    zbus::block_on(async {
+        let conn = zbus::Connection::system().await?;
+        // The daemon starting, stopping or restarting. Subscribed before the
+        // first read, so a change between the two isn't missed.
+        let mut owner = zbus::MessageStream::for_match_rule(
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.DBus")
+                .interface("org.freedesktop.DBus")
+                .member("NameOwnerChanged")
+                .add_arg(PPD)
+                .build()?,
+            &conn,
+            NonZeroUsize::new(8),
+        )
+        .await?;
+        let mut changes = zbus::MessageStream::for_match_rule(
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender(PPD)
+                .path(PPD_PATH)
+                .interface("org.freedesktop.DBus.Properties")
+                .member("PropertiesChanged")
+                .add_arg(PPD)
+                .build()?,
+            &conn,
+            NonZeroUsize::new(8),
+        )
+        .await?;
+        set_power_saver(jobs, status, read_profile(&conn).await);
         {
+            let (jobs, status) = (jobs.clone(), status.clone());
+            std::thread::spawn(move || {
+                zbus::block_on(async move {
+                    let Ok(conn) = zbus::Connection::system().await else {
+                        return;
+                    };
+                    while let Some(msg) = owner.next().await {
+                        let Ok(msg) = msg else { continue };
+                        let Ok((_, _, new)) = msg.body().deserialize::<(String, String, String)>()
+                        else {
+                            continue;
+                        };
+                        // Gone: no daemon, no power saver. A new owner: read what it says.
+                        let on = !new.is_empty() && read_profile(&conn).await;
+                        set_power_saver(&jobs, &status, on);
+                    }
+                })
+            });
+        }
+        while let Some(msg) = changes.next().await {
+            type Body = (String, HashMap<String, OwnedVariant>, Vec<String>);
+            let Ok(msg) = msg else { continue };
+            let Ok((interface, changed, invalidated)) = msg.body().deserialize::<Body>() else {
+                continue;
+            };
+            let on = match changed_profile(&interface, &changed, &invalidated) {
+                Change::Unrelated => continue,
+                Change::Now(on) => on,
+                Change::Reread => read_profile(&conn).await,
+            };
             set_power_saver(jobs, status, on);
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
     #[test]
     fn what_holds_indexing() {
@@ -278,36 +310,35 @@ mod tests {
         let profile = |p: &str| {
             HashMap::from([(
                 PROFILE.to_owned(),
-                OwnedValue::try_from(Value::from(p)).unwrap(),
+                OwnedVariant::try_from(Variant::from(p)).unwrap(),
             )])
         };
-        let unread = || panic!("read when the value was in the signal");
         assert_eq!(
-            changed_profile(PPD, &profile("power-saver"), &[], unread),
-            Some(true)
+            changed_profile(PPD, &profile("power-saver"), &[]),
+            Change::Now(true)
         );
         assert_eq!(
-            changed_profile(PPD, &profile("balanced"), &[], unread),
-            Some(false)
+            changed_profile(PPD, &profile("balanced"), &[]),
+            Change::Now(false)
         );
         assert_eq!(
-            changed_profile(PPD, &profile("performance"), &[], unread),
-            Some(false)
+            changed_profile(PPD, &profile("performance"), &[]),
+            Change::Now(false)
         );
         // Another property, or another interface.
         let other = HashMap::from([(
             "PerformanceDegraded".to_owned(),
-            OwnedValue::try_from(Value::from("")).unwrap(),
+            OwnedVariant::try_from(Variant::from("")).unwrap(),
         )]);
-        assert_eq!(changed_profile(PPD, &other, &[], unread), None);
+        assert_eq!(changed_profile(PPD, &other, &[]), Change::Unrelated);
         assert_eq!(
-            changed_profile("org.example", &profile("power-saver"), &[], unread),
-            None
+            changed_profile("org.example", &profile("power-saver"), &[]),
+            Change::Unrelated
         );
         // Invalidated: read again.
         assert_eq!(
-            changed_profile(PPD, &HashMap::new(), &[PROFILE.to_owned()], || true),
-            Some(true)
+            changed_profile(PPD, &HashMap::new(), &[PROFILE.to_owned()]),
+            Change::Reread
         );
     }
 }

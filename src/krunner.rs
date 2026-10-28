@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use zbus::interface;
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::{OwnedVariant, Variant};
 
 use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
@@ -40,7 +40,7 @@ type Match = (
     String,
     i32,
     f64,
-    HashMap<String, OwnedValue>,
+    HashMap<String, OwnedVariant>,
 );
 
 /// One connection for the handlers that read the index; queries are short.
@@ -155,15 +155,15 @@ fn describe(h: &Hit) -> (String, String) {
     (name, description)
 }
 
-fn owned(v: Value<'_>) -> OwnedValue {
+fn owned(v: Variant<'_>) -> OwnedVariant {
     v.try_into().expect("string values have no fds")
 }
 
 fn to_match(h: Hit, floors: Floors) -> Match {
     let (name, subtext) = describe(&h);
     let mut props = HashMap::new();
-    props.insert("subtext".into(), owned(Value::from(subtext)));
-    props.insert("urls".into(), owned(Value::from(vec![file_url(&h.path)])));
+    props.insert("subtext".into(), owned(Variant::from(subtext)));
+    props.insert("urls".into(), owned(Variant::from(vec![file_url(&h.path)])));
     // A group per kind, named so each reads as ours (#73). Text read in an
     // image (#106) is scored as a document but listed with the images.
     let category = match h.kind {
@@ -173,12 +173,12 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
         Kind::Code => "vinoSearch Code",
     };
-    props.insert("category".into(), owned(Value::from(category)));
+    props.insert("category".into(), owned(Variant::from(category)));
     // For vinosearch menu, which opens the pick itself; KRunner ignores keys
     // it doesn't know.
     match at(&h) {
-        Some(At::Line(l)) => drop(props.insert("line".into(), owned(Value::from(l)))),
-        Some(At::Page(p)) => drop(props.insert("page".into(), owned(Value::from(p)))),
+        Some(At::Line(l)) => drop(props.insert("line".into(), owned(Variant::from(l)))),
+        Some(At::Page(p)) => drop(props.insert("page".into(), owned(Variant::from(p)))),
         None => {}
     }
     let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
@@ -384,7 +384,7 @@ impl Gnome {
     }
 
     #[zbus(name = "GetResultMetas")]
-    fn metas(&self, ids: Vec<String>) -> Vec<HashMap<String, OwnedValue>> {
+    fn metas(&self, ids: Vec<String>) -> Vec<HashMap<String, OwnedVariant>> {
         let last = self.last.lock().unwrap();
         ids.into_iter()
             .map(|id| {
@@ -403,13 +403,13 @@ impl Gnome {
                     ),
                 };
                 let mut meta = HashMap::new();
-                meta.insert("name".into(), owned(Value::from(name)));
-                meta.insert("description".into(), owned(Value::from(description)));
+                meta.insert("name".into(), owned(Variant::from(name)));
+                meta.insert("description".into(), owned(Variant::from(description)));
                 // A serialized GThemedIcon, which falls back to the generic name.
                 let (specific, generic) = crate::icons::for_path(Path::new(&id), kind);
                 let gicon = format!(". GThemedIcon {specific} {generic}");
-                meta.insert("gicon".into(), owned(Value::from(gicon)));
-                meta.insert("id".into(), owned(Value::from(id)));
+                meta.insert("gicon".into(), owned(Variant::from(gicon)));
+                meta.insert("id".into(), owned(Variant::from(id)));
                 meta
             })
             .collect()
@@ -498,7 +498,7 @@ impl Control {
 impl Control {
     /// State, storage and progress; keys in vinosearch_shared::dbus::status,
     /// described in docs/dbus.md.
-    fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+    fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedVariant>> {
         let db = self.db.lock().map_err(failed)?;
         let (files, chunks) = index::counts(&db).map_err(failed)?;
         let roots: Vec<String> = index::roots(&db)
@@ -509,31 +509,31 @@ impl Control {
         let mut out = HashMap::new();
         out.insert(
             key::MODEL_LOADED.into(),
-            owned(Value::from(self.status.loaded.load(Ordering::Relaxed))),
+            owned(Variant::from(self.status.loaded.load(Ordering::Relaxed))),
         );
         out.insert(
             key::INDEXING.into(),
-            owned(Value::from(
+            owned(Variant::from(
                 self.status.indexing.load(Ordering::Relaxed)
                     || self.status.queued_reindex.load(Ordering::Relaxed) > 0,
             )),
         );
         out.insert(
             key::PAUSED.into(),
-            owned(Value::from(self.status.paused.load(Ordering::Relaxed))),
+            owned(Variant::from(self.status.paused.load(Ordering::Relaxed))),
         );
         out.insert(
             key::POWER_HOLD.into(),
-            owned(Value::from(
+            owned(Variant::from(
                 self.status.power.hold().map_or("", crate::power::Hold::key),
             )),
         );
         out.insert(
             key::DEVICE.into(),
-            owned(Value::from(self.status.device.lock().unwrap().clone())),
+            owned(Variant::from(self.status.device.lock().unwrap().clone())),
         );
-        out.insert(key::FILES.into(), owned(Value::from(files)));
-        out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
+        out.insert(key::FILES.into(), owned(Variant::from(files)));
+        out.insert(key::CHUNKS.into(), owned(Variant::from(chunks)));
         let [text, documents, images, code] = index::counts_by_kind(&db).map_err(failed)?;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
@@ -544,30 +544,30 @@ impl Control {
             (key::CODE_FILES, code.0),
             (key::CODE_CHUNKS, code.1),
         ] {
-            out.insert(k.into(), owned(Value::from(n)));
+            out.insert(k.into(), owned(Variant::from(n)));
         }
-        out.insert(key::ROOTS.into(), owned(Value::from(roots)));
+        out.insert(key::ROOTS.into(), owned(Variant::from(roots)));
         let st = &self.status;
         let u64_of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         out.insert(
             key::INDEXED_FILES.into(),
-            owned(Value::from(u64_of(&st.indexed_files))),
+            owned(Variant::from(u64_of(&st.indexed_files))),
         );
         out.insert(
             key::FETCHING.into(),
-            owned(Value::from(st.fetching.load(Ordering::Relaxed))),
+            owned(Variant::from(st.fetching.load(Ordering::Relaxed))),
         );
         out.insert(
             key::FETCH_DONE.into(),
-            owned(Value::from(u64_of(&st.fetch_done))),
+            owned(Variant::from(u64_of(&st.fetch_done))),
         );
         out.insert(
             key::FETCH_TOTAL.into(),
-            owned(Value::from(u64_of(&st.fetch_total))),
+            owned(Variant::from(u64_of(&st.fetch_total))),
         );
         out.insert(
             key::FETCH_ERROR.into(),
-            owned(Value::from(st.fetch_error.lock().unwrap().clone())),
+            owned(Variant::from(st.fetch_error.lock().unwrap().clone())),
         );
         let model_dir = model::default_dir().map_err(failed)?;
         let vision_dir = model::vision_dir().map_err(failed)?;
@@ -575,16 +575,16 @@ impl Control {
         // The vision encoder and OCR count while images are on.
         let present = model::present(&model_dir)
             && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir, &ocr_dir));
-        out.insert(key::MODEL_PRESENT.into(), owned(Value::from(present)));
+        out.insert(key::MODEL_PRESENT.into(), owned(Variant::from(present)));
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
             .iter()
             .map(|ext| disk_bytes(Path::new(&format!("{}{ext}", db_path.display()))))
             .sum();
-        out.insert(key::INDEX_BYTES.into(), owned(Value::from(index_bytes)));
+        out.insert(key::INDEX_BYTES.into(), owned(Variant::from(index_bytes)));
         out.insert(
             key::MODEL_BYTES.into(),
-            owned(Value::from(
+            owned(Variant::from(
                 disk_bytes(&model_dir) + disk_bytes(&vision_dir),
             )),
         );
@@ -592,11 +592,11 @@ impl Control {
             (key::LAST_CHECKED, &st.last_checked),
             (key::LAST_INDEXED, &st.last_indexed),
         ] {
-            out.insert(k.into(), owned(Value::from(u64_of(at))));
+            out.insert(k.into(), owned(Variant::from(u64_of(at))));
         }
         out.insert(
             key::INDEXING_REST.into(),
-            owned(Value::from(st.indexing_rest.load(Ordering::Relaxed))),
+            owned(Variant::from(st.indexing_rest.load(Ordering::Relaxed))),
         );
         let partial: Vec<(String, String, u64, u64)> = index::partial(&db, key::PARTIAL_MAX)
             .map_err(failed)?
@@ -606,10 +606,10 @@ impl Control {
                 (path, unit, done as u64, total as u64)
             })
             .collect();
-        out.insert(key::PARTIAL.into(), owned(Value::from(partial)));
+        out.insert(key::PARTIAL.into(), owned(Variant::from(partial)));
         out.insert(
             key::MODEL_CHANGED.into(),
-            owned(Value::from(st.model_changed.lock().unwrap().clone())),
+            owned(Variant::from(st.model_changed.lock().unwrap().clone())),
         );
         // Counted from the index: with a decoder installed, they are retried
         // at the next start and the count would mislead until then.
@@ -617,21 +617,24 @@ impl Control {
             None => index::undecodable(&db).map_err(failed)?,
             Some(_) => 0,
         };
-        out.insert(key::NO_DECODER.into(), owned(Value::from(no_decoder)));
+        out.insert(key::NO_DECODER.into(), owned(Variant::from(no_decoder)));
         let cache = crate::cache_dir().map_err(failed)?;
         out.insert(
             key::CACHE_BYTES.into(),
-            owned(Value::from(disk_bytes(&cache))),
+            owned(Variant::from(disk_bytes(&cache))),
         );
         let enc = st.encryption.lock().unwrap().clone();
-        out.insert(key::ENCRYPTED.into(), owned(Value::from(enc.encrypted)));
-        out.insert(key::SEAL.into(), owned(Value::from(enc.seal)));
+        out.insert(key::ENCRYPTED.into(), owned(Variant::from(enc.encrypted)));
+        out.insert(key::SEAL.into(), owned(Variant::from(enc.seal)));
         out.insert(
             key::TPM.into(),
-            owned(Value::from(st.tpm.load(Ordering::Relaxed))),
+            owned(Variant::from(st.tpm.load(Ordering::Relaxed))),
         );
-        out.insert(key::ENCRYPTION_ERROR.into(), owned(Value::from(enc.error)));
-        out.insert(key::SEAL_BROKEN.into(), owned(Value::from(enc.broken)));
+        out.insert(
+            key::ENCRYPTION_ERROR.into(),
+            owned(Variant::from(enc.error)),
+        );
+        out.insert(key::SEAL_BROKEN.into(), owned(Variant::from(enc.broken)));
         Ok(out)
     }
 
@@ -888,36 +891,44 @@ pub fn serve(opts: Options) -> Result<()> {
         config: opts.config.clone(),
     };
     let config = opts.config.clone();
-    let worker = std::thread::spawn(move || worker::run(rx, opts));
-    let _conn = zbus::blocking::connection::Builder::session()?
-        .name(SERVICE)?
-        .serve_at(
-            OBJECT,
-            Runner {
-                jobs: Mutex::new(tx.clone()),
-                db: db.clone(),
-                config: config.clone(),
-                places: Mutex::default(),
-                query: Mutex::default(),
-            },
-        )?
-        .serve_at(
-            GNOME,
-            Gnome {
-                jobs: Mutex::new(tx),
-                db,
-                config,
-                last: Mutex::default(),
-            },
-        )?
-        .serve_at(CONTROL, control)?
-        .build()
-        .context("registering on the session bus")?;
-    eprintln!("{SERVICE} on {OBJECT}");
-    // The worker only returns on a startup error or when the channel closes.
-    worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("worker panicked"))?
+    // The connection is driven by the thread that blocks on it, so that is
+    // this one; the worker reports back through a channel the future awaits.
+    let (done, finished) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(worker::run(rx, opts));
+    });
+    zbus::block_on(async {
+        let _conn = zbus::connection::Builder::session()
+            .name(SERVICE)
+            .serve_at(
+                OBJECT,
+                Runner {
+                    jobs: Mutex::new(tx.clone()),
+                    db: db.clone(),
+                    config: config.clone(),
+                    places: Mutex::default(),
+                    query: Mutex::default(),
+                },
+            )
+            .serve_at(
+                GNOME,
+                Gnome {
+                    jobs: Mutex::new(tx),
+                    db,
+                    config,
+                    last: Mutex::default(),
+                },
+            )
+            .serve_at(CONTROL, control)
+            .build()
+            .await
+            .context("registering on the session bus")?;
+        eprintln!("{SERVICE} on {OBJECT}");
+        // The worker only returns on a startup error or when the channel closes.
+        finished
+            .await
+            .map_err(|_| anyhow::anyhow!("worker panicked"))?
+    })
 }
 
 /// A place vinoSearch's results show (#45). Each has files of its own, written
@@ -1190,9 +1201,11 @@ fn systemctl(args: &[&str]) -> bool {
 /// Whether something already owns the runner's bus name.
 fn runner_running() -> bool {
     let owned = || -> Result<bool> {
-        let conn = zbus::blocking::Connection::session()?;
-        let bus = zbus::blocking::fdo::DBusProxy::new(&conn)?;
-        Ok(bus.name_has_owner(SERVICE.try_into()?)?)
+        zbus::block_on(async {
+            let conn = zbus::Connection::session().await?;
+            let bus = zbus::fdo::DBusProxy::new(&conn).await?;
+            Ok::<bool, anyhow::Error>(bus.name_has_owner(SERVICE.try_into()?).await?)
+        })
     };
     owned().unwrap_or(false)
 }

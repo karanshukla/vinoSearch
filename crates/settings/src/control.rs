@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use vinosearch_shared::dbus::{self, status};
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::{OwnedVariant, Variant};
 
 const POLL: Duration = Duration::from_secs(1);
 
@@ -75,41 +75,41 @@ pub struct Partial {
 }
 
 impl Status {
-    fn parse(map: &HashMap<String, OwnedValue>) -> Self {
+    fn parse(map: &HashMap<String, OwnedVariant>) -> Self {
         let get = |key: &str| map.get(key).map(|v| &**v);
-        let flag = |key| matches!(get(key), Some(Value::Bool(true)));
+        let flag = |key| matches!(get(key), Some(Variant::Bool(true)));
         let unsigned = |key| match get(key) {
-            Some(Value::U64(n)) => *n,
+            Some(Variant::U64(n)) => *n,
             _ => 0,
         };
         let signed = |key| match get(key) {
-            Some(Value::I64(n)) => *n,
+            Some(Variant::I64(n)) => *n,
             _ => 0,
         };
         let text = |key| match get(key) {
-            Some(Value::Str(s)) => s.to_string(),
+            Some(Variant::Str(s)) => s.to_string(),
             _ => String::new(),
         };
         let roots = match get(status::ROOTS) {
-            Some(Value::Array(a)) => a
+            Some(Variant::Array(a)) => a
                 .iter()
                 .filter_map(|v| match v {
-                    Value::Str(s) => Some(s.to_string()),
+                    Variant::Str(s) => Some(s.to_string()),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
         };
         let partial = match get(status::PARTIAL) {
-            Some(Value::Array(a)) => a
+            Some(Variant::Array(a)) => a
                 .iter()
                 .filter_map(|v| match v {
-                    Value::Structure(s) => match s.fields() {
+                    Variant::Structure(s) => match s.fields() {
                         [
-                            Value::Str(path),
-                            Value::Str(unit),
-                            Value::U64(done),
-                            Value::U64(total),
+                            Variant::Str(path),
+                            Variant::Str(unit),
+                            Variant::U64(done),
+                            Variant::U64(total),
                         ] => Some(Partial {
                             path: path.to_string(),
                             unit: unit.to_string(),
@@ -203,7 +203,7 @@ impl Link {
         let out = Arc::clone(&shared);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let mut conn: Option<zbus::blocking::Connection> = None;
+            let mut conn: Option<zbus::Connection> = None;
             loop {
                 let request = match rx.recv_timeout(POLL) {
                     Ok(r) => Some(r),
@@ -212,8 +212,7 @@ impl Link {
                 };
                 match request {
                     Some(Request::LargestFolders(limit)) => {
-                        let answer = proxy(&mut conn)
-                            .and_then(|p| p.call("LargestFolders", &(limit,)))
+                        let answer = invoke(&mut conn, "LargestFolders", &(limit,))
                             .map_err(|e| explain(&mut conn, e));
                         let mut shared = out.lock().unwrap();
                         match answer {
@@ -256,49 +255,61 @@ impl Link {
     }
 }
 
-fn proxy(
-    conn: &mut Option<zbus::blocking::Connection>,
-) -> zbus::Result<zbus::blocking::Proxy<'static>> {
-    let c = match conn {
-        Some(c) => c.clone(),
-        None => conn.insert(zbus::blocking::Connection::session()?).clone(),
-    };
-    zbus::blocking::Proxy::new_owned(
-        c,
-        dbus::SERVICE.to_owned(),
-        dbus::CONTROL_PATH.to_owned(),
-        dbus::CONTROL_INTERFACE.to_owned(),
-    )
+/// Calls `method` on the runner, connecting first if there is no connection.
+/// The connection is driven by this thread while it blocks here.
+fn invoke<B, R>(
+    conn: &mut Option<zbus::Connection>,
+    method: &'static str,
+    body: &B,
+) -> zbus::Result<R>
+where
+    B: serde::ser::Serialize + zbus::DynamicType,
+    R: for<'d> zbus::wire::DynamicDeserialize<'d>,
+{
+    zbus::block_on(async {
+        let c = match conn {
+            Some(c) => c.clone(),
+            None => conn.insert(zbus::Connection::session().await?).clone(),
+        };
+        zbus::Proxy::new_owned(
+            c,
+            dbus::SERVICE.to_owned(),
+            dbus::CONTROL_PATH.to_owned(),
+            dbus::CONTROL_INTERFACE.to_owned(),
+        )
+        .await?
+        .call(method, body)
+        .await
+    })
 }
 
-fn status_of(conn: &mut Option<zbus::blocking::Connection>) -> Result<Status, String> {
-    let map: HashMap<String, OwnedValue> = proxy(conn)
-        .and_then(|p| p.call("Status", &()))
-        .map_err(|e| explain(conn, e))?;
+fn status_of(conn: &mut Option<zbus::Connection>) -> Result<Status, String> {
+    let map: HashMap<String, OwnedVariant> =
+        invoke(conn, "Status", &()).map_err(|e| explain(conn, e))?;
     Ok(Status::parse(&map))
 }
 
-fn call(conn: &mut Option<zbus::blocking::Connection>, request: &Request) -> Result<(), String> {
-    let result = proxy(conn).and_then(|p| match request {
-        Request::Reindex(path) => p.call::<_, _, ()>("Reindex", &(path,)),
-        Request::Forget(path) => p.call("Forget", &(path,)),
-        Request::Unload => p.call("Unload", &()),
-        Request::FetchModel => p.call("FetchModel", &()),
-        Request::DeleteModel => p.call("DeleteModel", &()),
-        Request::ClearCache => p.call("ClearCache", &()),
-        Request::CheckNow => p.call("CheckNow", &()),
-        Request::PauseIndexing => p.call("PauseIndexing", &()),
-        Request::ResumeIndexing => p.call("ResumeIndexing", &()),
-        Request::ApplyEncryption => p.call("ApplyEncryption", &()),
-        Request::Rekey => p.call("Rekey", &()),
+fn call(conn: &mut Option<zbus::Connection>, request: &Request) -> Result<(), String> {
+    let result = match request {
+        Request::Reindex(path) => invoke::<_, ()>(conn, "Reindex", &(path,)),
+        Request::Forget(path) => invoke(conn, "Forget", &(path,)),
+        Request::Unload => invoke(conn, "Unload", &()),
+        Request::FetchModel => invoke(conn, "FetchModel", &()),
+        Request::DeleteModel => invoke(conn, "DeleteModel", &()),
+        Request::ClearCache => invoke(conn, "ClearCache", &()),
+        Request::CheckNow => invoke(conn, "CheckNow", &()),
+        Request::PauseIndexing => invoke(conn, "PauseIndexing", &()),
+        Request::ResumeIndexing => invoke(conn, "ResumeIndexing", &()),
+        Request::ApplyEncryption => invoke(conn, "ApplyEncryption", &()),
+        Request::Rekey => invoke(conn, "Rekey", &()),
         Request::LargestFolders(_) => unreachable!("answered in the loop"),
-    });
+    };
     result.map_err(|e| explain(conn, e))
 }
 
 /// The runner's own message for a refusal; otherwise what went wrong on the
 /// bus, after which the next call reconnects.
-fn explain(conn: &mut Option<zbus::blocking::Connection>, e: zbus::Error) -> String {
+fn explain(conn: &mut Option<zbus::Connection>, e: zbus::Error) -> String {
     match e {
         zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("ServiceUnknown") => {
             "The search service isn't installed. Turn it on under Integration.".to_owned()
@@ -314,22 +325,22 @@ fn explain(conn: &mut Option<zbus::blocking::Connection>, e: zbus::Error) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::Array;
+    use zbus::Array;
 
     #[test]
     fn status_reads_every_key_and_tolerates_missing_ones() {
         let mut map = HashMap::new();
-        let mut put = |k: &str, v: Value<'static>| {
-            map.insert(k.to_owned(), OwnedValue::try_from(v).unwrap());
+        let mut put = |k: &str, v: Variant<'static>| {
+            map.insert(k.to_owned(), OwnedVariant::try_from(v).unwrap());
         };
-        put(status::INDEXING, Value::Bool(true));
-        put(status::FILES, Value::I64(4395));
-        put(status::IMAGE_FILES, Value::I64(12));
-        put(status::INDEXED_FILES, Value::U64(1709));
-        put(status::DEVICE, Value::from("NPU"));
+        put(status::INDEXING, Variant::Bool(true));
+        put(status::FILES, Variant::I64(4395));
+        put(status::IMAGE_FILES, Variant::I64(12));
+        put(status::INDEXED_FILES, Variant::U64(1709));
+        put(status::DEVICE, Variant::from("NPU"));
         put(
             status::ROOTS,
-            Value::Array(Array::from(vec!["/home/u", "/home/u/Development"])),
+            Variant::Array(Array::from(vec!["/home/u", "/home/u/Development"])),
         );
         let s = Status::parse(&map);
         assert!(s.indexing);
@@ -349,14 +360,17 @@ mod tests {
     #[test]
     fn status_reads_encryption() {
         let mut map = HashMap::new();
-        map.insert(status::ENCRYPTED.to_owned(), OwnedValue::from(true));
-        map.insert(status::TPM.to_owned(), OwnedValue::from(true));
+        map.insert(status::ENCRYPTED.to_owned(), OwnedVariant::from(true));
+        map.insert(status::TPM.to_owned(), OwnedVariant::from(true));
         for (k, v) in [
             (status::SEAL, "tpm"),
             (status::ENCRYPTION_ERROR, ""),
             (status::SEAL_BROKEN, "the TPM was cleared"),
         ] {
-            map.insert(k.to_owned(), OwnedValue::try_from(Value::from(v)).unwrap());
+            map.insert(
+                k.to_owned(),
+                OwnedVariant::try_from(Variant::from(v)).unwrap(),
+            );
         }
         let s = Status::parse(&map);
         assert!(s.encrypted && s.tpm);
@@ -373,9 +387,9 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             status::PARTIAL.to_owned(),
-            OwnedValue::try_from(Value::from(partial)).unwrap(),
+            OwnedVariant::try_from(Variant::from(partial)).unwrap(),
         );
-        map.insert(status::INDEXING_REST.to_owned(), OwnedValue::from(true));
+        map.insert(status::INDEXING_REST.to_owned(), OwnedVariant::from(true));
         let s = Status::parse(&map);
         assert!(s.indexing_rest);
         assert_eq!(
