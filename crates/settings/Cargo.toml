@@ -13,7 +13,7 @@ publish = false
 vinosearch-shared = { path = "../shared" }
 anyhow = "1.0"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
-vino-ui = { path = "../vino-ui" }
+vino-ui = { git = "https://github.com/karanshukla/vinoUserInterface", tag = "v0.1.0" }
 serde_json = "1.0"
 zbus = "6"
 serde = "1.0"
