@@ -33,5 +33,4 @@ unknown-git = "deny"
 # intel/openvino-rs#202 is released.
 allow-git = [
     "https://github.com/karanshukla/openvino-rs",
-    "https://github.com/karanshukla/vinoUserInterface",
 ]
