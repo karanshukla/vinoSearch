@@ -1,4 +1,5 @@
 mod code;
+mod dupes;
 mod embed;
 mod encryption;
 mod estimate;
@@ -83,7 +84,8 @@ enum Command {
         uninstall: bool,
     },
     /// Turn one search place on (or off with --off): kde is KRunner and the Plasma launcher,
-    /// gnome is GNOME Shell's overview search, from the next login.
+    /// gnome is GNOME Shell's overview search, from the next login, menu is the search window
+    /// in the app menu.
     Integrate {
         place: krunner::Place,
         /// Remove this place's files instead of writing them. The service stays.
@@ -274,8 +276,8 @@ fn settings(cli: &Cli) -> Result<Settings> {
     })
 }
 
-fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
-    worker::Options {
+fn worker_options(cli: &Cli, s: Settings) -> Result<worker::Options> {
+    Ok(worker::Options {
         openvino_dir: cli.openvino_dir.clone(),
         status: std::sync::Arc::new(worker::Status::new(&s.device)),
         device: s.device,
@@ -285,7 +287,8 @@ fn worker_options(cli: &Cli, s: Settings) -> worker::Options {
         config: s.path,
         file: s.file,
         pinned: s.pinned,
-    }
+        db: index::default_db()?,
+    })
 }
 
 pub(crate) fn snippet(text: &str) -> String {
@@ -551,7 +554,7 @@ fn run(cli: Cli) -> Result<bool> {
             } else if uninstall {
                 krunner::uninstall()?;
             } else {
-                krunner::serve(worker_options(&cli, s))?;
+                krunner::serve(worker_options(&cli, s)?)?;
             }
             Ok(true)
         }
@@ -565,7 +568,7 @@ fn run(cli: Cli) -> Result<bool> {
         }
         Command::Watch => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let opts = worker_options(&cli, s);
+            let opts = worker_options(&cli, s)?;
             worker::prepare(&opts.status, &opts.file)?;
             power::spawn(tx.clone(), opts.status.clone());
             let _watcher = watch::spawn(

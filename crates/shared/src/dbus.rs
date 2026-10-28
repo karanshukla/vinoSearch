@@ -21,6 +21,9 @@ pub const KRUNNER_PLUGIN: &str = "krunner/dbusplugins/vinosearch.desktop";
 /// is the GNOME search place being on.
 pub const GNOME_PROVIDER: &str =
     "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini";
+/// The app menu entry for the search window, under the XDG data directory.
+/// Its presence is the menu place being on; off by default.
+pub const SEARCH_ENTRY: &str = "applications/dev.vinosearch.search.desktop";
 /// The D-Bus activation file, under the XDG data directory: the service is
 /// installed while it exists.
 pub const DBUS_SERVICE_FILE: &str = "dbus-1/services/dev.vinosearch.Runner.service";
@@ -46,7 +49,7 @@ pub mod status {
     pub const CODE_FILES: &str = "code_files";
     pub const CODE_CHUNKS: &str = "code_chunks";
     pub const ROOTS: &str = "roots";
-    /// Files embedded so far by the current indexing job.
+    /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";
     /// The indexing job is the rest of a long document (#108).
     pub const INDEXING_REST: &str = "indexing_rest";

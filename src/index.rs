@@ -1431,6 +1431,15 @@ pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
 /// An error from it stops indexing; every file finished so far is kept.
 pub type AfterFile<'a, E = Embedder> = dyn FnMut(&Stats, &Connection, &mut E) -> Result<()> + 'a;
 
+/// Remember `root` (canonical, from `resolve_root`) as a root to watch.
+pub fn add_root(conn: &Connection, root: &Path) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
+        [root.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
 /// Index everything wanted under `root` and remember it as a root to watch.
 /// Unchanged files (same mtime and size) are skipped; files under `root`
 /// that are gone are removed.
@@ -1444,10 +1453,7 @@ pub fn index<E: Embed>(
 ) -> Result<Stats> {
     let root = resolve_root(root, ex)?;
     let purged = purge(conn, ex)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
-        [root.to_string_lossy()],
-    )?;
+    add_root(conn, &root)?;
     let mut stats = Stats::default();
     let mut seen = HashSet::new();
     for entry in walk(&root, ex) {
@@ -1716,6 +1722,10 @@ pub struct Hit {
     pub text: String,
     /// Other indexed files with the same content.
     pub copies: Vec<String>,
+    /// An image's own vector, for telling near-duplicates apart (#78).
+    pub vector: Option<Vec<f32>>,
+    /// Near-duplicate images folded into this one (`dupes::collapse`).
+    pub similar: Vec<String>,
 }
 
 /// Every chunk's embedding, held as int8 with a per-vector scale: a quarter
@@ -2108,7 +2118,8 @@ pub fn search(
     scored.sort_by(by_score);
     scored.truncate(k);
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.path, f.sha256, c.start_line, c.text
+        "SELECT f.id, f.path, f.sha256, c.start_line, c.text,
+                CASE WHEN c.kind = ?2 THEN c.embedding END
          FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?1",
     )?;
     let mut copies =
@@ -2116,15 +2127,18 @@ pub fn search(
     let mut hits = Vec::with_capacity(scored.len());
     for (score, id) in scored {
         // Gone since the vectors were loaded.
-        let Ok((file, path, hash, line, text)) = stmt.query_row([id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get(1)?,
-                r.get::<_, Option<Vec<u8>>>(2)?,
-                r.get(3)?,
-                r.get(4)?,
-            ))
-        }) else {
+        let Ok((file, path, hash, line, text, vector)) =
+            stmt.query_row(params![id, Kind::Image as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get::<_, Option<Vec<u8>>>(5)?,
+                ))
+            })
+        else {
             continue;
         };
         let copies = match hash {
@@ -2140,6 +2154,8 @@ pub fn search(
             line,
             text,
             copies,
+            vector: vector.as_deref().and_then(from_blob),
+            similar: Vec::new(),
         });
     }
     Ok(hits)

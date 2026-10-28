@@ -1,0 +1,24 @@
+title: vinoSearch
+description: Search your files by what's in them, from KRunner or GNOME Shell, on your Intel NPU
+url: https://vinosearch.vinopilot.ca
+theme: just-the-docs
+search_enabled: true
+heading_anchors: true
+color_scheme: dark
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: false
+aux_links:
+  GitHub: https://github.com/karanshukla/vinoSearch
+footer_content: 'Released under the <a href="https://github.com/karanshukla/vinoSearch/blob/main/LICENSE">MIT licence</a>.'
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

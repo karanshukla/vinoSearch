@@ -87,7 +87,7 @@ Results need 3 or more characters. Enter opens the file: a text file at the matc
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images, documents and code on, set how close a result has to be and which editor opens text results, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images, documents and code on, set how close a result has to be and pick the editor that opens text results from your installed apps, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
 
 Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
 
@@ -95,7 +95,7 @@ Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather 
 exclude = ["~/Downloads"]   # never indexed or watched, even under an indexed root
 device = "NPU"
 idle_unload_minutes = 5     # free the model after this long idle; 0 keeps it loaded
-editor = "code"             # opens text results at their line [default: the default app]; or "foot -e nvim +{line} {file}"
+editor = "code"             # opens text results at their line [default: the default app]; or "org.kde.kate.desktop", or "foot -e nvim +{line} {file}"
 
 [formats.text]
 min_score = 0.65            # lower it for more, looser results
@@ -152,6 +152,7 @@ It can be encrypted at rest ([#4](https://github.com/karanshukla/vinoSearch/issu
 
 ## More
 
+- [vinosearch.vinopilot.ca](https://vinosearch.vinopilot.ca): these docs as a site.
 - [How it works](docs/how-it-works.md): indexing, watching, the runner, the settings window, the runtime and NPU gotchas.
 - [D-Bus interface](docs/dbus.md): KRunner, GNOME Shell and the control interface the settings app uses.
 

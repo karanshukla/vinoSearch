@@ -37,6 +37,10 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     link.shared.lock().unwrap().largest = Some(vec![("/srv/notes/build".into(), 200)]);
     let mut w = SettingsWindow::with(Some(page), link, dir.join("config.toml"));
     w.estimator = estimated;
+    w.editors = Some(vec![App {
+        id: "org.kde.kate.desktop".into(),
+        name: "Kate".into(),
+    }]);
     w.integration = Arc::new(Mutex::new(integration::State::default()));
     w.doctor = Arc::new(Mutex::new(doctor::State {
         running: false,
@@ -367,19 +371,58 @@ fn search_page_controls_are_named_by_their_row_labels() {
 }
 
 #[test]
-fn the_editor_is_saved_when_the_field_is_left() {
+fn an_editor_is_picked_from_the_installed_apps() {
+    let (w, _requests) = window(Page::Search, "editor-app");
+    let mut h = harness(w, WIDE, Theme::Light);
+    let editor = h.get_by_role_and_label(Role::ComboBox, "Editor:");
+    assert_eq!(
+        editor.accesskit_node().value().as_deref(),
+        Some("Default app")
+    );
+    editor.click();
+    settle(&mut h);
+    h.get_by_label("Kate").click();
+    settle(&mut h);
+    assert_eq!(
+        h.state().config.editor.as_deref(),
+        Some("org.kde.kate.desktop")
+    );
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(
+        saved.contains("editor = \"org.kde.kate.desktop\""),
+        "{saved}"
+    );
+    assert!(
+        h.query_by_role_and_label(Role::TextInput, "Command:")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_custom_editor_command_is_saved_when_the_field_is_left() {
     let (w, _requests) = window(Page::Search, "editor");
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::TextInput, "Editor:").focus();
+    h.get_by_role_and_label(Role::ComboBox, "Editor:").click();
     settle(&mut h);
-    h.get_by_role_and_label(Role::TextInput, "Editor:")
-        .type_text("kate");
+    h.get_by_label("Custom command…").click();
+    settle(&mut h);
+    assert_eq!(h.state().config.editor, None);
+    h.get_by_role_and_label(Role::TextInput, "Command:").focus();
+    settle(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Command:")
+        .type_text("foot -e nvim +{line} {file}");
     settle(&mut h);
     h.key_press(Key::Enter);
     settle(&mut h);
-    assert_eq!(h.state().config.editor.as_deref(), Some("kate"));
-    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
-    assert!(saved.contains("editor = \"kate\""), "{saved}");
+    assert_eq!(
+        h.state().config.editor.as_deref(),
+        Some("foot -e nvim +{line} {file}")
+    );
+    let value = h
+        .get_by_role_and_label(Role::ComboBox, "Editor:")
+        .accesskit_node()
+        .value();
+    assert_eq!(value.as_deref(), Some("Custom command…"));
 }
 
 #[test]
@@ -513,8 +556,8 @@ fn the_index_page_lists_documents_indexed_in_part() {
 fn integration_switches_say_their_state_in_words() {
     let (w, _requests) = window(Page::Integration, "integration");
     let h = harness(w, WIDE, Theme::Dark);
-    assert_eq!(h.get_all_by_label("Off").count(), 3);
-    for place in ["KRunner", "GNOME Shell", "Search service"] {
+    assert_eq!(h.get_all_by_label("Off").count(), 4);
+    for place in ["KRunner", "GNOME Shell", "App menu", "Search service"] {
         h.get_by_role_and_label(Role::Button, &format!("Turn on {place}"));
     }
     h.get_by_label("vinosearch doctor");

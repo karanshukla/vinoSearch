@@ -115,10 +115,11 @@ pub struct Config {
     /// plugged in (#109) [default: true].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_on_battery: Option<bool>,
-    /// What opens a text result at its line (#105): a known editor (`code`,
-    /// `kate`, `zed`, a JetBrains IDE...), or any command with `{file}` and
-    /// `{line}` in it, split on spaces and run without a shell
-    /// [default: the default app for the file's type].
+    /// What opens a text result at its line (#105): an app's desktop entry
+    /// id (`org.kde.kate.desktop`, as the settings app's picker saves it), a
+    /// known editor (`code`, `kate`, `zed`, a JetBrains IDE...), or any
+    /// command with `{file}` and `{line}` in it, split on spaces and run
+    /// without a shell [default: the default app for the file's type].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
     /// What kinds of file are indexed, and how close a result must be (#73).

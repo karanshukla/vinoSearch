@@ -12,7 +12,7 @@ use crate::index::{self, Hit, Kind};
 use crate::model;
 use crate::open::At;
 use crate::watch;
-use crate::worker::{self, Job, Options, Status};
+use crate::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
 use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
@@ -26,8 +26,8 @@ use zbus::{OwnedVariant, Variant};
 
 use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
-    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SERVICE, SETTINGS_APP_ID, recent, results,
-    status as key,
+    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SEARCH_ENTRY, SERVICE, SETTINGS_APP_ID, recent,
+    results, status as key,
 };
 /// Files of each kind shown.
 pub(crate) const RESULTS: usize = 5;
@@ -131,10 +131,20 @@ fn describe(h: &Hit) -> (String, String) {
         .parent()
         .map(|d| d.display().to_string())
         .unwrap_or_default();
-    let copies = match h.copies.len() {
-        0 => String::new(),
-        1 => "  (+1 copy)".to_owned(),
-        n => format!("  (+{n} copies)"),
+    let others: Vec<String> = [
+        match h.copies.len() {
+            0 => None,
+            1 => Some("+1 copy".to_owned()),
+            n => Some(format!("+{n} copies")),
+        },
+        (!h.similar.is_empty()).then(|| format!("+{} similar", h.similar.len())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let copies = match others.as_slice() {
+        [] => String::new(),
+        o => format!("  ({})", o.join(", ")),
     };
     let description = match h.kind {
         Kind::Text | Kind::Code => {
@@ -470,6 +480,12 @@ impl Control {
             .map_err(|_| failed("the worker has stopped"))
     }
 
+    /// For the worker's next step.
+    fn request(&self, r: Request) -> zbus::fdo::Result<()> {
+        self.status.pending.request(r);
+        self.send(Job::Wake)
+    }
+
     fn is_indexed(&self, path: &str) -> zbus::fdo::Result<()> {
         match self.db.lock().and_then(|c| index::is_indexed(&c, path)) {
             Ok(true) => Ok(()),
@@ -513,10 +529,7 @@ impl Control {
         );
         out.insert(
             key::INDEXING.into(),
-            owned(Variant::from(
-                self.status.indexing.load(Ordering::Relaxed)
-                    || self.status.queued_reindex.load(Ordering::Relaxed) > 0,
-            )),
+            owned(Variant::from(self.status.indexing())),
         );
         out.insert(
             key::PAUSED.into(),
@@ -641,16 +654,14 @@ impl Control {
     /// Index a directory and watch it from now on. Returns once queued.
     fn reindex(&self, path: String) -> zbus::fdo::Result<()> {
         let root = self.root(&path)?;
-        self.status.queued_reindex.fetch_add(1, Ordering::Relaxed);
-        self.send(Job::Reindex(root)).inspect_err(|_| {
-            self.status.queued_reindex.fetch_sub(1, Ordering::Relaxed);
-        })
+        self.status.work.root(root);
+        self.send(Job::Wake)
     }
 
     /// Stop indexing a root and drop what was indexed under it.
     fn forget(&self, path: String) -> zbus::fdo::Result<()> {
         let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-        self.send(Job::Forget(root))
+        self.request(Request::Forget(root))
     }
 
     /// The folders holding most of the index, biggest first, with their
@@ -755,7 +766,7 @@ impl Control {
 
     /// Free the model now.
     fn unload(&self) -> zbus::fdo::Result<()> {
-        self.send(Job::Unload)
+        self.request(Request::Unload)
     }
 
     /// Download the model (or whatever of it is missing or corrupt) in the
@@ -797,12 +808,12 @@ impl Control {
         if self.status.fetching.load(Ordering::SeqCst) {
             return Err(failed("a download is running"));
         }
-        self.send(Job::DeleteModel)
+        self.request(Request::DeleteModel)
     }
 
     /// Delete the compiled-model cache; the next model load recompiles (seconds).
     fn clear_cache(&self) -> zbus::fdo::Result<()> {
-        self.send(Job::ClearCache)
+        self.request(Request::ClearCache)
     }
 
     /// Encrypt or decrypt the index as the config file's `encryption` says,
@@ -813,7 +824,7 @@ impl Control {
         // The watcher too, or it would take the file it next reads for
         // unchanged and pass nothing on.
         self.status.reload_config.store(true, Ordering::Relaxed);
-        self.send(Job::Encryption(crate::encryption::Want::of(&file)))
+        self.request(Request::Encryption(crate::encryption::Want::of(&file)))
     }
 
     /// Encrypt the index again under a new key, sealed afresh. Fails while
@@ -822,7 +833,7 @@ impl Control {
         if !self.status.encryption.lock().unwrap().encrypted {
             return Err(failed("the index isn't encrypted"));
         }
-        self.send(Job::Rekey)
+        self.request(Request::Rekey)
     }
 }
 
@@ -846,7 +857,7 @@ const IMAGE_GAP: f32 = 0.06;
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then images, less images too far
 /// below the best of the others (IMAGE_GAP), then code (only ever on its
-/// own, for `code:`).
+/// own, for `code:`). Near-duplicate images are one result (#78).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 4] = Default::default();
@@ -860,9 +871,12 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
             Kind::Image => 2,
             Kind::Code => 3,
         }];
-        if group.len() < RESULTS {
-            group.push(h);
-        }
+        group.push(h);
+    }
+    // Before the cut, so a burst folded into one leaves room for others.
+    groups[2] = crate::dupes::collapse(std::mem::take(&mut groups[2]));
+    for group in &mut groups {
+        group.truncate(RESULTS);
     }
     let best = groups[..2]
         .iter()
@@ -941,15 +955,19 @@ pub enum Place {
     Kde,
     /// GNOME Shell's overview search, from the next login.
     Gnome,
+    /// The search window in the app menu, beside the settings window. Off
+    /// unless turned on: no desktop gets it at install.
+    Menu,
 }
 
 impl Place {
-    pub const ALL: [Place; 2] = [Place::Kde, Place::Gnome];
+    pub const ALL: [Place; 3] = [Place::Kde, Place::Gnome, Place::Menu];
 
     fn name(self) -> &'static str {
         match self {
             Place::Kde => "KRunner and the Plasma launcher",
             Place::Gnome => "GNOME Shell",
+            Place::Menu => "The search window in the app menu",
         }
     }
 }
@@ -962,7 +980,7 @@ impl Place {
 fn places_for(desktop: Option<&str>) -> Vec<Place> {
     let desktop = desktop.unwrap_or_default();
     if desktop.trim().is_empty() {
-        return Place::ALL.to_vec();
+        return vec![Place::Kde, Place::Gnome];
     }
     let names: Vec<String> = desktop.split(':').map(str::to_ascii_uppercase).collect();
     let has = |n: &str| names.iter().any(|d| d == n);
@@ -1027,6 +1045,32 @@ fn install_launcher() -> Result<PathBuf> {
         ),
     )?;
     Ok(launcher)
+}
+
+/// The search window's app menu entry. It needs vinosearch-settings beside
+/// us. No StartupWMClass: the window's app id is the settings entry's.
+fn install_search_entry() -> Result<()> {
+    let entry = data_home()?.join(SEARCH_ENTRY);
+    let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
+    if !settings.is_file() {
+        bail!("{}: not installed", settings.display());
+    }
+    let s = utf8(&settings)?;
+    if s.chars().any(char::is_control) {
+        bail!("{s:?}: cannot go in a desktop entry");
+    }
+    fs::create_dir_all(entry.parent().unwrap())?;
+    fs::write(&entry, search_entry(&desktop_quote(s)))?;
+    println!("wrote {}", entry.display());
+    Ok(())
+}
+
+fn search_entry(settings: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
+         Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
+         Icon={ICON}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n"
+    )
 }
 
 fn install_gnome() -> Result<()> {
@@ -1105,6 +1149,7 @@ pub fn install_place(place: Place) -> Result<()> {
     match place {
         Place::Kde => install_kde(),
         Place::Gnome => install_gnome(),
+        Place::Menu => install_search_entry(),
     }
 }
 
@@ -1117,6 +1162,7 @@ pub fn uninstall_place(place: Place) -> Result<()> {
             let g = gnome_files()?;
             vec![g.provider, g.environment]
         }
+        Place::Menu => vec![data_home()?.join(SEARCH_ENTRY)],
     };
     let mut removed = 0;
     for p in files {
@@ -1230,6 +1276,7 @@ pub fn install(
         match place {
             Place::Kde => install_kde()?,
             Place::Gnome => install_gnome()?,
+            Place::Menu => install_search_entry()?,
         }
     }
     Ok(())
@@ -1401,7 +1448,19 @@ mod tests {
             line: 1,
             text: String::new(),
             copies: Vec::new(),
+            vector: None,
+            similar: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_search_entry_opens_the_search_window() {
+        let entry = search_entry(&desktop_quote("/home/u/my bin/vinosearch-settings"));
+        assert!(
+            entry.contains("\nExec=\"/home/u/my bin/vinosearch-settings\" --search\n"),
+            "{entry}"
+        );
+        assert!(!entry.contains("StartupWMClass"), "{entry}");
     }
 
     #[test]
@@ -1503,6 +1562,29 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_takes_one_place_and_leaves_room_for_others() {
+        let photo = |path: &str, score: f32, axis: usize| {
+            let mut h = hit(Kind::Image, score, path);
+            let mut v = vec![0.0; 8];
+            v[axis] = 1.0;
+            h.vector = Some(v);
+            h
+        };
+        let mut hits: Vec<Hit> = (0..4)
+            .map(|i| photo(&format!("/p/burst{i}.jpg"), 0.80 - 0.01 * i as f32, 0))
+            .collect();
+        hits.extend((1..6).map(|i| photo(&format!("/p/other{i}.jpg"), 0.70, i)));
+        let got = per_file(hits, FLOORS);
+        assert_eq!(got.len(), RESULTS);
+        assert_eq!(got[0].similar.len(), 3);
+        assert!(
+            describe(&got[0]).1.ends_with("(+3 similar)"),
+            "{:?}",
+            describe(&got[0])
+        );
+    }
+
+    #[test]
     fn the_running_desktop_picks_the_places() {
         assert_eq!(places_for(Some("KDE")), [Place::Kde]);
         assert_eq!(places_for(Some("ubuntu:GNOME")), [Place::Gnome]);
@@ -1511,8 +1593,8 @@ mod tests {
         assert_eq!(places_for(Some("Hyprland")), []);
         assert_eq!(places_for(Some("COSMIC")), []);
         assert_eq!(places_for(Some("XFCE")), []);
-        assert_eq!(places_for(None), Place::ALL);
-        assert_eq!(places_for(Some("")), Place::ALL);
+        assert_eq!(places_for(None), [Place::Kde, Place::Gnome]);
+        assert_eq!(places_for(Some("")), [Place::Kde, Place::Gnome]);
     }
 
     #[test]
