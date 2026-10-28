@@ -10,12 +10,15 @@ use crate::index::{Hit, Kind};
 use image::{ImageDecoder, ImageReader};
 use std::path::Path;
 
-/// Cosine to a group's centre (not to any one member, so a slow series
-/// can't chain) at which a photo joins it. On 200 Flickr30k photos, each
-/// one's closest other photo scored 0.70 to 0.90; half-size, cropped to
-/// 85%, brightened and shifted copies 0.93 to 0.99 to their original, and
-/// every variant 0.92 to 0.997 to its group's centre. A JPEG saved again at
-/// quality 35 scored 0.89 to 0.98, so some of those stay apart.
+/// Cosine to a group's front, its best-scoring image, at which another
+/// joins it. The front is fixed: a centre that moved with each member let a
+/// borderline photo of another scene in at 0.923, and four more of that
+/// scene's copies followed it. On 200 Flickr30k photos, each one's closest
+/// other photo scored 0.70 to 0.90; half-size, cropped to 85%, brightened
+/// and shifted copies 0.93 to 0.99 to their original. A JPEG saved again at
+/// quality 35 scored 0.89 to 0.98, so some of those stay apart. Grouping
+/// the 800 bench photos in three random orders made about 375 groups, at
+/// most one of them holding two photos.
 const ALIKE: f32 = 0.92;
 /// The lower bar for a name that differs from a member's only by a size or
 /// copy suffix (`-800x400`, ` (1)`, ` copy`) in the same folder: a crop.
@@ -23,17 +26,19 @@ const ALIKE: f32 = 0.92;
 const ALIKE_NAMED: f32 = 0.80;
 /// Screenshots of one app score as copies whatever they show: two windows
 /// of a made-up app with different text 0.90 to 0.97, two different apps up
-/// to 0.955. So an image with no camera EXIF, the same shape as the other,
+/// to 0.955. So an image with no camera EXIF, the same size as the other,
 /// also has to match pixel for pixel: at most this share of a THUMB-square
-/// grey thumbnail more than PIXEL_STEP apart. Orchard's 64x64 and 3% can't
-/// see text change: different text differed in 0 to 0.6% of pixels. At
-/// 256x256, a changed clock differed in at most 0.02%, different text in
-/// at least 2.1%.
-const MAX_DIFFERING: f32 = 0.005;
-const PIXEL_STEP: i16 = 16;
+/// grey thumbnail, brightness and contrast evened out, more than PIXEL_STEP
+/// apart. Orchard's 64x64 and 3% can't see text change: different text
+/// differed in 0 to 0.6% of pixels. At 256x256, a changed clock differed in
+/// at most 0.02%, different text in at least 2.5%; a photo brightened and
+/// given more contrast in 0 to 3.7%, half of them under 0.75%. A resized
+/// copy or a crop is another size, so its vector alone decides.
+const MAX_DIFFERING: f32 = 0.01;
+/// On thumbnails spread to a standard deviation of SPREAD grey levels.
+const PIXEL_STEP: f32 = 16.0;
+const SPREAD: f32 = 48.0;
 const THUMB: u32 = 256;
-/// Shapes this close are the same, for a copy resized whole.
-const SAME_SHAPE: f64 = 0.01;
 
 /// What decides a pair without its pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,8 +57,7 @@ pub fn collapse(hits: Vec<Hit>) -> Vec<Hit> {
 struct Group {
     /// Where its front hit is in the output.
     at: usize,
-    sum: Vec<f32>,
-    members: Vec<String>,
+    front: Vec<f32>,
 }
 
 fn collapse_with(
@@ -68,35 +72,22 @@ fn collapse_with(
             out.push(h);
             continue;
         };
-        // Which group, and whether by its vector alone.
-        let joins = groups.iter().enumerate().find_map(|(i, g)| {
-            let c = cosine(&g.sum, v);
-            let named = || g.members.iter().any(|m| same_but_suffix(m, &h.path));
-            let alike = c >= ALIKE;
-            ((alike || (c >= ALIKE_NAMED && named()))
-                && g.members
-                    .iter()
-                    .all(|m| pixels_agree(m, &h.path, &look, &differing)))
-            .then_some((i, alike))
+        let joins = groups.iter().position(|g| {
+            let front = &out[g.at].path;
+            let c: f32 = g.front.iter().zip(v).map(|(a, b)| a * b).sum();
+            (c >= ALIKE || (c >= ALIKE_NAMED && same_but_suffix(front, &h.path)))
+                && pixels_agree(front, &h.path, &look, &differing)
         });
         match joins {
-            Some((i, alike)) => {
-                let g = &mut groups[i];
-                // A crop let in by its name doesn't move the centre, or
-                // other crops would follow it in.
-                if alike {
-                    g.sum.iter_mut().zip(v).for_each(|(s, x)| *s += x);
-                }
-                g.members.push(h.path.clone());
-                let front = &mut out[g.at];
+            Some(i) => {
+                let front = &mut out[groups[i].at];
                 front.similar.push(h.path);
                 front.similar.extend(h.copies);
             }
             None => {
                 groups.push(Group {
                     at: out.len(),
-                    sum: v.clone(),
-                    members: vec![h.path.clone()],
+                    front: v.clone(),
                 });
                 out.push(h);
             }
@@ -105,17 +96,10 @@ fn collapse_with(
     out
 }
 
-/// Cosine between `sum` (any length) and the unit vector `v`.
-fn cosine(sum: &[f32], v: &[f32]) -> f32 {
-    let dot: f32 = sum.iter().zip(v).map(|(a, b)| a * b).sum();
-    let norm = sum.iter().map(|a| a * a).sum::<f32>().sqrt();
-    if norm == 0.0 { 0.0 } else { dot / norm }
-}
-
 /// Whether two images alike by their vectors are alike enough: photos with
-/// camera EXIF always are, as are images of different shapes (a crop); a
-/// screenshot or render the same shape as the other must match pixel for
-/// pixel. Unreadable counts as alike.
+/// camera EXIF always are, as are images of different sizes (a resized copy,
+/// a crop); a screenshot or render the same size as the other must match
+/// pixel for pixel. Unreadable counts as alike.
 fn pixels_agree(
     a: &str,
     b: &str,
@@ -126,8 +110,7 @@ fn pixels_agree(
     let (Some(la), Some(lb)) = (look(a), look(b)) else {
         return true;
     };
-    let aspect = |(w, h): (u32, u32)| f64::from(w) / f64::from(h.max(1));
-    if (la.camera && lb.camera) || (aspect(la.size) / aspect(lb.size) - 1.0).abs() > SAME_SHAPE {
+    if (la.camera && lb.camera) || la.size != lb.size {
         return true;
     }
     differing(a, b).is_none_or(|d| d <= MAX_DIFFERING)
@@ -238,24 +221,33 @@ fn names_camera(exif: &[u8]) -> bool {
 /// The share of two images' THUMB-square grey thumbnails more than
 /// PIXEL_STEP apart; None if either doesn't decode.
 fn differing(a: &Path, b: &Path) -> Option<f32> {
-    let thumb = |p: &Path| -> Option<image::GrayImage> {
+    let thumb = |p: &Path| -> Option<Vec<f32>> {
         let bytes = std::fs::read(p).ok()?;
         let rgb = crate::vision::load(&bytes).ok()?;
         let grey = image::DynamicImage::ImageRgb8(rgb).into_luma8();
-        Some(image::imageops::resize(
-            &grey,
-            THUMB,
-            THUMB,
-            image::imageops::FilterType::Triangle,
-        ))
+        let small =
+            image::imageops::resize(&grey, THUMB, THUMB, image::imageops::FilterType::Triangle);
+        Some(evened(small.pixels().map(|p| f32::from(p.0[0])).collect()))
     };
     let (a, b) = (thumb(a)?, thumb(b)?);
     let apart = a
-        .pixels()
-        .zip(b.pixels())
-        .filter(|(x, y)| (i16::from(x.0[0]) - i16::from(y.0[0])).abs() > PIXEL_STEP)
+        .iter()
+        .zip(&b)
+        .filter(|(x, y)| (*x - *y).abs() > PIXEL_STEP)
         .count();
-    Some(apart as f32 / (THUMB * THUMB) as f32)
+    Some(apart as f32 / a.len() as f32)
+}
+
+/// `grey` with its brightness and contrast evened out: mean 0, standard
+/// deviation SPREAD. An edit that brightens a photo then changes few pixels.
+fn evened(mut grey: Vec<f32>) -> Vec<f32> {
+    let n = grey.len() as f32;
+    let mean = grey.iter().sum::<f32>() / n;
+    let sd = (grey.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
+    for x in &mut grey {
+        *x = (*x - mean) / sd.max(1e-3) * SPREAD;
+    }
+    grey
 }
 
 #[cfg(test)]
@@ -314,8 +306,8 @@ mod tests {
 
     #[test]
     fn a_slow_series_does_not_chain() {
-        // Each frame close to the last, the last far from the first: the
-        // centre moves less than a chain would.
+        // Each frame close to the last, the last far from the first: each
+        // is held to the first.
         let frames: Vec<Hit> = (0..8)
             .map(|i| {
                 let t = i as f32 * 0.12;
@@ -324,6 +316,24 @@ mod tests {
             .collect();
         let got = photos(frames);
         assert!(got.len() > 1, "{got:?}");
+    }
+
+    #[test]
+    fn a_borderline_member_does_not_drag_its_own_scene_in() {
+        // A beach; another scene's photo just over the bar to it; that
+        // scene's other copy, close to the second and not to the beach.
+        let got = photos(vec![
+            image("/p/beach.jpg", 0.70, &[1.0, 0.0, 0.0]),
+            image("/p/dunes.jpg", 0.69, &[1.0, 0.41, 0.0]), // 0.925 to the beach
+            image("/p/dunes (1).jpg", 0.68, &[1.0, 0.55, 0.1]), // 0.87 to the beach
+        ]);
+        assert_eq!(
+            got,
+            [
+                ("/p/beach.jpg".into(), vec!["/p/dunes.jpg".into()]),
+                ("/p/dunes (1).jpg".into(), vec![]),
+            ]
+        );
     }
 
     #[test]
@@ -376,7 +386,7 @@ mod tests {
             |_, _| Some(0.5),
         );
         assert_eq!(got.len(), 1);
-        // Half the size, the same shape: still compared pixel for pixel.
+        // Half the size: a resized copy, which the vectors decide.
         let got = collapse_with(
             hits(),
             |p| {
@@ -391,7 +401,33 @@ mod tests {
             },
             |_, _| Some(0.5),
         );
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Through real files: a brightened copy matches, a changed panel doesn't.
+    #[test]
+    fn an_edit_matches_pixel_for_pixel_and_new_content_does_not() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-dupes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let draw = |name: &str, lift: u8, panel: bool| {
+            let img = image::RgbImage::from_fn(640, 400, |x, y| {
+                let mut v = ((x / 4 + y / 3) % 200) as u8;
+                if panel && (300..420).contains(&x) && (100..220).contains(&y) {
+                    v = 250;
+                }
+                let v = v.saturating_add(lift);
+                image::Rgb([v, v, v])
+            });
+            let path = dir.join(name);
+            img.save(&path).unwrap();
+            path
+        };
+        let base = draw("base.png", 0, false);
+        let brighter = draw("brighter.png", 30, false);
+        let changed = draw("changed.png", 0, true);
+        assert!(differing(&base, &brighter).unwrap() <= MAX_DIFFERING);
+        assert!(differing(&base, &changed).unwrap() > MAX_DIFFERING);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
