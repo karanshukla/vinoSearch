@@ -957,8 +957,8 @@ fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
 /// process, #84). Err if it doesn't parse, the child was stopped, or the
 /// run's text is over MAX_FILE_BYTES.
 /// Documents are parsed in a child with limits (#84). A session is plain
-/// text in a zip, read with the same caps on what unzips, and nothing in
-/// it needs a parser that could crash or hang, so it's read here.
+/// text in a zip, nothing in it needs a parser that could crash or hang,
+/// and each part it unzips is held to 1 MiB, so it's read here.
 fn parser(kind: Kind) -> Parser {
     match kind {
         Kind::Session => crate::extract::parts,

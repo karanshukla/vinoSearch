@@ -5,7 +5,7 @@
 //! the summary's by its line from SUMMARY_LINES up, so a hit says which part
 //! it came from.
 
-use super::{check_zip, read};
+use super::check_zip;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -20,6 +20,10 @@ const TRANSCRIPT: &str = "transcript.txt";
 const SUMMARY: &str = "summary.md";
 const ATTESTATION: &str = "attestation.json";
 const MAX_ATTESTATION_BYTES: u64 = 64 << 10;
+/// A transcript or summary past this isn't read: about 20 hours of speech.
+/// Bundles are read in the runner, not the extract child, so what one can
+/// unzip there is held well under what a document's parts may.
+const MAX_PART_BYTES: u64 = crate::index::MAX_FILE_BYTES;
 /// What `made_by` says of a summary a model wrote.
 const AI_SUMMARY: &str = "ai-generated-summary";
 
@@ -150,6 +154,17 @@ impl std::fmt::Display for Unknown {
 }
 
 impl std::error::Error for Unknown {}
+
+fn read(zip: &mut Zip, name: &str) -> Result<String> {
+    let mut s = String::new();
+    zip.by_name(name)?
+        .take(MAX_PART_BYTES + 1)
+        .read_to_string(&mut s)?;
+    if s.len() as u64 > MAX_PART_BYTES {
+        bail!("{name} is over {MAX_PART_BYTES} bytes");
+    }
+    Ok(s)
+}
 
 fn has(zip: &Zip, name: &str) -> bool {
     zip.index_for_name(name).is_some()
@@ -302,6 +317,26 @@ pub(crate) mod tests {
         w.start_file(TRANSCRIPT, opts).unwrap();
         w.write_all(b"[00:00] hi\n").unwrap();
         let b = w.finish().unwrap().into_inner();
+        assert!(chunks(&b).is_err());
+    }
+
+    #[test]
+    fn a_part_too_big_to_be_a_transcript_is_refused() {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("mimetype", stored).unwrap();
+        w.write_all(MIMETYPE).unwrap();
+        let deflated = SimpleFileOptions::default();
+        w.start_file(ATTESTATION, deflated).unwrap();
+        w.write_all(attestation("vinowhisper-session/1").as_bytes())
+            .unwrap();
+        w.start_file(TRANSCRIPT, deflated).unwrap();
+        // Deflates to a few KiB.
+        w.write_all(&vec![b'a'; MAX_PART_BYTES as usize + 1])
+            .unwrap();
+        let b = w.finish().unwrap().into_inner();
+        assert!(b.len() < 64 << 10);
         assert!(chunks(&b).is_err());
     }
 
