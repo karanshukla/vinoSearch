@@ -5,7 +5,7 @@ nav_order: 3
 
 # Using it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, and `code:` queries in **vinoSearch Code**.
+- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, vinoWhisper sessions in **vinoWhisper sessions**, and `code:` queries in **vinoSearch Code**.
 - **GNOME:** the overview's search, from the next login.
 - **Sway, Hyprland, COSMIC and the rest:** see [below](#other-wayland-desktops).
 - **Terminal:** see [the CLI](#the-cli).

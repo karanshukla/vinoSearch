@@ -37,6 +37,9 @@ min_score = 0.63
 [formats.code]
 enabled = true              # off by default; found only by queries starting "code:"
 min_score = 0.72
+
+[formats.sessions]
+enabled = true              # off by default; vinoWhisper's saved transcripts and summaries
 ```
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda

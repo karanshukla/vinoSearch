@@ -25,6 +25,9 @@
 //! enabled = true
 //! min_score = 0.72
 //!
+//! [formats.sessions]
+//! enabled = true
+//!
 //! [encryption]
 //! enabled = true
 //! ```
@@ -160,6 +163,7 @@ pub struct Formats {
     pub images: ImageFormat,
     pub documents: DocumentFormat,
     pub code: CodeFormat,
+    pub sessions: SessionFormat,
 }
 
 /// Text is always indexed for now.
@@ -207,6 +211,18 @@ pub struct CodeFormat {
     pub min_score: Option<f32>,
 }
 
+/// vinoWhisper sessions (#143): `.vwsession` bundles, each a transcript and
+/// its summary, searched with text. Read from vinoWhisper's own folder as
+/// well as the folders indexed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionFormat {
+    /// Index vinoWhisper sessions. Off by default: a transcript holds
+    /// whatever was said or played, and the index keeps its text
+    /// [default: false].
+    pub enabled: Option<bool>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -242,6 +258,10 @@ impl Formats {
 
     pub fn code_enabled(&self) -> bool {
         self.code.enabled.unwrap_or(false)
+    }
+
+    pub fn sessions_enabled(&self) -> bool {
+        self.sessions.enabled.unwrap_or(false)
     }
 
     pub fn code_min_score(&self) -> Result<f32> {
@@ -394,6 +414,12 @@ impl Config {
             f.code.enabled.map(toml_edit::value),
         );
         set(&mut doc, "code", "min_score", f.code.min_score.map(score));
+        set(
+            &mut doc,
+            "sessions",
+            "enabled",
+            f.sessions.enabled.map(toml_edit::value),
+        );
         let e = &self.encryption;
         set_table(
             &mut doc,
@@ -742,6 +768,10 @@ mod tests {
         assert_eq!(c.formats.code_min_score().unwrap(), 0.7);
         let c: Config = toml::from_str("[formats.code]\nmin_score = -2\n").unwrap();
         assert!(c.formats.code_min_score().is_err());
+        // Sessions are opt-in (#143).
+        assert!(!Config::default().formats.sessions_enabled());
+        let c: Config = toml::from_str("[formats.sessions]\nenabled = true\n").unwrap();
+        assert!(c.formats.sessions_enabled());
     }
 
     #[test]
@@ -760,6 +790,7 @@ mod tests {
         c.formats.documents.enabled = Some(true);
         c.formats.code.enabled = Some(true);
         c.formats.code.min_score = Some(0.6);
+        c.formats.sessions.enabled = Some(true);
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("enabled = true # big download"), "{text}");
@@ -770,6 +801,10 @@ mod tests {
         );
         assert!(
             text.contains("[formats.code]\nenabled = true\nmin_score = 0.6"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[formats.sessions]\nenabled = true"),
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), c);

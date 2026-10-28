@@ -20,7 +20,7 @@ Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those ra
 | Method | What it does |
 |---|---|
 | `Actions() → a(sss)` | `open-folder` (Open containing folder), `show-all` (Show all results). |
-| `Match(s query)` | The search below; a query starting `code:` searches code alone ([#110](https://github.com/karanshukla/vinoSearch/issues/110)). Each match sets `subtext`, `urls` and `category`, and `line` (u) for a text file's matching line or `page` (u) for a PDF's matching page, which `vinosearch menu` opens at. |
+| `Match(s query)` | The search below; a query starting `code:` searches code alone ([#110](https://github.com/karanshukla/vinoSearch/issues/110)). Each match sets `subtext`, `urls`, `category` and `actions` (`open-summary` or `open-transcript` on a vinoWhisper session, besides `open-folder` and `show-all`), and `line` (u) for a text file's matching line or `page` (u) for a PDF's matching page, which `vinosearch menu` opens at. |
 | `Run(s matchId, s actionId)` | Refuses an id that is not an indexed file. The default action opens the file at the match, as below, `open-folder` `xdg-open`s its directory. `show-all` starts `vinosearch-settings --search` with the last `Match` query, when it is installed beside `vinosearch`, whatever the id. |
 
 ### Opening at the match
@@ -61,7 +61,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `Rekey` | `() → ()` | Seal a new key and encrypt the index again under it. Fails while it isn't encrypted. |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |
 | `RecentFiles` | `(u limit) → a(ssx)` | Indexed text files and documents (never images), newest first by modification time as the index recorded it, as (path, kind, mtime in Unix seconds). Kind is `text` or `document` (`dbus::recent::{TEXT, DOCUMENT}`). At most `limit`, capped at 50 (`dbus::recent::MAX`); files gone since they were indexed are left out. No model is used, so it answers before any search: for a list to pick from before the user types. |
-| `Search` | `(s query, u limit) → a(ssdssux)` | Every file the query finds, for the search window ([#111](https://github.com/karanshukla/vinoSearch/issues/111)): the best chunk of each, at or above its kind's `min_score` as KRunner's are, at most `limit` (capped at 100, `dbus::results::MAX`) of each kind: text, then documents, then images, best first within each. Each is (path, kind, score, snippet, unit, at, mtime): kind `text`, `document` or `image` (`dbus::results`; text OCR read in an image is an `image`, as KRunner lists it), or `code` alone for a query starting `code:` ([#110](https://github.com/karanshukla/vinoSearch/issues/110)), the cosine score, up to 140 characters of the matching text (empty for a photo), `at`'s unit (`line`, `page`, `slide`, `chapter`, `row`, `paragraph`, or empty when the match has no place to name), the match's number in it from 1 (0 for none), and the file's mtime in Unix seconds. Files gone since they were indexed are left out. Loads the model as `Match` does. |
+| `Search` | `(s query, u limit) → a(ssdssux)` | Every file the query finds, for the search window ([#111](https://github.com/karanshukla/vinoSearch/issues/111)): the best chunk of each, at or above its kind's `min_score` as KRunner's are, at most `limit` (capped at 100, `dbus::results::MAX`) of each kind: text, then documents, then vinoWhisper sessions, then images, best first within each. Each is (path, kind, score, snippet, unit, at, mtime): kind `text`, `document`, `session` or `image` (`dbus::results`; text OCR read in an image is an `image`, as KRunner lists it), or `code` alone for a query starting `code:` ([#110](https://github.com/karanshukla/vinoSearch/issues/110)), the cosine score, up to 140 characters of the matching text (empty for a photo), `at`'s unit (`line`, `page`, `slide`, `chapter`, `row`, `paragraph`, or empty when the match has no place to name), the match's number in it from 1 (0 for none), and the file's mtime in Unix seconds. Files gone since they were indexed are left out. Loads the model as `Match` does. |
 | `Open` | `(s path, u at) → ()` | Opens an indexed file at `at`, a number from `Search`, as KRunner's `Run` opens a match (below); 0 opens it at the top. Fails for a path that is not an indexed file. |
 | `OpenFolder` | `(s path) → ()` | `xdg-open`s the folder of an indexed file. Fails for a path that is not an indexed file. |
 | `FileText` | `(s path) → s` | The whole text of an indexed text file or document, for reading aloud. A text file's UTF-8 contents (1 MiB at most, as indexing takes); a document's text extracted as indexing does, in the sandboxed `vinosearch extract` child (32 MiB file, 1 MiB of text: a long document indexes in parts but doesn't read aloud whole), pages and slides apart by a blank line, a table's header once per sheet. Fails for a path that is not an indexed file, an image, a file that is not UTF-8, or a document that does not parse. A scanned PDF with no text layer gives an empty string: its OCR text is in the index, not read again here. |
@@ -80,7 +80,8 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `device` | `s` | OpenVINO device the model runs on, e.g. `NPU`. |
 | `files` | `x` | Files in the index. |
 | `chunks` | `x` | Chunks in the index. |
-| `text_files`, `text_chunks`, `document_files`, `document_chunks`, `image_files`, `code_files`, `code_chunks` | `x` | The same per format ([#73](https://github.com/karanshukla/vinoSearch/issues/73)); a file counts under the kind of its chunks, so one recorded with none (a photo with no decoder) is in `files` only. An image is one chunk, plus a chunk for each run of text OCR read in it, counted under images ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). |
+| `text_files`, `text_chunks`, `document_files`, `document_chunks`, `image_files`, `code_files`, `code_chunks`, `session_files`, `session_chunks` | `x` | The same per format ([#73](https://github.com/karanshukla/vinoSearch/issues/73)); a file counts under the kind of its chunks, so one recorded with none (a photo with no decoder) is in `files` only. An image is one chunk, plus a chunk for each run of text OCR read in it, counted under images ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). |
+| `sessions_unread` | `x` | vinoWhisper sessions indexed with no text: in a `format` this build doesn't read, or not a readable bundle ([#143](https://github.com/karanshukla/vinoSearch/issues/143)). |
 | `roots` | `as` | Indexed roots, canonical paths. |
 | `model_present` | `b` | Every model file is on disk, the vision encoder's included while images are on. |
 | `fetching` | `b` | A `FetchModel` download is running. |
@@ -122,6 +123,9 @@ min_score = 0.63
 enabled = true
 min_score = 0.72
 
+[formats.sessions]
+enabled = true
+
 [encryption]
 enabled = true
 allow_host_key = false
@@ -138,6 +142,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `index_on_battery` | at once, mid-index included: `false` holds indexing while on battery (the battery is read every 10 s) and `power_hold` in `Status` says `charger`. Default `true` |
 | `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, heif, avif |
 | `formats.code.enabled` | as `formats.images.enabled`: code no longer wanted is dropped, and every root is checked for code once it's on. Default off |
+| `formats.sessions.enabled` | as `formats.images.enabled`, and vinoWhisper's `$XDG_DATA_HOME/vinowhisper/transcripts` becomes a root while it's on (forgotten once it's off). Default off |
 | `formats.text.min_score`, `formats.images.min_score`, `formats.code.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65, 0.63 and 0.72) |
 | `encryption.enabled`, `encryption.allow_host_key` | at once (`ApplyEncryption` makes it straight away), stopping an indexing job: the index is converted in place, encrypted or decrypted, nothing indexed again. Default off. Without a TPM, turning it on is refused unless `allow_host_key = true` |
 

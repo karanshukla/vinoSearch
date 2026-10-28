@@ -74,7 +74,7 @@ Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn
 
 ## Use it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, and `code:` queries in **vinoSearch Code**.
+- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, vinoWhisper sessions in **vinoWhisper sessions**, and `code:` queries in **vinoSearch Code**.
 - **GNOME:** the overview's search, from the next login.
 - **Sway, Hyprland, COSMIC and the rest:** `vinosearch menu` asks for a query in fuzzel, wofi, rofi, tofi or bemenu (the first it finds), shows the results in it, and opens the one you pick. Bind it to a key, e.g. `bindsym $mod+s exec vinosearch menu` in sway or `bind = SUPER, S, exec, vinosearch menu` in Hyprland. `--launcher "rofi -dmenu -i"` (or `VINOSEARCH_LAUNCHER`) picks another dmenu-style command. It asks the running service, so a warm query is as quick as KRunner's.
 - **Terminal:** `vinosearch search "how do I rotate the signing key"`, `vinosearch search "code: retry a failed download"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg` for indexed photos that look like one.
@@ -108,6 +108,9 @@ min_score = 0.63
 [formats.code]
 enabled = true              # off by default; found only by queries starting "code:"
 min_score = 0.72
+
+[formats.sessions]
+enabled = true              # off by default; vinoWhisper's saved transcripts and summaries
 ```
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda installs are excluded by default; [how it works](docs/how-it-works.md#what-gets-indexed) has the list.

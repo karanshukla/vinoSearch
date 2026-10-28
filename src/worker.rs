@@ -465,6 +465,36 @@ fn check<E: Embed>(
     Ok(())
 }
 
+fn forget_root(conn: &rusqlite::Connection, db: &Path, work: &Work, root: &Path) {
+    match index::forget(conn, root) {
+        Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
+        Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
+    }
+    if let Err(e) = encryption::save_roots(db, conn) {
+        eprintln!("saving the folder list: {e:#}");
+    }
+    work.forget(root, &index::roots(conn).unwrap_or_default());
+}
+
+/// vinoWhisper's folder of sessions is a root while sessions are on
+/// (#143), registered as one added in the settings window is, and
+/// forgotten once they're off. A folder vinoWhisper makes later is
+/// followed from the next start or change of settings.
+fn follow_sessions(conn: &rusqlite::Connection, db: &Path, types: &FileTypes, work: &Work) {
+    let Some((dir, on)) = types.sessions_dir() else {
+        return;
+    };
+    let is_root = index::roots(conn)
+        .unwrap_or_default()
+        .iter()
+        .any(|r| r == dir);
+    if on && !is_root && index::is_real_dir(dir) {
+        work.root(dir.to_owned());
+    } else if !on && is_root {
+        forget_root(conn, db, work, dir);
+    }
+}
+
 /// Make `root` a root, as `vinosearch index` does, and find what under it
 /// the index is behind on, as the watcher's check of a root does. Needs no
 /// model: what it finds waits in `Work` for one.
@@ -556,6 +586,7 @@ fn run_with<E: Embed>(
     if purged > 0 {
         eprintln!("removed {purged} excluded files from the index");
     }
+    follow_sessions(&conn, &db, &rules.types, &opts.status.work);
     let mut load = |conn: &rusqlite::Connection, device: &str| -> Result<Loaded<E>> {
         let emb = load_model(device)?;
         let vectors = Vectors::load(conn)?;
@@ -634,6 +665,7 @@ fn run_with<E: Embed>(
                         Ok(n) => eprintln!("file types changed, {n} files removed"),
                         Err(e) => eprintln!("applying file types: {e:#}"),
                     }
+                    follow_sessions(&conn, &db, &rules.types, &status.work);
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("file types not applied: {e:#}"),
@@ -674,18 +706,7 @@ fn run_with<E: Embed>(
         }
         for r in requests {
             match r {
-                Request::Forget(root) => {
-                    match index::forget(&conn, &root) {
-                        Ok(n) => eprintln!("forgot {}, {n} files removed", root.display()),
-                        Err(e) => eprintln!("forgetting {}: {e:#}", root.display()),
-                    }
-                    if let Err(e) = encryption::save_roots(&db, &conn) {
-                        eprintln!("saving the folder list: {e:#}");
-                    }
-                    status
-                        .work
-                        .forget(&root, &index::roots(&conn).unwrap_or_default());
-                }
+                Request::Forget(root) => forget_root(&conn, &db, &status.work, &root),
                 Request::Encryption(w) => {
                     want = w;
                     reencrypt(&mut conn, &mut loaded, want, false)?;
@@ -1154,6 +1175,24 @@ mod tests {
     /// Enough text for several chunks, so a file can be stopped part way.
     fn long(word: &str) -> String {
         format!("{word} ").repeat(600)
+    }
+
+    #[test]
+    fn vinowhispers_folder_is_a_root_while_sessions_are_on() {
+        let h = Harness::new("sessions");
+        let dir = h.root().join(".local/share/vinowhisper/transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let conn = index::open(&h.db()).unwrap();
+        let on = FileTypes::default().with_sessions(true, Some(dir.clone()));
+        follow_sessions(&conn, &h.db(), &on, &h.status.work);
+        assert!(matches!(h.status.work.take(true), Some(Item::Root(r)) if r == dir));
+        index::add_root(&conn, &dir).unwrap();
+        // Already a root: nothing more to do.
+        follow_sessions(&conn, &h.db(), &on, &h.status.work);
+        assert!(!h.status.work.pending());
+        let off = FileTypes::default().with_sessions(false, Some(dir.clone()));
+        follow_sessions(&conn, &h.db(), &off, &h.status.work);
+        assert!(h.roots().is_empty());
     }
 
     #[test]

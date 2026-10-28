@@ -154,11 +154,15 @@ impl State {
         }
     }
 
+    /// The innermost root holding `path`: a root can sit in a hidden folder
+    /// under another (vinoWhisper's sessions, #143), which the outer one's
+    /// rules would skip.
     fn root_of(&self, path: &Path) -> Option<&Path> {
         self.roots
             .iter()
             .map(PathBuf::as_path)
-            .find(|r| path.starts_with(r))
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.components().count())
     }
 }
 
@@ -427,6 +431,35 @@ mod tests {
         assert!(!yes("private"));
         assert!(!yes("private/diary.md"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_path_belongs_to_its_innermost_root() {
+        let (tx, _rx) = mpsc::channel();
+        let mut st = State {
+            watcher: notify::recommended_watcher(tx).unwrap(),
+            status: Arc::default(),
+            roots: vec![
+                PathBuf::from("/h"),
+                PathBuf::from("/h/.local/share/vinowhisper/transcripts"),
+            ],
+            watched: HashSet::new(),
+            warned_limit: false,
+            excludes: Excludes::default(),
+            types: FileTypes::default(),
+        };
+        let s = Path::new("/h/.local/share/vinowhisper/transcripts/a.vwsession");
+        assert_eq!(
+            st.root_of(s),
+            Some(Path::new("/h/.local/share/vinowhisper/transcripts"))
+        );
+        assert_eq!(st.root_of(Path::new("/h/notes.md")), Some(Path::new("/h")));
+        st.roots.reverse();
+        assert_eq!(
+            st.root_of(s),
+            Some(Path::new("/h/.local/share/vinowhisper/transcripts"))
+        );
+        assert_eq!(st.root_of(Path::new("/elsewhere")), None);
     }
 
     #[test]
