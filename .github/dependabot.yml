@@ -10,7 +10,13 @@ updates:
       day: monday
     cooldown:
       default-days: 7
+      # Our own crate, released from karanshukla/vinoUserInterface.
+      exclude: ["vino-user-interface"]
+    # A dependency takes the first group it matches: the vino theme gets a PR
+    # of its own on the next Monday run, with no week's wait.
     groups:
+      vino-user-interface:
+        patterns: ["vino-user-interface"]
       cargo:
         patterns: ["*"]
 
