@@ -1,3 +1,8 @@
+---
+title: D-Bus interface
+nav_order: 8
+---
+
 # D-Bus interface
 
 The runner owns `dev.vinosearch.Runner` on the session bus. D-Bus starts it on first use (`vinosearch krunner --install` writes the activation file), so calling any method below is enough to bring it up; it does not load the model until a query or an indexing job needs it.

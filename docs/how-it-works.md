@@ -1,6 +1,11 @@
+---
+title: How it works
+nav_order: 7
+---
+
 # How vinoSearch works
 
-The details behind the [README](../README.md): what gets indexed, how the index stays current, what the runner does, and what we learned about the NPU along the way.
+The details behind the [README](https://github.com/karanshukla/vinoSearch#readme): what gets indexed, how the index stays current, what the runner does, and what we learned about the NPU along the way.
 
 ## What gets indexed
 

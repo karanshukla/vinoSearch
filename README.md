@@ -152,6 +152,7 @@ It can be encrypted at rest ([#4](https://github.com/karanshukla/vinoSearch/issu
 
 ## More
 
+- [vinosearch.vinopilot.ca](https://vinosearch.vinopilot.ca): these docs as a site.
 - [How it works](docs/how-it-works.md): indexing, watching, the runner, the settings window, the runtime and NPU gotchas.
 - [D-Bus interface](docs/dbus.md): KRunner, GNOME Shell and the control interface the settings app uses.
 
