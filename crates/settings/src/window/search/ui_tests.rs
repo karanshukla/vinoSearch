@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::Theme;
 use eframe::egui::accesskit::Role;
+use eframe::egui::{Theme, accesskit};
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, Node};
 
@@ -264,7 +264,7 @@ fn every_control_has_a_name_wide_or_narrow() {
             .collect();
         assert!(unnamed.is_empty(), "{size:?}: unnamed {unnamed:#?}");
         h.get_by_role_and_label(Role::TextInput, "Search");
-        for combo in ["Folder:", "Modified:", "File type:"] {
+        for combo in ["Folder", "Modified", "File type"] {
             h.get_by_role_and_label(Role::ComboBox, combo);
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -325,14 +325,13 @@ fn the_filter_menus_open_and_pick_from_the_keyboard() {
     let (w, _asked, dir) = window("camping", "menus");
     let mut h = harness(w, WIDE);
     answered(&mut h);
-    h.get_by_role_and_label(Role::ComboBox, "File type:")
-        .click();
+    h.get_by_role_and_label(Role::ComboBox, "File type").click();
     settle(&mut h);
     h.get_by_role_and_label(Role::Button, "PDF (1)").click();
     settle(&mut h);
     assert_eq!(h.state().filters.extension.as_deref(), Some("pdf"));
 
-    h.get_by_role_and_label(Role::ComboBox, "Folder:").click();
+    h.get_by_role_and_label(Role::ComboBox, "Folder").click();
     settle(&mut h);
     h.get_by_role_and_label(Role::Button, "/srv/photos").click();
     settle(&mut h);

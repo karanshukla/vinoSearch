@@ -96,7 +96,7 @@ Off by default; the Security page or `[encryption] enabled = true` turns it on (
 
 ## The settings window
 
-`vinosearch-settings` is egui, in the same style as vinoWhisper's settings (Inter, flat surfaces, the vino green). `--page index|folders|search|model|hardware|integration` opens a given page.
+`vinosearch-settings` is egui, styled by `crates/vino-ui`, the theme and widgets vinoWhisper's and vinoSpeak's windows share (Inter, flat surfaces with hairlines, the vino green). `--page index|folders|search|model|hardware|integration` opens a given page.
 
 | Page | Shows | Lets you |
 |---|---|---|

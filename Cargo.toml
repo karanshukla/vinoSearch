@@ -9,7 +9,7 @@ repository = "https://github.com/karanshukla/vinoSearch"
 publish = false
 
 [workspace]
-members = [".", "crates/shared", "crates/settings"]
+members = [".", "crates/shared", "crates/settings", "crates/vino-ui"]
 
 [dependencies]
 vinosearch-shared = { path = "crates/shared" }

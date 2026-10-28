@@ -4,7 +4,7 @@
 use std::sync::mpsc::Receiver;
 
 use eframe::egui::accesskit::Role;
-use eframe::egui::{Key, Theme};
+use eframe::egui::{Key, Theme, accesskit};
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, Node};
 
@@ -116,10 +116,12 @@ fn sent(requests: &Receiver<Request>) -> Vec<Request> {
 }
 
 /// Roles a user operates, and anything that takes focus; each needs a name of its own.
-const CONTROLS: [Role; 9] = [
+const CONTROLS: [Role; 11] = [
     Role::ScrollBar,
     Role::Button,
     Role::CheckBox,
+    Role::Switch,
+    Role::RadioButton,
     Role::TextInput,
     Role::Slider,
     Role::SpinButton,
@@ -343,7 +345,7 @@ fn a_folder_to_add_shows_its_estimate_and_its_longest_subfolders() {
 fn search_page_controls_are_named_by_their_row_labels() {
     let (w, _requests) = window(Page::Search, "search");
     let mut h = harness(w, WIDE, Theme::Dark);
-    let images = h.get_by_role_and_label(Role::CheckBox, "Index images");
+    let images = h.get_by_role_and_label(Role::Switch, "Index images");
     assert_eq!(
         images.accesskit_node().toggled(),
         Some(accesskit::Toggled::False)
@@ -352,9 +354,9 @@ fn search_page_controls_are_named_by_their_row_labels() {
     settle(&mut h);
     assert!(h.state().config.formats.images_enabled());
     // Shown once images are on, named by its row label rather than only a placeholder.
-    h.get_by_role_and_label(Role::TextInput, "Image types:");
+    h.get_by_role_and_label(Role::TextInput, "Image types");
     // Code is opt-in too (#110), and saved as it's turned on.
-    let code = h.get_by_role_and_label(Role::CheckBox, "Index code");
+    let code = h.get_by_role_and_label(Role::Switch, "Index code");
     assert_eq!(
         code.accesskit_node().toggled(),
         Some(accesskit::Toggled::False)
@@ -365,7 +367,7 @@ fn search_page_controls_are_named_by_their_row_labels() {
     let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
     assert!(saved.contains("[formats.code]\nenabled = true"), "{saved}");
     // So are vinoWhisper sessions (#143), with a nudge towards encryption.
-    let sessions = h.get_by_role_and_label(Role::CheckBox, "Index vinoWhisper sessions");
+    let sessions = h.get_by_role_and_label(Role::Switch, "Index vinoWhisper sessions");
     sessions.click();
     settle(&mut h);
     assert!(h.state().config.formats.sessions_enabled());
@@ -375,7 +377,7 @@ fn search_page_controls_are_named_by_their_row_labels() {
         saved.contains("[formats.sessions]\nenabled = true"),
         "{saved}"
     );
-    for row in ["Text:", "Images:", "Code:"] {
+    for row in ["Text", "Images", "Code"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);
     }
@@ -385,7 +387,7 @@ fn search_page_controls_are_named_by_their_row_labels() {
 fn an_editor_is_picked_from_the_installed_apps() {
     let (w, _requests) = window(Page::Search, "editor-app");
     let mut h = harness(w, WIDE, Theme::Light);
-    let editor = h.get_by_role_and_label(Role::ComboBox, "Editor:");
+    let editor = h.get_by_role_and_label(Role::ComboBox, "Editor");
     assert_eq!(
         editor.accesskit_node().value().as_deref(),
         Some("Default app")
@@ -404,7 +406,7 @@ fn an_editor_is_picked_from_the_installed_apps() {
         "{saved}"
     );
     assert!(
-        h.query_by_role_and_label(Role::TextInput, "Command:")
+        h.query_by_role_and_label(Role::TextInput, "Command")
             .is_none()
     );
 }
@@ -413,14 +415,14 @@ fn an_editor_is_picked_from_the_installed_apps() {
 fn a_custom_editor_command_is_saved_when_the_field_is_left() {
     let (w, _requests) = window(Page::Search, "editor");
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::ComboBox, "Editor:").click();
+    h.get_by_role_and_label(Role::ComboBox, "Editor").click();
     settle(&mut h);
     h.get_by_label("Custom command…").click();
     settle(&mut h);
     assert_eq!(h.state().config.editor, None);
-    h.get_by_role_and_label(Role::TextInput, "Command:").focus();
+    h.get_by_role_and_label(Role::TextInput, "Command").focus();
     settle(&mut h);
-    h.get_by_role_and_label(Role::TextInput, "Command:")
+    h.get_by_role_and_label(Role::TextInput, "Command")
         .type_text("foot -e nvim +{line} {file}");
     settle(&mut h);
     h.key_press(Key::Enter);
@@ -430,7 +432,7 @@ fn a_custom_editor_command_is_saved_when_the_field_is_left() {
         Some("foot -e nvim +{line} {file}")
     );
     let value = h
-        .get_by_role_and_label(Role::ComboBox, "Editor:")
+        .get_by_role_and_label(Role::ComboBox, "Editor")
         .accesskit_node()
         .value();
     assert_eq!(value.as_deref(), Some("Custom command…"));
@@ -440,7 +442,7 @@ fn a_custom_editor_command_is_saved_when_the_field_is_left() {
 fn a_score_slider_moves_from_the_keyboard() {
     let (w, _requests) = window(Page::Search, "slider");
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::Slider, "Text:").focus();
+    h.get_by_role_and_label(Role::Slider, "Text").focus();
     settle(&mut h);
     h.key_press(Key::ArrowRight);
     settle(&mut h);
@@ -456,10 +458,10 @@ fn a_score_slider_moves_from_the_keyboard() {
 fn model_page_controls_are_named_and_delete_asks_first() {
     let (w, requests) = window(Page::Model, "model");
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::ComboBox, "Device:");
-    h.get_by_role_and_label(Role::SpinButton, "Unload after:");
-    h.get_by_role_and_label(Role::Slider, "Indexing share:");
-    h.get_by_role_and_label(Role::SpinButton, "Indexing share:");
+    h.get_by_role_and_label(Role::RadioGroup, "Device");
+    h.get_by_role_and_label(Role::SpinButton, "Unload after");
+    h.get_by_role_and_label(Role::Slider, "Indexing share");
+    h.get_by_role_and_label(Role::SpinButton, "Indexing share");
     h.get_by_role_and_label(Role::Button, "Verify");
     h.get_by_role_and_label(Role::Button, "Unload now").click();
     settle(&mut h);
@@ -475,16 +477,22 @@ fn model_page_controls_are_named_and_delete_asks_first() {
 }
 
 #[test]
-fn the_device_menu_opens_and_picks_from_the_keyboard() {
+fn the_device_control_picks_by_click_and_by_arrow_keys() {
     let (w, _requests) = window(Page::Model, "device");
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::ComboBox, "Device:").focus();
-    settle(&mut h);
-    h.key_press(Key::Enter);
-    settle(&mut h);
-    h.get_by_role_and_label(Role::Button, "CPU").click();
+    let npu = h.get_by_role_and_label(Role::RadioButton, "NPU");
+    assert_eq!(
+        npu.accesskit_node().toggled(),
+        Some(accesskit::Toggled::True)
+    );
+    h.get_by_role_and_label(Role::RadioButton, "CPU").click();
     settle(&mut h);
     assert_eq!(h.state().config.device.as_deref(), Some("CPU"));
+    h.get_by_role_and_label(Role::RadioButton, "CPU").focus();
+    settle(&mut h);
+    h.key_press(Key::ArrowLeft);
+    settle(&mut h);
+    assert_eq!(h.state().config.device.as_deref(), Some("GPU"));
 }
 
 #[test]
@@ -503,7 +511,7 @@ fn index_on_battery_is_a_checkbox_saved_only_when_off() {
     let path = w.config_path.clone();
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_role_and_label(Role::Heading, "Power");
-    let battery = h.get_by_role_and_label(Role::CheckBox, "Index on battery");
+    let battery = h.get_by_role_and_label(Role::Switch, "Index on battery");
     assert_eq!(
         battery.accesskit_node().toggled(),
         Some(accesskit::Toggled::True)
@@ -513,7 +521,7 @@ fn index_on_battery_is_a_checkbox_saved_only_when_off() {
     assert!(!h.state().config.index_on_battery());
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("index_on_battery = false"), "{text}");
-    h.get_by_role_and_label(Role::CheckBox, "Index on battery")
+    h.get_by_role_and_label(Role::Switch, "Index on battery")
         .click();
     settle(&mut h);
     assert_eq!(h.state().config.index_on_battery, None);
@@ -674,7 +682,7 @@ fn encryption_is_saved_and_applied_at_once() {
         h.query_by_label("Use the host key instead (weaker)")
             .is_none()
     );
-    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
     settle(&mut h);
     assert!(h.state().config.encryption.on());
@@ -692,16 +700,16 @@ fn encryption_is_saved_and_applied_at_once() {
 fn without_a_tpm_turning_it_on_is_refused_until_the_host_key_is_allowed() {
     let (w, requests) = security("notpm", |_| {});
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
     settle(&mut h);
     assert!(!h.state().config.encryption.on());
     assert!(h.state().notice.as_ref().unwrap().contains("no TPM"));
     assert!(sent(&requests).is_empty());
-    h.get_by_role_and_label(Role::CheckBox, "Use the host key instead (weaker)")
+    h.get_by_role_and_label(Role::Switch, "Use the host key instead (weaker)")
         .click();
     settle(&mut h);
-    h.get_by_role_and_label(Role::CheckBox, "Encrypt the index")
+    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
     settle(&mut h);
     let c = &h.state().config.encryption;

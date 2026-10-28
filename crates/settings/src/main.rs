@@ -5,7 +5,6 @@ mod control;
 mod doctor;
 mod integration;
 mod portal;
-mod theme;
 mod window;
 
 use std::process::ExitCode;

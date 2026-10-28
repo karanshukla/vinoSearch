@@ -9,10 +9,14 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, Align, Layout, RichText};
+use vino_ui::a11y::for_what;
+use vino_ui::icons::{self, Icon};
+use vino_ui::theme;
+use vino_ui::widgets::{self, Button};
 
-use super::{SettingsWindow, Target, for_what, listed, spinner, tilde};
-use crate::{integration, theme};
+use super::{SettingsWindow, Target, tilde};
+use crate::integration;
 
 /// One of the subfolders taking longest.
 #[derive(Clone, Debug, PartialEq)]
@@ -117,71 +121,63 @@ impl SettingsWindow {
         let mut add = false;
         let mut cancel = false;
         let mut exclude = None;
-        ui.add_space(6.0);
-        egui::Frame::NONE
-            .stroke(egui::Stroke::new(1.0_f32, p.rule))
-            .corner_radius(4.0)
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.label(RichText::new(format!("Add {name}?")).strong());
-                match &answer {
-                    None => {
-                        // The answer lands on another thread; look for it.
-                        ui.ctx().request_repaint_after(Duration::from_millis(100));
-                        ui.horizontal(|ui| {
-                            spinner(ui);
-                            ui.label("Estimating…");
-                        });
+        widgets::group_section(ui, |ui| {
+            ui.label(RichText::new(format!("Add {name}?")).family(theme::semibold()));
+            match &answer {
+                None => {
+                    // The answer lands on another thread; look for it.
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    widgets::chip_busy(ui, widgets::ChipKind::Neutral, "Estimating…");
+                }
+                Some(Err(why)) => {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("Couldn't estimate it: {why}")).color(p.error),
+                        )
+                        .wrap(),
+                    );
+                }
+                Some(Ok(a)) => {
+                    ui.label(&a.summary);
+                    if let Some(note) = &a.note {
+                        widgets::small(ui, note);
                     }
-                    Some(Err(why)) => {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("Couldn't estimate it: {why}"))
-                                    .color(ui.visuals().error_fg_color),
-                            )
-                            .wrap(),
-                        );
-                    }
-                    Some(Ok(a)) => {
-                        ui.label(&a.summary);
-                        if let Some(note) = &a.note {
-                            ui.add(
-                                egui::Label::new(RichText::new(note).size(12.5).color(p.muted))
-                                    .wrap(),
-                            );
-                        }
-                        if !a.folders.is_empty() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("Longest to index; excluding one leaves it out:")
-                                    .size(12.5)
-                                    .color(p.muted),
-                            );
-                            for f in &a.folders {
-                                let entry = tilde(Path::new(&f.path));
-                                let excluded = self.config.exclude.contains(&entry);
-                                listed(ui, &entry, |ui, of| {
+                    if !a.folders.is_empty() {
+                        widgets::small(ui, "Longest to index; excluding one leaves it out:");
+                        for f in &a.folders {
+                            let entry = tilde(Path::new(&f.path));
+                            let excluded = self.config.exclude.contains(&entry);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                icons::icon(ui, Icon::Folder, 16.0, p.muted);
+                                widgets::mono(ui, &entry);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let can = !excluded && self.config_broken.is_none();
                                     let label = if excluded { "Excluded" } else { "Exclude" };
-                                    if of(ui.add_enabled(can, egui::Button::new(label))).clicked() {
+                                    if for_what(
+                                        ui.add_enabled(can, Button::secondary(label).small()),
+                                        &entry,
+                                    )
+                                    .clicked()
+                                    {
                                         exclude = Some(PathBuf::from(&f.path));
                                     }
-                                    ui.label(RichText::new(&f.summary).color(p.muted));
+                                    widgets::small(ui, &f.summary);
                                 });
-                            }
+                            });
                         }
                     }
                 }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if for_what(ui.button("Add and index"), &name).clicked() {
-                        add = true;
-                    }
-                    if for_what(ui.button("Cancel"), &format!("adding {name}")).clicked() {
-                        cancel = true;
-                    }
-                });
+            }
+            ui.horizontal(|ui| {
+                if for_what(ui.add(Button::primary("Add and index")), &name).clicked() {
+                    add = true;
+                }
+                if for_what(ui.add(Button::ghost("Cancel")), &format!("adding {name}")).clicked() {
+                    cancel = true;
+                }
             });
+        });
         if let Some(dir) = exclude {
             self.add(Target::Exclude, &dir);
             // Again, without it: the config is saved, and the walk reads it.

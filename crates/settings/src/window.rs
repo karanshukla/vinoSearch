@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{
-    self, Align, Color32, FontId, Id, Layout, RichText, Sense, Stroke, WidgetInfo, accesskit,
-};
+use eframe::egui::{self, Align, Layout, RichText};
+use vino_ui::a11y;
+use vino_ui::icons::{self, Icon};
+use vino_ui::theme;
+use vino_ui::widgets::{self, Button, ChipKind, Row, Tone};
 use vinosearch_shared::apps::{self, App};
 use vinosearch_shared::config::{
     self, Config, DEFAULT_CODE_MIN_SCORE, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
@@ -16,7 +18,7 @@ use vinosearch_shared::config::{
 use vinosearch_shared::dbus::{hold, seal};
 
 use crate::control::{Link, Partial, Request, Status};
-use crate::{doctor, integration, portal, theme};
+use crate::{doctor, integration, portal};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -57,6 +59,18 @@ impl Page {
             Page::Integration => "Integration",
         }
     }
+
+    fn icon(self) -> Icon {
+        match self {
+            Page::Index => Icon::Index,
+            Page::Folders => Icon::Folder,
+            Page::Search => Icon::Search,
+            Page::Security => Icon::Lock,
+            Page::Model => Icon::Model,
+            Page::Hardware => Icon::Hardware,
+            Page::Integration => Icon::Integration,
+        }
+    }
 }
 
 const TITLE: &str = "vinoSearch settings";
@@ -72,22 +86,6 @@ fn power_hold(key: &str) -> Option<&'static str> {
     }
 }
 
-fn device_label(device: &'static str) -> &'static str {
-    match device {
-        "NPU" => "NPU (recommended)",
-        "GPU" => "GPU",
-        _ => "CPU",
-    }
-}
-
-// Below this the sidebar folds into tabs in the header, and form labels go above their control.
-const SIDEBAR_FROM: f32 = 620.0;
-const SIDEBAR_WIDTH: f32 = 180.0;
-const LABEL_WIDTH: f32 = 150.0;
-const FORM_MAX_WIDTH: f32 = 620.0;
-// Between the form and the scroll bar, which sits on the window's right edge.
-const SCROLL_GAP: f32 = 24.0;
-const TWO_COLUMNS_FROM: f32 = 440.0;
 /// Folders listed under Largest folders.
 const LARGEST: u32 = 8;
 
@@ -278,6 +276,30 @@ impl SettingsWindow {
         self.add(target, &path);
     }
 
+    /// The chip beside the Index page's title: what the service is doing.
+    fn index_chip(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+        match status {
+            None => {
+                widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…");
+            }
+            Some(Err(_)) => {
+                widgets::chip(ui, ChipKind::Err, "Service stopped");
+            }
+            Some(Ok(s)) => {
+                if s.paused {
+                    widgets::chip(ui, ChipKind::Neutral, "Stopped");
+                } else if power_hold(&s.power_hold).is_some() {
+                    // The Now row says what for.
+                    widgets::chip(ui, ChipKind::Warn, "On hold");
+                } else if s.indexing {
+                    widgets::chip_busy(ui, ChipKind::Ok, "Indexing");
+                } else {
+                    widgets::chip(ui, ChipKind::Ok, "Up to date");
+                }
+            }
+        }
+    }
+
     fn index(
         &mut self,
         ui: &mut egui::Ui,
@@ -285,158 +307,149 @@ impl SettingsWindow {
         largest: Option<&Vec<(String, u64)>>,
     ) {
         let p = theme::palette(ui.ctx());
-        section(ui, "Status");
+        widgets::group_label(ui, "Status");
         let reachable = match status {
-            None => {
-                row(ui, "Now:", "", |ui| {
-                    value(
-                        ui,
-                        RichText::new("Asking the search service…").color(p.muted),
-                    );
-                });
-                None
-            }
-            Some(Err(why)) => {
-                row(ui, "Now:", "", |ui| {
-                    let color = ui.visuals().error_fg_color;
-                    value(ui, RichText::new(why).color(color));
-                });
-                None
-            }
             Some(Ok(s)) => Some(s),
+            _ => None,
         };
-        if let Some(s) = reachable {
-            row(ui, "Now:", "", |ui| {
-                ui.horizontal(|ui| {
-                    ui.set_min_height(ui.spacing().interact_size.y);
-                    if s.paused {
-                        ui.label("Indexing stopped. What's indexed so far is kept.");
-                        if ui.button("Resume").clicked() {
-                            self.link.send(Request::ResumeIndexing);
+        widgets::group(ui, |ui| {
+            match status {
+                None => {
+                    Row::new("Now")
+                        .help("Asking the search service…")
+                        .show(ui, |_, _| {});
+                }
+                Some(Err(why)) => {
+                    Row::new("Now")
+                        .help(why)
+                        .tone(Tone::Error)
+                        .show(ui, |_, _| {});
+                }
+                Some(Ok(_)) => {}
+            }
+            let Some(s) = reachable else {
+                return;
+            };
+            if s.files > 0 {
+                widgets::group_section(ui, |ui| {
+                    ui.columns(3, |cols| {
+                        widgets::stat(&mut cols[0], &count(s.files), "files");
+                        widgets::stat(&mut cols[1], &count(s.chunks), "chunks");
+                        widgets::stat(&mut cols[2], &size(s.index_bytes), "on disk");
+                    });
+                    let total = s.chunks.max(1) as f32;
+                    let shares = [
+                        (s.text_chunks, "Text"),
+                        (s.document_chunks, "Documents"),
+                        (s.image_files, "Images"),
+                        (s.code_chunks, "Code"),
+                    ];
+                    let bar: Vec<(f32, egui::Color32)> = shares
+                        .iter()
+                        .zip(p.kinds)
+                        .map(|((n, _), color)| (*n as f32 / total, color))
+                        .collect();
+                    ui.add_space(4.0);
+                    widgets::share_bar(ui, &bar, 8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 16.0;
+                        for ((n, name), color) in shares.iter().zip(p.kinds) {
+                            if *n > 0 {
+                                let pct = (*n as f64 * 100.0 / f64::from(total)).round();
+                                widgets::legend(ui, color, &format!("{name} {pct:.0}%"));
+                            }
                         }
-                    } else if let Some(why) = power_hold(&s.power_hold) {
-                        ui.label(why);
-                    } else if s.indexing {
-                        spinner(ui);
-                        if s.indexing_rest {
-                            ui.label("Indexing the rest of long documents");
-                        } else {
-                            ui.label(format!(
-                                "Indexing, {} files so far",
-                                count(s.indexed_files as i64)
-                            ));
-                        }
-                        if ui.button("Stop").clicked() {
-                            self.link.send(Request::PauseIndexing);
-                        }
-                    } else {
-                        ui.label("Up to date");
-                    }
+                    });
                 });
-                // Why it is indexing after a start: a model changed (#80).
-                if !s.model_changed.is_empty() {
-                    ui.add(
-                        egui::Label::new(RichText::new(&s.model_changed).size(12.5).color(p.muted))
-                            .wrap(),
-                    );
+            }
+            let now = if s.paused {
+                "Indexing stopped. What's indexed so far is kept.".to_owned()
+            } else if let Some(why) = power_hold(&s.power_hold) {
+                why.to_owned()
+            } else if s.indexing && s.indexing_rest {
+                "Indexing the rest of long documents".to_owned()
+            } else if s.indexing {
+                format!("Indexing, {} files so far", count(s.indexed_files as i64))
+            } else {
+                "Up to date".to_owned()
+            };
+            Row::new("Now").help(&now).show(ui, |ui, _| {
+                if s.paused {
+                    if ui.add(Button::secondary("Resume")).clicked() {
+                        self.link.send(Request::ResumeIndexing);
+                    }
+                } else if s.indexing
+                    && power_hold(&s.power_hold).is_none()
+                    && ui.add(Button::secondary("Stop")).clicked()
+                {
+                    self.link.send(Request::PauseIndexing);
                 }
             });
-            row(ui, "Contents:", "", |ui| {
-                value(
-                    ui,
-                    format!(
-                        "{} files, {} chunks, {} on disk",
-                        count(s.files),
-                        count(s.chunks),
-                        size(s.index_bytes)
-                    ),
-                );
-            });
+            // Why it is indexing after a start: a model changed (#80).
+            if !s.model_changed.is_empty() {
+                Row::new("Indexing again")
+                    .help(&s.model_changed)
+                    .show(ui, |_, _| {});
+            }
             if s.no_decoder > 0 {
-                row(
-                    ui,
-                    "Skipped:",
-                    &format!(
-                        "HEIC and AVIF need heif-convert: {}.",
+                Row::new("Skipped")
+                    .help(&format!(
+                        "{} photos: HEIC and AVIF need heif-convert ({}).",
+                        count(s.no_decoder),
                         config::HEIF_CONVERT_PACKAGES
-                    ),
-                    |ui| {
-                        let color = ui.visuals().warn_fg_color;
-                        value(
-                            ui,
-                            RichText::new(format!(
-                                "{} photos, no HEIF decoder installed",
-                                count(s.no_decoder)
-                            ))
-                            .color(color),
-                        );
-                    },
-                );
+                    ))
+                    .tone(Tone::Warn)
+                    .show(ui, |_, _| {});
             }
             if !s.partial.is_empty() {
-                row(
-                    ui,
-                    "In part:",
-                    "Long documents get their first 30 pages with everything else, and the rest after.",
-                    |ui| {
-                        ui.vertical(|ui| {
+                Row::new("In part")
+                    .help("Long documents finish later.")
+                    .show(ui, |ui, _| {
+                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
                             for d in s.partial.iter().take(PARTIAL_SHOWN) {
-                                value(ui, partial_line(d));
+                                ui.label(RichText::new(partial_line(d)).size(12.5));
                             }
                             let more = s.partial.len().saturating_sub(PARTIAL_SHOWN);
                             if more > 0 {
-                                value(
-                                    ui,
-                                    RichText::new(format!("and {} more", count(more as i64)))
-                                        .color(p.muted),
-                                );
+                                widgets::small(ui, format!("and {} more", count(more as i64)));
                             }
                         });
-                    },
-                );
+                    });
             }
-            row(ui, "Last change:", "", |ui| {
+            Row::new("Last change").show(ui, |ui, _| {
                 if s.last_indexed == 0 {
-                    value(
-                        ui,
-                        RichText::new("None since the service started").color(p.muted),
-                    );
+                    widgets::muted(ui, "None since the service started");
                 } else {
-                    value(ui, format!("Indexed {}", ago(s.last_indexed)));
+                    ui.label(format!("Indexed {}", ago(s.last_indexed)));
                 }
             });
             if self.check_asked.is_some_and(|at| s.last_checked != at) {
                 self.check_asked = None;
             }
-            row(
-                ui,
-                "Checked:",
-                "Also checked hourly and after sleep, for missed changes.",
-                |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(ui.spacing().interact_size.y);
-                        if self.check_asked.is_some() {
-                            spinner(ui);
-                            ui.label(if s.indexing {
-                                "Waiting for indexing to finish"
-                            } else {
-                                "Checking…"
-                            });
+            Row::new("Checked")
+                .help("Also hourly and after sleep.")
+                .show(ui, |ui, _| {
+                    if self.check_asked.is_some() {
+                        let text = if s.indexing {
+                            "Waiting for indexing to finish"
                         } else {
-                            ui.label(if s.last_checked == 0 {
-                                "Not yet".to_owned()
-                            } else {
-                                ago(s.last_checked)
-                            });
-                            if ui.button("Check now").clicked() {
-                                self.check_asked = Some(s.last_checked);
-                                self.link.send(Request::CheckNow);
-                            }
+                            "Checking…"
+                        };
+                        widgets::chip_busy(ui, ChipKind::Neutral, text);
+                    } else {
+                        if ui.add(Button::secondary("Check now")).clicked() {
+                            self.check_asked = Some(s.last_checked);
+                            self.link.send(Request::CheckNow);
                         }
-                    });
-                },
-            );
-        }
+                        if s.last_checked == 0 {
+                            widgets::muted(ui, "Not yet");
+                        } else {
+                            widgets::muted(ui, ago(s.last_checked));
+                        }
+                    }
+                });
+        });
         if let Some(s) = reachable.filter(|s| s.chunks > 0) {
             self.largest(ui, s, largest);
         }
@@ -449,79 +462,115 @@ impl SettingsWindow {
             Some(Ok(s)) => Some(s),
             Some(Err(why)) => {
                 ui.add_space(10.0);
-                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                widgets::banner(ui, Tone::Error, why, |_| {});
                 None
             }
             None => None,
         };
-        section(ui, "Included");
-        help_line(ui, "Indexed and watched for changes.");
+        widgets::group_label(ui, "Included");
+        widgets::group_help(ui, "Indexed and watched for changes.");
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
         self.forgetting.retain(|r| roots.contains(r));
         roots.retain(|r| !self.forgetting.contains(r));
         let indexing = reachable.is_some_and(|s| s.indexing);
-        if reachable.is_some() && roots.is_empty() {
-            ui.label(RichText::new("Nothing is indexed yet.").color(p.muted));
-        }
-        for root in &roots {
-            let forget = Confirm::Forget(root.clone());
-            listed(ui, &tilde(Path::new(root)), |ui, of| {
-                if self.confirm.as_ref() == Some(&forget) {
-                    if self.cancel_button(ui).clicked() {
-                        self.confirm = None;
-                    }
-                    if of(ui.button("Remove and drop its index")).clicked() {
-                        self.link.send(Request::Forget(root.clone()));
-                        self.forgetting.insert(root.clone());
-                        self.confirm = None;
-                    }
+        widgets::group(ui, |ui| {
+            if reachable.is_some() && roots.is_empty() {
+                widgets::group_section(ui, |ui| {
+                    widgets::muted(ui, "Nothing is indexed yet.");
+                });
+            }
+            for root in &roots {
+                let forget = Confirm::Forget(root.clone());
+                let confirming = self.confirm.as_ref() == Some(&forget);
+                let path = tilde(Path::new(root));
+                let row = if confirming {
+                    Row::new("").tint(p.error_tint)
                 } else {
-                    if of(ui.button("Remove")).clicked() {
-                        self.confirm = Some(forget);
-                        self.focus_cancel = true;
-                    }
-                    if of(ui.add_enabled(!indexing, egui::Button::new("Re-index")))
-                        .on_hover_text("Look for anything the watcher missed")
-                        .clicked()
-                    {
-                        self.link.send(Request::Reindex(root.clone()));
-                    }
-                }
+                    Row::new("")
+                };
+                row.custom(
+                    ui,
+                    |ui| {
+                        path_label(ui, Icon::Folder, &path, confirming);
+                        None
+                    },
+                    |ui, _| {
+                        let of = |r| a11y::for_what(r, &path);
+                        if confirming {
+                            if of(ui.add(Button::destructive("Remove and drop its index").small()))
+                                .clicked()
+                            {
+                                self.link.send(Request::Forget(root.clone()));
+                                self.forgetting.insert(root.clone());
+                                self.confirm = None;
+                            }
+                            if self.cancel_button(ui).clicked() {
+                                self.confirm = None;
+                            }
+                        } else {
+                            if of(ui.add(Button::secondary("Remove").small())).clicked() {
+                                self.confirm = Some(forget.clone());
+                                self.focus_cancel = true;
+                            }
+                            if of(ui.add_enabled(!indexing, Button::ghost("Re-index").small()))
+                                .on_hover_text("Look for anything the watcher missed")
+                                .clicked()
+                            {
+                                self.link.send(Request::Reindex(root.clone()));
+                            }
+                        }
+                    },
+                );
+            }
+            self.proposed(ui);
+            ui.add_enabled_ui(reachable.is_some(), |ui| {
+                self.adder(ui, Target::Root);
             });
-        }
-        self.proposed(ui);
-        ui.add_enabled_ui(reachable.is_some(), |ui| {
-            self.adder(ui, Target::Root);
         });
 
-        section(ui, "Excluded");
-        help_line(ui, "Never indexed, even inside an included folder.");
+        widgets::group_label(ui, "Excluded");
+        widgets::group_help(ui, "Never indexed, even inside an included folder.");
         if let Some(why) = &self.config_broken {
-            ui.label(
-                RichText::new(format!(
+            widgets::banner(
+                ui,
+                Tone::Error,
+                &format!(
                     "{} doesn't parse, so it isn't changed from here: {why}",
                     self.config_path.display()
-                ))
-                .color(ui.visuals().error_fg_color),
+                ),
+                |_| {},
             );
             return;
         }
-        if self.config.exclude.is_empty() {
-            ui.label(RichText::new("Nothing is excluded.").color(p.muted));
-        }
         let mut remove = None;
-        for (i, entry) in self.config.exclude.iter().enumerate() {
-            listed(ui, entry, |ui, of| {
-                if of(ui.button("Remove")).clicked() {
-                    remove = Some(i);
-                }
-            });
-        }
+        widgets::group(ui, |ui| {
+            if self.config.exclude.is_empty() {
+                widgets::group_section(ui, |ui| {
+                    widgets::muted(ui, "Nothing is excluded.");
+                });
+            }
+            for (i, entry) in self.config.exclude.iter().enumerate() {
+                Row::new("").custom(
+                    ui,
+                    |ui| {
+                        path_label(ui, Icon::Excluded, entry, false);
+                        None
+                    },
+                    |ui, _| {
+                        if a11y::for_what(ui.add(Button::secondary("Remove").small()), entry)
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                    },
+                );
+            }
+            self.adder(ui, Target::Exclude);
+        });
         if let Some(i) = remove {
             self.config.exclude.remove(i);
             self.save_config();
         }
-        self.adder(ui, Target::Exclude);
     }
 
     /// Where the index goes, with a one-click exclude: generated and copied
@@ -534,95 +583,127 @@ impl SettingsWindow {
             self.largest_for = Some(s.chunks);
             self.link.send(Request::LargestFolders(LARGEST));
         }
-        section(ui, "Largest folders");
-        help_line(ui, "Excluding one drops it from the index.");
-        let Some(largest) = largest else {
-            ui.label(RichText::new("Counting…").color(p.muted));
-            return;
-        };
-        if largest.is_empty() {
-            ui.label(RichText::new("No folders inside the indexed ones yet.").color(p.muted));
-            return;
-        }
+        widgets::group_label(ui, "Largest folders");
+        widgets::group_help(ui, "Excluding one drops it from the index.");
         let mut exclude = None;
-        for (path, chunks) in largest {
-            let entry = tilde(Path::new(path));
-            let excluded = self.config.exclude.contains(&entry);
-            listed(ui, &entry, |ui, of| {
-                let can = !excluded && self.config_broken.is_none();
-                let label = if excluded { "Excluded" } else { "Exclude" };
-                if of(ui.add_enabled(can, egui::Button::new(label))).clicked() {
-                    exclude = Some(PathBuf::from(path));
-                }
-                let share = *chunks as f64 * 100.0 / s.chunks.max(1) as f64;
-                ui.label(
-                    RichText::new(format!("{} chunks, {share:.0}%", count(*chunks as i64)))
-                        .color(p.muted),
+        widgets::group(ui, |ui| {
+            let Some(largest) = largest else {
+                widgets::group_section(ui, |ui| {
+                    widgets::muted(ui, "Counting…");
+                });
+                return;
+            };
+            if largest.is_empty() {
+                widgets::group_section(ui, |ui| {
+                    widgets::muted(ui, "No folders inside the indexed ones yet.");
+                });
+                return;
+            }
+            for (path, chunks) in largest {
+                let entry = tilde(Path::new(path));
+                let excluded = self.config.exclude.contains(&entry);
+                let share = *chunks as f32 / s.chunks.max(1) as f32;
+                Row::new("").custom(
+                    ui,
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        ui.horizontal(|ui| {
+                            widgets::mono(ui, &entry);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                widgets::small(
+                                    ui,
+                                    format!(
+                                        "{} chunks · {:.0}%",
+                                        count(*chunks as i64),
+                                        share * 100.0
+                                    ),
+                                );
+                            });
+                        });
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 4.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 2.0, p.pressed);
+                        let done = egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2(rect.width() * share.clamp(0.0, 1.0), 4.0),
+                        );
+                        ui.painter().rect_filled(done, 2.0, p.kinds[0]);
+                        None
+                    },
+                    |ui, _| {
+                        let can = !excluded && self.config_broken.is_none();
+                        let label = if excluded { "Excluded" } else { "Exclude" };
+                        if a11y::for_what(
+                            ui.add_enabled(can, Button::secondary(label).small()),
+                            &entry,
+                        )
+                        .clicked()
+                        {
+                            exclude = Some(PathBuf::from(path));
+                        }
+                    },
                 );
-            });
-        }
+            }
+        });
         if let Some(path) = exclude {
             self.add(Target::Exclude, &path);
         }
     }
 
     fn cancel_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
-        let cancel = ui.button("Cancel");
+        let cancel = ui.add(Button::ghost("Cancel").small());
         if std::mem::take(&mut self.focus_cancel) {
             cancel.request_focus();
         }
         cancel
     }
 
-    /// "Add folder…" through the desktop's chooser, or a typed path.
+    /// "Add folder…" through the desktop's chooser, or a typed path, at the
+    /// bottom of a group.
     fn adder(&mut self, ui: &mut egui::Ui, target: Target) {
-        ui.add_space(4.0);
-        // Wrapped: with large text on a narrow window the field and Add go under the button.
-        ui.horizontal_wrapped(|ui| {
-            let (button, hint) = match target {
-                Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
-                Target::Exclude => ("Exclude folder…", "or type a path, e.g. ~/Downloads/tax"),
-            };
-            if ui
-                .add_enabled(!self.picking, egui::Button::new(button))
-                .clicked()
-            {
-                self.pick(ui.ctx(), target);
-            }
-            let text = match target {
-                Target::Root => &mut self.new_root,
-                Target::Exclude => &mut self.new_exclude,
-            };
-            let room = match ui.available_width() {
-                beside if beside >= 180.0 => beside,
-                _ => ui.max_rect().width(),
-            };
-            let width = (room - 60.0).clamp(120.0, 300.0);
-            let edit = ui.add(
-                egui::TextEdit::singleline(text)
-                    .hint_text(hint)
-                    .desired_width(width)
-                    // As tall as the buttons beside it.
-                    .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
-                    .align(egui::Align2::LEFT_CENTER),
-            );
-            // The hint is only a placeholder; say what the field is for.
-            let name = match target {
-                Target::Root => "Folder to add",
-                Target::Exclude => "Folder to exclude",
-            };
-            ui.ctx()
-                .accesskit_node_builder(edit.id, |node| node.set_label(name));
-            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let typed = !text.trim().is_empty();
-            let to = match target {
-                Target::Root => "to included",
-                Target::Exclude => "to excluded",
-            };
-            let add = for_what(ui.add_enabled(typed, egui::Button::new("Add")), to);
-            if (add.clicked() || entered) && typed {
-                self.add_typed(target);
-            }
+        widgets::group_section(ui, |ui| {
+            // Wrapped: with large text on a narrow window the field and Add go under the button.
+            ui.horizontal_wrapped(|ui| {
+                let (button, hint) = match target {
+                    Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
+                    Target::Exclude => ("Exclude folder…", "or type a path, e.g. ~/Downloads/tax"),
+                };
+                if ui
+                    .add_enabled(!self.picking, Button::secondary(button).icon(Icon::Plus))
+                    .clicked()
+                {
+                    self.pick(ui.ctx(), target);
+                }
+                let text = match target {
+                    Target::Root => &mut self.new_root,
+                    Target::Exclude => &mut self.new_exclude,
+                };
+                let room = match ui.available_width() {
+                    beside if beside >= 180.0 => beside,
+                    _ => ui.max_rect().width(),
+                };
+                let width = (room - 60.0).clamp(120.0, 320.0);
+                let edit = ui.add(widgets::field(text, hint, width));
+                // The hint is only a placeholder; say what the field is for.
+                let name = match target {
+                    Target::Root => "Folder to add",
+                    Target::Exclude => "Folder to exclude",
+                };
+                ui.ctx()
+                    .accesskit_node_builder(edit.id, |node| node.set_label(name));
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let typed = !text.trim().is_empty();
+                let to = match target {
+                    Target::Root => "to included",
+                    Target::Exclude => "to excluded",
+                };
+                let add = a11y::for_what(ui.add_enabled(typed, Button::secondary("Add")), to);
+                if (add.clicked() || entered) && typed {
+                    self.add_typed(target);
+                }
+            });
         });
     }
 
@@ -632,167 +713,169 @@ impl SettingsWindow {
             Some(Ok(s)) => Some(s),
             Some(Err(why)) => {
                 ui.add_space(10.0);
-                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                widgets::banner(ui, Tone::Error, why, |_| {});
                 None
             }
             None => None,
         };
         if let Some(s) = s {
-            section(ui, "EmbeddingGemma 2");
-            row(ui, "Download:", "Needed for search and indexing.", |ui| {
-                // Status and buttons on one line, as on the rows below.
-                ui.horizontal_wrapped(|ui| {
-                    ui.set_min_height(ui.spacing().interact_size.y);
-                    if s.fetching {
-                        let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
-                        ui.add(
-                            egui::ProgressBar::new(fraction)
-                                .text(format!("{} of {}", size(s.fetch_done), size(s.fetch_total)))
-                                .desired_width(220.0),
-                        );
-                    } else if s.model_present {
-                        ui.label(format!("Downloaded, {}", size(s.model_bytes)));
-                    } else {
-                        let color = ui.visuals().warn_fg_color;
-                        ui.label(RichText::new("Not downloaded").color(color));
+            widgets::group_label(ui, "EmbeddingGemma 2");
+            let deleting = self.confirm == Some(Confirm::DeleteModel);
+            widgets::group(ui, |ui| {
+                let row = Row::new("Download").help("Needed for search and indexing.");
+                let row = if deleting {
+                    row.tint(p.error_tint)
+                } else {
+                    row
+                };
+                row.show(ui, |ui, _| {
+                    if deleting {
+                        if ui
+                            .add(Button::destructive("Delete the model").small())
+                            .clicked()
+                        {
+                            self.link.send(Request::DeleteModel);
+                            self.confirm = None;
+                        }
+                        if self.cancel_button(ui).clicked() {
+                            self.confirm = None;
+                        }
+                        return;
+                    }
+                    let deletable = s.model_present && !s.fetching;
+                    if ui
+                        .add_enabled(deletable, Button::secondary("Delete…"))
+                        .clicked()
+                    {
+                        self.confirm = Some(Confirm::DeleteModel);
+                        self.focus_cancel = true;
                     }
                     let label = if s.model_present {
                         "Verify"
                     } else {
                         "Download"
                     };
-                    if ui
-                        .add_enabled(!s.fetching, egui::Button::new(label))
-                        .clicked()
-                    {
+                    let button = if s.model_present {
+                        Button::secondary(label)
+                    } else {
+                        Button::primary(label).icon(Icon::Download)
+                    };
+                    if ui.add_enabled(!s.fetching, button).clicked() {
                         self.link.send(Request::FetchModel);
                     }
-                    let deletable = s.model_present && !s.fetching;
-                    if self.confirm == Some(Confirm::DeleteModel) {
-                        if self.cancel_button(ui).clicked() {
-                            self.confirm = None;
-                        }
-                        if ui.button("Delete the model").clicked() {
-                            self.link.send(Request::DeleteModel);
-                            self.confirm = None;
-                        }
-                    } else if ui
-                        .add_enabled(deletable, egui::Button::new("Delete…"))
-                        .clicked()
-                    {
-                        self.confirm = Some(Confirm::DeleteModel);
-                        self.focus_cancel = true;
+                    if s.fetching {
+                        let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
+                        widgets::small(
+                            ui,
+                            format!("{} of {}", size(s.fetch_done), size(s.fetch_total)),
+                        );
+                        widgets::progress(ui, fraction, 120.0);
+                    } else if s.model_present {
+                        widgets::chip(
+                            ui,
+                            ChipKind::Ok,
+                            &format!("Downloaded, {}", size(s.model_bytes)),
+                        );
+                    } else {
+                        widgets::chip(ui, ChipKind::Warn, "Not downloaded");
                     }
                 });
                 if !s.fetch_error.is_empty() {
-                    ui.label(
-                        RichText::new(format!("The last download failed: {}", s.fetch_error))
-                            .color(ui.visuals().error_fg_color),
-                    );
+                    Row::new("Last download")
+                        .help(&format!("Failed: {}", s.fetch_error))
+                        .tone(Tone::Error)
+                        .show(ui, |_, _| {});
                 }
-            });
-            row(ui, "Memory:", "", |ui| {
-                ui.horizontal(|ui| {
-                    if s.model_loaded {
-                        ui.label(format!("Loaded on {}", s.device));
-                    } else {
-                        ui.label(RichText::new("Not loaded").color(p.muted));
-                    }
+                Row::new("Memory").show(ui, |ui, _| {
                     if ui
-                        .add_enabled(s.model_loaded, egui::Button::new("Unload now"))
+                        .add_enabled(s.model_loaded, Button::secondary("Unload now"))
                         .clicked()
                     {
                         self.link.send(Request::Unload);
                     }
+                    if s.model_loaded {
+                        ui.label(format!("Loaded on {}", s.device));
+                    } else {
+                        widgets::muted(ui, "Not loaded");
+                    }
                 });
-            });
-            row(
-                ui,
-                "Compiled cache:",
-                "Clearing it makes the next load slower.",
-                |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(size(s.cache_bytes));
+                Row::new("Compiled cache")
+                    .help("Clearing it makes the next load slower.")
+                    .show(ui, |ui, _| {
                         if ui
-                            .add_enabled(s.cache_bytes > 0, egui::Button::new("Clear"))
+                            .add_enabled(s.cache_bytes > 0, Button::secondary("Clear"))
                             .clicked()
                         {
                             self.link.send(Request::ClearCache);
                         }
+                        ui.label(size(s.cache_bytes));
                     });
-                },
-            );
+            });
         }
 
-        section(ui, "Running");
+        widgets::group_label(ui, "Running");
         if self.config_broken.is_some() {
-            help_line(ui, "The settings file doesn't parse; see the Folders page.");
+            widgets::group_help(ui, "The settings file doesn't parse; see the Folders page.");
             return;
         }
         let mut changed = false;
-        labelled_row(
-            ui,
-            "Device:",
-            "The NPU is fastest and uses the least power.",
-            |ui, named| {
-                let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
-                let mut picked = DEVICES
-                    .into_iter()
-                    .find(|d| d.eq_ignore_ascii_case(current))
-                    .unwrap_or(DEFAULT_DEVICE);
-                let before = picked;
-                let combo = egui::ComboBox::from_id_salt("device")
-                    .width(ui.available_width().min(240.0))
-                    .selected_text(device_label(picked))
-                    .show_ui(ui, |ui| {
-                        for d in DEVICES {
-                            ui.selectable_value(&mut picked, d, device_label(d));
-                        }
-                    });
-                named(combo.response);
-                if picked != before {
-                    self.config.device = (picked != DEFAULT_DEVICE).then(|| picked.to_owned());
-                    changed = true;
-                }
-            },
-        );
-        labelled_row(ui, "Unload after:", "0 keeps it loaded.", |ui, named| {
-            let mut minutes = self
-                .config
-                .idle_unload_minutes
-                .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
-            let response = ui
-                .add(
-                    egui::DragValue::new(&mut minutes)
-                        .range(0.0..=1440.0)
-                        .speed(0.25)
-                        .custom_formatter(|m, _| {
-                            if m.fract() == 0.0 {
-                                format!("{m:.0}")
-                            } else {
-                                format!("{m:.1}")
-                            }
-                        })
-                        .suffix(" min"),
-                )
-                // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
-                .on_hover_cursor(egui::CursorIcon::Text);
-            let response = named(response);
-            if response.changed() {
-                self.config.idle_unload_minutes = Some(minutes);
-                self.idle_dirty = true;
-            }
-        });
-        labelled_row(ui, "Indexing share:", "Halved on battery.", |ui, named| {
-            let mut percent = self
-                .config
-                .index_busy_percent
-                .unwrap_or(DEFAULT_INDEX_BUSY_PERCENT);
-            let response = slider(ui, named, &mut percent, 10..=100, 1.0, 0, " %");
-            if response.changed() {
-                self.config.index_busy_percent = Some(percent);
-                self.idle_dirty = true;
-            }
+        widgets::group(ui, |ui| {
+            Row::new("Device")
+                .help("The NPU is fastest and uses the least power.")
+                .show(ui, |ui, _| {
+                    let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
+                    let mut picked = DEVICES
+                        .into_iter()
+                        .find(|d| d.eq_ignore_ascii_case(current))
+                        .unwrap_or(DEFAULT_DEVICE);
+                    let options: Vec<(&str, &str)> = DEVICES.iter().map(|d| (*d, *d)).collect();
+                    if widgets::segmented(ui, "Device", &mut picked, &options) {
+                        self.config.device = (picked != DEFAULT_DEVICE).then(|| picked.to_owned());
+                        changed = true;
+                    }
+                });
+            Row::new("Unload after")
+                .help("0 keeps it loaded.")
+                .show(ui, |ui, named| {
+                    let mut minutes = self
+                        .config
+                        .idle_unload_minutes
+                        .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
+                    widgets::small(ui, "min");
+                    let response = ui
+                        .add(
+                            egui::DragValue::new(&mut minutes)
+                                .range(0.0..=1440.0)
+                                .speed(0.25)
+                                .custom_formatter(|m, _| {
+                                    if m.fract() == 0.0 {
+                                        format!("{m:.0}")
+                                    } else {
+                                        format!("{m:.1}")
+                                    }
+                                }),
+                        )
+                        // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
+                        .on_hover_cursor(egui::CursorIcon::Text);
+                    let response = named(response);
+                    if response.changed() {
+                        self.config.idle_unload_minutes = Some(minutes);
+                        self.idle_dirty = true;
+                    }
+                });
+            Row::new("Indexing share")
+                .help("Halved on battery.")
+                .show(ui, |ui, named| {
+                    let mut percent = self
+                        .config
+                        .index_busy_percent
+                        .unwrap_or(DEFAULT_INDEX_BUSY_PERCENT);
+                    let response = slider(ui, named, &mut percent, 10..=100, 1.0, 0, " %");
+                    if response.changed() {
+                        self.config.index_busy_percent = Some(percent);
+                        self.idle_dirty = true;
+                    }
+                });
         });
         if changed {
             self.save_config();
@@ -803,15 +886,18 @@ impl SettingsWindow {
     fn search(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
         if let Some(why) = &self.config_broken {
             ui.add_space(10.0);
-            ui.label(
-                RichText::new(format!(
+            widgets::banner(
+                ui,
+                Tone::Error,
+                &format!(
                     "{} doesn't parse, so it isn't changed from here: {why}",
                     self.config_path.display()
-                ))
-                .color(ui.visuals().error_fg_color),
+                ),
+                |_| {},
             );
             return;
         }
+        let p = theme::palette(ui.ctx());
         let mut changed = false;
         let s = match status {
             Some(Ok(s)) => Some(s),
@@ -822,194 +908,178 @@ impl SettingsWindow {
         let share = |files: i64, chunks: Option<i64>| -> Option<String> {
             let s = s.filter(|_| files > 0)?;
             let what = match chunks {
-                Some(c) => format!("{} files, {} chunks", count(files), count(c)),
+                Some(_) => format!("{} files", count(files)),
                 None => format!("{} photos", count(files)),
             };
             let pct = chunks.unwrap_or(files) as f64 * 100.0 / s.chunks.max(1) as f64;
-            Some(format!("{what}, {pct:.0}% of the index"))
+            Some(format!("{what} · {pct:.0}%"))
         };
-        let p = theme::palette(ui.ctx());
-        section(ui, "What to index");
-        row(ui, "Text:", "Notes, Markdown and web pages.", |ui| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(ui.spacing().interact_size.y);
-                ui.label("On");
-                if let Some(s) = s
-                    && let Some(text) = share(s.text_files, Some(s.text_chunks))
-                {
-                    ui.label(RichText::new(text).color(p.muted));
-                }
-            });
-        });
-        row(
-            ui,
-            "Images:",
-            "Found by what's in them and the text they show. A 671 MB download.",
-            |ui| {
-                let mut on = self.config.formats.images_enabled();
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut on, "Index images").changed() {
-                        self.config.formats.images.enabled = on.then_some(true);
+        widgets::group_label(ui, "What to index");
+        widgets::group(ui, |ui| {
+            Row::new("Text")
+                .help("Notes, Markdown and web pages.")
+                .show(ui, |ui, _| {
+                    widgets::chip(ui, ChipKind::Neutral, "Always on");
+                    if let Some(s) = s
+                        && let Some(text) = share(s.text_files, Some(s.text_chunks))
+                    {
+                        widgets::small(ui, text);
+                    }
+                });
+            let mut images = self.config.formats.images_enabled();
+            Row::new("Images")
+                .help("By what's in them. 671 MB download.")
+                .show(ui, |ui, _| {
+                    if widgets::switch(ui, &mut images, "Index images").changed() {
+                        self.config.formats.images.enabled = images.then_some(true);
                         changed = true;
                     }
                     if let Some(s) = s
                         && let Some(text) = share(s.image_files, None)
                     {
-                        ui.label(RichText::new(text).color(p.muted));
+                        widgets::small(ui, text);
                     }
                 });
-                if on
-                    && let Some(Ok(s)) = status
-                    && !s.model_present
-                {
-                    ui.horizontal_wrapped(|ui| {
-                        let color = ui.visuals().warn_fg_color;
-                        ui.label(
-                            RichText::new("The vision model isn't downloaded yet.").color(color),
-                        );
+            if images
+                && let Some(s) = s
+                && !s.model_present
+            {
+                Row::new("").tint(p.warn_tint).custom(
+                    ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            icons::icon(ui, Icon::Warning, 16.0, p.warn);
+                            let shown = ui.add(
+                                egui::Label::new("The vision model isn't downloaded yet.").wrap(),
+                            );
+                            a11y::live(&shown);
+                        });
+                        None
+                    },
+                    |ui, _| {
                         if ui
-                            .add_enabled(!s.fetching, egui::Button::new("Download"))
+                            .add_enabled(!s.fetching, Button::primary("Download").small())
                             .clicked()
                         {
                             self.link.send(Request::FetchModel);
                         }
-                    });
-                }
-            },
-        );
-        if self.config.formats.images_enabled() {
-            labelled_row(
-                ui,
-                "Image types:",
-                "Comma-separated. Empty restores the defaults.",
-                |ui, named| {
-                    let current = self
-                        .config
-                        .formats
-                        .images
-                        .extensions
-                        .clone()
-                        .unwrap_or_else(|| {
-                            DEFAULT_IMAGE_EXTENSIONS
-                                .iter()
-                                .map(|&e| e.to_owned())
-                                .collect()
-                        })
-                        .join(", ");
-                    let text = self.image_extensions.get_or_insert(current);
-                    let response =
-                        named(ui.add(egui::TextEdit::singleline(text).desired_width(320.0)));
-                    if response.lost_focus() {
-                        let typed: Vec<String> = text
-                            .split([',', ' '])
-                            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-                            .filter(|e| !e.is_empty())
-                            .collect();
-                        let mut next = self.config.formats.clone();
-                        next.images.extensions = (!typed.is_empty()
-                            && typed != DEFAULT_IMAGE_EXTENSIONS)
-                            .then_some(typed);
-                        match next.image_extensions() {
-                            Ok(_) => {
-                                if next != self.config.formats {
-                                    self.config.formats = next;
-                                    changed = true;
+                    },
+                );
+            }
+            if images {
+                Row::new("Image types")
+                    .help("Empty restores the defaults.")
+                    .show(ui, |ui, named| {
+                        let current = self
+                            .config
+                            .formats
+                            .images
+                            .extensions
+                            .clone()
+                            .unwrap_or_else(|| {
+                                DEFAULT_IMAGE_EXTENSIONS
+                                    .iter()
+                                    .map(|&e| e.to_owned())
+                                    .collect()
+                            })
+                            .join(", ");
+                        let text = self.image_extensions.get_or_insert(current);
+                        let width = ui.available_width().min(220.0);
+                        let response = named(ui.add(widgets::field(text, "", width)));
+                        if response.lost_focus() {
+                            let typed: Vec<String> = text
+                                .split([',', ' '])
+                                .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                                .filter(|e| !e.is_empty())
+                                .collect();
+                            let mut next = self.config.formats.clone();
+                            next.images.extensions = (!typed.is_empty()
+                                && typed != DEFAULT_IMAGE_EXTENSIONS)
+                                .then_some(typed);
+                            match next.image_extensions() {
+                                Ok(_) => {
+                                    if next != self.config.formats {
+                                        self.config.formats = next;
+                                        changed = true;
+                                    }
+                                    self.image_extensions = None;
                                 }
-                                self.image_extensions = None;
+                                Err(e) => self.notice = Some(format!("{e:#}")),
                             }
-                            Err(e) => self.notice = Some(format!("{e:#}")),
                         }
-                    }
-                },
-            );
-        }
-
-        let documents = if self.config.encryption.on() {
-            "PDF, Office, RTF, EPUB, subtitles and CSV."
-        } else {
-            "PDF, Office, RTF, EPUB, subtitles and CSV. Their text is stored unencrypted \
-             unless the index is encrypted (Security)."
-        };
-        row(ui, "Documents:", documents, |ui| {
-            let mut on = self.config.formats.documents_enabled();
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut on, "Index documents").changed() {
+                    });
+            }
+            let documents = if self.config.encryption.on() {
+                "PDF, Office, EPUB, subtitles, CSV."
+            } else {
+                "PDF, Office, EPUB, subtitles, CSV. Stored unencrypted unless the index is \
+                 encrypted (Security)."
+            };
+            Row::new("Documents").help(documents).show(ui, |ui, _| {
+                let mut on = self.config.formats.documents_enabled();
+                if widgets::switch(ui, &mut on, "Index documents").changed() {
                     self.config.formats.documents.enabled = on.then_some(true);
                     changed = true;
                 }
                 if let Some(s) = s
                     && let Some(text) = share(s.document_files, Some(s.document_chunks))
                 {
-                    ui.label(RichText::new(text).color(p.muted));
+                    widgets::small(ui, text);
                 }
             });
-        });
-
-        row(
-            ui,
-            "Code:",
-            "Source code, found only by searches starting \"code:\". Files git ignores, \
-             vendored and generated code, and anything holding a key are left out.",
-            |ui| {
-                let mut on = self.config.formats.code_enabled();
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut on, "Index code").changed() {
+            Row::new("Code")
+                .help("Found with “code:” searches. Secrets and ignored files skipped.")
+                .show(ui, |ui, _| {
+                    let mut on = self.config.formats.code_enabled();
+                    if widgets::switch(ui, &mut on, "Index code").changed() {
                         self.config.formats.code.enabled = on.then_some(true);
                         changed = true;
                     }
                     if let Some(s) = s
                         && let Some(text) = share(s.code_files, Some(s.code_chunks))
                     {
-                        ui.label(RichText::new(text).color(p.muted));
+                        widgets::small(ui, text);
                     }
                 });
-            },
-        );
-
-        let sessions = if self.config.encryption.on() {
-            "vinoWhisper's saved transcripts and their summaries, searched with everything else."
-        } else {
-            "vinoWhisper's saved transcripts and their summaries, searched with everything \
-             else. A transcript holds whatever was said or played, and its text is stored \
-             unencrypted unless the index is encrypted (Security)."
-        };
-        row(ui, "Sessions:", sessions, |ui| {
-            let mut on = self.config.formats.sessions_enabled();
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut on, "Index vinoWhisper sessions").changed() {
-                    self.config.formats.sessions.enabled = on.then_some(true);
-                    changed = true;
-                }
-                if let Some(s) = s
-                    && let Some(text) = share(s.session_files, Some(s.session_chunks))
-                {
-                    ui.label(RichText::new(text).color(p.muted));
-                }
-            });
-            if on && !self.config.encryption.on() {
-                ui.label(
-                    RichText::new("Turn on encryption (Security) to keep transcripts encrypted.")
-                        .color(p.muted),
-                );
-            }
+            let sessions_on = self.config.formats.sessions_enabled();
+            let (sessions_help, tone) = if sessions_on && !self.config.encryption.on() {
+                (
+                    "Turn on encryption (Security) to keep transcripts encrypted.",
+                    Tone::Warn,
+                )
+            } else {
+                ("Transcripts and summaries.", Tone::Neutral)
+            };
+            Row::new("vinoWhisper sessions")
+                .help(sessions_help)
+                .tone(tone)
+                .show(ui, |ui, _| {
+                    let mut on = sessions_on;
+                    if widgets::switch(ui, &mut on, "Index vinoWhisper sessions").changed() {
+                        self.config.formats.sessions.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.session_files, Some(s.session_chunks))
+                    {
+                        widgets::small(ui, text);
+                    }
+                });
             if let Some(s) = s
                 && s.sessions_unread > 0
             {
                 let n = s.sessions_unread;
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "{n} {} not read: made by a newer vinoWhisper, or damaged.",
-                            if n == 1 { "session" } else { "sessions" }
-                        ))
-                        .color(p.error),
-                    )
-                    .wrap(),
-                );
+                Row::new("Not read")
+                    .help(&format!(
+                        "{n} {}: made by a newer vinoWhisper, or damaged.",
+                        if n == 1 { "session" } else { "sessions" }
+                    ))
+                    .tone(Tone::Error)
+                    .show(ui, |_, _| {});
             }
         });
 
-        section(ui, "Opening results");
+        widgets::group_label(ui, "Opening results");
         let editors = self.editors.get_or_insert_with(apps::editors).clone();
         let current = self.config.editor.clone();
         let mut pick = match &current {
@@ -1020,105 +1090,88 @@ impl SettingsWindow {
             None if self.custom_editor => Pick::Custom,
             None => Pick::Default,
         };
-        labelled_row(
-            ui,
-            "Editor:",
-            "Opens text at the matching line where the app allows it: VS Code, Kate, \
-             GNOME Text Editor, Zed, a JetBrains IDE.",
-            |ui, named| {
-                let before = pick.clone();
-                let label = |pick: &Pick| match pick {
-                    Pick::Default => "Default app".to_owned(),
-                    Pick::App(id) => editors
-                        .iter()
-                        .find(|a| &a.id == id)
-                        .map_or_else(|| id.clone(), |a| a.name.clone()),
-                    Pick::Custom => "Custom command…".to_owned(),
-                };
-                let combo = egui::ComboBox::from_id_salt("editor")
-                    .width((ui.available_width() - 60.0).clamp(120.0, 300.0))
-                    .selected_text(label(&pick))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut pick, Pick::Default, label(&Pick::Default));
-                        for a in editors.iter() {
-                            ui.selectable_value(&mut pick, Pick::App(a.id.clone()), &a.name);
-                        }
-                        ui.separator();
-                        ui.selectable_value(&mut pick, Pick::Custom, label(&Pick::Custom));
-                    });
-                named(combo.response);
-                if pick != before {
-                    self.custom_editor = pick == Pick::Custom;
-                    self.editor = None;
-                    let next = match &pick {
-                        Pick::Default => None,
-                        Pick::App(id) => Some(id.clone()),
-                        // Kept until a command is typed, unless it was an app.
-                        Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
+        widgets::group(ui, |ui| {
+            Row::new("Editor")
+                .help("Opens at the matching line.")
+                .show(ui, |ui, named| {
+                    let before = pick.clone();
+                    let label = |pick: &Pick| match pick {
+                        Pick::Default => "Default app".to_owned(),
+                        Pick::App(id) => editors
+                            .iter()
+                            .find(|a| &a.id == id)
+                            .map_or_else(|| id.clone(), |a| a.name.clone()),
+                        Pick::Custom => "Custom command…".to_owned(),
                     };
-                    if next != self.config.editor {
-                        self.config.editor = next;
-                        changed = true;
-                    }
-                }
-            },
-        );
-        if pick == Pick::Custom {
-            labelled_row(
-                ui,
-                "Command:",
-                "Any command with {file} and {line} in it, run without a shell. Empty uses the \
-             default app.",
-                |ui, named| {
-                    let current = self.config.editor.clone().unwrap_or_default();
-                    let text = self.editor.get_or_insert(current);
-                    let response = named(
-                        ui.add(
-                            egui::TextEdit::singleline(text)
-                                .hint_text("foot -e nvim +{line} {file}")
-                                .desired_width((ui.available_width() - 60.0).clamp(120.0, 300.0)),
-                        ),
-                    );
-                    if response.lost_focus() {
-                        let typed = text.trim();
-                        let next = (!typed.is_empty()).then(|| typed.to_owned());
+                    let combo =
+                        widgets::combo(ui, "editor", label(&pick), 200.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut pick, Pick::Default, label(&Pick::Default));
+                            for a in editors.iter() {
+                                ui.selectable_value(&mut pick, Pick::App(a.id.clone()), &a.name);
+                            }
+                            ui.separator();
+                            ui.selectable_value(&mut pick, Pick::Custom, label(&Pick::Custom));
+                        });
+                    named(combo.response);
+                    if pick != before {
+                        self.custom_editor = pick == Pick::Custom;
+                        self.editor = None;
+                        let next = match &pick {
+                            Pick::Default => None,
+                            Pick::App(id) => Some(id.clone()),
+                            // Kept until a command is typed, unless it was an app.
+                            Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
+                        };
                         if next != self.config.editor {
                             self.config.editor = next;
                             changed = true;
                         }
-                        self.editor = None;
                     }
-                },
-            );
-        }
+                });
+            if pick == Pick::Custom {
+                Row::new("Command")
+                    .help("With {file} and {line} in it, run without a shell.")
+                    .show(ui, |ui, named| {
+                        let current = self.config.editor.clone().unwrap_or_default();
+                        let text = self.editor.get_or_insert(current);
+                        let width = ui.available_width().min(260.0);
+                        let response = named(ui.add(widgets::field(
+                            text,
+                            "foot -e nvim +{line} {file}",
+                            width,
+                        )));
+                        if response.lost_focus() {
+                            let typed = text.trim();
+                            let next = (!typed.is_empty()).then(|| typed.to_owned());
+                            if next != self.config.editor {
+                                self.config.editor = next;
+                                changed = true;
+                            }
+                            self.editor = None;
+                        }
+                    });
+            }
+        });
 
-        section(ui, "How close results must be");
-        help_line(
-            ui,
-            "The higher the number, the closer a match has to be: fewer results, better ones.",
-        );
-        let text = self.config.formats.text.min_score;
-        if let Some(v) = score_row(ui, "Text:", "", text, DEFAULT_TEXT_MIN_SCORE, 0.45..=0.85) {
-            self.config.formats.text.min_score = v;
-            self.idle_dirty = true;
-        }
-        let image = self.config.formats.images.min_score;
-        if let Some(v) = score_row(
-            ui,
-            "Images:",
-            "",
-            image,
-            DEFAULT_IMAGE_MIN_SCORE,
-            0.45..=0.75,
-        ) {
-            self.config.formats.images.min_score = v;
-            self.idle_dirty = true;
-        }
-        let code = self.config.formats.code.min_score;
-        if let Some(v) = score_row(ui, "Code:", "", code, DEFAULT_CODE_MIN_SCORE, 0.45..=0.85) {
-            self.config.formats.code.min_score = v;
-            self.idle_dirty = true;
-        }
+        widgets::group_label(ui, "How close results must be");
+        widgets::group_help(ui, "Higher means fewer, better results.");
+        widgets::group(ui, |ui| {
+            let text = self.config.formats.text.min_score;
+            if let Some(v) = score_row(ui, "Text", text, DEFAULT_TEXT_MIN_SCORE, 0.45..=0.85) {
+                self.config.formats.text.min_score = v;
+                self.idle_dirty = true;
+            }
+            let image = self.config.formats.images.min_score;
+            if let Some(v) = score_row(ui, "Images", image, DEFAULT_IMAGE_MIN_SCORE, 0.45..=0.75) {
+                self.config.formats.images.min_score = v;
+                self.idle_dirty = true;
+            }
+            let code = self.config.formats.code.min_score;
+            if let Some(v) = score_row(ui, "Code", code, DEFAULT_CODE_MIN_SCORE, 0.45..=0.85) {
+                self.config.formats.code.min_score = v;
+                self.idle_dirty = true;
+            }
+        });
         if changed {
             self.save_config();
         }
@@ -1132,20 +1185,19 @@ impl SettingsWindow {
             Some(Ok(s)) => Some(s),
             Some(Err(why)) => {
                 ui.add_space(10.0);
-                ui.label(RichText::new(why).color(ui.visuals().error_fg_color));
+                widgets::banner(ui, Tone::Error, why, |_| {});
                 None
             }
             None => None,
         };
-        section(ui, "Encryption at rest");
-        help_line(
+        widgets::group_label(ui, "Encryption at rest");
+        widgets::group_help(
             ui,
-            "The index holds the text of what it covers, and its vectors can be turned back \
-             into much of that text. Encrypted, it reads only on this machine, as you: not \
-             from a backup or a copy of your home folder, or a disk taken out.",
+            "The index holds the text of what it covers. Encrypted, it reads only on this \
+             machine, as you: not from a backup, a copy of your home folder or a disk taken out.",
         );
         if let Some(why) = &self.config_broken {
-            help_line(
+            widgets::group_help(
                 ui,
                 &format!("The settings file doesn't parse, so it isn't changed from here: {why}"),
             );
@@ -1153,124 +1205,123 @@ impl SettingsWindow {
         }
         let no_tpm = s.is_some_and(|s| !s.tpm);
         let mut changed = false;
-        row(
-            ui,
-            "Encryption:",
-            "SQLCipher, its key sealed to this machine's TPM by systemd. Turning it on or off \
-             converts the index as it is; nothing is indexed again.",
-            |ui| {
-                let mut on = self.config.encryption.on();
-                if ui.checkbox(&mut on, "Encrypt the index").changed() {
-                    if on && no_tpm && !self.config.encryption.host_key_allowed() {
-                        // Refused here as the runner would refuse it: never weaker than asked.
-                        self.notice = Some(
-                            "This machine has no TPM that systemd can use, so the key can't be \
-                             sealed to it. Allow the host key below, or leave encryption off."
-                                .into(),
-                        );
-                    } else {
-                        self.config.encryption.enabled = on.then_some(true);
-                        changed = true;
+        let rekeying = self.confirm == Some(Confirm::Rekey);
+        widgets::group(ui, |ui| {
+            Row::new("Encrypt the index")
+                .help("Key sealed to the TPM. Nothing is re-indexed.")
+                .show(ui, |ui, _| {
+                    let mut on = self.config.encryption.on();
+                    if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
+                        if on && no_tpm && !self.config.encryption.host_key_allowed() {
+                            // Refused here as the runner would refuse it: never weaker than asked.
+                            self.notice = Some(
+                                "This machine has no TPM that systemd can use, so the key can't \
+                                 be sealed to it. Allow the host key below, or leave encryption \
+                                 off."
+                                    .into(),
+                            );
+                        } else {
+                            self.config.encryption.enabled = on.then_some(true);
+                            changed = true;
+                        }
                     }
-                }
-            },
-        );
-        if no_tpm || self.config.encryption.host_key_allowed() {
-            row(
-                ui,
-                "Without a TPM:",
-                "Seals the key with systemd's host key, which root can read. It still keeps the \
-                 index unreadable in a backup or copy of your home folder, but not on a disk \
-                 taken out with the rest of the system.",
-                |ui| {
-                    let mut allow = self.config.encryption.host_key_allowed();
-                    if ui
-                        .checkbox(&mut allow, "Use the host key instead (weaker)")
-                        .changed()
-                    {
-                        self.config.encryption.allow_host_key = allow.then_some(true);
-                        changed = true;
-                    }
-                },
-            );
-        }
-        if let Some(s) = s {
-            row(ui, "Now:", "", |ui| {
-                let (text, color) = match (s.encrypted, s.seal.as_str()) {
-                    (true, seal::TPM) => ("Encrypted, the key sealed to this machine's TPM", None),
-                    (true, seal::HOST) => {
-                        ("Encrypted, the key sealed with systemd's host key", None)
-                    }
-                    (true, _) => (
-                        "Encrypted with a key held in memory only: nothing could seal it, so the \
-                         index is rebuilt at the next start",
-                        Some(ui.visuals().warn_fg_color),
-                    ),
-                    (false, _) if self.config.encryption.on() && s.encryption_error.is_empty() => {
-                        ("Encrypting…", None)
-                    }
-                    (false, _) => ("Not encrypted", Some(p.muted)),
-                };
-                let text = RichText::new(text);
-                ui.add(
-                    egui::Label::new(match color {
-                        Some(c) => text.color(c),
-                        None => text,
-                    })
-                    .wrap(),
-                );
-                if !s.encryption_error.is_empty() {
-                    let color = ui.visuals().error_fg_color;
-                    ui.add(
-                        egui::Label::new(RichText::new(&s.encryption_error).color(color)).wrap(),
-                    );
-                }
-            });
-            if !s.seal_broken.is_empty() {
-                row(ui, "Rebuilt:", "", |ui| {
-                    let color = ui.visuals().warn_fg_color;
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(format!(
-                                "The index's key stopped working ({}), so the index is being \
-                                 built again from your files.",
-                                s.seal_broken
-                            ))
-                            .color(color),
-                        )
-                        .wrap(),
-                    );
                 });
+            if no_tpm || self.config.encryption.host_key_allowed() {
+                Row::new("Without a TPM")
+                    .help(
+                        "Seals the key with systemd's host key, which root can read: safe in a \
+                         backup, not on a disk taken out with the system.",
+                    )
+                    .show(ui, |ui, _| {
+                        let mut allow = self.config.encryption.host_key_allowed();
+                        if widgets::switch(ui, &mut allow, "Use the host key instead (weaker)")
+                            .changed()
+                        {
+                            self.config.encryption.allow_host_key = allow.then_some(true);
+                            changed = true;
+                        }
+                    });
+            }
+            let Some(s) = s else {
+                return;
+            };
+            let error = (!s.encryption_error.is_empty()).then_some(s.encryption_error.as_str());
+            Row::new("Now")
+                .help(error.unwrap_or(""))
+                .tone(Tone::Error)
+                .show(ui, |ui, _| {
+                    let (kind, text) = match (s.encrypted, s.seal.as_str()) {
+                        (true, seal::TPM) => (
+                            ChipKind::Ok,
+                            "Encrypted, the key sealed to this machine's TPM",
+                        ),
+                        (true, seal::HOST) => (
+                            ChipKind::Ok,
+                            "Encrypted, the key sealed with systemd's host key",
+                        ),
+                        (true, _) => (
+                            ChipKind::Warn,
+                            "Encrypted with a key held in memory only: nothing could seal it, so \
+                             the index is rebuilt at the next start",
+                        ),
+                        (false, _)
+                            if self.config.encryption.on() && s.encryption_error.is_empty() =>
+                        {
+                            (ChipKind::Neutral, "Encrypting…")
+                        }
+                        (false, _) => (ChipKind::Neutral, "Not encrypted"),
+                    };
+                    let shown = if kind == ChipKind::Neutral && text == "Encrypting…" {
+                        widgets::chip_busy(ui, kind, text)
+                    } else {
+                        widgets::chip(ui, kind, text)
+                    };
+                    a11y::live(&shown);
+                });
+            if !s.seal_broken.is_empty() {
+                Row::new("Rebuilt")
+                    .help(&format!(
+                        "The index's key stopped working ({}), so the index is being built again \
+                         from your files.",
+                        s.seal_broken
+                    ))
+                    .tone(Tone::Warn)
+                    .show(ui, |_, _| {});
             }
             if s.encrypted {
-                row(
-                    ui,
-                    "Key:",
-                    "Seals a new key and encrypts the index again under it: after moving to a \
-                     machine with a TPM, or to retire the old key.",
-                    |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if self.confirm == Some(Confirm::Rekey) {
-                                if self.cancel_button(ui).clicked() {
-                                    self.confirm = None;
-                                }
-                                if ui.button("Replace the key").clicked() {
-                                    self.link.send(Request::Rekey);
-                                    self.confirm = None;
-                                }
-                            } else if ui.button("New key…").clicked() {
-                                self.confirm = Some(Confirm::Rekey);
-                                self.focus_cancel = true;
-                            }
-                        });
-                    },
-                );
+                let row = Row::new("Key").help("Re-encrypt under a new key.");
+                let row = if rekeying {
+                    row.tint(p.error_tint)
+                } else {
+                    row
+                };
+                row.show(ui, |ui, _| {
+                    if rekeying {
+                        if ui
+                            .add(Button::destructive("Replace the key").small())
+                            .clicked()
+                        {
+                            self.link.send(Request::Rekey);
+                            self.confirm = None;
+                        }
+                        if self.cancel_button(ui).clicked() {
+                            self.confirm = None;
+                        }
+                    } else if ui
+                        .add(Button::secondary("New key…").icon(Icon::Key))
+                        .clicked()
+                    {
+                        self.confirm = Some(Confirm::Rekey);
+                        self.focus_cancel = true;
+                    }
+                });
             }
-        }
-        help_line(
+        });
+        ui.add_space(8.0);
+        widgets::small(
             ui,
-            "Turning it on leaves the old plaintext in free disk space until it is overwritten \
-             (or trimmed, on an SSD). Full-disk encryption covers that, and swap.",
+            "Old plaintext may linger in free disk space until overwritten; full-disk \
+             encryption covers it, and swap.",
         );
         if changed {
             self.save_config();
@@ -1287,68 +1338,64 @@ impl SettingsWindow {
         if state.report.is_none() && !state.running {
             doctor::run(Arc::clone(&self.doctor), ui.ctx());
         }
-        section(ui, "This machine");
-        if let Some(report) = &state.report {
-            for (label, text) in &report.lines {
-                let failed = label == "Probe:" && !report.ok;
-                row(ui, label, "", |ui| {
-                    let text = RichText::new(text);
-                    value(
-                        ui,
-                        if failed {
-                            text.color(ui.visuals().error_fg_color)
-                        } else if label == "Warning:" {
-                            text.color(ui.visuals().warn_fg_color)
-                        } else {
-                            text
-                        },
-                    );
-                });
-            }
-            if let Some(error) = &report.error {
-                row(ui, "Problem:", "", |ui| {
-                    let color = ui.visuals().error_fg_color;
-                    ui.add(egui::Label::new(RichText::new(error).color(color)).wrap());
-                });
-            }
-        }
-        row(ui, "", "Same as vinosearch doctor.", |ui| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(ui.spacing().interact_size.y);
-                if state.running {
-                    spinner(ui);
-                    ui.label("Checking…");
-                } else if ui.button("Check again").clicked() {
-                    doctor::run(Arc::clone(&self.doctor), ui.ctx());
+        widgets::group_label(ui, "This machine");
+        widgets::group(ui, |ui| {
+            if let Some(report) = &state.report {
+                for (label, text) in &report.lines {
+                    let failed = label == "Probe:" && !report.ok;
+                    let tone = if failed {
+                        Tone::Error
+                    } else if label == "Warning:" {
+                        Tone::Warn
+                    } else {
+                        Tone::Neutral
+                    };
+                    Row::new(label.trim_end_matches(':'))
+                        .help(text)
+                        .tone(tone)
+                        .show(ui, |_, _| {});
                 }
-            });
+                if let Some(error) = &report.error {
+                    Row::new("Problem")
+                        .help(error)
+                        .tone(Tone::Error)
+                        .show(ui, |_, _| {});
+                }
+            }
+            Row::new("Check")
+                .help("Same as vinosearch doctor.")
+                .show(ui, |ui, _| {
+                    if state.running {
+                        widgets::chip_busy(ui, ChipKind::Neutral, "Checking…");
+                    } else if ui.add(Button::secondary("Check again")).clicked() {
+                        doctor::run(Arc::clone(&self.doctor), ui.ctx());
+                    }
+                });
         });
 
-        section(ui, "Power");
+        widgets::group_label(ui, "Power");
         if self.config_broken.is_some() {
-            help_line(ui, "The settings file doesn't parse; see the Folders page.");
+            widgets::group_help(ui, "The settings file doesn't parse; see the Folders page.");
             return;
         }
-        row(
-            ui,
-            "Battery:",
-            "Off holds indexing until a charger is plugged in. Indexing also pauses while power saver is on.",
-            |ui| {
-                let mut on = self.config.index_on_battery();
-                if ui.checkbox(&mut on, "Index on battery").changed() {
-                    self.config.index_on_battery = (!on).then_some(false);
-                    self.save_config();
-                }
-            },
-        );
+        widgets::group(ui, |ui| {
+            Row::new("Index on battery")
+                .help("Off waits for a charger. Power saver pauses indexing too.")
+                .show(ui, |ui, _| {
+                    let mut on = self.config.index_on_battery();
+                    if widgets::switch(ui, &mut on, "Index on battery").changed() {
+                        self.config.index_on_battery = (!on).then_some(false);
+                        self.save_config();
+                    }
+                });
+        });
     }
 
     fn integration(&mut self, ui: &mut egui::Ui) {
-        let p = theme::palette(ui.ctx());
         let state = self.integration.lock().unwrap().clone();
         let (kde, gnome) = integration::desktops();
-        section(ui, "Search places");
-        help_line(
+        widgets::group_label(ui, "Search places");
+        widgets::group_help(
             ui,
             "Each place has its own switch; only what's on is installed.",
         );
@@ -1358,84 +1405,93 @@ impl SettingsWindow {
                               help: &str,
                               switch: integration::Switch,
                               absent: Option<&str>| {
-            row(ui, label, help, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.set_min_height(ui.spacing().interact_size.y);
-                    let on = state.is_on(switch);
-                    if state.running {
-                        spinner(ui);
-                        ui.label("Working…");
-                    } else if on {
-                        ui.label("On");
-                    } else {
-                        ui.label(RichText::new("Off").color(p.muted));
-                    }
-                    let button = if on { "Turn off" } else { "Turn on" };
-                    let button = ui.add_enabled(!state.running, egui::Button::new(button));
-                    if for_what(button, label.trim_end_matches(':')).clicked() {
-                        flip = Some((switch, !on));
-                    }
-                    if let Some(note) = absent {
-                        ui.label(RichText::new(note).color(p.muted));
-                    }
-                });
+            let help = match absent {
+                Some(note) => format!("{help} {note}"),
+                None => help.to_owned(),
+            };
+            Row::new(label).help(&help).show(ui, |ui, _| {
+                let on = state.is_on(switch);
+                let button = if on { "Turn off" } else { "Turn on" };
+                let button = ui.add_enabled(!state.running, Button::secondary(button));
+                if a11y::for_what(button, label).clicked() {
+                    flip = Some((switch, !on));
+                }
+                if state.running {
+                    widgets::chip_busy(ui, ChipKind::Neutral, "Working…");
+                } else if on {
+                    widgets::chip(ui, ChipKind::Ok, "On");
+                } else {
+                    widgets::chip(ui, ChipKind::Neutral, "Off");
+                }
             });
         };
-        switch_row(
-            ui,
-            "KRunner:",
-            "Alt+Space, and the search in the Plasma app launcher.",
-            integration::Switch::Kde,
-            (!kde).then_some("Plasma isn't running in this session."),
-        );
-        switch_row(
-            ui,
-            "GNOME Shell:",
-            "The overview's search, from the next login.",
-            integration::Switch::Gnome,
-            (!gnome).then_some("GNOME isn't running in this session."),
-        );
-        switch_row(
-            ui,
-            "App menu:",
-            "The search window as an app of its own, beside vinoSearch's settings.",
-            integration::Switch::Menu,
-            None,
-        );
-        section(ui, "Service");
-        switch_row(
-            ui,
-            "Search service:",
-            "Runs at login. Turning it off removes every search place too.",
-            integration::Switch::Service,
-            None,
-        );
+        widgets::group(ui, |ui| {
+            switch_row(
+                ui,
+                "KRunner",
+                "Alt+Space, and the search in the Plasma app launcher.",
+                integration::Switch::Kde,
+                (!kde).then_some("Plasma isn't running in this session."),
+            );
+            switch_row(
+                ui,
+                "GNOME Shell",
+                "The overview's search, from the next login.",
+                integration::Switch::Gnome,
+                (!gnome).then_some("GNOME isn't running in this session."),
+            );
+            switch_row(
+                ui,
+                "App menu",
+                "The search window as an app of its own.",
+                integration::Switch::Menu,
+                None,
+            );
+        });
+        widgets::group_label(ui, "Service");
+        widgets::group(ui, |ui| {
+            switch_row(
+                ui,
+                "Search service",
+                "Runs at login. Turning it off removes every search place too.",
+                integration::Switch::Service,
+                None,
+            );
+            if let Some(output) = &state.output {
+                widgets::group_section(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
+                });
+            }
+        });
         if let Some((switch, on)) = flip {
             integration::run(Arc::clone(&self.integration), ui.ctx(), switch, on);
         }
-        if let Some(output) = &state.output {
-            row(ui, "", "", |ui| {
-                egui::Frame::NONE
-                    .fill(p.code_bg)
-                    .stroke(Stroke::new(1.0_f32, p.rule))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
-                    });
-            });
-        }
-        section(ui, "Command line");
-        row(ui, "Search:", "", |ui| {
-            command(ui, "vinosearch search \"what you're looking for\"");
-        });
-        row(ui, "Similar photos:", "", |ui| {
-            command(ui, "vinosearch similar ~/Pictures/IMG_2041.jpg");
-        });
-        row(ui, "Check the NPU:", "", |ui| {
-            command(ui, "vinosearch doctor")
+        widgets::group_label(ui, "Command line");
+        widgets::group(ui, |ui| {
+            for (what, command) in [
+                ("Search", "vinosearch search \"what you're looking for\""),
+                (
+                    "Similar photos",
+                    "vinosearch similar ~/Pictures/IMG_2041.jpg",
+                ),
+                ("Check the NPU", "vinosearch doctor"),
+            ] {
+                Row::new(what).show(ui, |ui, _| {
+                    widgets::mono(ui, command);
+                });
+            }
         });
     }
+}
+
+/// A folder in a list: its icon and path, the path in full on hover.
+fn path_label(ui: &mut egui::Ui, icon: Icon, path: &str, alarmed: bool) {
+    let p = theme::palette(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        icons::icon(ui, icon, 16.0, if alarmed { p.error } else { p.muted });
+        widgets::mono(ui, path);
+    });
 }
 
 /// `/home/u/x` as `~/x`, the way the config file writes it.
@@ -1525,209 +1581,57 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// egui's Spinner asks for a repaint every frame, and with vsync off that is
-/// as fast as the GPU goes: 71% of a core here (2026-10-18), taken from
-/// indexing, which runs at idle priority. This one draws at 10 fps.
-/// It stands still when the desktop asks for less motion, and a screen reader skips it: the
-/// text beside it always says what is going on.
-fn spinner(ui: &mut egui::Ui) {
-    let size = 14.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    decorative(ui, response.id);
-    let still = theme::still(ui.ctx());
-    let t = if still { 0.0 } else { ui.input(|i| i.time) };
-    let start = (t * 6.0) % std::f64::consts::TAU;
-    let points: Vec<egui::Pos2> = (0..=16)
-        .map(|i| {
-            let a = start + i as f64 / 16.0 * std::f64::consts::PI * 1.5;
-            rect.center() + egui::vec2(a.cos() as f32, a.sin() as f32) * (size / 2.0 - 1.5)
-        })
-        .collect();
-    let color = ui.visuals().strong_text_color();
-    ui.painter()
-        .add(egui::Shape::line(points, Stroke::new(2.0_f32, color)));
-    if !still {
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(100));
-    }
-}
-
-/// egui's scroll bar, and the drag-to-scroll area it puts behind an overflowing page, both
-/// take keyboard focus but have no role or name of their own.
-fn name_scrolling<R>(ui: &egui::Ui, scrolled: &egui::scroll_area::ScrollAreaOutput<R>, page: &str) {
-    let view = scrolled.inner_rect;
-    let overflow = (scrolled.content_size.y - view.height()).max(0.0);
-    ui.ctx()
-        .accesskit_node_builder(scrolled.id.with(1_usize), |node| {
-            node.set_role(accesskit::Role::ScrollBar);
-            node.set_label("Scroll the page");
-            node.set_orientation(accesskit::Orientation::Vertical);
-            node.set_min_numeric_value(0.0);
-            node.set_max_numeric_value(f64::from(overflow));
-            node.set_numeric_value(f64::from(scrolled.state.clamped_offset().y));
-        });
-    if overflow > 0.0 {
-        ui.ctx()
-            .accesskit_node_builder(scrolled.id.with("area"), |node| {
-                node.set_role(accesskit::Role::ScrollView);
-                node.set_label(page);
-            });
-    }
-}
-
-/// A button's name with what it acts on after its text, where the same text shows more than
-/// once: "Turn on KRunner", not three "Turn on"s.
-fn for_what(button: egui::Response, what: &str) -> egui::Response {
-    button.ctx.accesskit_node_builder(button.id, |node| {
-        let text = node.label().unwrap_or_default();
-        node.set_label(format!("{text} {what}"));
-    });
-    button
-}
-
-/// Painted only for the eye: kept out of the accessibility tree.
-fn decorative(ui: &egui::Ui, id: Id) {
-    ui.ctx()
-        .accesskit_node_builder(id, |node| node.set_hidden());
-}
-
-/// A heading for screen readers to list and jump between; egui only has labels.
-fn heading(ui: &egui::Ui, label: &egui::Response, text: &str, level: usize) {
-    ui.ctx().accesskit_node_builder(label.id, |node| {
-        node.set_role(accesskit::Role::Heading);
-        node.set_level(level);
-        node.clear_value();
-        node.set_label(text);
-    });
-}
-
-/// The page switcher, sidebar or tabs, as a tab list.
-fn tab_list(ui: &egui::Ui) {
-    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-        node.set_role(accesskit::Role::TabList);
-        node.set_label("Pages");
-    });
-}
-
-/// One page in `tab_list`: its title is painted, so name it, and say which one is showing.
-fn page_tab(ui: &egui::Ui, response: &egui::Response, page: Page, selected: bool) {
-    response.widget_info(|| WidgetInfo::selected(egui::Role::Tab, true, selected, page.title()));
-    ui.ctx().accesskit_node_builder(response.id, |node| {
-        node.set_role(accesskit::Role::Tab);
-        node.clear_toggled();
-        node.set_selected(selected);
-    });
-}
-
-fn command(ui: &mut egui::Ui, text: &str) {
-    value(ui, RichText::new(text).monospace());
-}
-
-/// Text in a row's control column, centred on the label as a button would be.
-fn value(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(ui.spacing().interact_size.y);
-        ui.label(text);
-    });
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(14.0);
-    let label = ui.label(RichText::new(title).family(theme::bold()).size(14.0));
-    heading(ui, &label, title, 2);
-    ui.add_space(6.0);
-}
-
-fn help_line(ui: &mut egui::Ui, text: &str) {
-    let p = theme::palette(ui.ctx());
-    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(p.muted)).wrap());
-    ui.add_space(4.0);
-}
-
-/// One folder in a list: its path, with its buttons on the right. Pass a button through the
-/// function `buttons` is given and a screen reader hears which folder it is for: "Remove
-/// ~/Downloads", not one "Remove" after another.
-fn listed(
-    ui: &mut egui::Ui,
-    path: &str,
-    buttons: impl FnOnce(&mut egui::Ui, &dyn Fn(egui::Response) -> egui::Response),
-) {
-    let p = theme::palette(ui.ctx());
-    egui::Frame::NONE
-        .stroke(Stroke::new(1.0_f32, p.rule))
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(10, 4))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    buttons(ui, &|button| for_what(button, path));
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(path).monospace()).truncate())
-                            .on_hover_text(path);
-                    });
-                });
-            });
-        });
-    ui.add_space(2.0);
-}
-
 /// A minimum score as a slider, strict on the left and loose on the right,
 /// with a way back to the default. Some(new value) when it changed, None
 /// meaning the default.
 fn score_row(
     ui: &mut egui::Ui,
     label: &str,
-    help: &str,
     current: Option<f32>,
     default: f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Option<Option<f32>> {
     let mut out = None;
-    labelled_row(ui, label, help, |ui, named| {
-        ui.horizontal_wrapped(|ui| {
-            // Left to right as the number rises, so dragging, the number and
-            // the end labels all agree: further right, closer matches only.
-            let p = theme::palette(ui.ctx());
-            let mut v = current.unwrap_or(default);
-            let text = |ui: &egui::Ui, t: &str| {
-                egui::WidgetText::from(RichText::new(t).color(p.muted)).into_galley(
-                    ui,
-                    Some(egui::TextWrapMode::Extend),
-                    f32::INFINITY,
-                    egui::TextStyle::Body,
-                )
-            };
-            ui.label(text(ui, "Looser"));
-            // The bar takes what "Closer" and the number leave of the visible
-            // width (the row's own can run past a narrow window), so the row
-            // fits one at large text.
-            let closer = text(ui, "Closer");
-            let number_width = text(ui, "0.00").size().x + 2.0 * ui.spacing().button_padding.x;
-            let gaps = 2.0 * ui.spacing().item_spacing.x;
-            let visible = ui.clip_rect().right().min(ui.max_rect().right()) - ui.cursor().min.x;
-            let room = visible - closer.size().x - number_width - gaps;
-            ui.spacing_mut().slider_width = room.clamp(48.0, ui.spacing().slider_width);
-            let bar = egui::Slider::new(&mut v, range.clone())
-                .show_value(false)
-                .step_by(0.01);
-            let bar = named(ui.add(bar));
-            ui.label(closer);
-            let number = egui::DragValue::new(&mut v)
-                .range(range)
-                .speed(0.01)
-                .fixed_decimals(2);
-            let response = bar | named(ui.add(number));
-            if response.changed() {
-                // Stored rounded, as the slider shows it; the default is left unwritten.
-                let v = (v * 100.0).round() / 100.0;
-                out = Some(((v - default).abs() > 0.001).then_some(v));
-            }
-            if current.is_some()
-                && for_what(ui.button("Default"), label.trim_end_matches(':')).clicked()
-            {
-                out = Some(None);
-            }
-        });
+    Row::new(label).show(ui, |ui, named| {
+        // Left to right as the number rises, so dragging, the number and
+        // the end labels all agree: further right, closer matches only.
+        let p = theme::palette(ui.ctx());
+        let mut v = current.unwrap_or(default);
+        let text = |ui: &egui::Ui, t: &str| {
+            egui::WidgetText::from(RichText::new(t).size(12.5).color(p.muted)).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Small,
+            )
+        };
+        // Right to left: Default, the number, Closer, the bar, Looser.
+        if current.is_some()
+            && a11y::for_what(ui.add(Button::ghost("Default").small()), label).clicked()
+        {
+            out = Some(None);
+        }
+        let number = egui::DragValue::new(&mut v)
+            .range(range.clone())
+            .speed(0.01)
+            .fixed_decimals(2);
+        let number = named(ui.add(number));
+        ui.label(text(ui, "Closer"));
+        // The bar takes what "Looser" leaves of the row.
+        let looser = text(ui, "Looser");
+        let room = ui.available_width() - looser.size().x - 2.0 * ui.spacing().item_spacing.x;
+        ui.spacing_mut().slider_width = room.clamp(48.0, 240.0);
+        let bar = egui::Slider::new(&mut v, range)
+            .show_value(false)
+            .step_by(0.01);
+        let bar = named(ui.add(bar));
+        ui.label(looser);
+        let response = bar | number;
+        if response.changed() {
+            // Stored rounded, as the slider shows it; the default is left unwritten.
+            let v = (v * 100.0).round() / 100.0;
+            out = Some(((v - default).abs() > 0.001).then_some(v));
+        }
     });
     out
 }
@@ -1744,197 +1648,19 @@ fn slider<N: egui::emath::Numeric>(
     decimals: usize,
     suffix: &str,
 ) -> egui::Response {
-    ui.horizontal(|ui| {
-        let bar = egui::Slider::new(value, range.clone())
-            .show_value(false)
-            .step_by(step);
-        let bar = named(ui.add(bar));
-        let number = egui::DragValue::new(value)
-            .range(range)
-            .speed(step)
-            .fixed_decimals(decimals)
-            .suffix(suffix);
-        let number = named(ui.add(number));
-        bar | number
-    })
-    .inner
-}
-
-// Like a Kirigami FormLayout: right-aligned labels beside their controls, or above them
-// when the window is too narrow for two columns.
-fn row(ui: &mut egui::Ui, label: &str, help: &str, control: impl FnOnce(&mut egui::Ui)) {
-    labelled_row(ui, label, help, |ui, _| control(ui));
-}
-
-/// A `row` whose control is named by its label for a screen reader: pass the control's
-/// response through the function it is given.
-fn labelled_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    help: &str,
-    control: impl FnOnce(&mut egui::Ui, &dyn Fn(egui::Response) -> egui::Response),
-) {
-    let p = theme::palette(ui.ctx());
-    let help = |ui: &mut egui::Ui| {
-        if !help.is_empty() {
-            ui.add(egui::Label::new(RichText::new(help).size(12.5).color(p.muted)).wrap());
-        }
-    };
-    let width = ui.available_width();
-    if width >= TWO_COLUMNS_FROM {
-        let column = width - LABEL_WIDTH - ui.spacing().item_spacing.x;
-        ui.horizontal_top(|ui| {
-            let label_id = ui
-                .allocate_ui_with_layout(
-                    egui::vec2(LABEL_WIDTH, ui.spacing().interact_size.y),
-                    Layout::right_to_left(Align::Center),
-                    |ui| {
-                        ui.set_min_width(LABEL_WIDTH);
-                        ui.label(label).id
-                    },
-                )
-                .inner;
-            ui.vertical(|ui| {
-                // A horizontal parent leaves its children unbounded; wrap at the window's edge.
-                ui.set_max_width(column);
-                control(ui, &|response| response.labelled_by(label_id));
-                help(ui);
-            });
-        });
-    } else {
-        let label_id = (!label.is_empty()).then(|| ui.label(label).id);
-        control(ui, &|response| match label_id {
-            Some(id) => response.labelled_by(id),
-            None => response,
-        });
-        help(ui);
-    }
-    ui.add_space(8.0);
-}
-
-/// `data/dev.vinosearch.svg`, painted at `size` points square, so it stays sharp at any
-/// scale without an SVG renderer.
-fn logo(ui: &mut egui::Ui, size: f32) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    decorative(ui, response.id);
-    // The SVG's viewBox is 60 units from (2, 2).
-    let k = size / 60.0;
-    let at = |x: f32, y: f32| rect.min + egui::vec2((x - 2.0) * k, (y - 2.0) * k);
-    let box_ =
-        |x: f32, y: f32, w: f32, h: f32| egui::Rect::from_min_max(at(x, y), at(x + w, y + h));
-    let green = Color32::from_rgb(0x56, 0xcc, 0x78);
-    let painter = ui.painter();
-    painter.rect_filled(
-        box_(4.0, 4.0, 56.0, 56.0),
-        14.0 * k,
-        Color32::from_rgb(0x0e, 0x0e, 0x10),
-    );
-    painter.rect_stroke(
-        box_(5.0, 5.0, 54.0, 54.0),
-        13.0 * k,
-        Stroke::new(2.0 * k, Color32::from_white_alpha(46)),
-        egui::StrokeKind::Middle,
-    );
-    painter.circle_stroke(
-        at(28.0, 28.0),
-        12.0 * k,
-        Stroke::new(5.0 * k, Color32::from_rgb(0xfa, 0xfa, 0xfa)),
-    );
-    painter.rect_filled(
-        box_(22.0, 22.0, 12.0, 4.0),
-        2.0 * k,
-        Color32::from_rgb(0xa0, 0xa4, 0xac).gamma_multiply(0.5),
-    );
-    painter.rect_filled(box_(22.0, 30.0, 8.0, 4.0), 2.0 * k, green);
-    // The handle's round caps: egui strokes end square.
-    painter.line_segment(
-        [at(37.0, 37.0), at(47.0, 47.0)],
-        Stroke::new(6.0 * k, green),
-    );
-    painter.circle_filled(at(37.0, 37.0), 3.0 * k, green);
-    painter.circle_filled(at(47.0, 47.0), 3.0 * k, green);
-}
-
-fn sidebar_item(ui: &mut egui::Ui, page: Page, current: &mut Page) {
-    let p = theme::palette(ui.ctx());
-    let selected = *current == page;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
-    let fill = if selected {
-        p.link.gamma_multiply(0.22)
-    } else if response.hovered() {
-        p.code_bg
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, 4.0, fill);
-    if response.has_focus() {
-        ui.painter().rect_stroke(
-            rect,
-            4.0,
-            Stroke::new(2.0_f32, p.link),
-            egui::StrokeKind::Inside,
-        );
-    }
-    // Bold as well as tinted, as the tabs are, so the current page isn't told by colour alone.
-    ui.painter().text(
-        rect.left_center() + egui::vec2(10.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        page.title(),
-        if selected {
-            FontId::new(14.0, theme::bold())
-        } else {
-            FontId::proportional(14.0)
-        },
-        p.text,
-    );
-    page_tab(ui, &response, page, selected);
-    if response.clicked() {
-        *current = page;
-    }
-}
-
-fn tab_item(ui: &mut egui::Ui, page: Page, current: &mut Page, header: theme::Header) {
-    let active = *current == page;
-    let galley = ui.painter().layout_no_wrap(
-        page.title().to_owned(),
-        if active {
-            FontId::new(14.0, theme::bold())
-        } else {
-            FontId::proportional(14.0)
-        },
-        // left for the paint call below, so hovering can change it
-        Color32::PLACEHOLDER,
-    );
-    let (rect, response) =
-        ui.allocate_exact_size(galley.size() + egui::vec2(0.0, 6.0), Sense::click());
-    let lit = active || response.hovered() || response.has_focus();
-    if response.has_focus() {
-        let p = theme::palette(ui.ctx());
-        ui.painter().rect_stroke(
-            rect.expand(3.0),
-            4.0,
-            Stroke::new(2.0_f32, p.link),
-            egui::StrokeKind::Inside,
-        );
-    }
-    ui.painter().galley(
-        rect.left_top(),
-        galley,
-        if lit { header.text } else { header.muted },
-    );
-    if active {
-        let p = theme::palette(ui.ctx());
-        ui.painter().hline(
-            rect.left()..=rect.right(),
-            rect.bottom(),
-            Stroke::new(2.0_f32, p.link),
-        );
-    }
-    page_tab(ui, &response, page, active);
-    if response.clicked() {
-        *current = page;
-    }
+    // Right to left: the number box, then the bar.
+    let number = egui::DragValue::new(value)
+        .range(range.clone())
+        .speed(step)
+        .fixed_decimals(decimals)
+        .suffix(suffix);
+    let number = named(ui.add(number));
+    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(48.0, 200.0);
+    let bar = egui::Slider::new(value, range)
+        .show_value(false)
+        .step_by(step);
+    let bar = named(ui.add(bar));
+    bar | number
 }
 
 impl eframe::App for SettingsWindow {
@@ -1998,65 +1724,87 @@ impl SettingsWindow {
 
         let p = theme::palette(ctx);
         let header = theme::header(ctx, self.kde_header.as_ref(), focused);
-        let wide = ctx.content_rect().width() >= SIDEBAR_FROM;
-
-        egui::Panel::top("header")
-            // 0.33's central panel painted over this line; 0.37 draws it on top.
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(header.bg)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    let start = ui.cursor().left();
-                    logo(ui, 22.0);
-                    if wide {
-                        ui.label(
-                            RichText::new("vinoSearch")
-                                .family(theme::bold())
-                                .size(15.0)
-                                .color(header.text),
-                        );
-                        // The page title lines up with the content, past the sidebar.
-                        let title_at = start + SIDEBAR_WIDTH - 16.0 + 24.0;
-                        ui.add_space((title_at - ui.cursor().left()).max(12.0));
-                        let title = ui.label(
-                            RichText::new(self.page.title())
-                                .family(theme::bold())
-                                .size(16.0)
-                                .color(header.text),
-                        );
-                        heading(ui, &title, self.page.title(), 1);
-                    } else {
-                        // Seven tabs: wrap rather than clip at the narrowest widths.
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(18.0, 6.0);
-                            tab_list(ui);
-                            for page in Page::ALL {
-                                tab_item(ui, page, &mut self.page, header);
-                            }
-                        });
-                    }
-                });
-            });
+        let wide = ctx.content_rect().width() >= widgets::SIDEBAR_FROM;
+        let status = shared.status.as_ref();
 
         if wide {
             egui::Panel::left("pages")
                 .resizable(false)
-                .exact_size(SIDEBAR_WIDTH)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(p.bg)
-                        .inner_margin(egui::Margin::same(8)),
-                )
+                .show_separator_line(false)
+                .exact_size(widgets::SIDEBAR_WIDTH)
+                .frame(widgets::sidebar_frame(p))
                 .show(root, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    tab_list(ui);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        vino_ui::logo::search(ui, 28.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new("vinoSearch").size(15.0).family(theme::bold()));
+                            widgets::small(ui, "Settings");
+                        });
+                    });
+                    ui.add_space(14.0);
+                    a11y::tab_list(ui, "Pages");
                     for page in Page::ALL {
-                        sidebar_item(ui, page, &mut self.page);
+                        if widgets::nav_item(
+                            ui,
+                            page.icon(),
+                            page.title(),
+                            page.title(),
+                            self.page == page,
+                            None,
+                        )
+                        .clicked()
+                        {
+                            self.page = page;
+                        }
                     }
+                    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            let shown = match status {
+                                None => widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…"),
+                                Some(Err(_)) => widgets::chip(ui, ChipKind::Err, "Service stopped"),
+                                Some(Ok(_)) => widgets::chip(ui, ChipKind::Ok, "Service running"),
+                            };
+                            a11y::live(&shown);
+                        });
+                    });
+                    widgets::panel_rule(ui, widgets::Edge::Left);
+                });
+        } else {
+            egui::Panel::top("header")
+                .show_separator_line(false)
+                .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
+                    left: 16,
+                    right: 16,
+                    top: 8,
+                    bottom: 0,
+                }))
+                .show(root, |ui| {
+                    ui.horizontal(|ui| {
+                        vino_ui::logo::search(ui, 22.0);
+                        ui.label(
+                            RichText::new("vinoSearch")
+                                .size(15.0)
+                                .family(theme::bold())
+                                .color(header.text),
+                        );
+                    });
+                    // Seven tabs: wrap rather than clip at the narrowest widths.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(18.0, 0.0);
+                        a11y::tab_list(ui, "Pages");
+                        for page in Page::ALL {
+                            if widgets::tab(ui, page.title(), self.page == page, true, header)
+                                .clicked()
+                            {
+                                self.page = page;
+                            }
+                        }
+                    });
                 });
         }
 
@@ -2067,69 +1815,38 @@ impl SettingsWindow {
                     // No right margin: the scroll bar belongs on the window's edge, and the
                     // content keeps its own gap from it below.
                     .inner_margin(egui::Margin {
-                        left: 24,
+                        left: if wide { 28 } else { 16 },
                         right: 0,
-                        top: 4,
-                        bottom: 4,
+                        top: if wide { 20 } else { 12 },
+                        bottom: 0,
                     }),
             )
             .show(root, |ui| {
-                // A solid bar, always drawn: the floating one only shows on hover, so a page
-                // that runs past the window gave no sign there was more below.
-                ui.spacing_mut().scroll = egui::style::ScrollStyle {
-                    bar_width: 10.0,
-                    ..egui::style::ScrollStyle::solid()
-                };
-                let scrolled = egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .show(ui, |ui| {
-                        ui.set_max_width((ui.available_width() - SCROLL_GAP).min(FORM_MAX_WIDTH));
-                        if let Some(notice) = self.notice.clone() {
-                            ui.add_space(10.0);
-                            ui.horizontal_wrapped(|ui| {
-                                let shown = ui.label(
-                                    RichText::new(notice).color(ui.visuals().error_fg_color),
-                                );
-                                // Read out when it appears, wherever focus is.
-                                ui.ctx().accesskit_node_builder(shown.id, |node| {
-                                    node.set_live(accesskit::Live::Assertive)
-                                });
-                                if ui.small_button("Dismiss").clicked() {
-                                    self.notice = None;
-                                }
+                widgets::page_scroll(ui, self.page.title(), widgets::CONTENT_MAX, |ui| {
+                    ui.horizontal(|ui| {
+                        widgets::title(ui, self.page.title());
+                        if self.page == Page::Index {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                Self::index_chip(ui, status);
                             });
                         }
-                        let status = shared.status.as_ref();
-                        match self.page {
-                            Page::Index => self.index(ui, status, shared.largest.as_ref()),
-                            Page::Folders => self.folders(ui, status),
-                            Page::Search => self.search(ui, status),
-                            Page::Security => self.security(ui, status),
-                            Page::Model => self.model(ui, status),
-                            Page::Hardware => self.hardware(ui),
-                            Page::Integration => self.integration(ui),
-                        }
-                        ui.add_space(12.0);
                     });
-                let view = scrolled.inner_rect;
-                name_scrolling(ui, &scrolled, self.page.title());
-                // The bar alone is easy to miss: fade the last lines out while more is below.
-                if scrolled.state.clamped_offset().y + view.height() < scrolled.content_size.y - 1.0
-                {
-                    let fade = egui::Rect::from_min_max(
-                        egui::pos2(view.left(), view.bottom() - 48.0),
-                        view.right_bottom(),
-                    );
-                    let mut mesh = egui::Mesh::default();
-                    mesh.colored_vertex(fade.left_top(), Color32::TRANSPARENT);
-                    mesh.colored_vertex(fade.right_top(), Color32::TRANSPARENT);
-                    mesh.colored_vertex(fade.right_bottom(), p.bg);
-                    mesh.colored_vertex(fade.left_bottom(), p.bg);
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    ui.painter().add(mesh);
-                }
+                    if let Some(notice) = self.notice.clone() {
+                        ui.add_space(12.0);
+                        if widgets::notice(ui, Tone::Error, &notice) {
+                            self.notice = None;
+                        }
+                    }
+                    match self.page {
+                        Page::Index => self.index(ui, status, shared.largest.as_ref()),
+                        Page::Folders => self.folders(ui, status),
+                        Page::Search => self.search(ui, status),
+                        Page::Security => self.security(ui, status),
+                        Page::Model => self.model(ui, status),
+                        Page::Hardware => self.hardware(ui),
+                        Page::Integration => self.integration(ui),
+                    }
+                });
             });
 
         // Typing or dragging a number changes it every frame; write the file once it settles.
@@ -2146,7 +1863,7 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_app_id(app_id)
-            .with_inner_size([820.0, 640.0])
+            .with_inner_size([820.0, 676.0])
             .with_min_inner_size([340.0, 320.0]),
         // As in vinoWhisper: with vsync, a swap waits on a frame callback KWin holds back from
         // a window it considers hidden, and the window stops answering pings.
@@ -2161,7 +1878,6 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
         options,
         Box::new(|cc| {
             theme::install(&cc.egui_ctx);
-            theme::visible_scroll_handles(&cc.egui_ctx);
             Ok(Box::new(SettingsWindow::new(&cc.egui_ctx, page)))
         }),
     );
