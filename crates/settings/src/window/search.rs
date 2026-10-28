@@ -14,13 +14,13 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eframe::egui::{
-    self, Align, Color32, FontId, Key, Layout, Modifiers, RichText, Sense, Stroke, WidgetInfo,
-    accesskit,
-};
+use eframe::egui::{self, Align, Color32, FontId, Key, Layout, Modifiers, RichText, Sense};
+use vino_ui::a11y;
+use vino_ui::icons::{self, Icon};
+use vino_ui::theme;
+use vino_ui::widgets::{self, Button};
 
-use super::{decorative, for_what, heading, logo, name_scrolling, spinner, tilde};
-use crate::theme;
+use super::tilde;
 
 mod source;
 mod thumbs;
@@ -35,7 +35,8 @@ const MIN_QUERY_CHARS: usize = 3;
 const TYPING_PAUSE: f64 = 0.4;
 const TILE: f32 = 150.0;
 /// Below a tile, its file name.
-const TILE_LABEL: f32 = 22.0;
+const TILE_LABEL: f32 = 24.0;
+const TILE_RADIUS: f32 = 10.0;
 const DAY: i64 = 86_400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,31 +315,24 @@ impl SearchWindow {
 
         egui::Panel::top("search-header")
             .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(header.bg)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
+            .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
+                left: 20,
+                right: 20,
+                top: 8,
+                bottom: 14,
+            }))
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    logo(ui, 22.0);
-                    let label = ui.label(
-                        RichText::new("Search")
-                            .family(theme::bold())
-                            .size(15.0)
-                            .color(header.text),
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    vino_ui::logo::search(ui, 28.0);
+                    let width = (ui.available_width() - 24.0).clamp(120.0, 640.0);
+                    let field = widgets::search_field(
+                        ui,
+                        &mut self.query,
+                        "Describe what you're looking for",
+                        "Search",
+                        width,
                     );
-                    heading(ui, &label, "Search", 1);
-                    let width = (ui.available_width() - 40.0).clamp(120.0, 640.0);
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .id_salt("query")
-                            .hint_text("Describe what you're looking for")
-                            .desired_width(width)
-                            .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
-                            .align(egui::Align2::LEFT_CENTER),
-                    );
-                    let field = field.labelled_by(label.id);
                     if self.focus_query {
                         self.focus_query = false;
                         field.request_focus();
@@ -357,44 +351,56 @@ impl SearchWindow {
                         self.focus_first = true;
                     }
                     if self.searching {
-                        spinner(ui);
+                        widgets::spinner(ui);
                     }
                 });
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 self.filter_bar(ui);
             });
 
         if let Some(f) = self.selected().cloned() {
             egui::Panel::bottom("actions")
+                .show_separator_line(false)
                 .frame(
                     egui::Frame::NONE
-                        .fill(p.code_bg)
-                        .inner_margin(egui::Margin::symmetric(16, 8)),
+                        .fill(p.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, p.rule))
+                        .inner_margin(egui::Margin::symmetric(20, 10)),
                 )
                 .show(root, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        icons::icon(ui, kind_icon(f.kind), 16.0, p.muted);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let named = |r| for_what(r, f.name());
-                            if named(ui.button("Copy file"))
-                                .on_hover_text("Ctrl+C")
-                                .clicked()
-                            {
-                                self.act(Act::Copy, &f);
-                            }
-                            if named(ui.button("Open folder")).clicked() {
-                                self.act(Act::OpenFolder, &f);
-                            }
+                            let named = |r| a11y::for_what(r, f.name());
                             let open = if f.place().is_empty() {
                                 "Open".to_owned()
                             } else {
                                 format!("Open at {}", f.place())
                             };
-                            if named(ui.button(open)).on_hover_text("Enter").clicked() {
+                            if named(ui.add(Button::primary(open)))
+                                .on_hover_text("Enter")
+                                .clicked()
+                            {
                                 self.act(Act::Open, &f);
+                            }
+                            if named(ui.add(Button::secondary("Open folder"))).clicked() {
+                                self.act(Act::OpenFolder, &f);
+                            }
+                            if named(ui.add(Button::secondary("Copy file")))
+                                .on_hover_text("Ctrl+C")
+                                .clicked()
+                            {
+                                self.act(Act::Copy, &f);
                             }
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.add(
-                                    egui::Label::new(RichText::new(&f.path).monospace()).truncate(),
+                                    egui::Label::new(
+                                        RichText::new(tilde(Path::new(&f.path)))
+                                            .monospace()
+                                            .color(p.muted),
+                                    )
+                                    .truncate(),
                                 )
                                 .on_hover_text(&f.path);
                             });
@@ -405,25 +411,16 @@ impl SearchWindow {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin {
-                left: 16,
+                left: 20,
                 right: 0,
                 top: 4,
-                bottom: 4,
+                bottom: 0,
             }))
             .show(root, |ui| {
-                ui.spacing_mut().scroll = egui::style::ScrollStyle {
-                    bar_width: 10.0,
-                    ..egui::style::ScrollStyle::solid()
-                };
-                let scrolled = egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_max_width(ui.available_width() - 16.0);
-                        self.notice_line(ui);
-                        self.results(ui, &shown);
-                        ui.add_space(12.0);
-                    });
-                name_scrolling(ui, &scrolled, "Results");
+                widgets::page_scroll(ui, "Results", f32::INFINITY, |ui| {
+                    self.notice_line(ui);
+                    self.results(ui, &shown);
+                });
             });
     }
 
@@ -432,17 +429,13 @@ impl SearchWindow {
             return;
         };
         ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            let shown = ui.label(&notice);
-            ui.ctx()
-                .accesskit_node_builder(shown.id, |node| node.set_live(accesskit::Live::Polite));
-            if ui.small_button("Dismiss").clicked() {
-                self.notice = None;
-            }
-        });
+        if widgets::notice(ui, widgets::Tone::Info, &notice) {
+            self.notice = None;
+        }
     }
 
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui.ctx());
         let count = |kind| self.results.iter().filter(|f| f.kind == kind).count();
         let (text, documents, images) =
             (count(Kind::Text), count(Kind::Document), count(Kind::Image));
@@ -453,23 +446,18 @@ impl SearchWindow {
         }
         let filters = &mut self.filters;
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.label("Show:");
-            let checks = [
-                (&mut filters.text, format!("Text ({text})")),
-                (&mut filters.documents, format!("Documents ({documents})")),
-                (&mut filters.images, format!("Images ({images})")),
-            ];
-            for (on, name) in checks {
-                ui.checkbox(on, name);
-            }
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            widgets::toggle_chip(ui, &mut filters.images, "Images", Some(images));
+            widgets::toggle_chip(ui, &mut filters.text, "Text", Some(text));
+            widgets::toggle_chip(ui, &mut filters.documents, "Documents", Some(documents));
+            let (rule, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), Sense::hover());
+            ui.painter().rect_filled(rule, 0.0, p.rule);
 
             let folder = filters
                 .folder
                 .as_deref()
                 .map_or("All folders".to_owned(), |r| tilde(Path::new(r)));
-            menu(ui, "Folder:", folder, |ui| {
+            menu(ui, Icon::Folder, "Folder", folder, |ui| {
                 ui.selectable_value(&mut filters.folder, None, "All folders");
                 for root in &roots {
                     ui.selectable_value(
@@ -479,16 +467,22 @@ impl SearchWindow {
                     );
                 }
             });
-            menu(ui, "Modified:", filters.modified.label().to_owned(), |ui| {
-                for m in Modified::ALL {
-                    ui.selectable_value(&mut filters.modified, m, m.label());
-                }
-            });
+            menu(
+                ui,
+                Icon::Clock,
+                "Modified",
+                filters.modified.label().to_owned(),
+                |ui| {
+                    for m in Modified::ALL {
+                        ui.selectable_value(&mut filters.modified, m, m.label());
+                    }
+                },
+            );
             let selected = filters
                 .extension
                 .as_deref()
                 .map_or("All types".to_owned(), type_name);
-            menu(ui, "File type:", selected, |ui| {
+            menu(ui, Icon::File, "File type", selected, |ui| {
                 ui.selectable_value(&mut filters.extension, None, "All types");
                 for (e, n) in &extensions {
                     let name = format!("{} ({n})", type_name(e));
@@ -496,7 +490,9 @@ impl SearchWindow {
                 }
             });
 
-            if *filters != Filters::default() && ui.button("Clear filters").clicked() {
+            if *filters != Filters::default()
+                && ui.add(Button::ghost("Clear filters").small()).clicked()
+            {
                 *filters = Filters::default();
             }
         });
@@ -525,28 +521,30 @@ impl SearchWindow {
         };
         if let Some(status) = status {
             let label = ui.add(egui::Label::new(status).wrap());
-            ui.ctx()
-                .accesskit_node_builder(label.id, |node| node.set_live(accesskit::Live::Polite));
+            a11y::live(&label);
             return;
         }
         let mut first = std::mem::take(&mut self.focus_first);
         let images: Vec<&Found> = shown.iter().filter(|f| f.kind == Kind::Image).collect();
         if !images.is_empty() {
-            section(ui, &format!("Images ({})", images.len()));
+            section(ui, "Images", images.len());
             self.grid(ui, &images, &mut first);
         }
         let texts: Vec<&Found> = shown.iter().filter(|f| f.kind != Kind::Image).collect();
         if !texts.is_empty() {
-            section(ui, &format!("Text and documents ({})", texts.len()));
+            if !images.is_empty() {
+                ui.add_space(10.0);
+            }
+            section(ui, "Text and documents", texts.len());
             self.list(ui, &texts, &mut first);
         }
     }
 
     fn grid(&mut self, ui: &mut egui::Ui, images: &[&Found], first: &mut bool) {
         ui.horizontal_wrapped(|ui| {
-            list_box(ui, "Images");
-            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-            let columns = ((ui.available_width() + 10.0) / (TILE + 10.0)).max(1.0) as usize;
+            a11y::list_box(ui, "Images");
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            let columns = ((ui.available_width() + 12.0) / (TILE + 12.0)).max(1.0) as usize;
             let mut to = None;
             for (i, f) in images.iter().enumerate() {
                 let (rect, _) =
@@ -567,12 +565,13 @@ impl SearchWindow {
         let selected = self.selected.as_deref() == Some(f.path.as_str());
         let picture = egui::Rect::from_min_size(rect.min, egui::vec2(TILE, TILE));
         let painter = ui.painter();
-        painter.rect_filled(picture, 6.0, p.code_bg);
+        painter.rect_filled(picture, TILE_RADIUS, p.field);
         match self.thumbs.get(ui.ctx(), &f.path) {
             Thumb::Ready(texture) => {
                 let size = texture.size_vec2();
                 let fit = (picture.size() / size).min_elem();
                 let at = egui::Rect::from_center_size(picture.center(), size * fit);
+                // Rounded by the ring over it; a photo narrower than the tile keeps its corners.
                 painter.image(
                     texture.id(),
                     at,
@@ -586,7 +585,7 @@ impl SearchWindow {
                     picture.center(),
                     egui::Align2::CENTER_CENTER,
                     f.extension().to_uppercase(),
-                    FontId::proportional(18.0),
+                    FontId::new(18.0, theme::semibold()),
                     p.muted,
                 );
             }
@@ -602,25 +601,28 @@ impl SearchWindow {
         clipped.galley(
             egui::pos2(
                 name.center().x - galley.size().x.min(TILE) / 2.0,
-                name.top() + 3.0,
+                name.top() + 6.0,
             ),
             galley,
             p.text,
         );
-        if selected || response.has_focus() || response.hovered() {
-            let stroke = if selected || response.has_focus() {
-                Stroke::new(2.0_f32, p.link)
-            } else {
-                Stroke::new(1.0_f32, p.muted)
-            };
-            painter.rect_stroke(picture.expand(1.0), 6.0, stroke, egui::StrokeKind::Outside);
+        if selected || response.has_focus() {
+            widgets::paint_ring(ui, picture, TILE_RADIUS);
+        } else if response.hovered() {
+            painter.rect_stroke(
+                picture,
+                TILE_RADIUS,
+                egui::Stroke::new(1.0_f32, p.edge),
+                egui::StrokeKind::Inside,
+            );
         }
     }
 
     fn list(&mut self, ui: &mut egui::Ui, texts: &[&Found], first: &mut bool) {
         ui.vertical(|ui| {
-            list_box(ui, "Text and documents");
-            ui.spacing_mut().item_spacing.y = 4.0;
+            a11y::list_box(ui, "Text and documents");
+            ui.set_max_width(ui.available_width().min(760.0));
+            ui.spacing_mut().item_spacing.y = 2.0;
             let mut to = None;
             for (i, f) in texts.iter().enumerate() {
                 let response = self.row(ui, f);
@@ -635,56 +637,62 @@ impl SearchWindow {
         let p = theme::palette(ui.ctx());
         let selected = self.selected.as_deref() == Some(f.path.as_str());
         let width = ui.available_width();
+        let bg = ui.painter().add(egui::Shape::Noop);
         let inner = egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(10, 6))
-            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .corner_radius(TILE_RADIUS)
             .show(ui, |ui| {
-                ui.set_width(width - 20.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(f.name()).family(theme::bold()))
-                            .truncate()
-                            .selectable(false),
-                    );
-                    let place = f.place();
-                    let mut detail = tilde(f.folder());
-                    if !place.is_empty() {
-                        detail = format!("{detail}, {place}");
-                    }
-                    ui.add(
-                        egui::Label::new(RichText::new(detail).color(p.muted).size(12.5))
-                            .truncate()
-                            .selectable(false),
-                    );
+                ui.set_width(width - 24.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    widgets::file_tile(ui, kind_icon(f.kind), 32.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            ui.add(
+                                egui::Label::new(RichText::new(f.name()).family(theme::semibold()))
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            let place = f.place();
+                            let mut detail = tilde(f.folder());
+                            if !place.is_empty() {
+                                detail = format!("{detail}, {place}");
+                            }
+                            ui.add(
+                                egui::Label::new(RichText::new(detail).color(p.muted).size(12.5))
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                        });
+                        if !f.snippet.is_empty() {
+                            ui.add(
+                                egui::Label::new(RichText::new(&f.snippet).size(13.0))
+                                    .wrap()
+                                    .selectable(false),
+                            );
+                        }
+                    });
                 });
-                if !f.snippet.is_empty() {
-                    ui.add(
-                        egui::Label::new(RichText::new(&f.snippet).size(13.0))
-                            .wrap()
-                            .selectable(false),
-                    );
-                }
             });
         let rect = inner.response.rect;
         let response = ui.interact(rect, result_id(f), Sense::click());
-        let painter = ui.painter();
         if selected || response.has_focus() {
-            painter.rect_stroke(
+            ui.painter()
+                .set(bg, egui::Shape::rect_filled(rect, TILE_RADIUS, p.tint));
+            ui.painter().rect_stroke(
                 rect,
-                6.0,
-                Stroke::new(2.0_f32, p.link),
+                TILE_RADIUS,
+                egui::Stroke::new(1.0_f32, p.accent),
                 egui::StrokeKind::Inside,
             );
         } else if response.hovered() {
-            painter.rect_stroke(
-                rect,
-                6.0,
-                Stroke::new(1.0_f32, p.rule),
-                egui::StrokeKind::Inside,
-            );
+            ui.painter()
+                .set(bg, egui::Shape::rect_filled(rect, TILE_RADIUS, p.field));
         }
         // The labels inside are read as the row's name.
-        decorative(ui, inner.response.id);
+        a11y::decorative(ui, inner.response.id);
         response
     }
 
@@ -715,13 +723,7 @@ impl SearchWindow {
         if !f.snippet.is_empty() {
             name = format!("{name}: {}", f.snippet);
         }
-        response
-            .widget_info(|| WidgetInfo::selected(egui::Role::ListBoxOption, true, selected, &name));
-        ui.ctx().accesskit_node_builder(response.id, |node| {
-            node.set_role(accesskit::Role::ListBoxOption);
-            node.clear_toggled();
-            node.set_selected(selected);
-        });
+        a11y::list_box_option(response, &name, selected);
         if std::mem::take(first) {
             response.request_focus();
             self.selected = Some(f.path.clone());
@@ -746,6 +748,14 @@ impl SearchWindow {
                 }
             }
         });
+    }
+}
+
+fn kind_icon(kind: Kind) -> Icon {
+    match kind {
+        Kind::Text => Icon::FileText,
+        Kind::Document => Icon::File,
+        Kind::Image => Icon::Image,
     }
 }
 
@@ -783,17 +793,22 @@ fn result_id(f: &Found) -> egui::Id {
     egui::Id::unique(("vinosearch-result", &f.path))
 }
 
-/// A filter's menu, named by the label before it and kept on one line with it
-/// when the bar wraps.
-fn menu(ui: &mut egui::Ui, label: &str, selected: String, items: impl FnOnce(&mut egui::Ui)) {
+/// A filter's menu with an icon before it, named by `label` for a screen
+/// reader and kept on one line with its icon when the bar wraps.
+fn menu(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    selected: String,
+    items: impl FnOnce(&mut egui::Ui),
+) {
+    let p = theme::palette(ui.ctx());
     ui.horizontal(|ui| {
-        let salt = label;
-        let label = ui.label(label);
-        egui::ComboBox::from_id_salt(salt)
-            .selected_text(selected)
-            .show_ui(ui, items)
-            .response
-            .labelled_by(label.id);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        icons::icon(ui, icon, 16.0, p.muted);
+        let shown = widgets::combo(ui, label, selected, 180.0).show_ui(ui, items);
+        ui.ctx()
+            .accesskit_node_builder(shown.response.id, |node| node.set_label(label));
     });
 }
 
@@ -806,19 +821,28 @@ fn type_name(extension: &str) -> String {
     }
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
+/// A section's label: small caps with the count after it, read as "Images (8)".
+fn section(ui: &mut egui::Ui, title: &str, n: usize) {
+    let p = theme::palette(ui.ctx());
+    ui.add_space(8.0);
+    let name = format!("{title} ({n})");
+    let shown = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let caps = ui.label(
+                RichText::new(title.to_uppercase())
+                    .size(12.0)
+                    .family(theme::semibold())
+                    .extra_letter_spacing(0.7)
+                    .color(p.muted),
+            );
+            a11y::decorative(ui, caps.id);
+            let count = ui.label(RichText::new(n.to_string()).size(12.0).color(p.muted));
+            a11y::decorative(ui, count.id);
+        })
+        .response;
+    a11y::heading(&shown, &name, 2);
     ui.add_space(6.0);
-    let label = ui.label(RichText::new(title).family(theme::bold()).size(14.0));
-    heading(ui, &label, title, 2);
-    ui.add_space(6.0);
-}
-
-/// The results of a kind as one list for a screen reader to step through.
-fn list_box(ui: &egui::Ui, name: &str) {
-    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
-        node.set_role(accesskit::Role::ListBox);
-        node.set_label(name);
-    });
 }
 
 impl eframe::App for SearchWindow {
@@ -832,7 +856,7 @@ pub fn run(app_id: &str, query: &str) -> ExitCode {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_app_id(app_id)
-            .with_inner_size([960.0, 720.0])
+            .with_inner_size([960.0, 756.0])
             .with_min_inner_size([360.0, 320.0]),
         glow_options: eframe::egui_glow::GlowConfiguration {
             vsync: false,
@@ -846,7 +870,6 @@ pub fn run(app_id: &str, query: &str) -> ExitCode {
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
-            theme::visible_scroll_handles(&cc.egui_ctx);
             let mut window = SearchWindow::with(&query, source::Runner::default());
             window.text_scale = theme::text_scale();
             cc.egui_ctx.set_zoom_factor(window.text_scale);

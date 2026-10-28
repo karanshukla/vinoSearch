@@ -31,4 +31,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The openvino-rs fork pinned in Cargo.toml's [patch.crates-io], until
 # intel/openvino-rs#202 is released.
-allow-git = ["https://github.com/karanshukla/openvino-rs"]
+allow-git = [
+    "https://github.com/karanshukla/openvino-rs",
+    "https://github.com/karanshukla/vinoUserInterface",
+]
