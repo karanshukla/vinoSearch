@@ -98,6 +98,8 @@ mod tests {
             line: 3,
             text: "some   matching\ntext".into(),
             copies: Vec::new(),
+            vector: None,
+            similar: Vec::new(),
         }
     }
 

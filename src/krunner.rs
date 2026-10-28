@@ -131,10 +131,20 @@ fn describe(h: &Hit) -> (String, String) {
         .parent()
         .map(|d| d.display().to_string())
         .unwrap_or_default();
-    let copies = match h.copies.len() {
-        0 => String::new(),
-        1 => "  (+1 copy)".to_owned(),
-        n => format!("  (+{n} copies)"),
+    let others: Vec<String> = [
+        match h.copies.len() {
+            0 => None,
+            1 => Some("+1 copy".to_owned()),
+            n => Some(format!("+{n} copies")),
+        },
+        (!h.similar.is_empty()).then(|| format!("+{} similar", h.similar.len())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let copies = match others.as_slice() {
+        [] => String::new(),
+        o => format!("  ({})", o.join(", ")),
     };
     let description = match h.kind {
         Kind::Text | Kind::Code => {
@@ -844,7 +854,7 @@ const IMAGE_GAP: f32 = 0.06;
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then images, less images too far
 /// below the best of the others (IMAGE_GAP), then code (only ever on its
-/// own, for `code:`).
+/// own, for `code:`). Near-duplicate images are one result (#78).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 4] = Default::default();
@@ -858,9 +868,12 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
             Kind::Image => 2,
             Kind::Code => 3,
         }];
-        if group.len() < RESULTS {
-            group.push(h);
-        }
+        group.push(h);
+    }
+    // Before the cut, so a burst folded into one leaves room for others.
+    groups[2] = crate::dupes::collapse(std::mem::take(&mut groups[2]));
+    for group in &mut groups {
+        group.truncate(RESULTS);
     }
     let best = groups[..2]
         .iter()
@@ -1422,6 +1435,8 @@ mod tests {
             line: 1,
             text: String::new(),
             copies: Vec::new(),
+            vector: None,
+            similar: Vec::new(),
         }
     }
 
@@ -1531,6 +1546,29 @@ mod tests {
             hit(Kind::Image, 0.64, "/dog.jpg"),
         ];
         assert_eq!(paths(hits), ["/dog.jpg"]);
+    }
+
+    #[test]
+    fn a_burst_takes_one_place_and_leaves_room_for_others() {
+        let photo = |path: &str, score: f32, axis: usize| {
+            let mut h = hit(Kind::Image, score, path);
+            let mut v = vec![0.0; 8];
+            v[axis] = 1.0;
+            h.vector = Some(v);
+            h
+        };
+        let mut hits: Vec<Hit> = (0..4)
+            .map(|i| photo(&format!("/p/burst{i}.jpg"), 0.80 - 0.01 * i as f32, 0))
+            .collect();
+        hits.extend((1..6).map(|i| photo(&format!("/p/other{i}.jpg"), 0.70, i)));
+        let got = per_file(hits, FLOORS);
+        assert_eq!(got.len(), RESULTS);
+        assert_eq!(got[0].similar.len(), 3);
+        assert!(
+            describe(&got[0]).1.ends_with("(+3 similar)"),
+            "{:?}",
+            describe(&got[0])
+        );
     }
 
     #[test]
