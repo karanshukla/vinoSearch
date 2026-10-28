@@ -85,16 +85,26 @@ pub enum Kind {
     /// Source code (#110): on only when asked for, and searched only by
     /// queries starting `code:`.
     Code = 3,
+    /// A vinoWhisper session's transcript and summary (#143), chunks of one
+    /// `.vwsession` file; `extract::session::Part::of` says which.
+    Session = 4,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Text, Kind::Document, Kind::Image, Kind::Code];
+    pub const ALL: [Kind; 5] = [
+        Kind::Text,
+        Kind::Document,
+        Kind::Image,
+        Kind::Code,
+        Kind::Session,
+    ];
 
     fn from_db(v: i64) -> Self {
         match v {
             1 => Kind::Image,
             2 => Kind::Document,
             3 => Kind::Code,
+            4 => Kind::Session,
             _ => Kind::Text,
         }
     }
@@ -105,7 +115,7 @@ impl Kind {
             Kind::Text if is_prose(path) => MAX_TEXT_BYTES,
             Kind::Text | Kind::Code => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
-            Kind::Document => MAX_DOCUMENT_BYTES,
+            Kind::Document | Kind::Session => MAX_DOCUMENT_BYTES,
         }
     }
 
@@ -115,7 +125,9 @@ impl Kind {
     /// build's queries without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
-            Kind::Text | Kind::Document | Kind::Code => crate::model::REVISION.to_owned(),
+            Kind::Text | Kind::Document | Kind::Code | Kind::Session => {
+                crate::model::REVISION.to_owned()
+            }
             Kind::Image => format!(
                 "{}+{}/{}+ocr:{}/{}",
                 crate::model::REVISION,
@@ -133,17 +145,21 @@ impl Kind {
             Kind::Document => "model.document",
             Kind::Image => "model.image",
             Kind::Code => "model.code",
+            Kind::Session => "model.session",
         }
     }
 }
 
-/// The file types indexed: text always, images by extension, documents and
-/// code while they are on (#73, #55, #110).
+/// The file types indexed: text always, images by extension, documents,
+/// code and vinoWhisper sessions while they are on (#73, #55, #110, #143).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileTypes {
     images: Vec<String>,
     documents: bool,
     code: bool,
+    sessions: bool,
+    /// vinoWhisper's own folder of sessions, where nothing else is taken.
+    sessions_dir: Option<PathBuf>,
     ignores: SharedIgnores,
 }
 
@@ -164,13 +180,42 @@ impl FileTypes {
             images: formats.image_extensions()?,
             documents: formats.documents_enabled(),
             code: formats.code_enabled(),
+            sessions: formats.sessions_enabled(),
+            sessions_dir: sessions_dir(),
             ignores: SharedIgnores::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_sessions(mut self, on: bool, dir: Option<PathBuf>) -> Self {
+        self.sessions = on;
+        self.sessions_dir = dir;
+        self
+    }
+
+    /// vinoWhisper's folder of sessions, and whether sessions are on. While
+    /// they are it is a root of its own: the walk of a home folder skips
+    /// hidden directories.
+    pub fn sessions_dir(&self) -> Option<(&Path, bool)> {
+        Some((self.sessions_dir.as_deref()?, self.sessions))
     }
 
     /// The kind `path` is indexed as, by its name (and for code, the ignore
     /// files above it); None if it is not.
     pub fn kind(&self, path: &Path) -> Option<Kind> {
+        let session = crate::extract::is_session(path);
+        // A live transcript or a half-written bundle there is not wanted.
+        if self
+            .sessions_dir
+            .as_ref()
+            .is_some_and(|d| path.starts_with(d))
+            && !session
+        {
+            return None;
+        }
+        if session {
+            return self.sessions.then_some(Kind::Session);
+        }
         if text_file(path) {
             return Some(Kind::Text);
         }
@@ -185,16 +230,26 @@ impl FileTypes {
     }
 }
 
+/// Where vinoWhisper keeps its sessions (karanshukla/vinoWhisper#123),
+/// canonical as roots are.
+fn sessions_dir() -> Option<PathBuf> {
+    let dir = data_home().ok()?.join("vinowhisper/transcripts");
+    Some(fs::canonicalize(&dir).unwrap_or(dir))
+}
+
+fn data_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("XDG_DATA_HOME") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
+    })
+}
+
 /// Log entries kept. A Vectors further behind than this reloads in full,
 /// which at that many changes is no slower than applying them.
 const CHUNK_LOG_KEEP: i64 = 100_000;
 
 pub fn default_db() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    };
-    Ok(base.join("vinosearch/index.sqlite"))
+    Ok(data_home()?.join("vinosearch/index.sqlite"))
 }
 
 /// The index holds copies of file contents, so only the user may read it:
@@ -635,7 +690,7 @@ pub fn index_file<E: Embed>(
     }
     let read = match kind {
         Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
-        Kind::Image | Kind::Document => fs::read(path),
+        Kind::Image | Kind::Document | Kind::Session => fs::read(path),
     };
     let Ok(bytes) = read else {
         remove(conn, path)?;
@@ -700,18 +755,18 @@ pub fn index_file<E: Embed>(
             (first, vectors, kinds)
         }
         // A file that can't be read, or has no text (a scan), keeps a row with
-        // no chunks, so it isn't parsed again until it changes.
-        Kind::Document => {
+        // no chunks, so it isn't parsed again until it changes. So does a
+        // session in a format this build doesn't read.
+        Kind::Document | Kind::Session => {
             // Recorded first: the parser runs in a child with limits, but a
             // file the child cannot parse must not be parsed again on every
             // restart, and a stop while embedding must leave it to be indexed
             // next time, so the record goes once it parses.
             record(conn)?;
-            let mut first = document_parts(path, &bytes, 0, crate::extract::parts_in_child)
-                .unwrap_or_else(|e| {
-                    eprintln!("skip {}: {e:#}", path.display());
-                    Extract::default()
-                });
+            let mut first = document_parts(path, &bytes, 0, parser(kind)).unwrap_or_else(|e| {
+                eprintln!("skip {}: {e:#}", path.display());
+                Extract::default()
+            });
             // No text layer: a scan, read by OCR when it can be (#106).
             let scan = first.chunks.is_empty() && is_scannable(path) && emb.can_read_text();
             if !first.chunks.is_empty() || scan {
@@ -901,6 +956,16 @@ fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
 /// Parts `from..from + PARTS_AT_ONCE` of `path` through `parse` (the child
 /// process, #84). Err if it doesn't parse, the child was stopped, or the
 /// run's text is over MAX_FILE_BYTES.
+/// Documents are parsed in a child with limits (#84). A session is plain
+/// text in a zip, read with the same caps on what unzips, and nothing in
+/// it needs a parser that could crash or hang, so it's read here.
+fn parser(kind: Kind) -> Parser {
+    match kind {
+        Kind::Session => crate::extract::parts,
+        _ => crate::extract::parts_in_child,
+    }
+}
+
 fn document_parts(path: &Path, bytes: &[u8], from: usize, parse: Parser) -> Result<Extract> {
     let run = parse(path, bytes, from, PARTS_AT_ONCE)?;
     let size: usize = run.chunks.iter().map(|(_, c)| c.len()).sum();
@@ -1038,7 +1103,7 @@ pub fn index_rest<E: Embed>(
     let hash: Option<Vec<u8>> =
         conn.query_row("SELECT sha256 FROM files WHERE id = ?1", [id], |r| r.get(0))?;
     let (kind, bytes) = match (types.kind(path), fs::read(path)) {
-        (Some(kind @ (Kind::Text | Kind::Document | Kind::Code)), Ok(bytes))
+        (Some(kind @ (Kind::Text | Kind::Document | Kind::Code | Kind::Session)), Ok(bytes))
             if hash.as_deref() == Some(&Sha256::digest(&bytes)[..]) =>
         {
             (kind, bytes)
@@ -1046,7 +1111,7 @@ pub fn index_rest<E: Embed>(
         _ => return again(conn, emb, key, between),
     };
     let run = match kind {
-        Kind::Document => document_parts(path, &bytes, from, crate::extract::parts_in_child),
+        Kind::Document | Kind::Session => document_parts(path, &bytes, from, parser(kind)),
         _ => match String::from_utf8(bytes) {
             Ok(text) => Ok(text_parts(path, &text, from, PARTS_AT_ONCE)),
             Err(_) => return again(conn, emb, key, between),
@@ -1580,6 +1645,8 @@ pub fn readable_kind(path: &Path) -> Option<Kind> {
         Some(Kind::Code)
     } else if crate::extract::is_document(path) {
         Some(Kind::Document)
+    } else if crate::extract::is_session(path) {
+        Some(Kind::Session)
     } else {
         None
     }
@@ -1620,8 +1687,8 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
 /// A file counts under the kind of its chunks, an image's text (#106) under
 /// images, so one recorded without any (a photo with no decoder) counts
 /// under none.
-pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 4]> {
-    let mut out = [(0, 0); 4];
+pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 5]> {
+    let mut out = [(0, 0); 5];
     let mut stmt = conn.prepare(
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM chunks i WHERE i.file_id = c.file_id AND i.kind = ?1)
                 THEN ?1 ELSE c.kind END AS k,
@@ -1644,6 +1711,18 @@ pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 4]> {
         out[i] = (files, chunks);
     }
     Ok(out)
+}
+
+/// vinoWhisper sessions indexed with no chunks (#143): in a format this
+/// build doesn't read, or not readable at all.
+pub fn unread_sessions(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM files f
+         WHERE f.path LIKE '%.vwsession'
+           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// Roots `index` has been run on, which the watcher follows.
@@ -2053,7 +2132,10 @@ fn ranked(conn: &Connection, terms: &[String]) -> rusqlite::Result<Option<Vec<i6
 pub fn scope(query: &str) -> (&str, &'static [Kind]) {
     match crate::code::code_query(query) {
         Some(q) => (q, &[Kind::Code]),
-        None => (query, &[Kind::Text, Kind::Document, Kind::Image]),
+        None => (
+            query,
+            &[Kind::Text, Kind::Document, Kind::Image, Kind::Session],
+        ),
     }
 }
 
@@ -2263,7 +2345,7 @@ mod tests {
         file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
         let counts = counts_by_kind(&conn).unwrap();
         // Kind::ALL's order: text, documents, images.
-        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0)]);
+        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0), (0, 0)]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2618,6 +2700,28 @@ mod tests {
         assert_eq!(code.kind(Path::new("/p/README.md")), Some(Kind::Text));
         // Code is off unless turned on (#110).
         assert_eq!(FileTypes::default().kind(Path::new("/p/app.js")), None);
+    }
+
+    #[test]
+    fn sessions_are_taken_anywhere_and_only_sessions_from_vinowhispers_folder() {
+        let dir = PathBuf::from("/h/.local/share/vinowhisper/transcripts");
+        let on = FileTypes::default().with_sessions(true, Some(dir.clone()));
+        let off = FileTypes::default().with_sessions(false, Some(dir.clone()));
+        let s = "2026-10-27-140512.vwsession";
+        assert_eq!(on.kind(&dir.join(s)), Some(Kind::Session));
+        assert_eq!(
+            on.kind(&Path::new("/h/Documents").join(s)),
+            Some(Kind::Session)
+        );
+        // A live transcript, and a bundle being written.
+        assert_eq!(on.kind(&dir.join("2026-10-28-090000.txt")), None);
+        assert_eq!(
+            on.kind(&dir.join(".2026-10-27-140512.vwsession.k3j.tmp")),
+            None
+        );
+        assert_eq!(off.kind(&dir.join(s)), None);
+        assert_eq!(off.kind(&Path::new("/h/Documents").join(s)), None);
+        assert_eq!(on.sessions_dir(), Some((dir.as_path(), true)));
     }
 
     #[test]
@@ -2977,7 +3081,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             counts_by_kind(&conn).unwrap(),
-            [(2, 3), (0, 0), (1, 1), (0, 0)]
+            [(2, 3), (0, 0), (1, 1), (0, 0), (0, 0)]
         );
         assert_eq!(counts(&conn).unwrap(), (4, 4));
         fs::remove_dir_all(&dir).unwrap();

@@ -8,6 +8,7 @@
 //! answers while the worker is busy indexing.
 
 use crate::config::Config;
+use crate::extract::session::{self, Part};
 use crate::index::{self, Hit, Kind};
 use crate::model;
 use crate::open::At;
@@ -88,7 +89,7 @@ impl Floors {
 
     fn of(&self, kind: Kind) -> f32 {
         match kind {
-            Kind::Text | Kind::Document => self.text,
+            Kind::Text | Kind::Document | Kind::Session => self.text,
             Kind::Image => self.image,
             Kind::Code => self.code,
         }
@@ -151,8 +152,49 @@ fn describe(h: &Hit) -> (String, String) {
             h.line,
             crate::snippet(&h.text)
         ),
+        Kind::Session => format!(
+            "{}{copies}  {}",
+            session_place(h).unwrap_or(dir),
+            crate::snippet(&h.text)
+        ),
     };
     (name, description)
+}
+
+/// Which part of a session matched, and when it was (#143): "Transcript at
+/// 01:12 · 2026-10-27 14:05, 43 min", "Summary, AI-generated · ...". None
+/// for a bundle that no longer reads.
+fn session_place(h: &Hit) -> Option<String> {
+    let bytes = session::load(Path::new(&h.path)).ok()?;
+    let about = session::about(&bytes).ok()?;
+    let part = match Part::of(h.line) {
+        (Part::Transcript, line) => {
+            let text = session::text(&bytes, Part::Transcript).ok()?;
+            match session::stamp_at(&text, usize::try_from(line).unwrap_or(0)) {
+                Some(stamp) => format!("Transcript at {stamp}"),
+                None => "Transcript".to_owned(),
+            }
+        }
+        (Part::Summary, _) if about.ai_summary => "Summary, AI-generated".to_owned(),
+        (Part::Summary, _) => "Summary".to_owned(),
+    };
+    Some(format!("{part} · {}", about.when()))
+}
+
+/// The actions a match offers: the other part of a session (#143) as well.
+fn match_actions(h: &Hit) -> Vec<&'static str> {
+    let mut out = vec![OPEN_FOLDER, SHOW_ALL];
+    if h.kind == Kind::Session {
+        let other = match Part::of(h.line).0 {
+            Part::Summary => Some(OPEN_TRANSCRIPT),
+            Part::Transcript => session::load(Path::new(&h.path))
+                .and_then(|b| session::about(&b))
+                .is_ok_and(|a| a.has_summary)
+                .then_some(OPEN_SUMMARY),
+        };
+        out.splice(0..0, other);
+    }
+    out
 }
 
 fn owned(v: Value<'_>) -> OwnedValue {
@@ -172,14 +214,21 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
         Kind::Code => "vinoSearch Code",
+        Kind::Session => "vinoWhisper sessions",
     };
     props.insert("category".into(), owned(Value::from(category)));
+    // Without it KRunner offers every action on every match.
+    props.insert("actions".into(), owned(Value::from(match_actions(&h))));
     // For vinosearch menu, which opens the pick itself; KRunner ignores keys
     // it doesn't know.
     match at(&h) {
         Some(At::Line(l)) => drop(props.insert("line".into(), owned(Value::from(l)))),
         Some(At::Page(p)) => drop(props.insert("page".into(), owned(Value::from(p)))),
-        None => {}
+        // A transcript's line opens at its stamp; a summary at its top.
+        Some(At::Session(Part::Transcript, l)) => {
+            drop(props.insert("line".into(), owned(Value::from(l))))
+        }
+        Some(At::Session(Part::Summary, _)) | None => {}
     }
     let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = relevance(&h, floors);
@@ -257,8 +306,8 @@ fn at(h: &Hit) -> Option<At> {
 }
 
 /// The text of the indexed file `id`, for Control1.FileText: a text file's
-/// contents (an HTML page's without its tags), or a document's text from the
-/// extractor child (seconds for a big PDF). Err for anything else, an image
+/// contents (an HTML page's without its tags), a document's text from the
+/// extractor child (seconds for a big PDF), or a session's transcript. Err for anything else, an image
 /// included.
 fn file_text(db: &Db, id: &str) -> Result<String> {
     if !index::is_indexed(&*db.lock()?, id)? {
@@ -283,6 +332,10 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
         Some(Kind::Document) => {
             crate::extract::text(path).with_context(|| format!("extracting {id}"))
         }
+        // The record; the summary is a model's account of it.
+        Some(Kind::Session) => session::load(path)
+            .and_then(|b| session::text(&b, Part::Transcript))
+            .with_context(|| format!("reading {id}")),
         _ => bail!("{id} is not a text file or document"),
     }
 }
@@ -293,7 +346,17 @@ impl Runner {
     fn actions(&self) -> Vec<(String, String, String)> {
         vec![
             (
-                "open-folder".into(),
+                OPEN_SUMMARY.into(),
+                "Open summary".into(),
+                "view-list-text".into(),
+            ),
+            (
+                OPEN_TRANSCRIPT.into(),
+                "Open transcript".into(),
+                "text-x-generic".into(),
+            ),
+            (
+                OPEN_FOLDER.into(),
                 "Open containing folder".into(),
                 "document-open-folder".into(),
             ),
@@ -323,19 +386,23 @@ impl Runner {
             launch_settings(&["--search", &query]);
             return;
         }
-        let at = self
-            .places
-            .lock()
-            .unwrap()
-            .get(&match_id)
-            .copied()
-            .flatten();
+        let at = match action_id.as_str() {
+            OPEN_SUMMARY => Some(At::Session(Part::Summary, 0)),
+            OPEN_TRANSCRIPT => Some(At::Session(Part::Transcript, 0)),
+            _ => self
+                .places
+                .lock()
+                .unwrap()
+                .get(&match_id)
+                .copied()
+                .flatten(),
+        };
         open(
             &self.db,
             &self.config,
             &match_id,
             at,
-            action_id == "open-folder",
+            action_id == OPEN_FOLDER,
         );
     }
 
@@ -431,6 +498,10 @@ impl Gnome {
 
 /// KRunner's action for opening the query in the search window.
 const SHOW_ALL: &str = "show-all";
+const OPEN_FOLDER: &str = "open-folder";
+/// A session's other part (#143).
+const OPEN_SUMMARY: &str = "open-summary";
+const OPEN_TRANSCRIPT: &str = "open-transcript";
 
 /// Start vinosearch-settings with `args`, when it is installed beside us.
 fn launch_settings(args: &[&str]) {
@@ -537,7 +608,8 @@ impl Control {
         );
         out.insert(key::FILES.into(), owned(Value::from(files)));
         out.insert(key::CHUNKS.into(), owned(Value::from(chunks)));
-        let [text, documents, images, code] = index::counts_by_kind(&db).map_err(failed)?;
+        let [text, documents, images, code, sessions] =
+            index::counts_by_kind(&db).map_err(failed)?;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
             (key::TEXT_CHUNKS, text.1),
@@ -546,6 +618,12 @@ impl Control {
             (key::IMAGE_FILES, images.0),
             (key::CODE_FILES, code.0),
             (key::CODE_CHUNKS, code.1),
+            (key::SESSION_FILES, sessions.0),
+            (key::SESSION_CHUNKS, sessions.1),
+            (
+                key::SESSIONS_UNREAD,
+                index::unread_sessions(&db).map_err(failed)?,
+            ),
         ] {
             out.insert(k.into(), owned(Value::from(n)));
         }
@@ -842,12 +920,12 @@ fn disk_bytes(path: &Path) -> u64 {
 const IMAGE_GAP: f32 = 0.06;
 
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
-/// of each kind: text, then documents, then images, less images too far
-/// below the best of the others (IMAGE_GAP), then code (only ever on its
-/// own, for `code:`).
+/// of each kind: text, then documents, then vinoWhisper sessions, then
+/// images, less images too far below the best of the others (IMAGE_GAP),
+/// then code (only ever on its own, for `code:`).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 4] = Default::default();
+    let mut groups: [Vec<Hit>; 5] = Default::default();
     for h in hits {
         if h.score < floors.of(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -855,19 +933,20 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
         let group = &mut groups[match h.kind {
             Kind::Text => 0,
             Kind::Document => 1,
-            Kind::Image => 2,
-            Kind::Code => 3,
+            Kind::Session => 2,
+            Kind::Image => 3,
+            Kind::Code => 4,
         }];
         if group.len() < RESULTS {
             group.push(h);
         }
     }
-    let best = groups[..2]
+    let best = groups[..3]
         .iter()
         .flatten()
         .map(|h| h.score)
         .fold(f32::NEG_INFINITY, f32::max);
-    groups[2].retain(|h| h.score >= best - IMAGE_GAP);
+    groups[3].retain(|h| h.score >= best - IMAGE_GAP);
     groups.into_iter().flatten().collect()
 }
 
@@ -1469,6 +1548,47 @@ mod tests {
             subtext.starts_with("/src:24  pub fn check_url"),
             "{subtext}"
         );
+    }
+
+    #[test]
+    fn a_session_says_which_part_matched_and_offers_the_other() {
+        use crate::extract::session::tests::{SUMMARY_TEXT, bundle};
+        let dir =
+            std::env::temp_dir().join(format!("vinosearch-krunner-session-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-10-27-140512.vwsession");
+        fs::write(&path, bundle(Some(SUMMARY_TEXT), "vinowhisper-session/1")).unwrap();
+        let session = |line: i64| {
+            let mut h = hit(Kind::Session, 0.8, path.to_str().unwrap());
+            h.line = line;
+            let m = to_match(h, FLOORS);
+            let get = |k: &str| m.5.get(k).cloned().unwrap();
+            (
+                String::try_from(get("category")).unwrap(),
+                String::try_from(get("subtext")).unwrap(),
+                Vec::<String>::try_from(get("actions")).unwrap(),
+                m.5.get("line").map(|v| u32::try_from(v.clone()).unwrap()),
+            )
+        };
+        // "It happens in March.", in the [01:12] paragraph.
+        let (category, subtext, actions, line) = session(6);
+        assert_eq!(category, "vinoWhisper sessions");
+        assert!(
+            subtext.starts_with("Transcript at 01:12 · 2026-10-27 14:05, 43 min"),
+            "{subtext}"
+        );
+        assert_eq!(actions, [OPEN_SUMMARY, OPEN_FOLDER, SHOW_ALL]);
+        assert_eq!(line, Some(6));
+        let summary = crate::extract::session::SUMMARY_LINES as i64 + 1;
+        let (_, subtext, actions, line) = session(summary);
+        assert!(subtext.starts_with("Summary, AI-generated · "), "{subtext}");
+        assert_eq!(actions, [OPEN_TRANSCRIPT, OPEN_FOLDER, SHOW_ALL]);
+        assert_eq!(line, None);
+        // Anything else offers neither.
+        let m = to_match(hit(Kind::Text, 0.8, "/n.md"), FLOORS);
+        let actions = Vec::<String>::try_from(m.5.get("actions").cloned().unwrap()).unwrap();
+        assert_eq!(actions, [OPEN_FOLDER, SHOW_ALL]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

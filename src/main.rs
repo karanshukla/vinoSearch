@@ -619,6 +619,10 @@ fn run(cli: Cli) -> Result<bool> {
                     index::Kind::Document => {
                         format!(", {} {}", extract::unit(Path::new(&h.path)), h.line)
                     }
+                    index::Kind::Session => match extract::session::Part::of(h.line) {
+                        (extract::session::Part::Transcript, l) => format!(", transcript:{l}"),
+                        (extract::session::Part::Summary, l) => format!(", summary:{l}"),
+                    },
                     _ => format!(":{}", h.line),
                 };
                 println!(

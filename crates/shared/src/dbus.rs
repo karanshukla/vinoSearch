@@ -48,6 +48,11 @@ pub mod status {
     /// Source code (#110).
     pub const CODE_FILES: &str = "code_files";
     pub const CODE_CHUNKS: &str = "code_chunks";
+    /// vinoWhisper sessions (#143), and those not read: in a format this
+    /// build doesn't know, or broken.
+    pub const SESSION_FILES: &str = "session_files";
+    pub const SESSION_CHUNKS: &str = "session_chunks";
+    pub const SESSIONS_UNREAD: &str = "sessions_unread";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";
@@ -129,5 +134,7 @@ pub mod results {
     pub const IMAGE: &str = "image";
     /// Source code, only ever alone, for a query starting `code:` (#110).
     pub const CODE: &str = "code";
+    /// A vinoWhisper session's transcript or summary (#143).
+    pub const SESSION: &str = "session";
     pub const MAX: u32 = 100;
 }

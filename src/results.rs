@@ -19,6 +19,7 @@ fn kind(h: &Hit) -> &'static str {
     match h.kind {
         Kind::Text => results::TEXT,
         Kind::Code => results::CODE,
+        Kind::Session => results::SESSION,
         Kind::Document if crate::extract::is_document(Path::new(&h.path)) => results::DOCUMENT,
         Kind::Document | Kind::Image => results::IMAGE,
     }
@@ -26,10 +27,10 @@ fn kind(h: &Hit) -> &'static str {
 
 /// Best chunk per file, files at or above their kind's `floor`, at most
 /// `limit` files of each of the window's kinds: text, then documents, then
-/// images, best first within each.
+/// sessions, then images, best first within each.
 pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 4] = Default::default();
+    let mut groups: [Vec<Hit>; 5] = Default::default();
     for h in hits {
         if h.score < floor(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -37,8 +38,9 @@ pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> 
         let group = &mut groups[match kind(&h) {
             results::TEXT => 0,
             results::DOCUMENT => 1,
-            results::IMAGE => 2,
-            _ => 3,
+            results::SESSION => 2,
+            results::IMAGE => 3,
+            _ => 4,
         }];
         group.push(h);
     }
