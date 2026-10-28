@@ -1,0 +1,29 @@
+848 image vectors
+
+Variant to its original:
+  -800x400   n=100  min 0.9460  p5 0.9576  p50 0.9785  p95 0.9890  max 0.9902
+   (1)       n=100  min 0.8931  p5 0.9062  p50 0.9296  p95 0.9607  max 0.9849
+  -crop85    n=100  min 0.9320  p5 0.9362  p50 0.9739  p95 0.9867  max 0.9954
+  -crop50    n=100  min 0.8127  p5 0.8511  p50 0.9169  p95 0.9631  max 0.9763
+  -edit      n=100  min 0.9734  p5 0.9836  p50 0.9929  p95 0.9966  max 0.9973
+  -burst     n=100  min 0.9521  p5 0.9582  p50 0.9799  p95 0.9910  max 0.9938
+
+Variant to its group's centre (original and the variants but -crop50):
+             n=600  min 0.9238  p5 0.9513  p50 0.9881  p95 0.9943  max 0.9967
+
+Different photos, each original's closest other original:
+             n=200  min 0.6958  p5 0.7212  p50 0.7702  p95 0.8486  max 0.9034
+  pairs over 0.90: 1, over 0.95: 0
+
+Screenshots, cosine:
+  clock only       n= 12  min 0.9880  p5 0.9880  p50 0.9938  p95 0.9956  max 0.9956
+  same UI          n= 60  min 0.9026  p5 0.9166  p50 0.9457  p95 0.9629  max 0.9683
+  other UI         n=1056  min 0.8739  p5 0.8879  p50 0.9117  p95 0.9342  max 0.9550
+Screenshots, share of 64x64 grey pixels over 32/255 apart:
+  clock only       n= 12  min 0.0000  p5 0.0000  p50 0.0000  p95 0.0000  max 0.0000
+  same UI          n= 60  min 0.0000  p5 0.0000  p50 0.0005  p95 0.0056  max 0.0056
+  other UI         n=1056  min 0.0044  p5 0.0107  p50 0.0393  p95 0.1445  max 0.8459
+Screenshots, share of 256x256 grey pixels over 16/255 apart:
+  clock only       n= 12  min 0.0001  p5 0.0001  p50 0.0002  p95 0.0002  max 0.0002
+  same UI          n= 60  min 0.0214  p5 0.0239  p50 0.0283  p95 0.0327  max 0.0337
+  other UI         n=1056  min 0.0422  p5 0.0547  p50 0.1423  p95 0.9766  max 0.9848
