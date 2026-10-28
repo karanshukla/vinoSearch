@@ -15,6 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 
 mod ole;
 mod rtf;
+pub mod session;
 
 /// Address space the extracting child may map (#84). The runner's own share
 /// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
@@ -204,6 +205,11 @@ pub fn is_document(path: &Path) -> bool {
     EXTENSIONS.contains(&ext(path).as_str())
 }
 
+/// A vinoWhisper session bundle (#143), by its name.
+pub fn is_session(path: &Path) -> bool {
+    ext(path) == session::EXTENSION
+}
+
 /// What a chunk's number counts in `path`: "page", "slide", "row" or
 /// "paragraph".
 pub fn unit(path: &Path) -> &'static str {
@@ -289,6 +295,7 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
         )),
         "fodp" => Ok(numbered(xml_text(utf8(bytes)?, &Tags::ODF).split('\u{c}'))),
         "epub" => epub(bytes),
+        session::EXTENSION => session::chunks(bytes),
         // Older Words saved RTF under .doc, and a renamed .docx or .pptx is
         // still one.
         "doc" | "dot" if bytes.starts_with(b"{\\rtf") => Ok(chunk(&rtf::rtf(bytes)?)),

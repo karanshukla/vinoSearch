@@ -966,6 +966,49 @@ impl SettingsWindow {
             },
         );
 
+        let sessions = if self.config.encryption.on() {
+            "vinoWhisper's saved transcripts and their summaries, searched with everything else."
+        } else {
+            "vinoWhisper's saved transcripts and their summaries, searched with everything \
+             else. A transcript holds whatever was said or played, and its text is stored \
+             unencrypted unless the index is encrypted (Security)."
+        };
+        row(ui, "Sessions:", sessions, |ui| {
+            let mut on = self.config.formats.sessions_enabled();
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut on, "Index vinoWhisper sessions").changed() {
+                    self.config.formats.sessions.enabled = on.then_some(true);
+                    changed = true;
+                }
+                if let Some(s) = s
+                    && let Some(text) = share(s.session_files, Some(s.session_chunks))
+                {
+                    ui.label(RichText::new(text).color(p.muted));
+                }
+            });
+            if on && !self.config.encryption.on() {
+                ui.label(
+                    RichText::new("Turn on encryption (Security) to keep transcripts encrypted.")
+                        .color(p.muted),
+                );
+            }
+            if let Some(s) = s
+                && s.sessions_unread > 0
+            {
+                let n = s.sessions_unread;
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{n} {} not read: made by a newer vinoWhisper, or damaged.",
+                            if n == 1 { "session" } else { "sessions" }
+                        ))
+                        .color(p.error),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+
         section(ui, "Opening results");
         let editors = self.editors.get_or_insert_with(apps::editors).clone();
         let current = self.config.editor.clone();

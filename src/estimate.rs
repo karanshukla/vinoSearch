@@ -46,6 +46,8 @@ fn document_text_share(path: &Path) -> f64 {
         .to_ascii_lowercase();
     match ext.as_str() {
         "csv" | "tsv" | "srt" | "vtt" => 1.0,
+        // A deflated transcript: plain text, about a third its size zipped.
+        "vwsession" => 2.0,
         "pdf" => 0.25,
         _ => 0.5,
     }
@@ -59,7 +61,7 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
         Kind::Text => bytes,
         // Text past MAX_FILE_BYTES is skipped, so a document makes at most
         // that much.
-        Kind::Document => {
+        Kind::Document | Kind::Session => {
             ((bytes as f64 * document_text_share(path)) as u64).min(index::MAX_FILE_BYTES)
         }
     };
@@ -70,7 +72,7 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
 fn secs_of(kind: Kind, chunks: u64) -> f64 {
     match kind {
         Kind::Image => chunks as f64 * SECS_PER_IMAGE,
-        Kind::Text | Kind::Document | Kind::Code => chunks as f64 / CHUNKS_PER_SEC,
+        Kind::Text | Kind::Document | Kind::Code | Kind::Session => chunks as f64 / CHUNKS_PER_SEC,
     }
 }
 
@@ -85,8 +87,8 @@ pub struct Tally {
 #[derive(Debug, Default)]
 pub struct Estimate {
     pub root: PathBuf,
-    /// In `Kind::ALL`'s order: text, documents, images, code.
-    pub kinds: [Tally; 4],
+    /// In `Kind::ALL`'s order: text, documents, images, code, sessions.
+    pub kinds: [Tally; 5],
     /// Files already indexed and unchanged since, which cost nothing.
     pub up_to_date: u64,
     /// The subfolders taking longest, longest first: (folder, seconds, files).
@@ -148,6 +150,7 @@ impl Estimate {
                     Kind::Document => "documents",
                     Kind::Image => "images",
                     Kind::Code => "code",
+                    Kind::Session => "sessions",
                 };
                 (
                     name.to_owned(),
@@ -477,6 +480,7 @@ mod tests {
                 Tally::default(),
                 Tally::default(),
                 Tally::default(),
+                Tally::default(),
             ],
             ..Estimate::default()
         };
@@ -495,6 +499,7 @@ mod tests {
                     bytes: 0,
                     chunks: 113_341,
                 },
+                Tally::default(),
                 Tally::default(),
                 Tally::default(),
                 Tally::default(),

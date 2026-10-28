@@ -241,7 +241,8 @@ impl Source for Runner {
                 path,
                 kind: match kind.as_str() {
                     // Code comes alone, for `code:` (#110), and reads as text.
-                    results::TEXT | results::CODE => Kind::Text,
+                    // A session's transcript or summary reads as text too (#143).
+                    results::TEXT | results::CODE | results::SESSION => Kind::Text,
                     results::DOCUMENT => Kind::Document,
                     _ => Kind::Image,
                 },

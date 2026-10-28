@@ -8,9 +8,16 @@
 //! to run. Only apps known to take a line or page get one; anything else, a
 //! terminal app or a Flatpak included, gets `xdg-open` as before. Every
 //! command is an argv, never a shell line.
+//!
+//! A vinoWhisper session (#143) is a zip no editor opens: it goes to
+//! vinoWhisper's settings window, or without vinoWhisper, the part that
+//! matched is copied out to a private file and that is opened.
 
+use crate::extract::session::{self, Part};
 use crate::index::Kind;
-use std::path::Path;
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Where in its file a result matched.
@@ -21,6 +28,8 @@ pub enum At {
     /// A PDF's page, counted from 1 in document order (an index, not a
     /// printed page label).
     Page(u32),
+    /// A vinoWhisper session's part, at a line of it (0 for the top).
+    Session(Part, u32),
 }
 
 impl At {
@@ -29,6 +38,10 @@ impl At {
     /// numbers other than a PDF's page are slides, rows or chapters, which
     /// no common app takes from the command line.
     pub fn of(kind: Kind, path: &Path, line: i64) -> Option<At> {
+        if kind == Kind::Session {
+            let (part, n) = Part::of(line);
+            return Some(At::Session(part, u32::try_from(n).unwrap_or(0)));
+        }
         let n = u32::try_from(line).ok().filter(|&n| n > 0)?;
         match kind {
             Kind::Text if !crate::extract::is_html(path) => Some(At::Line(n)),
@@ -275,6 +288,7 @@ fn default_entry(file: &Path, at: At) -> Option<Entry> {
     let mime = match at {
         At::Page(_) => "application/pdf".to_owned(),
         At::Line(_) => xdg_mime(&["query".as_ref(), "filetype".as_ref(), file.as_os_str()])?,
+        At::Session(..) => return None,
     };
     let default = |m: &str| xdg_mime(&["query".as_ref(), "default".as_ref(), m.as_ref()]);
     let id = match default(&mime) {
@@ -352,6 +366,18 @@ fn spawn(argv: Vec<String>) -> std::io::Result<()> {
 /// Open `file` at `at` in the editor or default app, else with `xdg-open`.
 /// Looking up the default app runs `xdg-mime`, so call this off the bus.
 pub fn open(file: &Path, at: Option<At>, editor: Option<&str>) {
+    if crate::extract::is_session(file) {
+        let (part, line) = match at {
+            Some(At::Session(part, line)) => (part, line),
+            // From `vinosearch menu` or the search window, which pass a line.
+            Some(At::Line(line)) => (Part::Transcript, line),
+            _ => (Part::Transcript, 0),
+        };
+        if let Err(e) = open_session(file, part, line, editor) {
+            eprintln!("opening {}: {e:#}", file.display());
+        }
+        return;
+    }
     if let Some(argv) = at.and_then(|at| argv_at(file, at, editor)) {
         let program = argv[0].clone();
         match spawn(argv) {
@@ -366,6 +392,86 @@ pub fn xdg_open(target: &Path) {
     if let Err(e) = spawn(vec!["xdg-open".into(), target.display().to_string()]) {
         eprintln!("xdg-open {}: {e}", target.display());
     }
+}
+
+/// vinoWhisper's settings window, which opens a session's part (and the
+/// transcript at a `[MM:SS]`); KRunner's PATH may lack ~/.local/bin, where
+/// its setup puts it.
+fn vinowhisper_gui() -> Option<PathBuf> {
+    const GUI: &str = "vinowhisper-gui";
+    if crate::menu::on_path(GUI) {
+        return Some(PathBuf::from(GUI));
+    }
+    let local = PathBuf::from(std::env::var_os("HOME")?)
+        .join(".local/bin")
+        .join(GUI);
+    local.is_file().then_some(local)
+}
+
+/// What follows the bundle's path for vinoWhisper (vinoWhisper#123):
+/// `transcript`, `transcript@MM:SS` or `summary`.
+fn fragment(part: Part, stamp: Option<&str>) -> String {
+    match (part, stamp) {
+        (Part::Summary, _) => "summary".into(),
+        (Part::Transcript, Some(s)) => format!("transcript@{s}"),
+        (Part::Transcript, None) => "transcript".into(),
+    }
+}
+
+fn session_argv(gui: &Path, file: &Path, part: Part, stamp: Option<&str>) -> Vec<String> {
+    vec![
+        gui.display().to_string(),
+        "--page".into(),
+        "sessions".into(),
+        "--open".into(),
+        format!("{}#{}", file.display(), fragment(part, stamp)),
+    ]
+}
+
+fn open_session(file: &Path, part: Part, line: u32, editor: Option<&str>) -> Result<()> {
+    let bytes = session::load(file)?;
+    let text = session::text(&bytes, part)?;
+    if let Some(gui) = vinowhisper_gui() {
+        let stamp = match part {
+            Part::Transcript if line > 0 => session::stamp_at(&text, line as usize),
+            _ => None,
+        };
+        spawn(session_argv(&gui, file, part, stamp.as_deref()))?;
+        return Ok(());
+    }
+    let copy = copy_out(file, part, &text)?;
+    open(&copy, (line > 0).then_some(At::Line(line)), editor);
+    Ok(())
+}
+
+/// `text`, `file`'s `part`, in a file only this user can read, under
+/// $XDG_RUNTIME_DIR (memory, gone at logout), never /tmp. Copies from
+/// before are deleted first: each open leaves at most one behind.
+fn copy_out(file: &Path, part: Part, text: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("no XDG_RUNTIME_DIR")?;
+    let dir = PathBuf::from(runtime).join("vinosearch/sessions");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    for old in std::fs::read_dir(&dir)?.flatten() {
+        let _ = std::fs::remove_file(old.path());
+    }
+    let stem = file
+        .file_stem()
+        .map_or("session".into(), |s| s.to_string_lossy());
+    let copy = dir.join(match part {
+        Part::Transcript => format!("{stem} transcript.txt"),
+        Part::Summary => format!("{stem} summary.md"),
+    });
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&copy)?
+        .write_all(text.as_bytes())?;
+    Ok(copy)
 }
 
 #[cfg(test)]
@@ -391,6 +497,60 @@ mod tests {
         assert_eq!(At::of(Kind::Document, &p("/a.srt"), 3), None);
         assert_eq!(At::of(Kind::Image, &p("/a.jpg"), 0), None);
         assert_eq!(At::of(Kind::Text, &p("/a.rs"), 0), None);
+        assert_eq!(
+            At::of(Kind::Session, &p("/s.vwsession"), 7),
+            Some(At::Session(Part::Transcript, 7))
+        );
+        assert_eq!(
+            At::of(
+                Kind::Session,
+                &p("/s.vwsession"),
+                session::SUMMARY_LINES as i64 + 2
+            ),
+            Some(At::Session(Part::Summary, 2))
+        );
+    }
+
+    #[test]
+    fn a_session_opens_in_vinowhisper_at_its_stamp() {
+        let gui = Path::new("/home/u/.local/bin/vinowhisper-gui");
+        let file = Path::new("/d/#1 2026-10-27-140512.vwsession");
+        assert_eq!(
+            session_argv(gui, file, Part::Transcript, Some("61:05")),
+            [
+                "/home/u/.local/bin/vinowhisper-gui",
+                "--page",
+                "sessions",
+                "--open",
+                "/d/#1 2026-10-27-140512.vwsession#transcript@61:05"
+            ]
+        );
+        assert_eq!(
+            session_argv(gui, file, Part::Summary, Some("01:00"))[4],
+            "/d/#1 2026-10-27-140512.vwsession#summary"
+        );
+        assert_eq!(
+            session_argv(gui, file, Part::Transcript, None)[4],
+            "/d/#1 2026-10-27-140512.vwsession#transcript"
+        );
+    }
+
+    #[test]
+    fn a_part_copied_out_is_private_and_replaces_the_last() {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = std::env::temp_dir().join(format!("vs-copy-{}", std::process::id()));
+        // SAFETY: no other test reads XDG_RUNTIME_DIR.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime) };
+        let file = Path::new("/d/2026-10-27-140512.vwsession");
+        let first = copy_out(file, Part::Transcript, "one").unwrap();
+        let second = copy_out(file, Part::Summary, "two").unwrap();
+        assert!(!first.exists());
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two");
+        assert!(second.ends_with("2026-10-27-140512 summary.md"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&second), 0o600);
+        assert_eq!(mode(second.parent().unwrap()), 0o700);
+        std::fs::remove_dir_all(&runtime).unwrap();
     }
 
     #[test]

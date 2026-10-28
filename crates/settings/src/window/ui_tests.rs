@@ -364,6 +364,17 @@ fn search_page_controls_are_named_by_their_row_labels() {
     assert!(h.state().config.formats.code_enabled());
     let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
     assert!(saved.contains("[formats.code]\nenabled = true"), "{saved}");
+    // So are vinoWhisper sessions (#143), with a nudge towards encryption.
+    let sessions = h.get_by_role_and_label(Role::CheckBox, "Index vinoWhisper sessions");
+    sessions.click();
+    settle(&mut h);
+    assert!(h.state().config.formats.sessions_enabled());
+    h.get_by_label("Turn on encryption (Security) to keep transcripts encrypted.");
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(
+        saved.contains("[formats.sessions]\nenabled = true"),
+        "{saved}"
+    );
     for row in ["Text:", "Images:", "Code:"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);

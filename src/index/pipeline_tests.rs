@@ -338,7 +338,7 @@ fn code_is_indexed_apart_and_found_only_with_the_code_prefix() {
     );
     assert_eq!(
         counts_by_kind(&conn).unwrap(),
-        [(1, 1), (0, 0), (0, 0), (1, 1)]
+        [(1, 1), (0, 0), (0, 0), (1, 1), (0, 0)]
     );
     // Code chunks carry their line, for opening an editor there.
     let line: i64 = conn
@@ -412,7 +412,7 @@ fn code_indexed_as_text_moves_to_its_own_kind_once() {
     assert_eq!(names_of(&conn), ["a.rs", "b.md", "c.py"]);
     assert_eq!(
         counts_by_kind(&conn).unwrap(),
-        [(1, 1), (0, 0), (0, 0), (2, 2)]
+        [(1, 1), (0, 0), (0, 0), (2, 2), (0, 0)]
     );
     // Vectors loaded before catch the new kinds up from the log.
     vectors.refresh(&conn).unwrap();
@@ -433,4 +433,91 @@ fn code_indexed_as_text_moves_to_its_own_kind_once() {
     conn.execute("UPDATE chunks SET kind = 0", []).unwrap();
     drop(conn);
     assert_eq!(counts_by_kind(&t.db()).unwrap()[3], (0, 0));
+}
+
+const SESSION_V1: &str = "vinowhisper-session/1";
+
+fn sessions_on() -> FileTypes {
+    FileTypes::default().with_sessions(true, None)
+}
+
+/// (transcript, summary) chunks of `path`.
+fn session_parts(conn: &Connection, path: &Path) -> (i64, i64) {
+    conn.query_row(
+        "SELECT coalesce(sum(c.start_line < ?2), 0), coalesce(sum(c.start_line >= ?2), 0)
+         FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ?1",
+        params![
+            path.to_str().unwrap(),
+            crate::extract::session::SUMMARY_LINES as i64
+        ],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_session_is_one_file_of_two_parts_that_comes_and_goes_whole() {
+    use crate::extract::session::tests::{SUMMARY_TEXT, bundle};
+    let t = Tree::new("session");
+    let path = t.root().join("2026-10-27-140512.vwsession");
+    fs::write(&path, bundle(None, SESSION_V1)).unwrap();
+    let mut conn = t.db();
+    let mut emb = FakeEmbed::default();
+    let types = sessions_on();
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &types,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(session_parts(&conn, &path), (1, 0));
+    assert_eq!(counts_by_kind(&conn).unwrap()[4], (1, 1));
+    // Searched with everything else, not behind a prefix.
+    assert!(
+        found(&conn, "quarterly budget")
+            .contains(&(Kind::Session, "2026-10-27-140512.vwsession".to_owned()))
+    );
+
+    // vinoWhisper adds the summary: a new bundle renamed over the old one,
+    // which the watcher hands over as a changed path.
+    let tmp = t.root().join(".2026-10-27-140512.vwsession.k3j.tmp");
+    fs::write(&tmp, bundle(Some(SUMMARY_TEXT), SESSION_V1)).unwrap();
+    fs::rename(&tmp, &path).unwrap();
+    let out = index_file(&mut conn, &mut emb, &path, &types, &mut |_, _| Ok(())).unwrap();
+    assert!(matches!(out, Outcome::Embedded(2)));
+    assert_eq!(session_parts(&conn, &path), (1, 1));
+
+    // Deleted, both parts go with it.
+    fs::remove_file(&path).unwrap();
+    index_file(&mut conn, &mut emb, &path, &types, &mut |_, _| Ok(())).unwrap();
+    assert_eq!(session_parts(&conn, &path), (0, 0));
+    assert!(paths(&conn).is_empty());
+}
+
+#[test]
+fn a_session_of_an_unknown_format_is_kept_unread_and_counted() {
+    use crate::extract::session::tests::{SUMMARY_TEXT, bundle};
+    let t = Tree::new("session-v2");
+    let path = t.root().join("new.vwsession");
+    fs::write(&path, bundle(Some(SUMMARY_TEXT), "vinowhisper-session/2")).unwrap();
+    t.write("old.vwsession", "not a zip at all");
+    let mut conn = t.db();
+    let mut emb = FakeEmbed::default();
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &sessions_on(),
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(emb.documents, 0);
+    assert_eq!(names_of(&conn), ["new.vwsession", "old.vwsession"]);
+    assert_eq!(unread_sessions(&conn).unwrap(), 2);
+    // Turned off, sessions leave the index.
+    assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 2);
 }

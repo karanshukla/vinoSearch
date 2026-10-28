@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+const SESSION_ICON: &str = "io.github.karanshukla.vinowhisper";
+
 /// The best icon name for `path`, then the generic one for its kind.
 pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
     static ICONS: OnceLock<HashMap<String, String>> = OnceLock::new();
@@ -18,6 +20,9 @@ pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
         Kind::Image => "image-x-generic",
         Kind::Document => "x-office-document",
         Kind::Code => "text-x-script",
+        // What vinoWhisper registers for the type (vinoWhisper#123), so a
+        // result looks as the file does in a file manager.
+        Kind::Session => return (SESSION_ICON, "text-x-generic"),
     };
     let specific = path
         .extension()
