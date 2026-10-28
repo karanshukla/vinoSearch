@@ -358,6 +358,8 @@ mod tests {
             line,
             text: text.into(),
             copies: Vec::new(),
+            vector: None,
+            similar: Vec::new(),
         }
     }
 
