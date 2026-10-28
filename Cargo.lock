@@ -4349,9 +4349,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vino-ui"
+name = "vino-user-interface"
 version = "0.1.0"
-source = "git+https://github.com/karanshukla/vinoUserInterface?tag=v0.1.0#2380a14215455dd111d4564fefe19b5d35adbbeb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3459c772d6e7b91d4f4876dd1c68969004a44a1b8281f13099c48b54fb741ee3"
 dependencies = [
  "egui",
 ]
@@ -4407,7 +4408,7 @@ dependencies = [
  "md-5",
  "serde",
  "serde_json",
- "vino-ui",
+ "vino-user-interface",
  "vinosearch-shared",
  "zbus 6.0.0",
 ]
