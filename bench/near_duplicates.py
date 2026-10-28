@@ -161,5 +161,37 @@ def score(out):
             print(f"  {'same UI':16} {pct(s_)}")
             print(f"  {'other UI':16} {pct(o)}")
 
+def grouped(out, alike=0.92, max_differing=0.01, orders=3):
+    """`dupes::collapse` over every photo, in random orders standing in for
+    queries: groups held to their front, the pixel rule for the same size,
+    on thumbnails with brightness and contrast evened out."""
+    import random
+    v = {k: x for k, x in vectors(out).items() if not k.startswith("shots/")}
+    img = lambda k: os.path.join(out, "img", k)
+    size = {k: Image.open(img(k)).size for k in v}
+    thumbs = {}
+    def thumb(k):
+        if k not in thumbs:
+            a = grey(img(k), 256).astype(np.float32)
+            thumbs[k] = (a - a.mean()) / max(a.std(), 1e-3) * 48
+        return thumbs[k]
+    agree = lambda a, b: size[a] != size[b] or float((np.abs(thumb(a) - thumb(b)) > 16).mean()) <= max_differing
+    photo = lambda k: os.path.basename(k).split("-")[0].split(" ")[0].split(".")[0]
+    print("\nGrouped, front-anchored, over every photo:")
+    for seed in range(orders):
+        groups = []
+        for k in random.Random(seed).sample(sorted(v), len(v)):
+            g = next((g for g in groups if float(v[g[0]] @ v[k]) >= alike and agree(g[0], k)), None)
+            (g.append(k) if g else groups.append([k]))
+        mixed = sum(len({photo(m) for m in g}) > 1 for g in groups)
+        per = {}
+        for g in groups:
+            for p in {photo(m) for m in g}:
+                per[p] = per.get(p, 0) + 1
+        varied = {photo(k) for k in v if k.startswith("var/")}
+        print(f"  order {seed}: {len(groups)} groups, {mixed} holding two photos, "
+              f"{np.mean([per[p] for p in varied]):.2f} groups per photo with variants")
+
 if __name__ == "__main__":
-    {"make": lambda: make(sys.argv[2], sys.argv[3]), "score": lambda: score(sys.argv[2])}[sys.argv[1]]()
+    {"make": lambda: make(sys.argv[2], sys.argv[3]),
+     "score": lambda: (score(sys.argv[2]), grouped(sys.argv[2]))}[sys.argv[1]]()

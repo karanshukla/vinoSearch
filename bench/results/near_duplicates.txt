@@ -27,3 +27,8 @@ Screenshots, share of 256x256 grey pixels over 16/255 apart:
   clock only       n= 12  min 0.0001  p5 0.0001  p50 0.0002  p95 0.0002  max 0.0002
   same UI          n= 60  min 0.0214  p5 0.0239  p50 0.0283  p95 0.0327  max 0.0337
   other UI         n=1056  min 0.0422  p5 0.0547  p50 0.1423  p95 0.9766  max 0.9848
+
+Grouped, front-anchored, over every photo:
+  order 0: 375 groups, 1 holding two photos, 2.76 groups per photo with variants
+  order 1: 375 groups, 0 holding two photos, 2.75 groups per photo with variants
+  order 2: 377 groups, 0 holding two photos, 2.77 groups per photo with variants
