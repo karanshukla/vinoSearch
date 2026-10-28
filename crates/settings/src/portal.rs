@@ -6,14 +6,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{OwnedValue, Value};
+use futures_lite::StreamExt;
+use zbus::{Connection, Proxy};
+use zbus::{OwnedVariant, Variant};
 
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 
 /// Blocks until the dialog closes. None when it was cancelled.
 pub fn pick_folder(title: &str) -> Result<Option<PathBuf>> {
-    let conn = Connection::session()?;
+    zbus::block_on(pick(title))
+}
+
+async fn pick(title: &str) -> Result<Option<PathBuf>> {
+    let conn = Connection::session().await?;
     // The portal answers on a Request object whose path it derives from our
     // bus name and this token. Listening there before asking means a fast
     // answer can't arrive ahead of the match rule.
@@ -28,30 +33,33 @@ pub fn pick_folder(title: &str) -> Result<Option<PathBuf>> {
         PORTAL,
         format!("/org/freedesktop/portal/desktop/request/{sender}/{token}"),
         "org.freedesktop.portal.Request",
-    )?;
-    let mut responses = request.receive_signal("Response")?;
+    )
+    .await?;
+    let mut responses = request.receive_signal("Response").await?;
     let chooser = Proxy::new(
         &conn,
         PORTAL,
         "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.FileChooser",
-    )?;
-    let options: HashMap<&str, Value> = HashMap::from([
-        ("handle_token", Value::from(token.as_str())),
-        ("directory", Value::from(true)),
-        ("modal", Value::from(true)),
+    )
+    .await?;
+    let options: HashMap<&str, Variant> = HashMap::from([
+        ("handle_token", Variant::from(token.as_str())),
+        ("directory", Variant::from(true)),
+        ("modal", Variant::from(true)),
     ]);
-    let _: zbus::zvariant::OwnedObjectPath = chooser
+    let _: zbus::OwnedObjectPath = chooser
         .call("OpenFile", &("", title, options))
+        .await
         .context("the desktop has no file chooser portal")?;
-    let message = responses.next().context("the portal went away")?;
-    let (code, results): (u32, HashMap<String, OwnedValue>) = message.body().deserialize()?;
+    let message = responses.next().await.context("the portal went away")?;
+    let (code, results): (u32, HashMap<String, OwnedVariant>) = message.body().deserialize()?;
     if code != 0 {
         return Ok(None);
     }
     let uri = match results.get("uris").map(|v| &**v) {
-        Some(Value::Array(a)) => a.iter().find_map(|v| match v {
-            Value::Str(s) => Some(s.to_string()),
+        Some(Variant::Array(a)) => a.iter().find_map(|v| match v {
+            Variant::Str(s) => Some(s.to_string()),
             _ => None,
         }),
         _ => None,

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui;
 use vinosearch_shared::dbus::{self, results, status};
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::{OwnedVariant, Variant};
 
 /// What a result is, as the window groups them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,26 +179,34 @@ fn run(source: &mut impl Source, out: &Mutex<Answers>, ask: Ask) {
 /// The runner's `Control1`.
 #[derive(Default)]
 pub struct Runner {
-    conn: Option<zbus::blocking::Connection>,
+    conn: Option<zbus::Connection>,
 }
 
 type Row = (String, String, f64, String, String, u32, i64);
 
 impl Runner {
-    fn proxy(&mut self) -> zbus::Result<zbus::blocking::Proxy<'static>> {
-        let c = match &self.conn {
-            Some(c) => c.clone(),
-            None => self
-                .conn
-                .insert(zbus::blocking::Connection::session()?)
-                .clone(),
-        };
-        zbus::blocking::Proxy::new_owned(
-            c,
-            dbus::SERVICE.to_owned(),
-            dbus::CONTROL_PATH.to_owned(),
-            dbus::CONTROL_INTERFACE.to_owned(),
-        )
+    /// Calls `method` on the runner, connecting first if there is no
+    /// connection. The connection is driven by this thread while it blocks.
+    fn invoke<B, R>(&mut self, method: &'static str, body: &B) -> zbus::Result<R>
+    where
+        B: serde::ser::Serialize + zbus::DynamicType,
+        R: for<'d> zbus::wire::DynamicDeserialize<'d>,
+    {
+        zbus::block_on(async {
+            let c = match &self.conn {
+                Some(c) => c.clone(),
+                None => self.conn.insert(zbus::Connection::session().await?).clone(),
+            };
+            zbus::Proxy::new_owned(
+                c,
+                dbus::SERVICE.to_owned(),
+                dbus::CONTROL_PATH.to_owned(),
+                dbus::CONTROL_INTERFACE.to_owned(),
+            )
+            .await?
+            .call(method, body)
+            .await
+        })
     }
 
     /// The runner's own message for a refusal; otherwise what went wrong on
@@ -225,9 +233,7 @@ impl Runner {
 
 impl Source for Runner {
     fn search(&mut self, query: &str) -> Result<Vec<Found>, String> {
-        let rows: zbus::Result<Vec<Row>> = self
-            .proxy()
-            .and_then(|p| p.call("Search", &(query, results::MAX)));
+        let rows: zbus::Result<Vec<Row>> = self.invoke("Search", &(query, results::MAX));
         let rows = rows.map_err(|e| self.explain(e))?;
         Ok(rows
             .into_iter()
@@ -250,14 +256,14 @@ impl Source for Runner {
     }
 
     fn roots(&mut self) -> Result<Vec<String>, String> {
-        let map: zbus::Result<std::collections::HashMap<String, OwnedValue>> =
-            self.proxy().and_then(|p| p.call("Status", &()));
+        let map: zbus::Result<std::collections::HashMap<String, OwnedVariant>> =
+            self.invoke("Status", &());
         let map = map.map_err(|e| self.explain(e))?;
         Ok(match map.get(status::ROOTS).map(|v| &**v) {
-            Some(Value::Array(a)) => a
+            Some(Variant::Array(a)) => a
                 .iter()
                 .filter_map(|v| match v {
-                    Value::Str(s) => Some(s.to_string()),
+                    Variant::Str(s) => Some(s.to_string()),
                     _ => None,
                 })
                 .collect(),
@@ -266,12 +272,12 @@ impl Source for Runner {
     }
 
     fn open(&mut self, path: &str, at: u32) -> Result<(), String> {
-        let done: zbus::Result<()> = self.proxy().and_then(|p| p.call("Open", &(path, at)));
+        let done: zbus::Result<()> = self.invoke("Open", &(path, at));
         done.map_err(|e| self.explain(e))
     }
 
     fn open_folder(&mut self, path: &str) -> Result<(), String> {
-        let done: zbus::Result<()> = self.proxy().and_then(|p| p.call("OpenFolder", &(path,)));
+        let done: zbus::Result<()> = self.invoke("OpenFolder", &(path,));
         done.map_err(|e| self.explain(e))
     }
 
