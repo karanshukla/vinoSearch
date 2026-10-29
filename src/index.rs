@@ -1428,9 +1428,10 @@ pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
 }
 
 /// Formats whose text is read differently now, with the reading's version:
-/// HTML through `extract::html` since 1 (#97). Mtime and size don't show the
+/// HTML through `extract::html` since 1 (#97), PDFs without their headers,
+/// footers and page numbers since 1 (#158). Mtime and size don't show the
 /// change, so files read the old way are dropped once instead.
-const READINGS: &[(&str, &[&str], u32)] = &[("html", &["html", "htm"], 1)];
+const READINGS: &[(&str, &[&str], u32)] = &[("html", &["html", "htm"], 1), ("pdf", &["pdf"], 1)];
 
 /// Forget the files of each format in `READINGS` indexed under an older
 /// reading, so the next check of each root indexes them again. Returns files
@@ -3031,10 +3032,15 @@ mod tests {
     fn html_indexed_before_it_was_read_as_html_is_indexed_again_once() {
         let dir = std::env::temp_dir().join(format!("vinosearch-reread-{}", std::process::id()));
         let conn = open(&dir.join("i.sqlite")).unwrap();
-        for p in ["/site/index.html", "/site/OLD.HTM", "/notes.md"] {
+        for p in [
+            "/site/index.html",
+            "/site/OLD.HTM",
+            "/notes.md",
+            "/docs/a.pdf",
+        ] {
             add_file(&conn, p, &[0]);
         }
-        assert_eq!(reread_formats(&conn).unwrap(), 2);
+        assert_eq!(reread_formats(&conn).unwrap(), 3);
         assert!(is_indexed(&conn, "/notes.md").unwrap());
         assert!(!is_indexed(&conn, "/site/index.html").unwrap());
         add_file(&conn, "/site/index.html", &[0]);
