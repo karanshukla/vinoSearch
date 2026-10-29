@@ -1815,7 +1815,7 @@ impl SettingsWindow {
                     // No right margin: the scroll bar belongs on the window's edge, and the
                     // content keeps its own gap from it below.
                     .inner_margin(egui::Margin {
-                        left: if wide { 28 } else { 16 },
+                        left: if wide { widgets::PAGE_INSET as i8 } else { 16 },
                         right: 0,
                         top: if wide { 20 } else { 12 },
                         bottom: 0,
