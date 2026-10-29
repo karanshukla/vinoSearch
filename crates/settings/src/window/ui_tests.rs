@@ -218,7 +218,6 @@ fn index_page_buttons_reach_the_runner() {
         let heading = h.get_by_role_and_label(Role::Heading, section);
         assert_eq!(heading.accesskit_node().data().level(), Some(2));
     }
-    // The spinner is decoration: the text beside it says the same.
     h.get_by_label("Indexing, 12 files so far");
     for button in ["Stop", "Check now", "Exclude /srv/notes/build"] {
         h.get_by_role_and_label(Role::Button, button).click();
