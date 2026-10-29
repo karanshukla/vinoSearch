@@ -127,7 +127,7 @@ impl SettingsWindow {
                 None => {
                     // The answer lands on another thread; look for it.
                     ui.ctx().request_repaint_after(Duration::from_millis(100));
-                    widgets::chip_busy(ui, widgets::ChipKind::Neutral, "Estimating…");
+                    widgets::small(ui, "Estimating…");
                 }
                 Some(Err(why)) => {
                     ui.add(

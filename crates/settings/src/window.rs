@@ -276,25 +276,25 @@ impl SettingsWindow {
         self.add(target, &path);
     }
 
-    /// The chip beside the Index page's title: what the service is doing.
-    fn index_chip(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+    /// Beside the Index page's title: what the service is doing, in words.
+    fn index_status(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
         match status {
             None => {
-                widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…");
+                status_words(ui, ChipKind::Neutral, "Connecting…");
             }
             Some(Err(_)) => {
-                widgets::chip(ui, ChipKind::Err, "Service stopped");
+                status_words(ui, ChipKind::Err, "Service stopped");
             }
             Some(Ok(s)) => {
                 if s.paused {
-                    widgets::chip(ui, ChipKind::Neutral, "Stopped");
+                    status_words(ui, ChipKind::Neutral, "Stopped");
                 } else if power_hold(&s.power_hold).is_some() {
                     // The Now row says what for.
-                    widgets::chip(ui, ChipKind::Warn, "On hold");
+                    status_words(ui, ChipKind::Warn, "On hold");
                 } else if s.indexing {
-                    widgets::chip_busy(ui, ChipKind::Ok, "Indexing");
+                    status_words(ui, ChipKind::Ok, "Indexing");
                 } else {
-                    widgets::chip(ui, ChipKind::Ok, "Up to date");
+                    status_words(ui, ChipKind::Ok, "Up to date");
                 }
             }
         }
@@ -436,7 +436,7 @@ impl SettingsWindow {
                         } else {
                             "Checking…"
                         };
-                        widgets::chip_busy(ui, ChipKind::Neutral, text);
+                        status_words(ui, ChipKind::Neutral, text);
                     } else {
                         if ui.add(Button::secondary("Check now")).clicked() {
                             self.check_asked = Some(s.last_checked);
@@ -771,13 +771,13 @@ impl SettingsWindow {
                         );
                         widgets::progress(ui, fraction, 120.0);
                     } else if s.model_present {
-                        widgets::chip(
+                        status_words(
                             ui,
                             ChipKind::Ok,
                             &format!("Downloaded, {}", size(s.model_bytes)),
                         );
                     } else {
-                        widgets::chip(ui, ChipKind::Warn, "Not downloaded");
+                        status_words(ui, ChipKind::Warn, "Not downloaded");
                     }
                 });
                 if !s.fetch_error.is_empty() {
@@ -919,7 +919,7 @@ impl SettingsWindow {
             Row::new("Text")
                 .help("Notes, Markdown and web pages.")
                 .show(ui, |ui, _| {
-                    widgets::chip(ui, ChipKind::Neutral, "Always on");
+                    status_words(ui, ChipKind::Neutral, "Always on");
                     if let Some(s) = s
                         && let Some(text) = share(s.text_files, Some(s.text_chunks))
                     {
@@ -1271,12 +1271,7 @@ impl SettingsWindow {
                         }
                         (false, _) => (ChipKind::Neutral, "Not encrypted"),
                     };
-                    let shown = if kind == ChipKind::Neutral && text == "Encrypting…" {
-                        widgets::chip_busy(ui, kind, text)
-                    } else {
-                        widgets::chip(ui, kind, text)
-                    };
-                    a11y::live(&shown);
+                    a11y::live(&status_words(ui, kind, text));
                 });
             if !s.seal_broken.is_empty() {
                 Row::new("Rebuilt")
@@ -1366,7 +1361,7 @@ impl SettingsWindow {
                 .help("Same as vinosearch doctor.")
                 .show(ui, |ui, _| {
                     if state.running {
-                        widgets::chip_busy(ui, ChipKind::Neutral, "Checking…");
+                        status_words(ui, ChipKind::Neutral, "Checking…");
                     } else if ui.add(Button::secondary("Check again")).clicked() {
                         doctor::run(Arc::clone(&self.doctor), ui.ctx());
                     }
@@ -1417,11 +1412,11 @@ impl SettingsWindow {
                     flip = Some((switch, !on));
                 }
                 if state.running {
-                    widgets::chip_busy(ui, ChipKind::Neutral, "Working…");
+                    status_words(ui, ChipKind::Neutral, "Working…");
                 } else if on {
-                    widgets::chip(ui, ChipKind::Ok, "On");
+                    status_words(ui, ChipKind::Ok, "On");
                 } else {
-                    widgets::chip(ui, ChipKind::Neutral, "Off");
+                    status_words(ui, ChipKind::Neutral, "Off");
                 }
             });
         };
@@ -1482,6 +1477,18 @@ impl SettingsWindow {
             }
         });
     }
+}
+
+/// A status in words, where a pill with a dot was: dim, or in the warning or
+/// error colour when it is one. The words say it, so nothing turns or glows.
+fn status_words(ui: &mut egui::Ui, kind: ChipKind, text: &str) -> egui::Response {
+    let p = theme::palette(ui.ctx());
+    let color = match kind {
+        ChipKind::Warn => p.warn,
+        ChipKind::Err => p.error,
+        ChipKind::Ok | ChipKind::Neutral => p.muted,
+    };
+    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap())
 }
 
 /// A folder in a list: its icon and path, the path in full on hover.
@@ -1765,9 +1772,9 @@ impl SettingsWindow {
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
                             let shown = match status {
-                                None => widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…"),
-                                Some(Err(_)) => widgets::chip(ui, ChipKind::Err, "Service stopped"),
-                                Some(Ok(_)) => widgets::chip(ui, ChipKind::Ok, "Service running"),
+                                None => status_words(ui, ChipKind::Neutral, "Connecting…"),
+                                Some(Err(_)) => status_words(ui, ChipKind::Err, "Service stopped"),
+                                Some(Ok(_)) => status_words(ui, ChipKind::Ok, "Service running"),
                             };
                             a11y::live(&shown);
                         });
@@ -1827,7 +1834,7 @@ impl SettingsWindow {
                         widgets::title(ui, self.page.title());
                         if self.page == Page::Index {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                Self::index_chip(ui, status);
+                                Self::index_status(ui, status);
                             });
                         }
                     });
