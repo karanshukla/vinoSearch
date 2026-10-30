@@ -276,11 +276,11 @@ impl SettingsWindow {
         self.add(target, &path);
     }
 
-    /// The chip beside the Index page's title: what the service is doing.
-    fn index_chip(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+    /// Beside the Index page's title: what the service is doing, in words.
+    fn index_status(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
         match status {
             None => {
-                widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…");
+                widgets::chip(ui, ChipKind::Neutral, "Connecting…");
             }
             Some(Err(_)) => {
                 widgets::chip(ui, ChipKind::Err, "Service stopped");
@@ -292,7 +292,7 @@ impl SettingsWindow {
                     // The Now row says what for.
                     widgets::chip(ui, ChipKind::Warn, "On hold");
                 } else if s.indexing {
-                    widgets::chip_busy(ui, ChipKind::Ok, "Indexing");
+                    widgets::chip(ui, ChipKind::Ok, "Indexing");
                 } else {
                     widgets::chip(ui, ChipKind::Ok, "Up to date");
                 }
@@ -436,7 +436,7 @@ impl SettingsWindow {
                         } else {
                             "Checking…"
                         };
-                        widgets::chip_busy(ui, ChipKind::Neutral, text);
+                        widgets::chip(ui, ChipKind::Neutral, text);
                     } else {
                         if ui.add(Button::secondary("Check now")).clicked() {
                             self.check_asked = Some(s.last_checked);
@@ -1271,12 +1271,7 @@ impl SettingsWindow {
                         }
                         (false, _) => (ChipKind::Neutral, "Not encrypted"),
                     };
-                    let shown = if kind == ChipKind::Neutral && text == "Encrypting…" {
-                        widgets::chip_busy(ui, kind, text)
-                    } else {
-                        widgets::chip(ui, kind, text)
-                    };
-                    a11y::live(&shown);
+                    a11y::live(&widgets::chip(ui, kind, text));
                 });
             if !s.seal_broken.is_empty() {
                 Row::new("Rebuilt")
@@ -1366,7 +1361,7 @@ impl SettingsWindow {
                 .help("Same as vinosearch doctor.")
                 .show(ui, |ui, _| {
                     if state.running {
-                        widgets::chip_busy(ui, ChipKind::Neutral, "Checking…");
+                        widgets::chip(ui, ChipKind::Neutral, "Checking…");
                     } else if ui.add(Button::secondary("Check again")).clicked() {
                         doctor::run(Arc::clone(&self.doctor), ui.ctx());
                     }
@@ -1417,7 +1412,7 @@ impl SettingsWindow {
                     flip = Some((switch, !on));
                 }
                 if state.running {
-                    widgets::chip_busy(ui, ChipKind::Neutral, "Working…");
+                    widgets::chip(ui, ChipKind::Neutral, "Working…");
                 } else if on {
                     widgets::chip(ui, ChipKind::Ok, "On");
                 } else {
@@ -1765,7 +1760,7 @@ impl SettingsWindow {
                         ui.horizontal(|ui| {
                             ui.add_space(4.0);
                             let shown = match status {
-                                None => widgets::chip_busy(ui, ChipKind::Neutral, "Connecting…"),
+                                None => widgets::chip(ui, ChipKind::Neutral, "Connecting…"),
                                 Some(Err(_)) => widgets::chip(ui, ChipKind::Err, "Service stopped"),
                                 Some(Ok(_)) => widgets::chip(ui, ChipKind::Ok, "Service running"),
                             };
@@ -1815,7 +1810,7 @@ impl SettingsWindow {
                     // No right margin: the scroll bar belongs on the window's edge, and the
                     // content keeps its own gap from it below.
                     .inner_margin(egui::Margin {
-                        left: if wide { 28 } else { 16 },
+                        left: if wide { widgets::PAGE_INSET as i8 } else { 16 },
                         right: 0,
                         top: if wide { 20 } else { 12 },
                         bottom: 0,
@@ -1827,7 +1822,7 @@ impl SettingsWindow {
                         widgets::title(ui, self.page.title());
                         if self.page == Page::Index {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                Self::index_chip(ui, status);
+                                Self::index_status(ui, status);
                             });
                         }
                     });

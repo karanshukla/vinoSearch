@@ -316,9 +316,9 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
 }
 
 /// The text layer of pages `from..from + count`, NFKC so ligatures like `ﬁ`
-/// read as `fi`. A scan has none and comes out empty. The whole file is
-/// loaded each run, but only these pages' content is decoded, which is most
-/// of the time a page takes.
+/// read as `fi`, without its headers, footers and page numbers. A scan has
+/// none and comes out empty. The whole file is loaded each run, but only
+/// these pages' content is decoded, which is most of the time a page takes.
 fn pdf(bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     let mut doc = lopdf::Document::load_mem(bytes)?;
     if doc.is_encrypted() {
@@ -326,25 +326,180 @@ fn pdf(bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     }
     prefer_to_unicode(&mut doc);
     let pages = doc.get_pages();
-    let chunks = pages
+    let mut texts: Vec<(usize, String)> = pages
         .keys()
         .enumerate()
         .skip(from)
         .take(count)
-        .flat_map(|(i, p)| {
+        .map(|(i, p)| {
             let text = doc
                 .extract_text(&[*p])
                 .unwrap_or_default()
                 .nfkc()
                 .collect::<String>();
-            let text = if readable(&text) { text } else { String::new() };
-            chunk(&text).into_iter().map(move |(_, c)| (i + 1, c))
+            (i + 1, if readable(&text) { text } else { String::new() })
         })
+        .collect();
+    drop_furniture(&mut texts);
+    let chunks = texts
+        .into_iter()
+        .flat_map(|(n, text)| chunk(&text).into_iter().map(move |(_, c)| (n, c)))
         .collect();
     Ok(Extract {
         parts: pages.len(),
         chunks,
     })
+}
+
+/// Lines at each end of a page that may be its header or footer.
+const FURNITURE_LINES: usize = 3;
+
+/// Takes the running headers, footers and page numbers out of `pages` (numbered
+/// from 1) while their text is still in lines (#158). Once `pdf_pages` puts a page
+/// on one line they can't be told from its first and last sentences, and reading
+/// aloud says "Annual Report 2025 3 Introduction The company grew...".
+///
+/// A page's first and last FURNITURE_LINES non-empty lines are its slots. A slot
+/// goes when it is only a page number ("3", "Page 3 of 40", "3/40", "iv"), or when,
+/// with its digits blanked, it fills a slot on 3 or more pages and on more than
+/// half of them, or of the odd or the even ones, for left and right headers. So a
+/// PDF of one or two pages loses only its page numbers. Indexing reads a run of
+/// PARTS_AT_ONCE pages at a time, and counts within the run.
+fn drop_furniture(pages: &mut [(usize, String)]) {
+    let slots: Vec<Vec<(usize, String)>> = pages
+        .iter()
+        .map(|(_, text)| {
+            let lines: Vec<(usize, &str)> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim().is_empty())
+                .collect();
+            let head = FURNITURE_LINES.min(lines.len());
+            let tail = lines.len().saturating_sub(FURNITURE_LINES).max(head);
+            lines[..head]
+                .iter()
+                .chain(&lines[tail..])
+                .map(|&(i, l)| (i, blanked(l)))
+                .collect()
+        })
+        .collect();
+    // Pages with text, and how many of them each slot's text is on: even, odd.
+    let mut with_text = [0usize; 2];
+    let mut on: std::collections::HashMap<&str, [usize; 2]> = Default::default();
+    for ((n, _), slots) in pages.iter().zip(&slots) {
+        if slots.is_empty() {
+            continue;
+        }
+        with_text[n % 2] += 1;
+        let mut seen: Vec<&str> = slots.iter().map(|(_, s)| s.as_str()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        for s in seen {
+            on.entry(s).or_default()[n % 2] += 1;
+        }
+    }
+    let all = with_text[0] + with_text[1];
+    let repeated = |s: &str| {
+        on.get(s).is_some_and(|c| {
+            c[0] + c[1] >= 3 && ((c[0] + c[1]) * 2 > all || (0..2).any(|p| c[p] * 2 > with_text[p]))
+        })
+    };
+    for ((_, text), slots) in pages.iter_mut().zip(&slots) {
+        let gone: Vec<usize> = slots
+            .iter()
+            .filter(|(_, s)| page_number(s) || repeated(s))
+            .map(|(i, _)| *i)
+            .collect();
+        if !gone.is_empty() {
+            *text = text
+                .lines()
+                .enumerate()
+                .filter(|(i, _)| !gone.contains(i))
+                .map(|(_, l)| l)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+}
+
+/// A line trimmed, its whitespace collapsed and each run of digits made `#`, so
+/// "Page 3 of 40" and "Page 4 of 40" are the same slot.
+fn blanked(line: &str) -> String {
+    let mut out = String::new();
+    for word in line.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        let mut digits = false;
+        for c in word.chars() {
+            if !c.is_ascii_digit() {
+                out.push(c);
+            } else if !digits {
+                out.push('#');
+            }
+            digits = c.is_ascii_digit();
+        }
+    }
+    out
+}
+
+/// Whether a `blanked` line is only a page number: `(page )#( of #)`, `#/#`, or a
+/// roman numeral, any case.
+fn page_number(blanked: &str) -> bool {
+    let line = blanked.to_lowercase();
+    let rest = line.strip_prefix("page ").unwrap_or(&line);
+    match rest.strip_prefix('#') {
+        Some(rest) => {
+            let rest = rest.trim_start();
+            rest.is_empty()
+                || rest
+                    .strip_prefix("of")
+                    .or_else(|| rest.strip_prefix('/'))
+                    .is_some_and(|total| total.trim_start() == "#")
+        }
+        None => roman(blanked),
+    }
+}
+
+/// Whether `s` is a roman numeral written the usual way, all in one case:
+/// "iv" and "XII", not "iiii", "Mix" or "dim".
+fn roman(s: &str) -> bool {
+    const NUMERALS: [(u32, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    if s.is_empty() || s.len() > 15 || (s != s.to_lowercase() && s != s.to_uppercase()) {
+        return false;
+    }
+    let s = s.to_lowercase();
+    // Read greedily, then written back the usual way: only that is a numeral.
+    let mut value = 0;
+    let mut rest = s.as_str();
+    for (n, numeral) in NUMERALS {
+        while let Some(r) = rest.strip_prefix(numeral) {
+            rest = r;
+            value += n;
+        }
+    }
+    let mut usual = String::new();
+    for (n, numeral) in NUMERALS {
+        while value >= n {
+            usual.push_str(numeral);
+            value -= n;
+        }
+    }
+    rest.is_empty() && usual == s
 }
 
 /// lopdf decodes by a font's /Encoding whenever it has one and reads /ToUnicode only
@@ -1037,18 +1192,169 @@ mod tests {
 
     #[test]
     fn a_pdf_is_read_a_run_of_pages_at_a_time() {
-        let pages: Vec<String> = (1..=7).map(|i| format!("Page number {i}")).collect();
+        // Each different: a line on every page is a running header.
+        let pages: Vec<String> = ["one", "two", "three", "four", "five", "six", "seven"]
+            .iter()
+            .map(|n| format!("This is page {n}"))
+            .collect();
         let pdf = text_pdf(&pages);
         let run = parts(Path::new("a.pdf"), &pdf, 2, 3).unwrap();
         assert_eq!(run.parts, 7);
         let numbers: Vec<usize> = run.chunks.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, [3, 4, 5]);
-        assert!(run.chunks[0].1.contains("Page number 3"), "{run:?}");
+        assert!(run.chunks[0].1.contains("This is page three"), "{run:?}");
         // Past the end there is nothing, but still the count.
         let past = parts(Path::new("a.pdf"), &pdf, 7, 30).unwrap();
         assert_eq!((past.parts, past.chunks.len()), (7, 0));
         // Every page, as reading aloud takes it.
         assert_eq!(chunks(Path::new("a.pdf"), &pdf).unwrap().len(), 7);
+    }
+
+    /// Page `n`'s own word: with its digits blanked, "page 3" is on every page.
+    fn word(n: usize) -> &'static str {
+        [
+            "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ][n]
+    }
+
+    /// `pages`, numbered from 1, after `drop_furniture`.
+    fn without_furniture(pages: &[&str]) -> Vec<String> {
+        let mut pages: Vec<(usize, String)> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i + 1, (*p).to_owned()))
+            .collect();
+        drop_furniture(&mut pages);
+        pages.into_iter().map(|(_, p)| p).collect()
+    }
+
+    #[test]
+    fn a_running_header_goes_with_its_page_number() {
+        let pages: Vec<String> = (1..=5)
+            .map(|n| format!("Annual Report 2025  {n}\nBody of page {}.\n", word(n)))
+            .collect();
+        let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+        let want: Vec<String> = (1..=5)
+            .map(|n| format!("Body of page {}.", word(n)))
+            .collect();
+        assert_eq!(without_furniture(&pages), want);
+    }
+
+    #[test]
+    fn left_and_right_headers_go_though_each_is_on_half_the_pages() {
+        let pages: Vec<String> = (1..=6)
+            .map(|n| {
+                if n % 2 == 1 {
+                    format!("Field Notes on Soil\nPage {} text.\n{n}", word(n))
+                } else {
+                    format!("{n}\nChapter 2: Clay\nPage {} text.", word(n))
+                }
+            })
+            .collect();
+        let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+        let want: Vec<String> = (1..=6).map(|n| format!("Page {} text.", word(n))).collect();
+        assert_eq!(without_furniture(&pages), want);
+    }
+
+    #[test]
+    fn a_line_in_a_slot_on_under_half_the_pages_stays() {
+        // The footer's on every page; the opening line on 4 of 10, two odd and
+        // two even, so it's the text.
+        let opens = [1, 2, 5, 6];
+        let pages: Vec<String> = (1..=10)
+            .map(|n| {
+                let first = if opens.contains(&n) {
+                    "Water the beds at dawn.".to_owned()
+                } else {
+                    format!("Page {} begins here.", word(n))
+                };
+                format!("{first}\nThe rest of page {}.\nExample Press", word(n))
+            })
+            .collect();
+        let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+        let out = without_furniture(&pages);
+        assert_eq!(out[0], "Water the beds at dawn.\nThe rest of page one.");
+        assert_eq!(out[2], "Page three begins here.\nThe rest of page three.");
+        assert!(out.iter().all(|p| !p.contains("Example Press")), "{out:?}");
+    }
+
+    #[test]
+    fn two_pages_lose_only_their_page_numbers() {
+        let out = without_furniture(&[
+            "Annual Report\nFirst page.\nPage 1 of 2",
+            "Annual Report\nSecond page.\n2",
+        ]);
+        assert_eq!(
+            out,
+            ["Annual Report\nFirst page.", "Annual Report\nSecond page."]
+        );
+        // A number in the body is the text.
+        let page = "alpha\nbravo\ncharlie\n42\ndelta\necho\nfoxtrot";
+        assert_eq!(without_furniture(&[page]), [page]);
+    }
+
+    #[test]
+    fn page_numbers_are_told_from_text() {
+        for line in [
+            "3",
+            " 12 ",
+            "Page 3",
+            "page 3 of 40",
+            "PAGE 3 OF 40",
+            "3/40",
+            "3 / 40",
+            "iv",
+            "XII",
+            "xlii",
+        ] {
+            assert!(page_number(&blanked(line)), "{line}");
+        }
+        for line in [
+            "3 apples",
+            "Page",
+            "Page three",
+            "page3",
+            "Chapter 3",
+            "3 of",
+            "iiii",
+            "Mix",
+            "dim",
+            "Vic",
+            "",
+        ] {
+            assert!(!page_number(&blanked(line)), "{line}");
+        }
+        assert_eq!(blanked("  Page 3   of 40 "), "Page # of #");
+        assert_eq!(blanked("v2.10"), "v#.#");
+    }
+
+    #[test]
+    fn a_pdf_reads_without_its_headers_footers_and_page_numbers() {
+        // Made by make-furniture-pdf.py next to it: four pages, each with a
+        // header on two lines and a footer and page number.
+        let path = Path::new("tests/fixtures/furniture.pdf");
+        let pdf = include_bytes!("../tests/fixtures/furniture.pdf");
+        assert_eq!(
+            join(path, chunks(path, pdf).unwrap()),
+            "Clay holds water well but drains slowly after rain. \
+             Adding compost each autumn loosens it over a few years.\n\n\
+             Sandy beds dry out within a day of watering. \
+             A mulch of leaves keeps the top layer damp in summer.\n\n\
+             Earthworms were counted in a square of turned soil. \
+             The composted bed had twice as many as the bare one.\n\n\
+             Test the pH before liming, since most vegetables like it near neutral. \
+             These notes will be updated after the next season."
+        );
+        // Indexing too, a run at a time: a run of 2 keeps the header, not the number.
+        let run = parts(path, pdf, 2, 2).unwrap();
+        assert!(
+            run.chunks[0].1.starts_with("Field Notes on Garden Soil\n"),
+            "{run:?}"
+        );
+        assert!(
+            run.chunks.iter().all(|(_, c)| !c.contains("Page ")),
+            "{run:?}"
+        );
     }
 
     #[test]

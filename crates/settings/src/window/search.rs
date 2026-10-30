@@ -856,7 +856,7 @@ pub fn run(app_id: &str, query: &str) -> ExitCode {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_app_id(app_id)
-            .with_inner_size([960.0, 756.0])
+            .with_inner_size([960.0, 680.0])
             .with_min_inner_size([360.0, 320.0]),
         glow_options: eframe::egui_glow::GlowConfiguration {
             vsync: false,

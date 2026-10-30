@@ -2327,9 +2327,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lopdf"
-version = "0.45.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfffda0fe1ab0157e1a13c14bebd3f28671f2fccb7922f0722ec53926e6922d3"
+checksum = "d43f64cb8c0d673ff84245a6de9e0172c0cc05dc5dd9d263660b5b4a02b6c4ae"
 dependencies = [
  "aes",
  "bitflags 2.13.2",
@@ -4259,9 +4259,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.4.2"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -4349,16 +4349,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vino-ui"
-version = "0.1.0"
-source = "git+https://github.com/karanshukla/vinoUserInterface?tag=v0.1.0#2380a14215455dd111d4564fefe19b5d35adbbeb"
+name = "vino-user-interface"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b224a37d7bc8f94dc4862867125eca83afc99cf9fb0b80a0e84103dd4fe1b716"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "vinosearch"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "calamine",
@@ -4397,7 +4398,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch-settings"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4407,14 +4408,14 @@ dependencies = [
  "md-5",
  "serde",
  "serde_json",
- "vino-ui",
+ "vino-user-interface",
  "vinosearch-shared",
  "zbus 6.0.0",
 ]
 
 [[package]]
 name = "vinosearch-shared"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "serde",
