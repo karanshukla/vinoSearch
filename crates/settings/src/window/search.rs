@@ -16,7 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Align, Color32, FontId, Key, Layout, Modifiers, RichText, Sense};
 use vino_ui::a11y;
+use vino_ui::file_tile::{self, Format};
 use vino_ui::icons::{self, Icon};
+use vino_ui::logo;
 use vino_ui::theme;
 use vino_ui::widgets::{self, Button};
 
@@ -37,6 +39,8 @@ const TILE: f32 = 150.0;
 /// Below a tile, its file name.
 const TILE_LABEL: f32 = 24.0;
 const TILE_RADIUS: f32 = 10.0;
+/// The file tile standing in for a thumbnail the grid can't make.
+const GRID_TILE: f32 = 60.0;
 const DAY: i64 = 86_400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -370,7 +374,7 @@ impl SearchWindow {
                 .show(root, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        icons::icon(ui, kind_icon(f.kind), 16.0, p.muted);
+                        tile(ui, &f, 20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let named = |r| a11y::for_what(r, f.name());
                             let open = if f.place().is_empty() {
@@ -580,15 +584,13 @@ impl SearchWindow {
                 );
             }
             Thumb::Loading => {}
-            Thumb::Failed => {
-                painter.text(
-                    picture.center(),
-                    egui::Align2::CENTER_CENTER,
-                    f.extension().to_uppercase(),
-                    FontId::new(18.0, theme::semibold()),
-                    p.muted,
-                );
-            }
+            // The same tile the list draws, so a photo without a thumbnail
+            // still reads as a file of its format.
+            Thumb::Failed => file_tile::paint(
+                painter,
+                egui::Rect::from_center_size(picture.center(), egui::vec2(GRID_TILE, GRID_TILE)),
+                format_of(&f.path).unwrap_or(Format::Image),
+            ),
         }
         let name = egui::Rect::from_min_max(egui::pos2(rect.left(), picture.bottom()), rect.max);
         let galley = painter.layout(
@@ -645,7 +647,7 @@ impl SearchWindow {
                 ui.set_width(width - 24.0);
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
-                    widgets::file_tile(ui, kind_icon(f.kind), 32.0);
+                    tile(ui, f, 30.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         ui.horizontal_wrapped(|ui| {
@@ -751,12 +753,27 @@ impl SearchWindow {
     }
 }
 
-fn kind_icon(kind: Kind) -> Icon {
-    match kind {
-        Kind::Text => Icon::FileText,
-        Kind::Document => Icon::File,
-        Kind::Image => Icon::Image,
+/// A vinoWhisper session bundle's extension (the indexer's
+/// `extract::session::EXTENSION`, which this crate can't reach).
+const SESSION: &str = "vwsession";
+
+/// A file's tile: vino-ui's for its format, by extension, so a file looks
+/// the same here as in vinoSpeak; the vinoWhisper logo for a session, which
+/// `Kind` doesn't tell from text.
+fn tile(ui: &mut egui::Ui, f: &Found, size: f32) -> egui::Response {
+    match format_of(&f.path) {
+        Some(format) => file_tile::file(ui, format, size),
+        None => logo::whisper(ui, size),
     }
+}
+
+/// The format a path's tile shows, or None for a session.
+fn format_of(path: &str) -> Option<Format> {
+    let path = Path::new(path);
+    let session = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(SESSION));
+    (!session).then(|| Format::of(path))
 }
 
 /// Where an arrow key moves from result `i` of `len`, the focused one: `down`
@@ -887,3 +904,29 @@ pub fn run(app_id: &str, query: &str) -> ExitCode {
 
 #[cfg(test)]
 mod ui_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lists vinoSearch indexes by (`src/extract.rs`, `src/code.rs`, the
+    /// default image extensions) aren't reachable from this crate; vino-ui's
+    /// own test walks them. This checks the tile picked for each kind, and
+    /// that a session gets the logo.
+    #[test]
+    fn a_file_gets_the_tile_of_its_format_and_a_session_the_logo() {
+        assert_eq!(format_of("/a/b.PDF"), Some(Format::Pdf));
+        assert_eq!(format_of("/a/b.odt"), Some(Format::Writing));
+        assert_eq!(format_of("/a/b.pptx"), Some(Format::Slides));
+        assert_eq!(format_of("/a/b.epub"), Some(Format::Book));
+        assert_eq!(format_of("/a/b.srt"), Some(Format::Subtitles));
+        assert_eq!(format_of("/a/b.md"), Some(Format::Markdown));
+        assert_eq!(format_of("/a/b.csv"), Some(Format::Sheet));
+        assert_eq!(format_of("/a/b.py"), Some(Format::Code));
+        assert_eq!(format_of("/a/b.jpg"), Some(Format::Image));
+        assert_eq!(format_of("/a/b.txt"), Some(Format::Plain));
+        assert_eq!(format_of("/a/Makefile"), Some(Format::Plain));
+        assert_eq!(format_of("/t/2026-10-29-101500.vwsession"), None);
+        assert_eq!(format_of("/t/a.VWSESSION"), None);
+    }
+}
