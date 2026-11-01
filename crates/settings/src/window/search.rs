@@ -39,6 +39,8 @@ const TILE: f32 = 150.0;
 /// Below a tile, its file name.
 const TILE_LABEL: f32 = 24.0;
 const TILE_RADIUS: f32 = 10.0;
+/// The file tile standing in for a thumbnail the grid can't make.
+const GRID_TILE: f32 = 60.0;
 const DAY: i64 = 86_400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -582,15 +584,13 @@ impl SearchWindow {
                 );
             }
             Thumb::Loading => {}
-            Thumb::Failed => {
-                painter.text(
-                    picture.center(),
-                    egui::Align2::CENTER_CENTER,
-                    f.extension().to_uppercase(),
-                    FontId::new(18.0, theme::semibold()),
-                    p.muted,
-                );
-            }
+            // The same tile the list draws, so a photo without a thumbnail
+            // still reads as a file of its format.
+            Thumb::Failed => file_tile::paint(
+                painter,
+                egui::Rect::from_center_size(picture.center(), egui::vec2(GRID_TILE, GRID_TILE)),
+                format_of(&f.path).unwrap_or(Format::Image),
+            ),
         }
         let name = egui::Rect::from_min_max(egui::pos2(rect.left(), picture.bottom()), rect.max);
         let galley = painter.layout(
