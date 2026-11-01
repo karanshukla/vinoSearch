@@ -354,13 +354,52 @@ fn in_unit() -> bool {
     std::env::var_os("INVOCATION_ID").is_some() && crate::menu::on_path("systemd-run")
 }
 
-fn spawn(argv: Vec<String>) -> std::io::Result<()> {
-    let argv = detached(argv, in_unit());
-    Command::new(&argv[0])
+/// `KEY=value` entries as pairs, skipping any without a `=`.
+fn env_pairs(entries: Vec<String>) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// The user manager's environment now. A unit keeps the one it started with,
+/// which lacks `WAYLAND_DISPLAY` and the like when it started before the
+/// graphical session. Blocks on the bus, so call this off the runner's.
+fn manager_env() -> zbus::Result<Vec<(String, String)>> {
+    zbus::block_on(async {
+        let bus = zbus::Connection::session().await?;
+        let manager = zbus::Proxy::new(
+            &bus,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await?;
+        Ok(env_pairs(manager.get_property("Environment").await?))
+    })
+}
+
+/// Start `argv` for the desktop, and reap it when it exits. Blocks on the bus
+/// in a unit, so call this off the runner's.
+pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
+    let in_unit = in_unit();
+    let env = if in_unit {
+        manager_env().unwrap_or_else(|e| {
+            eprintln!("reading the user manager's environment: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    let argv = detached(argv, in_unit);
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env)
         .stdin(Stdio::null())
-        .spawn()
-        .map(drop)
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// Open `file` at `at` in the editor or default app, else with `xdg-open`.
@@ -646,6 +685,24 @@ mod tests {
         );
         assert_eq!(unescape(r"a\sb\\c"), r"a b\c");
         assert!(exec_words("\"unterminated %U").is_none());
+    }
+
+    #[test]
+    fn env_pairs_split_on_the_first_equals_and_skip_the_rest() {
+        let entries = vec![
+            "WAYLAND_DISPLAY=wayland-1".to_owned(),
+            "OPTS=a=b".into(),
+            "EMPTY=".into(),
+            "no equals".into(),
+        ];
+        assert_eq!(
+            env_pairs(entries),
+            [
+                ("WAYLAND_DISPLAY".to_owned(), "wayland-1".to_owned()),
+                ("OPTS".into(), "a=b".into()),
+                ("EMPTY".into(), String::new()),
+            ]
+        );
     }
 
     #[test]
