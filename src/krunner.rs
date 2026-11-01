@@ -297,7 +297,7 @@ fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     }
     let path = PathBuf::from(id);
     if folder {
-        crate::open::xdg_open(path.parent().unwrap_or(&path));
+        std::thread::spawn(move || crate::open::xdg_open(path.parent().unwrap_or(&path)));
         return;
     }
     let editor = Config::load(config).ok().and_then(|c| c.editor);
@@ -513,14 +513,21 @@ const OPEN_FOLDER: &str = "open-folder";
 const OPEN_SUMMARY: &str = "open-summary";
 const OPEN_TRANSCRIPT: &str = "open-transcript";
 
-/// Start vinosearch-settings with `args`, when it is installed beside us.
+/// Start vinosearch-settings with `args` on a thread of its own, when it is
+/// installed beside us.
 fn launch_settings(args: &[&str]) {
     let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
     match settings {
         Ok(s) if s.is_file() => {
-            if let Err(e) = std::process::Command::new(&s).args(args).spawn() {
-                eprintln!("{}: {e}", s.display());
-            }
+            let program = s.display().to_string();
+            let argv = std::iter::once(program.clone())
+                .chain(args.iter().map(ToString::to_string))
+                .collect();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::open::spawn(argv) {
+                    eprintln!("{program}: {e}");
+                }
+            });
         }
         _ => eprintln!("vinosearch-settings is not installed beside vinosearch"),
     }
