@@ -30,7 +30,7 @@ ovfetch = { version = "0.6.0", default-features = false }
 # 3): security fixes come with the distro's updates, and building needs
 # libssl-dev / openssl-devel rather than OpenSSL's Perl build. Without a key
 # a database is plain SQLite, as before.
-rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "0.41", features = ["bundled-sqlcipher"] }
 # Wipes the index key from memory when it's dropped.
 zeroize = "1.8"
 serde = { version = "1.0", features = ["derive"] }
