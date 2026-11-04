@@ -29,10 +29,11 @@ enum Page {
     Model,
     Hardware,
     Integration,
+    About,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 8] = [
         Page::Index,
         Page::Folders,
         Page::Search,
@@ -40,6 +41,7 @@ impl Page {
         Page::Model,
         Page::Hardware,
         Page::Integration,
+        Page::About,
     ];
 
     fn parse(name: &str) -> Option<Page> {
@@ -57,6 +59,7 @@ impl Page {
             Page::Model => "Model",
             Page::Hardware => "Hardware",
             Page::Integration => "Integration",
+            Page::About => vino_ui::about::TITLE,
         }
     }
 
@@ -69,6 +72,7 @@ impl Page {
             Page::Model => Icon::Model,
             Page::Hardware => Icon::Hardware,
             Page::Integration => Icon::Integration,
+            Page::About => Icon::Info,
         }
     }
 }
@@ -1840,6 +1844,11 @@ impl SettingsWindow {
                         Page::Model => self.model(ui, status),
                         Page::Hardware => self.hardware(ui),
                         Page::Integration => self.integration(ui),
+                        Page::About => vino_ui::about::page(
+                            ui,
+                            vino_ui::App::Search,
+                            env!("CARGO_PKG_VERSION"),
+                        ),
                     }
                 });
             });
