@@ -162,6 +162,23 @@ struct SettingsWindow {
     /// The desktop's text scale as last applied. Only a change is applied again, so a Ctrl +
     /// zoom isn't undone every time the window gets focus.
     text_scale: f32,
+    /// The About page's Updates row.
+    updater: vino_ui::update::Updater,
+}
+
+/// The release installer leaves itself as `~/.local/bin/vinosearch-upgrade`; with it,
+/// About's Update button installs a release. A build from source has none, and links to the
+/// release instead.
+fn updater() -> vino_ui::update::Updater {
+    let updater = vino_ui::update::Updater::new(vino_ui::App::Search, env!("CARGO_PKG_VERSION"));
+    match std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/bin/vinosearch-upgrade"))
+    {
+        Some(upgrade) if upgrade.is_file() => {
+            updater.with_command([upgrade.to_string_lossy().into_owned()])
+        }
+        _ => updater,
+    }
 }
 
 impl SettingsWindow {
@@ -209,6 +226,7 @@ impl SettingsWindow {
             focused: true,
             kde_header: theme::kde_header(),
             text_scale: 1.0,
+            updater: updater(),
         };
         window.reload_config();
         window
@@ -1844,11 +1862,7 @@ impl SettingsWindow {
                         Page::Model => self.model(ui, status),
                         Page::Hardware => self.hardware(ui),
                         Page::Integration => self.integration(ui),
-                        Page::About => vino_ui::about::page(
-                            ui,
-                            vino_ui::App::Search,
-                            env!("CARGO_PKG_VERSION"),
-                        ),
+                        Page::About => vino_ui::about::page_with_updates(ui, &mut self.updater),
                     }
                 });
             });

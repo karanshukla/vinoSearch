@@ -73,6 +73,7 @@ if [ "$uninstall" = 1 ]; then
         break
     done
     step "Removing the binaries"
+    rm -f -- "$LOCAL_BIN/vinosearch-upgrade"
     for b in vinosearch vinosearch-settings; do
         if [ -x "$CARGO_BIN/$b" ]; then cargo uninstall "$b"; fi
         if [ -x "$LOCAL_BIN/$b" ]; then rm -f -- "$LOCAL_BIN/$b" && echo "removed $LOCAL_BIN/$b"; fi
@@ -174,6 +175,11 @@ if [ "$prebuilt" = 1 ]; then
     for b in "${bins[@]}"; do
         cp --remove-destination "bin/$b" "$BIN/$b" && echo "installed $BIN/$b"
     done
+    # The release's one-line installer, kept as the upgrade command: the
+    # settings window's Update button runs it with VINO_UPDATE_TAG set.
+    if [ -f install.sh ]; then
+        install -m 755 install.sh "$BIN/vinosearch-upgrade" && echo "installed $BIN/vinosearch-upgrade"
+    fi
 else
     step "Building vinosearch"
     cargo install --locked --path .
