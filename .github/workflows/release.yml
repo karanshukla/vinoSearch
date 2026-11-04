@@ -44,7 +44,7 @@ jobs:
           mkdir -p "$dir/bin" "$dir/scripts"
           cp target/release/vinosearch target/release/vinosearch-settings "$RUNNER_TEMP/ovfetch/bin/ovfetch" "$dir/bin/"
           cp scripts/install.sh scripts/install-runtime.sh "$dir/scripts/"
-          cp README.md LICENSE "$dir/"
+          cp README.md LICENSE install.sh "$dir/"
           tar czf vinosearch-x86_64-linux.tar.gz "$dir"
           sha256sum vinosearch-x86_64-linux.tar.gz > vinosearch-x86_64-linux.tar.gz.sha256
       # The tarball as a user gets it: unpacked elsewhere, binaries run, the
@@ -59,7 +59,9 @@ jobs:
           bin/vinosearch-settings --help > /dev/null
           printf 'a,b\n1,2\n' | bin/vinosearch extract /x/a.csv | jq -e '.parts == 1'
           bash scripts/install.sh --help > /dev/null
+          bash -n install.sh
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" vinosearch-x86_64-linux.tar.gz vinosearch-x86_64-linux.tar.gz.sha256 --clobber
+        # install.sh on its own too, for releases/latest/download/install.sh.
+        run: gh release upload "$TAG" vinosearch-x86_64-linux.tar.gz vinosearch-x86_64-linux.tar.gz.sha256 install.sh --clobber

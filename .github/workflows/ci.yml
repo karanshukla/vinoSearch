@@ -95,7 +95,7 @@ jobs:
           persist-credentials: false
       # Preinstalled on the runner. Info-level notes (SC1091, SC2018/2019) are
       # left alone.
-      - run: shellcheck -S warning scripts/*.sh
+      - run: shellcheck -S warning install.sh scripts/*.sh
 
   # Ranking evals (#107): the testbed indexed on the CPU, every query in
   # evals/queries.toml run, failing under its thresholds. Image queries are

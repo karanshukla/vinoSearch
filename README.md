@@ -25,13 +25,14 @@ It's early days: a working proof of concept, used daily on one laptop. Expect ro
 ## Install
 
 ```bash
-curl -L https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64-linux.tar.gz | tar xz
-vinosearch/scripts/install.sh --index ~/Documents
+curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --index ~/Documents
 ```
 
-That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. It skips whatever is already done, so re-running it from a newer download upgrades in place. If something is missing (the NPU driver, say), it stops with one line saying what.
+That downloads the latest release, checks it against its `.sha256`, installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. No sudo: everything goes in your home. If something is missing (the NPU driver, say), it stops with one line saying what.
 
-`vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
+To upgrade, use **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (a release tag like `vinosearch-upgrade v6` installs that one). It skips whatever is already done and restarts the service.
+
+`curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
 
 <details>
 <summary>From source instead</summary>
