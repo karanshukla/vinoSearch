@@ -56,7 +56,8 @@ vinosearch integrate gnome                 # or kde: add the other desktop's sea
 The release download runs on x86_64 with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13,
 Arch, openSUSE Tumbleweed, and the image-based Fedora Atomic (Silverblue, Kinoite, Bazzite) and
 openSUSE Aeon. On anything older (Debian 12, Ubuntu 22.04, openSUSE Leap 15) `install.sh` says so;
-build from source there.
+build from source there. The binaries also need the standard dynamic linker, so on NixOS enable
+`programs.nix-ld`.
 
 Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from
 [rustup](https://rustup.rs). The C compiler and OpenSSL's headers (SQLCipher links the system's
