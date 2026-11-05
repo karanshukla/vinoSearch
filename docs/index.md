@@ -27,7 +27,7 @@ reads the pixels, not the name.
 ## Start here
 
 You need Linux with an Intel NPU (Core Ultra or newer) and the
-[NPU driver](https://github.com/intel/linux-npu-driver); no NPU, `--device CPU` works, just slower.
+[NPU driver](https://github.com/intel/linux-npu-driver); no NPU, `install.sh` falls back to the CPU, just slower.
 Then:
 
 ```bash
