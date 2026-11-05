@@ -15,7 +15,8 @@
 #                  nothing is indexed unless you name it. At a terminal it
 #                  says how long indexing will take and asks first.
 #   --device D     run the model on D instead of the NPU (written to
-#                  config.toml if it doesn't set a device already)
+#                  config.toml if it doesn't set a device already). With
+#                  no Intel NPU and no device set, the CPU.
 #   --no-settings  skip the settings window (vinosearch-settings)
 #   --uninstall    remove the service, KRunner / GNOME files and binaries
 #   --purge        with --uninstall, also delete the index, model, compiled
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -150,8 +151,25 @@ want="$device"
 if [ -z "$want" ] && [ -f "$CONFIG" ]; then
     want="$(sed -n 's/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -1)"
 fi
+# An Intel NPU on the PCI bus (class 0x12, processing accelerator), whether
+# or not its driver is loaded.
+intel_npu_on_bus() {
+    local d
+    for d in /sys/bus/pci/devices/*; do
+        [ "$(cat "$d/vendor" 2>/dev/null)" = 0x8086 ] || continue
+        case "$(cat "$d/class" 2>/dev/null)" in 0x12*) return 0 ;; esac
+    done
+    return 1
+}
 if [ "$(printf %s "${want:-NPU}" | tr a-z A-Z)" = NPU ] && ! compgen -G '/dev/accel/accel*' >/dev/null; then
-    die "no NPU (/dev/accel/accel*): install Intel's NPU driver, or run on another device with --device CPU"
+    # Nothing asked for the NPU and there is none (AMD handhelds, pre-Core
+    # Ultra Intel): the CPU, saved to config.toml like --device CPU. An Intel
+    # NPU without its driver still stops here, since the driver is the fix.
+    if [ -n "$want" ] || intel_npu_on_bus; then
+        die "no NPU (/dev/accel/accel*): install Intel's NPU driver, or run on another device with --device CPU"
+    fi
+    device=CPU
+    echo "no Intel NPU here, so the model runs on the CPU (--device GPU for an Intel GPU instead)"
 fi
 
 ovfetch_ok() {

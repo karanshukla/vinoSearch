@@ -18,7 +18,7 @@ It's early days: a working proof of concept, used daily on one laptop. Expect ro
 
 ## Requirements
 
-- Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU? `--device CPU` works, just slower.
+- Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU (AMD, older Intel)? `install.sh` runs it on the CPU, just slower; `--device CPU` does the same explicitly.
 - KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher (fuzzel, wofi, rofi, tofi or bemenu). The settings window is Wayland only.
 - Rust, a C compiler and OpenSSL's headers, only to build from source.
 
