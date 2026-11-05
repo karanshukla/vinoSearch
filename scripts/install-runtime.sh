@@ -25,7 +25,7 @@ for arg in "$@"; do
 done
 
 find_ovfetch() {
-    local bin have
+    local bin have broken=""
     for bin in "$(command -v ovfetch 2>/dev/null || true)" "$HOME/.cargo/bin/ovfetch"; do
         [ -n "$bin" ] && [ -x "$bin" ] || continue
         have="$("$bin" --version 2>/dev/null | awk '{print $2}')"
@@ -33,15 +33,20 @@ find_ovfetch() {
             printf '%s\n' "$bin"
             return 0
         fi
+        if [ -z "$have" ] && ! "$bin" --version >/dev/null 2>&1; then
+            broken="$bin"
+            continue
+        fi
         echo "ignoring $bin (${have:-unknown version}); needs $OVFETCH_MIN or newer" >&2
     done
+    [ -z "$broken" ] || { echo "$broken is present but won't run (see $broken --version): cargo install ovfetch" >&2; return 2; }
     return 1
 }
 
-if ! OVFETCH="$(find_ovfetch)"; then
-    echo "ovfetch $OVFETCH_MIN or newer not found: cargo install ovfetch" >&2
+OVFETCH="$(find_ovfetch)" || {
+    [ $? = 2 ] || echo "ovfetch $OVFETCH_MIN or newer not found: cargo install ovfetch" >&2
     exit 1
-fi
+}
 
 "$OVFETCH" resolve --openvino-only
 mkdir -p "$(dirname "$PREFIX")"

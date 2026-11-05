@@ -124,6 +124,11 @@ if [ "$prebuilt" = 1 ]; then
     arch="$(uname -m)"
     [ "$arch" = x86_64 ] ||
         die "the release binaries are x86_64 and this is $arch: build from a source checkout instead"
+    # Before getconf, which passes on NixOS, where without nix-ld they fail with a bare ENOENT.
+    interp="$(LC_ALL=C head -c 4096 bin/vinosearch |
+        grep -ao '/lib[0-9]*/ld-linux[-a-z0-9_]*\.so\.[0-9]*' | head -1 || true)"
+    [ -z "$interp" ] || [ -e "$interp" ] ||
+        die "$interp is missing: this needs a standard dynamic linker (on NixOS, enable programs.nix-ld)"
     glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')" || true
     [ -n "$glibc" ] ||
         die "the release binaries need glibc (not musl): build from a source checkout instead"
