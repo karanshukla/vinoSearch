@@ -2,7 +2,7 @@
 
 <h1 align="center">vinoSearch</h1>
 
-<p align="center">Search your files by what's in them, from KRunner or GNOME Shell.</p>
+<p align="center">Search your files by what's in them with natural language & keywords, from KRunner or GNOME Shell.</p>
 
 <p align="center"><img src="docs/media/krunner.svg" width="800" alt="KRunner opens with Alt+Space. Typing &quot;how do I rotate the signing key&quot; lists signing-keys.md, release-checklist.md, gpg.md and deploy.sh under vinoSearch Text, most of which never use the word rotate. Then &quot;dog watching the sunset&quot; lists IMG_2041.jpg and three other camera-named photos under vinoSearch Images, and Enter opens a photo of a dog silhouetted against a sunset."></p>
 
