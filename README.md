@@ -2,19 +2,17 @@
 
 <h1 align="center">vinoSearch</h1>
 
-<p align="center">Search your files by what's in them, from KRunner or GNOME Shell. Every model runs on your Intel NPU, and nothing leaves your machine.</p>
+<p align="center">Search your files by what's in them, from KRunner or GNOME Shell.</p>
 
 <p align="center"><img src="docs/media/krunner.svg" width="800" alt="KRunner opens with Alt+Space. Typing &quot;how do I rotate the signing key&quot; lists signing-keys.md, release-checklist.md, gpg.md and deploy.sh under vinoSearch Text, most of which never use the word rotate. Then &quot;dog watching the sunset&quot; lists IMG_2041.jpg and three other camera-named photos under vinoSearch Images, and Enter opens a photo of a dog silhouetted against a sunset."></p>
 
 Filename search finds `signing-keys.md` when you remember it's called that. vinoSearch finds it when you remember what it says. It also finds `IMG_2041.jpg` from "dog watching the sunset", because it reads the pixels, not the name.
 
-- **Text and images**, searched from one box. Markdown and plain text, plus photos, documents and source code when you turn them on. Code is searched apart, with `code:` in front of the query, so it never crowds out your notes.
+- **Text and images**, searched from one box. Markdown and plain text, plus photos, documents and source code when you turn them on. Code is searched apart, with `code:` in front of the query.
 - **On the NPU.** Indexing runs at ~28.6 chunks/s and 3% of one core, so it doesn't fight you for the CPU. A warm query takes 26 ms (p50).
 - **Where you already search.** KRunner and GNOME Shell's overview. A CLI too.
 - **Stays current.** inotify picks up changes within seconds, and an hourly check catches anything it missed.
 - **Private.** The only network calls download the model and the runtime, and each model file is checked against a pinned SHA-256.
-
-It's early days: a working proof of concept, used daily on one laptop. Expect rough edges.
 
 ## Requirements
 
