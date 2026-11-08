@@ -351,7 +351,7 @@ fn detached(argv: Vec<String>, in_unit: bool) -> Vec<String> {
 }
 
 fn in_unit() -> bool {
-    std::env::var_os("INVOCATION_ID").is_some() && crate::menu::on_path("systemd-run")
+    std::env::var_os("INVOCATION_ID").is_some() && crate::search::menu::on_path("systemd-run")
 }
 
 /// `KEY=value` entries as pairs, skipping any without a `=`.
@@ -438,7 +438,7 @@ pub fn xdg_open(target: &Path) {
 /// its setup puts it.
 fn vinowhisper_gui() -> Option<PathBuf> {
     const GUI: &str = "vinowhisper-gui";
-    if crate::menu::on_path(GUI) {
+    if crate::search::menu::on_path(GUI) {
         return Some(PathBuf::from(GUI));
     }
     let local = PathBuf::from(std::env::var_os("HOME")?)

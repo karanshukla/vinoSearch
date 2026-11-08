@@ -16,7 +16,7 @@
 //! copy of the home folder, on a disk taken out, or read by another user.
 
 use crate::index;
-use crate::seal::{self, Key, Seal, Sealer};
+use crate::index::seal::{self, Key, Seal, Sealer};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 use std::fs::{self, File, OpenOptions};

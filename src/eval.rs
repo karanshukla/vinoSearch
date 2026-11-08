@@ -2,9 +2,10 @@
 //! every query in a queries file through the search KRunner uses, and score
 //! where the expected files land.
 
+use crate::extract;
 use crate::index::{self, Hit, Kind};
-use crate::krunner::{self, Floors};
-use crate::{extract, worker};
+use crate::service::krunner::{self, Floors};
+use crate::service::worker;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -205,7 +206,7 @@ pub fn run(
     opts: &Options,
     queries: &Queries,
     device: &str,
-    mut emb: crate::embed::Embedder,
+    mut emb: crate::ml::embed::Embedder,
 ) -> Result<bool> {
     let root = fs::canonicalize(&opts.testbed)
         .with_context(|| format!("testbed {}", opts.testbed.display()))?;
@@ -218,7 +219,7 @@ pub fn run(
     fs::create_dir(&scratch.0).with_context(|| scratch.0.display().to_string())?;
     let db = scratch.0.join("index.sqlite");
     if opts.encrypted {
-        crate::encryption::hold_in_memory(&db)?;
+        crate::index::encryption::hold_in_memory(&db)?;
     }
     let mut conn = index::open(&db)?;
 

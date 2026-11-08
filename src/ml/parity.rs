@@ -45,8 +45,8 @@ pub fn reference(stage: &str) -> Option<Vec<f32>> {
 fn header() -> String {
     format!(
         "{}{}",
-        &crate::model::REVISION[..12],
-        &crate::model::VISION_REVISION[..12]
+        &crate::ml::model::REVISION[..12],
+        &crate::ml::model::VISION_REVISION[..12]
     )
 }
 
@@ -66,7 +66,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<f32>> {
         .strip_prefix(header.as_bytes())
         .context("for another model revision")?;
     ensure!(
-        body.len() == crate::embed::DIM * 4,
+        body.len() == crate::ml::embed::DIM * 4,
         "{} bytes of vector",
         body.len()
     );
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn a_reference_for_another_revision_is_refused() {
-        let mut bytes = encode(&vec![0.0; crate::embed::DIM]);
+        let mut bytes = encode(&vec![0.0; crate::ml::embed::DIM]);
         bytes[0] ^= 1;
         assert!(decode(&bytes).is_err());
         assert!(decode(&encode(&[1.0])).is_err());

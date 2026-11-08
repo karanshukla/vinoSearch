@@ -10,10 +10,10 @@
 use crate::config::Config;
 use crate::extract::session::{self, Part};
 use crate::index::{self, Hit, Kind};
-use crate::model;
-use crate::open::At;
-use crate::watch;
-use crate::worker::{self, Job, Options, Request, Status};
+use crate::ml::model;
+use crate::search::open::At;
+use crate::service::watch;
+use crate::service::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
 use futures_channel::oneshot;
 use std::collections::{HashMap, HashSet};
@@ -46,7 +46,7 @@ type Match = (
 
 /// One connection for the handlers that read the index; queries are short.
 /// Closed and opened again under it when encryption changes (#4).
-type Db = Arc<crate::encryption::Live>;
+type Db = Arc<crate::index::encryption::Live>;
 
 struct Runner {
     jobs: Mutex<mpsc::Sender<Job>>,
@@ -240,7 +240,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         }
         Some(At::Session(Part::Summary, _)) | None => {}
     }
-    let (icon, _) = crate::icons::for_path(Path::new(&h.path), h.kind);
+    let (icon, _) = crate::search::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = relevance(&h, floors);
     (
         h.path,
@@ -297,11 +297,11 @@ fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     }
     let path = PathBuf::from(id);
     if folder {
-        std::thread::spawn(move || crate::open::xdg_open(path.parent().unwrap_or(&path)));
+        std::thread::spawn(move || crate::search::open::xdg_open(path.parent().unwrap_or(&path)));
         return;
     }
     let editor = Config::load(config).ok().and_then(|c| c.editor);
-    std::thread::spawn(move || crate::open::open(&path, at, editor.as_deref()));
+    std::thread::spawn(move || crate::search::open::open(&path, at, editor.as_deref()));
 }
 
 /// The last search's places, by result id, for opening a result there.
@@ -483,7 +483,7 @@ impl Gnome {
                 meta.insert("name".into(), owned(Variant::from(name)));
                 meta.insert("description".into(), owned(Variant::from(description)));
                 // A serialized GThemedIcon, which falls back to the generic name.
-                let (specific, generic) = crate::icons::for_path(Path::new(&id), kind);
+                let (specific, generic) = crate::search::icons::for_path(Path::new(&id), kind);
                 let gicon = format!(". GThemedIcon {specific} {generic}");
                 meta.insert("gicon".into(), owned(Variant::from(gicon)));
                 meta.insert("id".into(), owned(Variant::from(id)));
@@ -524,7 +524,7 @@ fn launch_settings(args: &[&str]) {
                 .chain(args.iter().map(ToString::to_string))
                 .collect();
             std::thread::spawn(move || {
-                if let Err(e) = crate::open::spawn(argv) {
+                if let Err(e) = crate::search::open::spawn(argv) {
                     eprintln!("{program}: {e}");
                 }
             });
@@ -616,7 +616,10 @@ impl Control {
         out.insert(
             key::POWER_HOLD.into(),
             owned(Variant::from(
-                self.status.power.hold().map_or("", crate::power::Hold::key),
+                self.status
+                    .power
+                    .hold()
+                    .map_or("", crate::service::power::Hold::key),
             )),
         );
         out.insert(
@@ -711,7 +714,7 @@ impl Control {
         );
         // Counted from the index: with a decoder installed, they are retried
         // at the next start and the count would mislead until then.
-        let no_decoder = match crate::vision::heif_convert() {
+        let no_decoder = match crate::ml::vision::heif_convert() {
             None => index::undecodable(&db).map_err(failed)?,
             Some(_) => 0,
         };
@@ -816,19 +819,21 @@ impl Control {
 
     /// Every file `query` finds, for the search window (#111): the best
     /// chunk of each, at or above its kind's min_score, at most `limit`
-    /// (capped at results::MAX) of each kind. See crate::results::Found.
+    /// (capped at results::MAX) of each kind. See crate::search::results::Found.
     async fn search(
         &self,
         query: String,
         limit: u32,
-    ) -> zbus::fdo::Result<Vec<crate::results::Found>> {
+    ) -> zbus::fdo::Result<Vec<crate::search::results::Found>> {
         let limit = limit.min(results::MAX) as usize;
         let floors = Floors::load(&self.config);
         let hits = chunks(&self.jobs, query, limit * 4).await;
-        Ok(crate::results::every_file(hits, |k| floors.of(k), limit)
-            .into_iter()
-            .filter_map(crate::results::found)
-            .collect())
+        Ok(
+            crate::search::results::every_file(hits, |k| floors.of(k), limit)
+                .into_iter()
+                .filter_map(crate::search::results::found)
+                .collect(),
+        )
     }
 
     /// Open an indexed file at `line`, a number from Search's results, as
@@ -909,7 +914,9 @@ impl Control {
         // The watcher too, or it would take the file it next reads for
         // unchanged and pass nothing on.
         self.status.reload_config.store(true, Ordering::Relaxed);
-        self.request(Request::Encryption(crate::encryption::Want::of(&file)))
+        self.request(Request::Encryption(crate::index::encryption::Want::of(
+            &file,
+        )))
     }
 
     /// Encrypt the index again under a new key, sealed afresh. Fails while
@@ -961,7 +968,7 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
         group.push(h);
     }
     // Before the cut, so a burst folded into one leaves room for others.
-    groups[3] = crate::dupes::collapse(std::mem::take(&mut groups[3]));
+    groups[3] = crate::search::dupes::collapse(std::mem::take(&mut groups[3]));
     for group in &mut groups {
         group.truncate(RESULTS);
     }
@@ -977,14 +984,14 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     worker::prepare(&opts.status, &opts.file)?;
-    crate::power::spawn(tx.clone(), opts.status.clone());
+    crate::service::power::spawn(tx.clone(), opts.status.clone());
     let _watcher = watch::spawn(
         tx.clone(),
         opts.config.clone(),
         opts.file.clone(),
         opts.status.clone(),
     )?;
-    let db: Db = crate::encryption::Live::open(&index::default_db()?)?;
+    let db: Db = crate::index::encryption::Live::open(&index::default_db()?)?;
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
@@ -1314,7 +1321,7 @@ fn config_home() -> Result<PathBuf> {
 /// The vinoPilot landing page's vinoSearch mark, with the viewBox cropped to
 /// a 2 px margin: the page's 4 px left the tile visibly smaller than other
 /// apps' icons in a task manager.
-const ICON_SVG: &str = include_str!("../data/dev.vinosearch.svg");
+const ICON_SVG: &str = include_str!("../../data/dev.vinosearch.svg");
 
 fn icon_path() -> Result<PathBuf> {
     Ok(data_home()?.join(format!("icons/hicolor/scalable/apps/{ICON}.svg")))
@@ -1789,7 +1796,7 @@ mod tests {
             .unwrap();
         }
         drop(conn);
-        let db: Db = crate::encryption::Live::open(&dir.join("i.sqlite")).unwrap();
+        let db: Db = crate::index::encryption::Live::open(&dir.join("i.sqlite")).unwrap();
         assert_eq!(file_text(&db, note.to_str().unwrap()).unwrap(), "# Hello\n");
         let e = file_text(&db, photo.to_str().unwrap()).unwrap_err();
         assert!(

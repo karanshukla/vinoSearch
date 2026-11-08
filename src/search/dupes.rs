@@ -223,7 +223,7 @@ fn names_camera(exif: &[u8]) -> bool {
 fn differing(a: &Path, b: &Path) -> Option<f32> {
     let thumb = |p: &Path| -> Option<Vec<f32>> {
         let bytes = std::fs::read(p).ok()?;
-        let rgb = crate::vision::load(&bytes).ok()?;
+        let rgb = crate::ml::vision::load(&bytes).ok()?;
         let grey = image::DynamicImage::ImageRgb8(rgb).into_luma8();
         let small =
             image::imageops::resize(&grey, THUMB, THUMB, image::imageops::FilterType::Triangle);

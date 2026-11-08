@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::config::{Excludes, Formats};
-use crate::embed::FakeEmbed;
+use crate::index::seal::tests::{Fake, HOST_HEAD, TPM_HEAD, creds_body, retry};
 use crate::index::{FileTypes, Kind, Vectors, Words};
-use crate::seal::tests::{Fake, HOST_HEAD, TPM_HEAD, creds_body, retry};
+use crate::ml::embed::FakeEmbed;
 
 const SECRET: &str = "the ledger code is QUOKKA-7731 for the harbour invoice";
 

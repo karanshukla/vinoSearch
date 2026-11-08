@@ -11,8 +11,8 @@
 //! Held work waits in the worker with what a PauseIndexing holds, and a
 //! `Job::Retry` runs it once nothing holds it any more.
 
-use crate::sched;
-use crate::worker::{Job, Status};
+use crate::service::sched;
+use crate::service::worker::{Job, Status};
 use futures_lite::StreamExt;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;

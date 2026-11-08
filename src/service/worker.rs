@@ -16,10 +16,10 @@
 //! doing is published in `Status`, so status queries never wait behind it.
 
 use crate::config::{self, Config, Excludes};
-use crate::embed::Embed;
-use crate::encryption::{self, Want};
+use crate::index::encryption::{self, Want};
 use crate::index::{self, FileTypes, Hit, Kind, Outcome, Vectors};
-use crate::sched;
+use crate::ml::embed::Embed;
+use crate::service::sched;
 use anyhow::Result;
 use futures_channel::oneshot;
 use std::collections::BTreeSet;
@@ -258,7 +258,7 @@ pub struct Status {
     /// chunk, and the rest waits until Retry.
     pub paused: AtomicBool,
     /// What may hold indexing for power (#109), as `paused` does.
-    pub power: crate::power::State,
+    pub power: crate::service::power::State,
     /// Why this start dropped part of the index to be indexed again (a model
     /// changed, #80), until that indexing is done; empty otherwise.
     pub model_changed: std::sync::Mutex<String>,
@@ -325,7 +325,7 @@ pub fn prepare(status: &Status, file: &Config) -> Result<()> {
     encryption::hold_shared(&db)?;
     status
         .tpm
-        .store(crate::seal::tpm_available(), Ordering::Relaxed);
+        .store(crate::index::seal::tpm_available(), Ordering::Relaxed);
     apply_encryption(status, &db, Want::of(file), false);
     let conn = index::open(&db)?;
     let purged = index::purge_other_models(&conn)?;
@@ -337,7 +337,7 @@ pub fn prepare(status: &Status, file: &Config) -> Result<()> {
     if retry > 0 {
         eprintln!("a HEIF decoder is installed now: {retry} photos will be indexed");
     }
-    let ocr = crate::model::ocr_dir().is_ok_and(|d| crate::model::ocr_present(&d));
+    let ocr = crate::ml::model::ocr_dir().is_ok_and(|d| crate::ml::model::ocr_present(&d));
     let scans = index::retry_scans(&conn, ocr)?;
     if scans > 0 {
         eprintln!("{scans} PDFs with no text will be read by OCR");
@@ -352,7 +352,7 @@ pub fn prepare(status: &Status, file: &Config) -> Result<()> {
 /// `encryption::apply`, its outcome logged and kept for Status. A rebuild
 /// reported earlier stays until a later one replaces it.
 fn apply_encryption(status: &Status, db: &std::path::Path, want: Want, rekey: bool) {
-    let st = encryption::apply(db, want, rekey, &crate::seal::Sealer::default());
+    let st = encryption::apply(db, want, rekey, &crate::index::seal::Sealer::default());
     if !st.error.is_empty() {
         eprintln!("encryption: {}", st.error);
     }
@@ -721,7 +721,7 @@ fn run_with<E: Embed>(
                         continue;
                     }
                     unload(&mut loaded, "deleting the model");
-                    match crate::model::delete() {
+                    match crate::ml::model::delete() {
                         Ok(()) => eprintln!("model deleted"),
                         Err(e) => eprintln!("deleting the model: {e:#}"),
                     }
@@ -969,7 +969,7 @@ fn run_with<E: Embed>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::FakeEmbed;
+    use crate::ml::embed::FakeEmbed;
     use std::fs;
     use std::sync::atomic::AtomicUsize;
 
@@ -1119,7 +1119,7 @@ mod tests {
                 db: self.db(),
             };
             let embedded = self.embedded.clone();
-            let mut hook: Option<crate::embed::OnDocument> = Some(Box::new(on_document));
+            let mut hook: Option<crate::ml::embed::OnDocument> = Some(Box::new(on_document));
             let worker = std::thread::spawn(move || {
                 run_with(rx, opts, move |_| {
                     let embedded = embedded.clone();
