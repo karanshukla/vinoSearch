@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use zbus::OwnedVariant;
 
-use crate::open::At;
+use crate::search::open::At;
 use vinosearch_shared::dbus::{RUNNER_PATH, SERVICE};
 
 /// Launchers tried in order when none is given: each speaks dmenu (choices
@@ -204,7 +204,7 @@ pub fn run(given: Option<&str>, editor: Option<&str>) -> Result<()> {
     let Some(row) = rows.iter().find(|r| r.line == picked) else {
         return Ok(());
     };
-    crate::open::open(Path::new(&row.path), row.at, editor);
+    crate::search::open::open(Path::new(&row.path), row.at, editor);
     Ok(())
 }
 

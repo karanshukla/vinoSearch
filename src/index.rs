@@ -5,9 +5,14 @@
 //! sensitive as the files it covers: encrypted at rest when `encryption` is
 //! on (encryption.rs, #4), plaintext readable only by the user otherwise.
 
+pub mod code;
+pub mod encryption;
+pub mod estimate;
+pub mod seal;
+
 use crate::config::{Excludes, Formats};
-use crate::embed::{DIM, Embed, Embedder, document_text};
 use crate::extract::{Extract, MAX_PARTS, PARTS_AT_ONCE, Parser};
+use crate::ml::embed::{DIM, Embed, Embedder, document_text};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -126,15 +131,15 @@ impl Kind {
     pub fn model_tag(self) -> String {
         match self {
             Kind::Text | Kind::Document | Kind::Code | Kind::Session => {
-                crate::model::REVISION.to_owned()
+                crate::ml::model::REVISION.to_owned()
             }
             Kind::Image => format!(
                 "{}+{}/{}+ocr:{}/{}",
-                crate::model::REVISION,
-                crate::model::VISION_REVISION,
-                crate::vision::SOFT_TOKENS,
-                crate::model::OCR_REVISION,
-                crate::ocr::READING,
+                crate::ml::model::REVISION,
+                crate::ml::model::VISION_REVISION,
+                crate::ml::vision::SOFT_TOKENS,
+                crate::ml::model::OCR_REVISION,
+                crate::ml::ocr::READING,
             ),
         }
     }
@@ -166,7 +171,7 @@ pub struct FileTypes {
 /// The ignore files read, shared by a `FileTypes` and its clones; no part
 /// of what makes two equal.
 #[derive(Debug, Clone, Default)]
-struct SharedIgnores(std::sync::Arc<crate::code::Ignores>);
+struct SharedIgnores(std::sync::Arc<crate::index::code::Ignores>);
 
 impl PartialEq for SharedIgnores {
     fn eq(&self, _: &Self) -> bool {
@@ -219,7 +224,7 @@ impl FileTypes {
         if text_file(path) {
             return Some(Kind::Text);
         }
-        if crate::code::is_code(path) {
+        if crate::index::code::is_code(path) {
             return (self.code && !self.ignores.0.left_out(path)).then_some(Kind::Code);
         }
         if self.documents && crate::extract::is_document(path) {
@@ -258,7 +263,7 @@ pub fn default_db() -> Result<PathBuf> {
 /// key that won't unseal is an error (`encryption::Unusable`), never an
 /// empty or plaintext index.
 pub fn open(path: &Path) -> Result<Connection> {
-    let key = crate::encryption::key_for(path)?;
+    let key = crate::index::encryption::key_for(path)?;
     if let Some(dir) = path.parent() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -274,7 +279,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         .with_context(|| path.display().to_string())?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let conn = Connection::open(path)?;
-    crate::encryption::unlock(&conn, key.as_deref())?;
+    crate::index::encryption::unlock(&conn, key.as_deref())?;
     conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA foreign_keys = ON;
@@ -398,7 +403,7 @@ fn code_apart(conn: &Connection) -> Result<()> {
         )?
         .query_map([Kind::Text as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    files.retain(|(_, p)| crate::code::is_code(Path::new(p)));
+    files.retain(|(_, p)| crate::index::code::is_code(Path::new(p)));
     let mut text = tx.prepare("SELECT text FROM chunks WHERE file_id = ?1 ORDER BY id")?;
     let mut relabel = tx.prepare("UPDATE chunks SET kind = ?1 WHERE file_id = ?2")?;
     // So loaded Vectors read these chunks' new kind (`Vectors::catch_up`).
@@ -409,7 +414,7 @@ fn code_apart(conn: &Connection) -> Result<()> {
         let all: String = text
             .query_map([id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
-        if let Some(why) = crate::code::unwanted(&all) {
+        if let Some(why) = crate::index::code::unwanted(&all) {
             eprintln!("dropping {path} from the index: {why}");
             dropped.push(*id);
             continue;
@@ -742,7 +747,7 @@ pub fn index_file<E: Embed>(
             // Kept as a row with no chunks, so it isn't read again until it
             // changes.
             if let Some(why) = (kind == Kind::Code)
-                .then(|| crate::code::unwanted(&text))
+                .then(|| crate::index::code::unwanted(&text))
                 .flatten()
             {
                 eprintln!("skip {}: {why}", path.display());
@@ -789,15 +794,15 @@ pub fn index_file<E: Embed>(
         // isn't decoded again at every check.
         Kind::Image => {
             // From the bytes hashed, so the file can't change in between.
-            let decoded = crate::vision::load(&bytes)
-                .and_then(|img| Ok((crate::vision::prepare(&img)?, img)));
+            let decoded = crate::ml::vision::load(&bytes)
+                .and_then(|img| Ok((crate::ml::vision::prepare(&img)?, img)));
             let (pixels, img) = match decoded {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("skip {}: {e:#}", path.display());
                     record(conn)?;
                     return Ok(Outcome::Unreadable {
-                        no_decoder: e.downcast_ref::<crate::vision::NoDecoder>().is_some(),
+                        no_decoder: e.downcast_ref::<crate::ml::vision::NoDecoder>().is_some(),
                     });
                 }
             };
@@ -805,7 +810,7 @@ pub fn index_file<E: Embed>(
             drop(pixels);
             between(conn, emb)?;
             let lines = emb.read_text(&img)?;
-            let lines = if crate::ocr::text_size(&lines) >= crate::ocr::MIN_IMAGE_TEXT {
+            let lines = if crate::ml::ocr::text_size(&lines) >= crate::ml::ocr::MIN_IMAGE_TEXT {
                 lines
             } else {
                 Vec::new()
@@ -881,7 +886,7 @@ fn embed_chunks<E: Embed>(
 fn is_scannable(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-        && crate::ocr::poppler()
+        && crate::ml::ocr::poppler()
 }
 
 /// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
@@ -897,25 +902,25 @@ fn scan_chunks<E: Embed>(
 ) -> Result<Vec<(usize, String)>> {
     // Rendering only: OCR and embedding are the runner's own work, paced by
     // `between`.
-    let mut deadline = std::time::Instant::now() + crate::ocr::SCAN_WALL;
-    let pages = match crate::ocr::pdf_pages(bytes, deadline) {
+    let mut deadline = std::time::Instant::now() + crate::ml::ocr::SCAN_WALL;
+    let pages = match crate::ml::ocr::pdf_pages(bytes, deadline) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
             return Ok(Vec::new());
         }
     };
-    if pages > crate::ocr::MAX_SCAN_PAGES {
+    if pages > crate::ml::ocr::MAX_SCAN_PAGES {
         eprintln!(
             "{}: reading the first {} of {pages} scanned pages",
             path.display(),
-            crate::ocr::MAX_SCAN_PAGES
+            crate::ml::ocr::MAX_SCAN_PAGES
         );
     }
     let mut out = Vec::new();
-    for page in 1..=pages.min(crate::ocr::MAX_SCAN_PAGES) {
+    for page in 1..=pages.min(crate::ml::ocr::MAX_SCAN_PAGES) {
         let started = std::time::Instant::now();
-        let img = match crate::ocr::render_page(bytes, page, deadline) {
+        let img = match crate::ml::ocr::render_page(bytes, page, deadline) {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("{} page {page}: {e:#}; stopping there", path.display());
@@ -945,8 +950,8 @@ fn title_of(path: &Path) -> String {
 fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
     let chunks = if crate::extract::is_html(path) {
         chunk(&crate::extract::html(text))
-    } else if crate::code::is_code(path) {
-        crate::code::chunk(text)
+    } else if crate::index::code::is_code(path) {
+        crate::index::code::chunk(text)
     } else {
         chunk(text)
     };
@@ -1351,7 +1356,7 @@ fn drop_kind(tx: &Connection, kind: Kind) -> Result<usize> {
 
 /// `LIKE` patterns for files with a HEIF extension (#79).
 fn heif_patterns() -> Vec<String> {
-    crate::vision::HEIF_EXTENSIONS
+    crate::ml::vision::HEIF_EXTENSIONS
         .iter()
         .map(|e| format!("%.{e}"))
         .collect()
@@ -1379,7 +1384,7 @@ pub fn undecodable(conn: &Connection) -> Result<i64> {
 /// Forget the images recorded as undecodable once a decoder is there, so the
 /// next check of each root indexes them. Returns files dropped.
 pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
-    if crate::vision::heif_convert().is_none() {
+    if crate::ml::vision::heif_convert().is_none() {
         return Ok(0);
     }
     let mut n = 0;
@@ -1399,11 +1404,15 @@ pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
 /// (#106): with this OCR model, and poppler installed. Recorded in `meta`, so
 /// it happens once for each, not at every start. Returns files dropped.
 pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
-    if !ocr || !crate::ocr::poppler() {
+    if !ocr || !crate::ml::ocr::poppler() {
         return Ok(0);
     }
     let key = "reading.scans";
-    let now = format!("{}/{}", crate::model::OCR_REVISION, crate::ocr::READING);
+    let now = format!(
+        "{}/{}",
+        crate::ml::model::OCR_REVISION,
+        crate::ml::ocr::READING
+    );
     let now = now.as_str();
     let was: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -1642,7 +1651,7 @@ pub fn is_indexed(conn: &Connection, path: &str) -> Result<bool> {
 pub fn readable_kind(path: &Path) -> Option<Kind> {
     if text_file(path) {
         Some(Kind::Text)
-    } else if crate::code::is_code(path) {
+    } else if crate::index::code::is_code(path) {
         Some(Kind::Code)
     } else if crate::extract::is_document(path) {
         Some(Kind::Document)
@@ -2135,7 +2144,7 @@ fn ranked(conn: &Connection, terms: &[String]) -> rusqlite::Result<Option<Vec<i6
 /// or everything but code, text first; with the query to embed and look up,
 /// less its `code:`.
 pub fn scope(query: &str) -> (&str, &'static [Kind]) {
-    match crate::code::code_query(query) {
+    match crate::index::code::code_query(query) {
         Some(q) => (q, &[Kind::Code]),
         None => (
             query,
@@ -2376,7 +2385,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(retry_scans(&conn, false).unwrap(), 0);
-        if crate::ocr::poppler() {
+        if crate::ml::ocr::poppler() {
             assert_eq!(retry_scans(&conn, true).unwrap(), 1);
             assert_eq!(paths(&conn), ["/broken.jpg", "/text.pdf"]);
             // Once per OCR model: a scan recorded again isn't dropped at every start.

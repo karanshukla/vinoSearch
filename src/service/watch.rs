@@ -14,7 +14,7 @@
 
 use crate::config::{Config, Excludes};
 use crate::index::{self, FileTypes};
-use crate::worker::{Job, Status, unix_now};
+use crate::service::worker::{Job, Status, unix_now};
 use anyhow::Result;
 use notify::event::{Event, EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -248,7 +248,7 @@ pub fn spawn(
     let excludes = file.excludes()?;
     let types = FileTypes::new(&file.formats)?;
     // Closed and opened again under it when encryption changes (#4).
-    let db = crate::encryption::Live::open(&index::default_db()?)?;
+    let db = crate::index::encryption::Live::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
     Ok(std::thread::spawn(move || {

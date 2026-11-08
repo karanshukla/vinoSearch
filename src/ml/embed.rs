@@ -75,7 +75,7 @@ pub struct Embedder {
     query: Stage,
     docs: Option<Stage>,
     images: Option<ImageStage>,
-    ocr: Option<crate::ocr::Ocr>,
+    ocr: Option<crate::ml::ocr::Ocr>,
     docs_share: f64,
 }
 
@@ -122,7 +122,7 @@ fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Ve
 /// evicts them: one day of changing shapes left 1.4 GB, five ~280 MB blobs,
 /// for two in use.
 fn cache_key(device: &str, len: usize) -> String {
-    stage_key(crate::model::REVISION, device, &len.to_string())
+    stage_key(crate::ml::model::REVISION, device, &len.to_string())
 }
 
 pub(crate) fn stage_key(revision: &str, device: &str, stage: &str) -> String {
@@ -135,17 +135,17 @@ pub(crate) fn stage_key(revision: &str, device: &str, stage: &str) -> String {
 
 /// The stages this build compiles, as (model revision, stage).
 fn stages() -> Vec<(&'static str, String)> {
-    let tokens = crate::vision::SOFT_TOKENS;
+    let tokens = crate::ml::vision::SOFT_TOKENS;
     let mut out = vec![
-        (crate::model::REVISION, QUERY_LEN.to_string()),
-        (crate::model::REVISION, DOC_LEN.to_string()),
-        (crate::model::REVISION, format!("image{tokens}")),
-        (crate::model::VISION_REVISION, format!("vision{tokens}")),
+        (crate::ml::model::REVISION, QUERY_LEN.to_string()),
+        (crate::ml::model::REVISION, DOC_LEN.to_string()),
+        (crate::ml::model::REVISION, format!("image{tokens}")),
+        (crate::ml::model::VISION_REVISION, format!("vision{tokens}")),
     ];
     out.extend(
-        crate::ocr::stages()
+        crate::ml::ocr::stages()
             .into_iter()
-            .map(|s| (crate::model::OCR_REVISION, s)),
+            .map(|s| (crate::ml::model::OCR_REVISION, s)),
     );
     out
 }
@@ -240,11 +240,11 @@ impl Stage {
                 core,
                 device,
                 &cache,
-                |core| match crate::model::static_path(model_dir, len).filter(|p| p.is_file()) {
+                |core| match crate::ml::model::static_path(model_dir, len).filter(|p| p.is_file()) {
                     Some(path) => compile_file(core, &path, device),
                     // A model fetched before the static graphs were published.
                     None => {
-                        let path = crate::model::onnx_path(model_dir);
+                        let path = crate::ml::model::onnx_path(model_dir);
                         let mut model = core
                             .read_model_from_file(
                                 path.to_str().context("model path is not UTF-8")?,
@@ -346,26 +346,26 @@ impl ImageStage {
         tok: &Tokenizer,
     ) -> Result<Self> {
         ensure!(
-            crate::model::vision_present(model_dir, vision_dir),
+            crate::ml::model::vision_present(model_dir, vision_dir),
             "the vision encoder is not in {}; run: vinosearch fetch-model",
             vision_dir.display()
         );
-        let tokens = crate::vision::SOFT_TOKENS;
+        let tokens = crate::ml::vision::SOFT_TOKENS;
         let cache = cache_root.join(stage_key(
-            crate::model::VISION_REVISION,
+            crate::ml::model::VISION_REVISION,
             device,
             &format!("vision{tokens}"),
         ));
-        let path = crate::model::vision_path(vision_dir);
+        let path = crate::ml::model::vision_path(vision_dir);
         let (mut vision, vision_fresh) = compile_cached(core, device, &cache, |core| {
             compile_file(core, &path, device)
         })?;
         let cache = cache_root.join(stage_key(
-            crate::model::REVISION,
+            crate::ml::model::REVISION,
             device,
             &format!("image{tokens}"),
         ));
-        let path = crate::model::image_text_path(model_dir);
+        let path = crate::ml::model::image_text_path(model_dir);
         let (mut text, text_fresh) = compile_cached(core, device, &cache, |core| {
             compile_file(core, &path, device)
         })?;
@@ -391,8 +391,8 @@ impl ImageStage {
         })
     }
 
-    fn run(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
-        use crate::vision::{PATCH_DIM, PATCHES, SOFT_TOKENS};
+    fn run(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
+        use crate::ml::vision::{PATCH_DIM, PATCHES, SOFT_TOKENS};
         ensure!(
             (1..=SOFT_TOKENS).contains(&px.tokens),
             "{} soft tokens, expected 1 to {SOFT_TOKENS}",
@@ -466,20 +466,20 @@ fn checked<S: Compiled>(
     probe: impl FnOnce(&mut S) -> Result<Vec<f32>>,
 ) -> Result<S> {
     let mut stage = build(device)?;
-    let Some(reference) = crate::parity::reference(name).filter(|_| device != "CPU") else {
+    let Some(reference) = crate::ml::parity::reference(name).filter(|_| device != "CPU") else {
         return Ok(stage);
     };
     let build_id = openvino::version().build_number;
-    let cosine = match crate::parity::recorded(stage.cache()) {
+    let cosine = match crate::ml::parity::recorded(stage.cache()) {
         Some((checked, cosine)) if checked == build_id && !stage.fresh() => cosine,
         _ => {
-            let cosine = crate::parity::cosine(&probe(&mut stage)?, &reference);
-            crate::parity::record(stage.cache(), &build_id, cosine)?;
+            let cosine = crate::ml::parity::cosine(&probe(&mut stage)?, &reference);
+            crate::ml::parity::record(stage.cache(), &build_id, cosine)?;
             eprintln!("{name} stage on {device}: cosine {cosine:.5} to the CPU reference");
             cosine
         }
     };
-    if cosine >= crate::parity::MIN_COSINE {
+    if cosine >= crate::ml::parity::MIN_COSINE {
         return Ok(stage);
     }
     eprintln!(
@@ -492,24 +492,28 @@ fn checked<S: Compiled>(
 /// What each stage's last check on `device` found, as doctor reports it: None for not
 /// checked yet.
 pub fn parity(cache_root: &Path, device: &str) -> Vec<(&'static str, Option<f32>)> {
-    let tokens = crate::vision::SOFT_TOKENS;
+    let tokens = crate::ml::vision::SOFT_TOKENS;
     let dirs = [
         cache_key(device, QUERY_LEN),
         cache_key(device, DOC_LEN),
-        stage_key(crate::model::REVISION, device, &format!("image{tokens}")),
+        stage_key(
+            crate::ml::model::REVISION,
+            device,
+            &format!("image{tokens}"),
+        ),
     ];
-    crate::parity::STAGES
+    crate::ml::parity::STAGES
         .iter()
         .zip(dirs)
         .map(|((name, _), dir)| {
-            let cosine = crate::parity::recorded(&cache_root.join(dir)).map(|(_, c)| c);
+            let cosine = crate::ml::parity::recorded(&cache_root.join(dir)).map(|(_, c)| c);
             (*name, cosine)
         })
         .collect()
 }
 
 fn query_probe(stage: &mut Stage, tok: &Tokenizer) -> Result<Vec<f32>> {
-    let text = format!("{QUERY_PREFIX}{}", crate::parity::QUERY);
+    let text = format!("{QUERY_PREFIX}{}", crate::ml::parity::QUERY);
     Ok(stage.run(tok, &[text], 1.0)?.remove(0))
 }
 
@@ -524,7 +528,7 @@ impl Embedder {
     ) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         prune_cache(cache_dir)?;
-        let tok_path = crate::model::tokenizer_path(model_dir);
+        let tok_path = crate::ml::model::tokenizer_path(model_dir);
         let tok =
             Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{}: {e}", tok_path.display()))?;
         let query = checked(
@@ -589,8 +593,10 @@ impl Embedder {
                     )
                 },
                 |stage| {
-                    let text =
-                        document_text(crate::parity::DOCUMENT_TITLE, crate::parity::DOCUMENT);
+                    let text = document_text(
+                        crate::ml::parity::DOCUMENT_TITLE,
+                        crate::ml::parity::DOCUMENT,
+                    );
                     Ok(stage.run(tok, &[text], 1.0)?.remove(0))
                 },
             )?);
@@ -619,13 +625,13 @@ impl Embedder {
 
     /// The OCR model's files are fetched.
     pub fn can_read_text(&self) -> bool {
-        crate::model::ocr_present(&self.ocr_dir)
+        crate::ml::model::ocr_present(&self.ocr_dir)
     }
 
     /// The lines of text in `img` (#106), at the document share of the device.
     pub fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
         if self.ocr.is_none() {
-            self.ocr = Some(crate::ocr::Ocr::new(
+            self.ocr = Some(crate::ml::ocr::Ocr::new(
                 &mut self.core,
                 &self.ocr_dir,
                 &self.device,
@@ -635,8 +641,8 @@ impl Embedder {
         self.ocr.as_mut().unwrap().read(img, self.docs_share)
     }
 
-    /// Embed an image, prepared by [`crate::vision::prepare`].
-    pub fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+    /// Embed an image, prepared by [`crate::ml::vision::prepare`].
+    pub fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         if self.images.is_none() {
             let (core, tok) = (&mut self.core, &self.tok);
             self.images = Some(checked(
@@ -652,7 +658,7 @@ impl Embedder {
                         tok,
                     )
                 },
-                |stage| stage.run(&crate::vision::prepare(&crate::parity::image())?),
+                |stage| stage.run(&crate::ml::vision::prepare(&crate::ml::parity::image())?),
             )?);
         }
         let t0 = Instant::now();
@@ -674,8 +680,8 @@ impl Embedder {
 pub trait Embed {
     /// Embed documents already formatted with [`document_text`].
     fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-    /// Embed an image, prepared by [`crate::vision::prepare`].
-    fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>>;
+    /// Embed an image, prepared by [`crate::ml::vision::prepare`].
+    fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>>;
     /// The OCR model's files are fetched.
     fn can_read_text(&self) -> bool;
     /// The lines of text in `img`.
@@ -697,7 +703,7 @@ impl Embed for Embedder {
         Embedder::documents(self, texts)
     }
 
-    fn image(&mut self, px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+    fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         Embedder::image(self, px)
     }
 
@@ -780,7 +786,7 @@ impl Embed for FakeEmbed {
         Ok(texts.iter().map(|t| Self::vector(t)).collect())
     }
 
-    fn image(&mut self, _px: &crate::vision::Pixels) -> Result<Vec<f32>> {
+    fn image(&mut self, _px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         self.images += 1;
         Ok(Self::vector("image"))
     }
@@ -816,40 +822,44 @@ impl Embed for FakeEmbed {
 mod tests {
     use super::*;
 
-    /// Writes `src/parity/*.f32` from the CPU. Run after a model revision changes:
+    /// Writes `src/ml/parity/*.f32` from the CPU. Run after a model revision changes:
     /// `cargo test --release write_parity_references -- --ignored`.
     #[test]
     #[ignore = "needs the OpenVINO runtime and the model"]
     fn write_parity_references() {
-        let prefix = crate::runtime::default_prefix(None).unwrap();
-        crate::runtime::load(&prefix).unwrap();
+        let prefix = crate::ml::runtime::default_prefix(None).unwrap();
+        crate::ml::runtime::load(&prefix).unwrap();
         // Not the temp dir, which is RAM here; the CPU blobs are hundreds of MB.
         let home = std::env::var_os("HOME").unwrap();
         let cache = Path::new(&home).join(".cache/vinosearch/parity-references");
         let mut e = Embedder::new(
             Core::new().unwrap(),
-            &crate::model::default_dir().unwrap(),
-            &crate::model::vision_dir().unwrap(),
-            &crate::model::ocr_dir().unwrap(),
+            &crate::ml::model::default_dir().unwrap(),
+            &crate::ml::model::vision_dir().unwrap(),
+            &crate::ml::model::ocr_dir().unwrap(),
             "CPU",
             &cache,
         )
         .unwrap();
         let vectors = [
-            e.query_for(crate::parity::QUERY, &[crate::index::Kind::Text])
+            e.query_for(crate::ml::parity::QUERY, &[crate::index::Kind::Text])
                 .unwrap(),
             e.documents(&[document_text(
-                crate::parity::DOCUMENT_TITLE,
-                crate::parity::DOCUMENT,
+                crate::ml::parity::DOCUMENT_TITLE,
+                crate::ml::parity::DOCUMENT,
             )])
             .unwrap()
             .remove(0),
-            e.image(&crate::vision::prepare(&crate::parity::image()).unwrap())
+            e.image(&crate::ml::vision::prepare(&crate::ml::parity::image()).unwrap())
                 .unwrap(),
         ];
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/parity");
-        for ((name, _), v) in crate::parity::STAGES.iter().zip(vectors) {
-            std::fs::write(dir.join(format!("{name}.f32")), crate::parity::encode(&v)).unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ml/parity");
+        for ((name, _), v) in crate::ml::parity::STAGES.iter().zip(vectors) {
+            std::fs::write(
+                dir.join(format!("{name}.f32")),
+                crate::ml::parity::encode(&v),
+            )
+            .unwrap();
         }
         let _ = std::fs::remove_dir_all(&cache);
     }
@@ -863,13 +873,13 @@ mod tests {
             cache_key("NPU", QUERY_LEN),
             cache_key("NPU", DOC_LEN),
             cache_key("CPU", DOC_LEN),
-            stage_key(crate::model::REVISION, "NPU", "image140"),
-            stage_key(crate::model::VISION_REVISION, "NPU", "vision140"),
+            stage_key(crate::ml::model::REVISION, "NPU", "image140"),
+            stage_key(crate::ml::model::VISION_REVISION, "NPU", "vision140"),
         ];
         let drop = [
             cache_key("NPU", 64),
             format!("0123456789ab-NPU-{QUERY_LEN}"),
-            stage_key(crate::model::VISION_REVISION, "NPU", "vision280"),
+            stage_key(crate::ml::model::VISION_REVISION, "NPU", "vision280"),
         ];
         for d in keep.iter().chain(&drop) {
             std::fs::create_dir_all(root.join(d)).unwrap();

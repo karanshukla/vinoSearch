@@ -367,7 +367,9 @@ pub const SCAN_WALL: std::time::Duration = std::time::Duration::from_secs(300);
 /// poppler on Arch). Looked up once.
 pub fn poppler() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOUND.get_or_init(|| crate::menu::on_path("pdfinfo") && crate::menu::on_path("pdftoppm"))
+    *FOUND.get_or_init(|| {
+        crate::search::menu::on_path("pdfinfo") && crate::search::menu::on_path("pdftoppm")
+    })
 }
 
 /// `tool` reading the PDF on stdin, under POPPLER's limits.
@@ -474,16 +476,17 @@ impl Graph {
         device: &str,
         cache: &Path,
     ) -> Result<Self> {
-        let (mut compiled, fresh) = crate::embed::compile_cached(core, device, cache, |core| {
-            let mut model = core
-                .read_model_from_file(path.to_str().context("model path is not UTF-8")?, "")
-                .with_context(|| format!("reading {}", path.display()))?;
-            model
-                .reshape_single_input(&openvino::PartialShape::new_static(4, &shape)?)
-                .context("reshaping to a static shape")?;
-            core.compile_model(&model, DeviceType::from(device))
-                .with_context(|| format!("compiling {}", path.display()))
-        })?;
+        let (mut compiled, fresh) =
+            crate::ml::embed::compile_cached(core, device, cache, |core| {
+                let mut model = core
+                    .read_model_from_file(path.to_str().context("model path is not UTF-8")?, "")
+                    .with_context(|| format!("reading {}", path.display()))?;
+                model
+                    .reshape_single_input(&openvino::PartialShape::new_static(4, &shape)?)
+                    .context("reshaping to a static shape")?;
+                core.compile_model(&model, DeviceType::from(device))
+                    .with_context(|| format!("compiling {}", path.display()))
+            })?;
         Ok(Self {
             request: compiled.create_infer_request()?,
             _compiled: compiled,
@@ -553,8 +556,8 @@ pub fn stages() -> Vec<String> {
 impl Ocr {
     fn compile(core: &mut Core, dir: &Path, device: &str, cache_root: &Path) -> Result<Self> {
         let key = |stage: &str| {
-            cache_root.join(crate::embed::stage_key(
-                crate::model::OCR_REVISION,
+            cache_root.join(crate::ml::embed::stage_key(
+                crate::ml::model::OCR_REVISION,
                 device,
                 stage,
             ))
@@ -567,7 +570,7 @@ impl Ocr {
             .map(|(&s, stage)| {
                 Graph::new(
                     core,
-                    &crate::model::ocr_det_path(dir),
+                    &crate::ml::model::ocr_det_path(dir),
                     det_shape(s),
                     device,
                     &key(stage),
@@ -580,14 +583,14 @@ impl Ocr {
             .map(|(&w, stage)| {
                 Graph::new(
                     core,
-                    &crate::model::ocr_rec_path(dir),
+                    &crate::ml::model::ocr_rec_path(dir),
                     rec_shape(w),
                     device,
                     &key(stage),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let chars = read_dict(&crate::model::ocr_dict_path(dir))?;
+        let chars = read_dict(&crate::ml::model::ocr_dict_path(dir))?;
         Ok(Self {
             det,
             rec,
@@ -604,7 +607,7 @@ impl Ocr {
     /// answer, it runs on the CPU instead.
     pub fn new(core: &mut Core, dir: &Path, device: &str, cache_root: &Path) -> Result<Self> {
         ensure!(
-            crate::model::ocr_present(dir),
+            crate::ml::model::ocr_present(dir),
             "the OCR model is not in {}; run: vinosearch fetch-model",
             dir.display()
         );
@@ -614,17 +617,17 @@ impl Ocr {
         }
         let build = openvino::version().build_number;
         let fresh = ocr.det.iter().chain(&ocr.rec).any(|g| g.fresh);
-        let cosine = match crate::parity::recorded(&ocr.cache) {
+        let cosine = match crate::ml::parity::recorded(&ocr.cache) {
             Some((checked, cosine)) if checked == build && !fresh => cosine,
             _ => {
                 let mut cpu = Self::compile(core, dir, "CPU", cache_root)?;
                 let cosine = cosine(&ocr.probe()?, &cpu.probe()?);
-                crate::parity::record(&ocr.cache, &build, cosine)?;
+                crate::ml::parity::record(&ocr.cache, &build, cosine)?;
                 eprintln!("ocr stage on {device}: cosine {cosine:.5} to the CPU");
                 cosine
             }
         };
-        if cosine < crate::parity::MIN_COSINE {
+        if cosine < crate::ml::parity::MIN_COSINE {
             eprintln!(
                 "ocr stage on {device} is off the CPU (cosine {cosine:.4}); running it on CPU"
             );
@@ -677,7 +680,7 @@ impl Ocr {
                 lines.push(text.to_owned());
             }
         }
-        crate::embed::yield_device(t0, share);
+        crate::ml::embed::yield_device(t0, share);
         Ok(lines)
     }
 }

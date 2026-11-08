@@ -1,4 +1,4 @@
-"""Writes src/probe.onnx: Relu over a static [1, 64] f32 input.
+"""Writes src/ml/probe.onnx: Relu over a static [1, 64] f32 input.
 
     uv run --with onnx scripts/gen-probe.py
 """
@@ -19,6 +19,6 @@ graph = helper.make_graph(
 model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], producer_name="vinosearch")
 model.ir_version = 8
 onnx.checker.check_model(model)
-out = Path(__file__).resolve().parent.parent / "src" / "probe.onnx"
+out = Path(__file__).resolve().parent.parent / "src" / "ml" / "probe.onnx"
 onnx.save(model, out)
 print(f"{out} ({out.stat().st_size} bytes)")

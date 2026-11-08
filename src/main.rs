@@ -1,27 +1,15 @@
-mod code;
-mod dupes;
-mod embed;
-mod encryption;
-mod estimate;
 mod eval;
 mod extract;
-mod icons;
 mod index;
-mod krunner;
-mod menu;
-mod model;
-mod ocr;
-mod open;
-mod parity;
-mod power;
+mod ml;
 mod proc;
-mod results;
-mod runtime;
-mod sched;
-mod seal;
-mod vision;
-mod watch;
-mod worker;
+mod search;
+mod service;
+
+use index::{encryption, estimate, seal};
+use ml::{embed, model, ocr, parity, runtime, vision};
+use search::menu;
+use service::{krunner, power, watch, worker};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};

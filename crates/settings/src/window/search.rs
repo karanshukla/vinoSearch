@@ -909,7 +909,7 @@ mod ui_tests;
 mod tests {
     use super::*;
 
-    /// The lists vinoSearch indexes by (`src/extract.rs`, `src/code.rs`, the
+    /// The lists vinoSearch indexes by (`src/extract.rs`, `src/index/code.rs`, the
     /// default image extensions) aren't reachable from this crate; vino-ui's
     /// own test walks them. This checks the tile picked for each kind, and
     /// that a session gets the logo.

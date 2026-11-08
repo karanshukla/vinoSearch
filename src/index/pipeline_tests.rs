@@ -3,7 +3,7 @@
 //! resumed. No OpenVINO or model.
 
 use super::*;
-use crate::embed::FakeEmbed;
+use crate::ml::embed::FakeEmbed;
 use std::os::unix::fs::symlink;
 use std::time::{Duration, SystemTime};
 

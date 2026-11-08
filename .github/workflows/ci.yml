@@ -111,13 +111,13 @@ jobs:
       - name: Pins
         id: pins
         run: |
-          pin() { sed -n "s/.*const $1: &str = \"\([0-9a-f]*\)\";/\1/p" src/model.rs; }
+          pin() { sed -n "s/.*const $1: &str = \"\([0-9a-f]*\)\";/\1/p" src/ml/model.rs; }
           echo "text=$(pin REVISION)" >> "$GITHUB_OUTPUT"
           echo "ocr=$(pin OCR_REVISION)" >> "$GITHUB_OUTPUT"
           ovfetch=$(cargo metadata --locked --format-version 1 | jq -r '.packages[] | select(.name == "ovfetch") | .version')
           echo "ovfetch=$ovfetch" >> "$GITHUB_OUTPUT"
       # The text model (~300 MB) and OCR (~30 MB), by the Hugging Face commits
-      # src/model.rs pins. fetch-model still checks every file's SHA-256 and
+      # src/ml/model.rs pins. fetch-model still checks every file's SHA-256 and
       # fetches what's missing.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
