@@ -8,8 +8,8 @@
 
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, imageops::FilterType};
-use std::io::Cursor;
-use std::os::unix::fs::DirBuilderExt;
+use std::io::{Cursor, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -116,6 +116,38 @@ pub fn heif_convert() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// Where HEIF files are converted: $XDG_RUNTIME_DIR (memory, this user's
+/// only), else the cache. Never /tmp, where another user could make the
+/// directory first and point its files elsewhere.
+fn heif_scratch() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d).join("vinosearch"),
+        _ => crate::cache_dir()?.with_file_name("scratch"),
+    };
+    let dir = base.join("heif");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    Ok(dir)
+}
+
+/// A new directory under `parent`, made by this call and no earlier one: a
+/// name left behind by a crash is skipped, not reused.
+fn fresh_dir(parent: &Path) -> Result<PathBuf> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = parent.join(format!("{}-{n}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("no free directory under {}", parent.display())
+}
+
 /// Decode a HEIF file by converting it to JPEG with heif-convert in a
 /// directory of its own. libheif applies the file's rotation and mirroring
 /// properties as it decodes.
@@ -123,20 +155,16 @@ fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
     let Some(tool) = heif_convert() else {
         return Err(NoDecoder.into());
     };
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "vinosearch-heif-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
+    let dir = fresh_dir(&heif_scratch()?)?;
     let converted = (|| -> Result<Vec<u8>> {
         let input = dir.join("in.heic");
         let output = dir.join("out.jpg");
-        std::fs::write(&input, bytes)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&input)?
+            .write_all(bytes)?;
         let mut cmd = std::process::Command::new(tool);
         cmd.arg("-q").arg("90").arg(&input).arg(&output);
         crate::proc::run(cmd, &[], CONVERT_WALL).context("heif-convert")?;
@@ -238,6 +266,33 @@ fn patchify(img: &RgbImage) -> Result<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scratch_dir_is_never_one_that_was_already_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir().join(format!("vinosearch-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        // Every name the next few calls could pick, made beforehand.
+        let pid = std::process::id();
+        for n in 0..200 {
+            let _ = std::fs::create_dir(parent.join(format!("{pid}-{n}")));
+        }
+        let before: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        match fresh_dir(&parent) {
+            Ok(dir) => {
+                assert!(!before.contains(&dir));
+                let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+            Err(e) => assert!(e.to_string().contains("no free directory")),
+        }
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
 
     #[test]
     fn sizes_match_the_processor() {
