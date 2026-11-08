@@ -1101,6 +1101,28 @@ fn gnome_files() -> Result<GnomeFiles> {
     })
 }
 
+/// Tell the desktop the app menu entries changed. Plasma reads them from its
+/// ksycoca cache, which can go on launching a binary that's gone (a release
+/// replaced by a source build) until it's rebuilt. Best effort: neither tool
+/// is needed for the entries to work once the cache catches up.
+fn refresh_menu() {
+    let quiet = |program: &str, args: &[&std::ffi::OsStr]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if let Ok(data) = data_home() {
+        quiet(
+            "update-desktop-database",
+            &["-q".as_ref(), data.join("applications").as_os_str()],
+        );
+    }
+    let _ = quiet("kbuildsycoca6", &[]) || quiet("kbuildsycoca5", &[]);
+}
+
 fn launcher_path() -> Result<PathBuf> {
     Ok(data_home()?.join("applications").join(DESKTOP_ID))
 }
@@ -1237,7 +1259,9 @@ pub fn install_place(place: Place) -> Result<()> {
         Place::Kde => install_kde(),
         Place::Gnome => install_gnome(),
         Place::Menu => install_search_entry(),
-    }
+    }?;
+    refresh_menu();
+    Ok(())
 }
 
 /// Remove `place`'s files; the service stays for the other place, the CLI
@@ -1265,6 +1289,7 @@ pub fn uninstall_place(place: Place) -> Result<()> {
     if place == Place::Kde {
         restart_krunner();
     }
+    refresh_menu();
     Ok(())
 }
 
@@ -1366,6 +1391,7 @@ pub fn install(
             Place::Menu => install_search_entry()?,
         }
     }
+    refresh_menu();
     Ok(())
 }
 
@@ -1520,6 +1546,7 @@ pub fn uninstall() -> Result<()> {
         }
     }
     systemctl(&["daemon-reload"]);
+    refresh_menu();
     Ok(())
 }
 
