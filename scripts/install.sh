@@ -203,6 +203,12 @@ if [ "$prebuilt" = 1 ]; then
     if [ -f install.sh ]; then
         install -m 755 install.sh "$BIN/vinosearch-upgrade" && echo "installed $BIN/vinosearch-upgrade"
     fi
+    # A source build left in ~/.cargo/bin would keep the service on it. Only
+    # once the new copy is in place, so a failed install keeps the old one.
+    for b in vinosearch vinosearch-settings; do
+        [ -x "$CARGO_BIN/$b" ] || continue
+        if command -v cargo >/dev/null; then cargo uninstall "$b"; else rm -f -- "$CARGO_BIN/$b"; fi
+    done
 else
     step "Building vinosearch"
     cargo install --locked --path .
@@ -214,6 +220,11 @@ else
         step "Installing ovfetch"
         cargo install --locked ovfetch
     fi
+    # A release install left in ~/.local/bin comes first on PATH and would
+    # shadow this build; its vinosearch-upgrade marks it as a release install.
+    for f in vinosearch vinosearch-settings vinosearch-upgrade; do
+        if [ -e "$LOCAL_BIN/$f" ]; then rm -f -- "$LOCAL_BIN/$f" && echo "removed $LOCAL_BIN/$f"; fi
+    done
 fi
 export PATH="$BIN:$PATH"
 
