@@ -127,8 +127,9 @@ impl Pending {
 /// Paths to check against the index, each once however many times it was
 /// asked for: the watcher's debounced batches, its check of every root and
 /// a Reindex of one can all name the same file. The worker takes the most
-/// urgent: a path the watcher saw change (what the user is working on), then
-/// a root to register and walk, then what a walk found the index behind on.
+/// urgent: a root to register and walk (asked for, and needing no model, so
+/// a busy watcher can't hold it back), then a path the watcher saw change
+/// (what the user is working on), then what a walk found the index behind on.
 /// Held work (paused, for power, or for a model that failed to load) simply
 /// stays here, and queries never wait behind any of it.
 #[derive(Default)]
@@ -189,16 +190,16 @@ impl Work {
     /// needs no model) and nothing else.
     fn take(&self, roots_only: bool) -> Option<Item> {
         let mut s = self.0.lock().unwrap();
-        if !roots_only && let Some(p) = s.changes.pop_first() {
-            return Some(Item::Check(p));
-        }
         if !s.roots.is_empty() {
             return Some(Item::Root(s.roots.remove(0)));
         }
         if roots_only {
             return None;
         }
-        s.stale.pop_first().map(Item::Check)
+        s.changes
+            .pop_first()
+            .or_else(|| s.stale.pop_first())
+            .map(Item::Check)
     }
 
     /// Drop a forgotten root: a Reindex of it still waiting would make it a
@@ -978,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn work_takes_changes_then_roots_then_what_walks_found_each_once() {
+    fn work_takes_roots_then_changes_then_what_walks_found_each_once() {
         let work = Work::default();
         work.found([p("/h/b"), p("/h/c")]);
         work.changed([p("/h/b"), p("/h/a")]);
@@ -994,13 +995,23 @@ mod tests {
         assert_eq!(
             order,
             [
+                Item::Root(p("/h")),
                 Item::Check(p("/h/a")),
                 Item::Check(p("/h/b")),
-                Item::Root(p("/h")),
                 Item::Check(p("/h/c")),
             ]
         );
         assert!(!work.pending());
+    }
+
+    #[test]
+    fn a_root_added_while_the_watcher_keeps_finding_changes_is_taken_next() {
+        let work = Work::default();
+        work.changed([p("/h/a"), p("/h/b")]);
+        assert_eq!(work.take(false), Some(Item::Check(p("/h/a"))));
+        work.root(p("/h/dev"));
+        work.changed([p("/h/c")]);
+        assert_eq!(work.take(false), Some(Item::Root(p("/h/dev"))));
     }
 
     #[test]
@@ -1031,9 +1042,9 @@ mod tests {
         assert_eq!(
             left,
             [
+                Item::Root(p("/h/docs")),
                 Item::Check(p("/h/dev/proj/x.rs")),
                 Item::Check(p("/h/docs/z.md")),
-                Item::Root(p("/h/docs")),
             ]
         );
     }
