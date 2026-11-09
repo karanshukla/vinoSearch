@@ -285,6 +285,20 @@ fn typed_folders_are_named_fields_that_take_enter() {
         "{sent:?}"
     );
     assert!(h.state().adding.is_none());
+    // Listed at once, though the service hasn't registered it yet.
+    assert!(h.query_by_label("/srv/photos").is_some());
+    assert!(h.query_by_label("Waiting to index").is_some());
+    // Once Status lists it, it's an ordinary root.
+    if let Some(Ok(s)) = &mut h.state().link.shared.lock().unwrap().status {
+        s.roots.push("/srv/photos".into());
+    }
+    settle(&mut h);
+    assert!(h.state().joining.is_empty());
+    assert!(h.query_by_label("Waiting to index").is_none());
+    assert!(
+        h.query_by_role_and_label(Role::Button, "Remove /srv/photos")
+            .is_some()
+    );
 
     h.get_by_role_and_label(Role::TextInput, "Folder to exclude")
         .focus();
