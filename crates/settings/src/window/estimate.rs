@@ -186,6 +186,9 @@ impl SettingsWindow {
         if add {
             self.link
                 .send(crate::control::Request::Reindex(path.display().to_string()));
+            // As Status will list it: the service canonicalizes what it's sent.
+            let listed = std::fs::canonicalize(&path).unwrap_or(path);
+            self.joining.insert(listed.display().to_string());
             self.adding = None;
         } else if cancel {
             self.adding = None;

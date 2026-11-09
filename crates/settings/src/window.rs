@@ -148,6 +148,10 @@ struct SettingsWindow {
     check_asked: Option<u64>,
     /// Roots asked to be forgotten that Status still lists, hidden meanwhile.
     forgetting: HashSet<String>,
+    /// Folders added that Status doesn't list yet, shown meanwhile: the
+    /// service registers one only once its worker takes it, behind whatever
+    /// changed under the other roots.
+    joining: HashSet<String>,
     notice: Option<String>,
     integration: Arc<Mutex<integration::State>>,
     doctor: Arc<Mutex<doctor::State>>,
@@ -217,6 +221,7 @@ impl SettingsWindow {
             focus_cancel: false,
             check_asked: None,
             forgetting: HashSet::new(),
+            joining: HashSet::new(),
             notice: None,
             integration: Arc::new(Mutex::new(integration::State::read())),
             doctor: Arc::default(),
@@ -494,6 +499,9 @@ impl SettingsWindow {
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
         self.forgetting.retain(|r| roots.contains(r));
         roots.retain(|r| !self.forgetting.contains(r));
+        self.joining.retain(|r| !roots.contains(r));
+        roots.extend(self.joining.iter().cloned());
+        roots.sort();
         let indexing = reachable.is_some_and(|s| s.indexing);
         widgets::group(ui, |ui| {
             if reachable.is_some() && roots.is_empty() {
@@ -502,6 +510,20 @@ impl SettingsWindow {
                 });
             }
             for root in &roots {
+                if self.joining.contains(root) {
+                    let path = tilde(Path::new(root));
+                    Row::new("").custom(
+                        ui,
+                        |ui| {
+                            path_label(ui, Icon::Folder, &path, false);
+                            None
+                        },
+                        |ui, _| {
+                            widgets::small(ui, "Waiting to index");
+                        },
+                    );
+                    continue;
+                }
                 let forget = Confirm::Forget(root.clone());
                 let confirming = self.confirm.as_ref() == Some(&forget);
                 let path = tilde(Path::new(root));
@@ -1728,6 +1750,8 @@ impl SettingsWindow {
         let shared = self.link.shared.lock().unwrap().clone();
         if let Some(refused) = shared.refused {
             self.link.shared.lock().unwrap().refused = None;
+            // Which request it was isn't known; an add refused would show forever.
+            self.joining.clear();
             self.notice = Some(refused);
         }
 
