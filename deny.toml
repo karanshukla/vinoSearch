@@ -15,6 +15,12 @@ ignore = [
     # ttf-parser is unmaintained; lopdf uses it only to embed fonts when
     # writing a PDF, which reading text never does. No safe upgrade is available.
     "RUSTSEC-2026-0192",
+    # Bundled SQLCipher is vulnerable to a crafted database and WAL with
+    # different page sizes. The index directory is private, but imported or
+    # tampered indexes remain a risk. Even rusqlite 0.41 bundles an affected
+    # SQLCipher; remove this when a patched release is available:
+    # https://github.com/rusqlite/rusqlite/pull/1932
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
