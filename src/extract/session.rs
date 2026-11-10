@@ -186,12 +186,66 @@ pub fn load(path: &std::path::Path) -> Result<Vec<u8>> {
 /// The transcript's chunks by line, then the summary's from SUMMARY_LINES.
 pub fn chunks(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     let (mut zip, _) = open(bytes)?;
-    let mut out = crate::index::chunk(&read(&mut zip, TRANSCRIPT)?);
+    let mut out = transcript_chunks(&read(&mut zip, TRANSCRIPT)?);
     if has(&zip, SUMMARY) {
         let summary = crate::index::chunk(&read(&mut zip, SUMMARY)?);
         out.extend(summary.into_iter().map(|(n, c)| (SUMMARY_LINES + n, c)));
     }
     Ok(out)
+}
+
+/// A transcript chunk holds at least this much before the next paragraph
+/// starts a new one: about 15 s of speech. A one-sentence paragraph alone
+/// embeds poorly, and a session that pauses often would make many.
+const MIN_PARAGRAPHS_CHARS: usize = crate::index::CHUNK_CHARS / 4;
+
+/// A transcript's chunks, each starting at a paragraph, so a hit's `[MM:SS]`
+/// is the paragraph it matched in rather than the first of a minute's speech
+/// packed together. Short paragraphs are joined up to MIN_PARAGRAPHS_CHARS; a
+/// paragraph over CHUNK_CHARS is cut as any long line is. A chunk is numbered
+/// by its first stamped line, so the header before `[00:00]` doesn't leave
+/// the first chunk without a stamp. Text with no stamps is chunked as text.
+fn transcript_chunks(text: &str) -> Vec<(usize, String)> {
+    use crate::index::CHUNK_CHARS;
+    if !text.lines().any(|l| stamp(l).is_some()) {
+        return crate::index::chunk(text);
+    }
+    // (first line, first stamped line, text) of each run of paragraphs.
+    let mut runs: Vec<(usize, usize, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut first = 1;
+    let mut stamped: Option<usize> = None;
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
+        if stamp(line).is_some() {
+            if let Some(s) = stamped.filter(|_| {
+                cur.trim().len() >= MIN_PARAGRAPHS_CHARS || cur.len() + line.len() + 1 > CHUNK_CHARS
+            }) {
+                runs.push((first, s, std::mem::take(&mut cur)));
+                stamped = None;
+            }
+            stamped.get_or_insert(n);
+        }
+        if cur.is_empty() {
+            first = n;
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    runs.push((first, stamped.unwrap_or(first), cur));
+    let mut out = Vec::new();
+    for (first, stamped, run) in runs {
+        if run.len() <= CHUNK_CHARS {
+            out.push((stamped, run));
+            continue;
+        }
+        // One paragraph too long for a chunk: its pieces keep its line.
+        for (line, piece) in crate::index::chunk(&run) {
+            out.push(((first + line - 1).max(stamped), piece));
+        }
+    }
+    out.retain(|(_, c)| !c.trim().is_empty());
+    out
 }
 
 pub fn about(bytes: &[u8]) -> Result<About> {
@@ -280,7 +334,9 @@ pub(crate) mod tests {
     fn transcript_by_line_then_summary_past_it() {
         let c = chunks(&bundle(Some(SUMMARY_TEXT), "vinowhisper-session/1")).unwrap();
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0].0, 1);
+        // The header joins [00:00]'s chunk, numbered by [00:00]'s line.
+        assert_eq!(c[0].0, 3);
+        assert!(c[0].1.starts_with("vinoWhisper transcript"));
         assert!(c[0].1.contains("[01:12] The second item"));
         assert_eq!(c[1].0, SUMMARY_LINES + 1);
         assert_eq!(Part::of(c[1].0 as i64), (Part::Summary, 1));
@@ -379,6 +435,66 @@ pub(crate) mod tests {
                 .all(|(n, _)| *n < SUMMARY_LINES)
         );
         assert!(!about(without).unwrap().has_summary);
+    }
+
+    /// One paragraph per topic, each long enough to stand alone.
+    fn three_topics() -> String {
+        let para = |t: &str, what: &str| format!("[{t}] {}\n\n", what.repeat(12));
+        format!(
+            "vinoWhisper transcript, 2026-11-10 22:43, weekend notes.mp4, CPU\n\n{}{}{}",
+            para("00:00", "Feed the sourdough starter. "),
+            para("00:21", "Replace the bike chain. "),
+            para("00:46", "File the tax return. ")
+        )
+    }
+
+    #[test]
+    fn each_paragraph_starts_a_chunk_under_its_stamp() {
+        let text = three_topics();
+        let c = transcript_chunks(&text);
+        let stamps: Vec<_> = c.iter().map(|(n, _)| stamp_at(&text, *n)).collect();
+        assert_eq!(
+            stamps,
+            ["00:00", "00:21", "00:46"].map(|s| Some(s.to_owned()))
+        );
+        assert!(c[1].1.starts_with("[00:21] Replace the bike chain."));
+        assert!(!c[1].1.contains("sourdough") && !c[1].1.contains("tax"));
+    }
+
+    #[test]
+    fn short_paragraphs_join_until_a_chunk_is_long_enough() {
+        let mut text = String::from("vinoWhisper transcript, header\n\n");
+        for s in 0..40 {
+            text.push_str(&format!("[00:{s:02}] Yes.\n\n"));
+        }
+        let c = transcript_chunks(&text);
+        assert!(c.len() > 1, "a chunk stops once it is long enough");
+        assert!(c.len() < 40, "one-word paragraphs aren't chunks alone");
+        for (n, chunk) in &c {
+            let at = stamp_at(&text, *n).unwrap();
+            assert!(chunk.contains(&format!("[{at}] Yes.")));
+        }
+    }
+
+    #[test]
+    fn a_paragraph_too_long_for_a_chunk_is_cut_under_its_stamp() {
+        let text = format!(
+            "header\n\n[00:00] Short.\n\n[02:30] {}\n",
+            "Word after word. ".repeat(200)
+        );
+        let c = transcript_chunks(&text);
+        assert!(c.len() > 2);
+        assert!(c.iter().all(|(_, t)| t.len() <= crate::index::CHUNK_CHARS));
+        assert_eq!(stamp_at(&text, c[0].0).as_deref(), Some("00:00"));
+        for (n, _) in &c[1..] {
+            assert_eq!(stamp_at(&text, *n).as_deref(), Some("02:30"));
+        }
+    }
+
+    #[test]
+    fn text_with_no_stamps_is_chunked_as_text() {
+        let text = "no stamps here\njust lines\n";
+        assert_eq!(transcript_chunks(text), crate::index::chunk(text));
     }
 
     #[test]
