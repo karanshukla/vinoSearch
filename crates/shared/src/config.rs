@@ -9,6 +9,7 @@
 //! index_busy_percent = 50
 //! index_on_battery = true
 //! editor = "code"
+//! player = "mpv --start={seconds} {file}"
 //!
 //! [formats.text]
 //! min_score = 0.65
@@ -125,6 +126,12 @@ pub struct Config {
     /// without a shell [default: the default app for the file's type].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// What plays a media result at its time (#188): an app's desktop entry
+    /// id, a known player (`mpv`, `vlc`, `celluloid`), or any command with
+    /// `{file}` and `{seconds}` (whole seconds) in it, split on spaces and
+    /// run without a shell [default: the default app for the file's type].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<String>,
     /// What kinds of file are indexed, and how close a result must be (#73).
     pub formats: Formats,
     /// Encrypting the index at rest (#4).
@@ -232,6 +239,7 @@ impl Default for Config {
             index_busy_percent: None,
             index_on_battery: None,
             editor: None,
+            player: None,
             formats: Formats::default(),
             encryption: Encryption::default(),
         }
@@ -376,6 +384,10 @@ impl Config {
         match self.editor.as_deref().map(str::trim) {
             Some(e) if !e.is_empty() => doc["editor"] = toml_edit::value(e),
             _ => drop(doc.remove("editor")),
+        }
+        match self.player.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => doc["player"] = toml_edit::value(p),
+            _ => drop(doc.remove("player")),
         }
         let f = &self.formats;
         // Through its shortest decimal, so 0.7 is written as 0.7, not 0.699999988.
@@ -674,6 +686,7 @@ mod tests {
         c.idle_unload_minutes = Some(0.0);
         c.index_on_battery = Some(false);
         c.editor = Some("foot -e nvim +{line} {file}".into());
+        c.player = Some("mpv --start={seconds} {file}".into());
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("index_on_battery = false\n"), "{text}");
@@ -683,6 +696,10 @@ mod tests {
         );
         assert!(!text.contains("device"), "{text}");
         assert!(text.contains("idle_unload_minutes = 0\n"), "{text}");
+        assert!(
+            text.contains("player = \"mpv --start={seconds} {file}\"\n"),
+            "{text}"
+        );
         assert_eq!(Config::load(&path).unwrap(), c);
 
         c.exclude.clear();
@@ -695,8 +712,14 @@ mod tests {
                 .contains("index_on_battery")
         );
         c.editor = None;
+        c.player = Some("  ".into());
         c.save(&path).unwrap();
-        assert!(!fs::read_to_string(&path).unwrap().contains("editor"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("editor") && !text.contains("player"),
+            "{text}"
+        );
+        c.player = None;
         assert_eq!(Config::load(&path).unwrap(), c);
         fs::remove_dir_all(&dir).unwrap();
     }
