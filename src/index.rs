@@ -8,6 +8,7 @@
 pub mod code;
 pub mod encryption;
 pub mod estimate;
+pub mod media;
 pub mod seal;
 
 use crate::config::{Excludes, Formats};
@@ -93,15 +94,21 @@ pub enum Kind {
     /// A vinoWhisper session's transcript and summary (#143), chunks of one
     /// `.vwsession` file; `extract::session::Part::of` says which.
     Session = 4,
+    /// An audio or video file's sound, 10 s windows numbered by their first
+    /// second, and its frames, from `extract::media::FRAME_LINES` up
+    /// (#187); `extract::media::Track::of` says which. Embedded after
+    /// everything else, from `index_rest`.
+    Media = 5,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Text,
         Kind::Document,
         Kind::Image,
         Kind::Code,
         Kind::Session,
+        Kind::Media,
     ];
 
     fn from_db(v: i64) -> Self {
@@ -110,6 +117,7 @@ impl Kind {
             2 => Kind::Document,
             3 => Kind::Code,
             4 => Kind::Session,
+            5 => Kind::Media,
             _ => Kind::Text,
         }
     }
@@ -121,6 +129,9 @@ impl Kind {
             Kind::Text | Kind::Code => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document | Kind::Session => MAX_DOCUMENT_BYTES,
+            // Held to `formats.media.max_hours` by duration instead, and
+            // never read whole.
+            Kind::Media => u64::MAX,
         }
     }
 
@@ -142,6 +153,14 @@ impl Kind {
                 crate::ml::model::OCR_REVISION,
                 crate::ml::ocr::READING,
             ),
+            Kind::Media => format!(
+                "{}+{}/{}+audio:{}+{}",
+                crate::ml::model::REVISION,
+                crate::ml::model::VISION_REVISION,
+                crate::ml::vision::SOFT_TOKENS,
+                crate::ml::model::AUDIO_REVISION,
+                crate::ml::model::AUDIO_TEXT_REVISION,
+            ),
         }
     }
 
@@ -152,6 +171,7 @@ impl Kind {
             Kind::Image => "model.image",
             Kind::Code => "model.code",
             Kind::Session => "model.session",
+            Kind::Media => "model.media",
         }
     }
 }
@@ -166,6 +186,10 @@ pub struct FileTypes {
     sessions: bool,
     /// vinoWhisper's own folder of sessions, where nothing else is taken.
     sessions_dir: Option<PathBuf>,
+    /// Audio and video, while on and ffmpeg is installed (#187).
+    media: bool,
+    /// The longest media file indexed, in seconds.
+    max_media_seconds: f64,
     ignores: SharedIgnores,
 }
 
@@ -188,8 +212,17 @@ impl FileTypes {
             code: formats.code_enabled(),
             sessions: formats.sessions_enabled(),
             sessions_dir: sessions_dir(),
+            media: formats.media_enabled() && crate::extract::media::ffmpeg(),
+            max_media_seconds: formats.media_max_seconds()?,
             ignores: SharedIgnores::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_media(mut self, on: bool, max_seconds: f64) -> Self {
+        self.media = on;
+        self.max_media_seconds = max_seconds;
+        self
     }
 
     #[cfg(test)]
@@ -232,6 +265,9 @@ impl FileTypes {
             return Some(Kind::Document);
         }
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        if self.media && crate::config::MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+            return Some(Kind::Media);
+        }
         self.images.contains(&ext).then_some(Kind::Image)
     }
 }
@@ -369,6 +405,15 @@ pub fn open(path: &Path) -> Result<Connection> {
                AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
          END;",
     )?;
+    // Media in part (#187) waits for every document's rest, and only on AC.
+    let has_media: bool = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('partial') WHERE name = 'media'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_media {
+        conn.execute_batch("ALTER TABLE partial ADD COLUMN media INTEGER NOT NULL DEFAULT 0")?;
+    }
     words_table(&conn)?;
     code_apart(&conn)?;
     Ok(conn)
@@ -697,12 +742,23 @@ pub fn index_file<E: Embed>(
     let read = match kind {
         Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
         Kind::Image | Kind::Document | Kind::Session => fs::read(path),
+        // Hashed as it streams instead.
+        Kind::Media => Ok(Vec::new()),
     };
     let Ok(bytes) = read else {
         remove(conn, path)?;
         return Ok(Outcome::Skipped);
     };
-    let hash = Sha256::digest(&bytes).to_vec();
+    let hash = match kind {
+        Kind::Media => match media::hash(path) {
+            Ok(h) => h,
+            Err(_) => {
+                remove(conn, path)?;
+                return Ok(Outcome::Skipped);
+            }
+        },
+        _ => Sha256::digest(&bytes).to_vec(),
+    };
     let holder = holder_of(conn, &hash, key)?;
     if let Some((id, _, _, old_hash)) = known {
         if old_hash.as_ref() == Some(&hash) {
@@ -741,8 +797,17 @@ pub fn index_file<E: Embed>(
         record(conn)?;
         return Ok(Outcome::Duplicate);
     }
+    if kind == Kind::Media {
+        return media::start(
+            conn,
+            path,
+            (key, mtime, size, &hash),
+            types.max_media_seconds,
+        );
+    }
     let title = title_of(path);
     let (first, vectors, kinds) = match kind {
+        Kind::Media => unreachable!("started above"),
         Kind::Text | Kind::Code => {
             let text = String::from_utf8(bytes).expect("read as a string");
             // Kept as a row with no chunks, so it isn't read again until it
@@ -1001,7 +1066,7 @@ fn next_rest(conn: &Connection) -> Result<Option<Next>> {
         .query_row(
             "SELECT f.id, f.path, f.mtime, f.size, p.done, p.total
              FROM partial p JOIN files f ON f.id = p.file_id
-             ORDER BY p.file_id LIMIT 1",
+             ORDER BY p.media, p.file_id LIMIT 1",
             [],
             |r| {
                 Ok((
@@ -1106,6 +1171,15 @@ pub fn index_rest<E: Embed>(
         } => (id, path, from, total),
     };
     let path = Path::new(&key);
+    // Media isn't hashed again for each slice: next_rest's stamp check
+    // stands for it.
+    match types.kind(path) {
+        Some(Kind::Media) => {
+            return media::rest(conn, emb, id, key, from, total, between).map(Some);
+        }
+        None => return again(conn, emb, key, between),
+        _ => {}
+    }
     let hash: Option<Vec<u8>> =
         conn.query_row("SELECT sha256 FROM files WHERE id = ?1", [id], |r| r.get(0))?;
     let (kind, bytes) = match (types.kind(path), fs::read(path)) {
@@ -1179,10 +1253,16 @@ fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
     cut
 }
 
-/// Whether any document is indexed in part only.
-pub fn has_partial(conn: &Connection) -> Result<bool> {
+/// Whether any document is indexed in part only, or any media file if
+/// `media`. `index_rest` takes media last, so with documents waiting it
+/// takes those whatever this says.
+pub fn has_partial(conn: &Connection, media: bool) -> Result<bool> {
     Ok(conn
-        .query_row("SELECT 1 FROM partial LIMIT 1", [], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM partial WHERE media = 0 OR ?1 LIMIT 1",
+            [media],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some())
 }
@@ -1698,8 +1778,8 @@ pub fn counts(conn: &Connection) -> Result<(i64, i64)> {
 /// A file counts under the kind of its chunks, an image's text (#106) under
 /// images, so one recorded without any (a photo with no decoder) counts
 /// under none.
-pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 5]> {
-    let mut out = [(0, 0); 5];
+pub fn counts_by_kind(conn: &Connection) -> Result<[(i64, i64); 6]> {
+    let mut out = [(0, 0); 6];
     let mut stmt = conn.prepare(
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM chunks i WHERE i.file_id = c.file_id AND i.kind = ?1)
                 THEN ?1 ELSE c.kind END AS k,
@@ -2149,7 +2229,13 @@ pub fn scope(query: &str) -> (&str, &'static [Kind]) {
         Some(q) => (q, &[Kind::Code]),
         None => (
             query,
-            &[Kind::Text, Kind::Document, Kind::Image, Kind::Session],
+            &[
+                Kind::Text,
+                Kind::Document,
+                Kind::Image,
+                Kind::Session,
+                Kind::Media,
+            ],
         ),
     }
 }
@@ -2366,7 +2452,7 @@ mod tests {
         file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
         let counts = counts_by_kind(&conn).unwrap();
         // Kind::ALL's order: text, documents, images.
-        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0), (0, 0)]);
+        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0), (0, 0), (0, 0)]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2940,7 +3026,7 @@ mod tests {
         fs::write(&book, "a long book").unwrap();
         let key = book.to_str().unwrap().to_owned();
         let id = add_partial(&conn, &book, 30, 70);
-        assert!(has_partial(&conn).unwrap());
+        assert!(has_partial(&conn, true).unwrap());
         assert_eq!(partial(&conn, 10).unwrap(), [(key.clone(), 30, 70)]);
         let parts = |from| Next::Parts {
             id,
@@ -2958,7 +3044,7 @@ mod tests {
         let run = [(61, "third".to_owned())];
         store_rest(&mut conn, id, Kind::Text, 70, 70, &run, &[vec![0.0; DIM]]).unwrap();
         assert_eq!(next_rest(&conn).unwrap(), None);
-        assert!(!has_partial(&conn).unwrap());
+        assert!(!has_partial(&conn, true).unwrap());
         // Still one file, with every run's chunks.
         assert_eq!(counts(&conn).unwrap(), (1, 3));
         assert_eq!(counts_by_kind(&conn).unwrap()[0], (1, 3));
@@ -2980,7 +3066,7 @@ mod tests {
         // Indexed again, the old row and its partial row go.
         conn.execute("DELETE FROM files WHERE id = ?1", [id])
             .unwrap();
-        assert!(!has_partial(&conn).unwrap());
+        assert!(!has_partial(&conn, true).unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3006,7 +3092,7 @@ mod tests {
         assert_eq!(counts(&conn).unwrap(), (1, 1));
         conn.execute("DELETE FROM files WHERE id = ?1", [copy])
             .unwrap();
-        assert!(!has_partial(&conn).unwrap());
+        assert!(!has_partial(&conn, true).unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3107,7 +3193,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             counts_by_kind(&conn).unwrap(),
-            [(2, 3), (0, 0), (1, 1), (0, 0), (0, 0)]
+            [(2, 3), (0, 0), (1, 1), (0, 0), (0, 0), (0, 0)]
         );
         assert_eq!(counts(&conn).unwrap(), (4, 4));
         fs::remove_dir_all(&dir).unwrap();

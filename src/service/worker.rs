@@ -747,8 +747,10 @@ fn run_with<E: Embed>(
         } else {
             status.work.take(waiting_model).or_else(|| {
                 // The first pass over everything is done; the rest of long
-                // documents is what's left, a run of parts at a time.
-                (rest_ready && !waiting_model && index::has_partial(&conn).unwrap_or(false))
+                // documents is what's left, a run of parts at a time, then
+                // audio and video, on AC only (#192).
+                let media = !status.power.on_battery();
+                (rest_ready && !waiting_model && index::has_partial(&conn, media).unwrap_or(false))
                     .then_some(Item::Rest)
             })
         };

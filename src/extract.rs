@@ -13,6 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
+pub mod media;
 mod ole;
 mod rtf;
 pub mod session;
