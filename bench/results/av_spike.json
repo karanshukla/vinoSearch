@@ -1,0 +1,150 @@
+{
+ "timing": {
+  "audio": 64.1,
+  "frames": 535.5020000000001,
+  "fused": 599.8019999999999,
+  "transcript": 1.546
+ },
+ "windows": 19,
+ "frames": 46,
+ "paras": [
+  [
+   0,
+   "To make sourdough bread, feed your start"
+  ],
+  [
+   49,
+   "Then lube it and wipe off the extra oil."
+  ]
+ ],
+ "out": [
+  {
+   "kind": "speech",
+   "query": "how do I fix my bicycle drivetrain",
+   "transcript": "NO 0.760 @0s (right -, wrong 0.760)",
+   "audio": "ok 0.714 @25s (right 0.714, wrong 0.699)",
+   "frames": "NO 0.607 @40s (right 0.601, wrong 0.607)",
+   "fused": "ok 0.712 @25s (right 0.712, wrong 0.671)"
+  },
+  {
+   "kind": "speech",
+   "query": "baking bread with wild yeast",
+   "transcript": "ok 0.711 @0s (right 0.711, wrong 0.546)",
+   "audio": "ok 0.611 @5s (right 0.611, wrong 0.579)",
+   "frames": "ok 0.594 @10s (right 0.594, wrong 0.574)",
+   "fused": "ok 0.677 @5s (right 0.677, wrong 0.589)"
+  },
+  {
+   "kind": "speech",
+   "query": "when is my tax paperwork due",
+   "transcript": "NO 0.744 @49s (right -, wrong 0.744)",
+   "audio": "ok 0.708 @65s (right 0.708, wrong 0.559)",
+   "frames": "NO 0.562 @25s (right 0.528, wrong 0.562)",
+   "fused": "ok 0.658 @65s (right 0.658, wrong 0.590)"
+  },
+  {
+   "kind": "sound",
+   "query": "a dog barking",
+   "transcript": "NO 0.582 @0s (right -, wrong 0.582)",
+   "audio": "ok 0.713 @15s (right 0.713, wrong 0.688)",
+   "frames": "NO 0.643 @50s (right 0.578, wrong 0.643)",
+   "fused": "NO 0.704 @85s (right 0.670, wrong 0.704)"
+  },
+  {
+   "kind": "sound",
+   "query": "church bells ringing",
+   "transcript": "NO 0.565 @0s (right 0.543, wrong 0.565)",
+   "audio": "NO 0.711 @50s (right 0.686, wrong 0.711)",
+   "frames": "NO 0.591 @60s (right 0.579, wrong 0.591)",
+   "fused": "NO 0.624 @85s (right 0.598, wrong 0.624)"
+  },
+  {
+   "kind": "sound",
+   "query": "rain falling",
+   "transcript": "NO 0.614 @49s (right -, wrong 0.614)",
+   "audio": "ok 0.659 @55s (right 0.659, wrong 0.651)",
+   "frames": "NO 0.613 @60s (right 0.600, wrong 0.613)",
+   "fused": "NO 0.633 @90s (right 0.621, wrong 0.633)"
+  },
+  {
+   "kind": "sound",
+   "query": "an ambulance siren",
+   "transcript": "NO 0.580 @49s (right -, wrong 0.580)",
+   "audio": "ok 0.722 @85s (right 0.722, wrong 0.673)",
+   "frames": "ok 0.624 @80s (right 0.624, wrong 0.617)",
+   "fused": "ok 0.716 @85s (right 0.716, wrong 0.653)"
+  },
+  {
+   "kind": "sound",
+   "query": "someone talking",
+   "transcript": "ok 0.599 @0s (right 0.599, wrong 0.587)",
+   "audio": "NO 0.642 @90s (right 0.631, wrong 0.642)",
+   "frames": "NO 0.645 @50s (right 0.624, wrong 0.645)",
+   "fused": "NO 0.676 @20s (right 0.665, wrong 0.676)"
+  },
+  {
+   "kind": "picture",
+   "query": "a sea turtle swimming",
+   "transcript": "NO 0.559 @49s (right -, wrong 0.559)",
+   "audio": "NO 0.605 @55s (right 0.590, wrong 0.605)",
+   "frames": "ok 0.735 @15s (right 0.735, wrong 0.687)",
+   "fused": "ok 0.769 @15s (right 0.769, wrong 0.698)"
+  },
+  {
+   "kind": "picture",
+   "query": "a football match in a stadium",
+   "transcript": "NO 0.520 @0s (right 0.513, wrong 0.520)",
+   "audio": "NO 0.613 @80s (right 0.564, wrong 0.613)",
+   "frames": "ok 0.681 @45s (right 0.681, wrong 0.671)",
+   "fused": "NO 0.677 @50s (right 0.675, wrong 0.677)"
+  },
+  {
+   "kind": "picture",
+   "query": "cats sleeping on a couch",
+   "transcript": "NO 0.546 @0s (right -, wrong 0.546)",
+   "audio": "NO 0.585 @15s (right 0.558, wrong 0.585)",
+   "frames": "NO 0.737 @60s (right 0.735, wrong 0.737)",
+   "fused": "NO 0.708 @45s (right 0.706, wrong 0.708)"
+  },
+  {
+   "kind": "picture",
+   "query": "a tiger",
+   "transcript": "NO 0.568 @0s (right -, wrong 0.568)",
+   "audio": "ok 0.643 @90s (right 0.643, wrong 0.634)",
+   "frames": "ok 0.752 @90s (right 0.752, wrong 0.709)",
+   "fused": "ok 0.773 @90s (right 0.773, wrong 0.714)"
+  },
+  {
+   "kind": "picture",
+   "query": "an airport terminal",
+   "transcript": "NO 0.578 @49s (right -, wrong 0.578)",
+   "audio": "NO 0.613 @90s (right 0.600, wrong 0.613)",
+   "frames": "ok 0.681 @75s (right 0.681, wrong 0.681)",
+   "fused": "ok 0.708 @65s (right 0.708, wrong 0.693)"
+  },
+  {
+   "kind": "picture",
+   "query": "zebras and giraffes on the savanna",
+   "transcript": "NO 0.536 @49s (right 0.524, wrong 0.536)",
+   "audio": "NO 0.573 @55s (right 0.519, wrong 0.573)",
+   "frames": "ok 0.759 @5s (right 0.759, wrong 0.615)",
+   "fused": "ok 0.708 @0s (right 0.708, wrong 0.626)"
+  },
+  {
+   "kind": "picture",
+   "query": "a busy city street",
+   "transcript": "NO 0.598 @49s (right -, wrong 0.598)",
+   "audio": "NO 0.654 @55s (right 0.605, wrong 0.654)",
+   "frames": "NO 0.694 @40s (right 0.691, wrong 0.694)",
+   "fused": "NO 0.685 @40s (right 0.682, wrong 0.685)"
+  },
+  {
+   "kind": "both",
+   "query": "a tiger with a siren wailing",
+   "transcript": "NO 0.554 @49s (right -, wrong 0.554)",
+   "audio": "ok 0.726 @85s (right 0.726, wrong 0.662)",
+   "frames": "ok 0.703 @85s (right 0.703, wrong 0.687)",
+   "fused": "ok 0.801 @85s (right 0.801, wrong 0.715)"
+  }
+ ]
+}
