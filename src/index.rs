@@ -130,9 +130,10 @@ impl Kind {
     /// build's queries without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
-            Kind::Text | Kind::Document | Kind::Code | Kind::Session => {
-                crate::ml::model::REVISION.to_owned()
-            }
+            Kind::Text | Kind::Document | Kind::Code => crate::ml::model::REVISION.to_owned(),
+            // Chunked by paragraph since #186: the vectors are the same model's,
+            // but a hit's stamp is only right in chunks made that way.
+            Kind::Session => format!("{}+paragraphs", crate::ml::model::REVISION),
             Kind::Image => format!(
                 "{}+{}/{}+ocr:{}/{}",
                 crate::ml::model::REVISION,
