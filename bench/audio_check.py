@@ -96,7 +96,10 @@ def main():
             del r
 
     text = core.compile_model(core.read_model(text_dir / "onnx" / "model_audio_250.onnx"), device)
-    query_model = core.compile_model(core.read_model(text_dir / "onnx" / "model_text.onnx"), device)
+    # Static like the app's (src/ml/embed.rs): the NPU won't compile dynamic token counts.
+    query_graph = core.read_model(text_dir / "onnx" / "model_text.onnx")
+    query_graph.reshape({"input_ids": [1, L], "attention_mask": [1, L]})
+    query_model = core.compile_model(query_graph, device)
     tok = Tokenizer.from_file(str(text_dir / "tokenizer.json"))
     tok.enable_truncation(L)
     tok.enable_padding(length=L)
