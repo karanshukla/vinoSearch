@@ -56,6 +56,8 @@ pub mod status {
     /// Audio and video files (#187), and their sound windows and frames.
     pub const MEDIA_FILES: &str = "media_files";
     pub const MEDIA_CHUNKS: &str = "media_chunks";
+    /// ffmpeg and ffprobe are on the service's PATH; media needs both.
+    pub const FFMPEG: &str = "ffmpeg";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";

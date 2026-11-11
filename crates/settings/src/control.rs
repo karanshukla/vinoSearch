@@ -36,6 +36,10 @@ pub struct Status {
     pub session_chunks: i64,
     /// Sessions not read: a newer format, or broken (#143).
     pub sessions_unread: i64,
+    /// Audio and video (#187), and whether the service has ffmpeg for them.
+    pub media_files: i64,
+    pub media_chunks: i64,
+    pub ffmpeg: bool,
     pub roots: Vec<String>,
     pub model_present: bool,
     pub fetching: bool,
@@ -146,6 +150,9 @@ impl Status {
             session_files: signed(status::SESSION_FILES),
             session_chunks: signed(status::SESSION_CHUNKS),
             sessions_unread: signed(status::SESSIONS_UNREAD),
+            media_files: signed(status::MEDIA_FILES),
+            media_chunks: signed(status::MEDIA_CHUNKS),
+            ffmpeg: flag(status::FFMPEG),
             roots,
             model_present: flag(status::MODEL_PRESENT),
             fetching: flag(status::FETCHING),

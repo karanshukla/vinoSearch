@@ -1109,6 +1109,58 @@ impl SettingsWindow {
                         widgets::small(ui, text);
                     }
                 });
+            let media = self.config.formats.media_enabled();
+            Row::new("Audio and video")
+                .help("By what's heard and seen. Plugged in only. 295 MB download.")
+                .show(ui, |ui, _| {
+                    let mut on = media;
+                    if widgets::switch(ui, &mut on, "Index audio and video").changed() {
+                        self.config.formats.media.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.media_files, Some(s.media_chunks))
+                    {
+                        widgets::small(ui, text);
+                    }
+                });
+            if media
+                && let Some(s) = s
+                && !s.ffmpeg
+            {
+                Row::new("")
+                    .help("Needs ffmpeg: install it from your distribution's packages.")
+                    .tone(Tone::Error)
+                    .show(ui, |_, _| {});
+            } else if media
+                && let Some(s) = s
+                && !s.model_present
+            {
+                Row::new("").tint(p.warn_tint).custom(
+                    ui,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            icons::icon(ui, Icon::Warning, 16.0, p.warn);
+                            let shown = ui.add(
+                                egui::Label::new(
+                                    "The audio and vision models aren't downloaded yet.",
+                                )
+                                .wrap(),
+                            );
+                            a11y::live(&shown);
+                        });
+                        None
+                    },
+                    |ui, _| {
+                        if ui
+                            .add_enabled(!s.fetching, Button::primary("Download").small())
+                            .clicked()
+                        {
+                            self.link.send(Request::FetchModel);
+                        }
+                    },
+                );
+            }
             if let Some(s) = s
                 && s.sessions_unread > 0
             {

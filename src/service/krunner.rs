@@ -702,6 +702,10 @@ impl Control {
                 || (model::vision_present(&model_dir, &vision_dir)
                     && model::audio_present(&model_dir, &model::audio_dir().map_err(failed)?)));
         out.insert(key::MODEL_PRESENT.into(), owned(Variant::from(present)));
+        out.insert(
+            key::FFMPEG.into(),
+            owned(Variant::from(crate::extract::media::ffmpeg())),
+        );
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
             .iter()
