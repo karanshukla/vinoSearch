@@ -26,6 +26,8 @@ const ADDRESS_SPACE: u64 = 2 << 30;
 /// CPU seconds per second of media, on top of a minute. 4K HEVC decoded in
 /// software runs near real time on a small laptop.
 const CPU_PER_SECOND: f64 = 2.0;
+/// The longest duration the CPU limit allows for, whatever a file claims.
+const MAX_SECONDS: f64 = 12.0 * 3600.0;
 /// No output for this long and the decoder is killed: a hang, or a FIFO
 /// that never fills.
 const STALL: Duration = Duration::from_secs(120);
@@ -333,8 +335,10 @@ fn input(path: &Path) -> std::ffi::OsString {
     s
 }
 
+/// From the duration the file claims, so held to MAX_SECONDS: an enormous
+/// claim would otherwise cast to `u64::MAX`, which is RLIM_INFINITY.
 fn cpu_seconds(probe: &Probe) -> u64 {
-    60 + (probe.seconds * CPU_PER_SECOND) as u64
+    60 + (probe.seconds.clamp(0.0, MAX_SECONDS) * CPU_PER_SECOND) as u64
 }
 
 /// `tool` with the address space and CPU limits, reading only files.
@@ -645,6 +649,19 @@ mod tests {
             .collect();
         assert_eq!(seconds.len(), 3, "{seconds:?}");
         assert!((seconds[1] - 30.0).abs() < 0.5 && (seconds[2] - 60.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_claimed_duration_cant_lift_the_cpu_limit() {
+        let claim = |seconds| Probe {
+            seconds,
+            audio: true,
+            video: true,
+        };
+        let most = 60 + (MAX_SECONDS * CPU_PER_SECOND) as u64;
+        assert_eq!(cpu_seconds(&claim(1e300)), most);
+        assert_eq!(cpu_seconds(&claim(f64::INFINITY)), most);
+        assert_eq!(cpu_seconds(&claim(10.0)), 80);
     }
 
     #[test]
