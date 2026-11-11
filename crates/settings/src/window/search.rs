@@ -128,6 +128,8 @@ impl Filters {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Act {
     Open,
+    /// A session that plays its recording by default: its transcript.
+    OpenTranscript,
     OpenFolder,
     Copy,
 }
@@ -208,7 +210,9 @@ impl SearchWindow {
 
     fn act(&mut self, act: Act, f: &Found) {
         self.link.send(match act {
+            Act::Open if f.timed() => Ask::Play(f.path.clone(), f.at),
             Act::Open => Ask::Open(f.path.clone(), f.at),
+            Act::OpenTranscript => Ask::Open(f.path.clone(), 0),
             Act::OpenFolder => Ask::OpenFolder(f.path.clone()),
             Act::Copy => Ask::Copy(f.path.clone()),
         });
@@ -377,7 +381,9 @@ impl SearchWindow {
                         tile(ui, &f, 20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let named = |r| a11y::for_what(r, f.name());
-                            let open = if f.place().is_empty() {
+                            let open = if f.timed() {
+                                format!("Play at {}", f.place())
+                            } else if f.place().is_empty() {
                                 "Open".to_owned()
                             } else {
                                 format!("Open at {}", f.place())
@@ -387,6 +393,12 @@ impl SearchWindow {
                                 .clicked()
                             {
                                 self.act(Act::Open, &f);
+                            }
+                            if f.timed()
+                                && format_of(&f.path).is_none()
+                                && named(ui.add(Button::secondary("Open transcript"))).clicked()
+                            {
+                                self.act(Act::OpenTranscript, &f);
                             }
                             if named(ui.add(Button::secondary("Open folder"))).clicked() {
                                 self.act(Act::OpenFolder, &f);

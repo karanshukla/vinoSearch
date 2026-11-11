@@ -44,6 +44,14 @@ impl Source for Fake {
         Ok(())
     }
 
+    fn play(&mut self, path: &str, second: u32) -> Result<(), String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(Ask::Play(path.to_owned(), second));
+        Ok(())
+    }
+
     fn open_folder(&mut self, path: &str) -> Result<(), String> {
         self.asked
             .lock()
@@ -337,6 +345,51 @@ fn the_filter_menus_open_and_pick_from_the_keyboard() {
     settle(&mut h);
     assert_eq!(h.state().filters.folder.as_deref(), Some("/srv/photos"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_session_with_a_recording_plays_it_and_still_opens_its_transcript() {
+    let session = "/srv/t/2026-10-27-140512.vwsession";
+    let asked_ = Asked::default();
+    let fake = Fake {
+        results: vec![found(
+            session,
+            Kind::Text,
+            "It happens in March.",
+            "second",
+            72,
+            1,
+        )],
+        asked: Arc::clone(&asked_),
+    };
+    let mut w = SearchWindow::with("budget", fake);
+    w.now = || NOW;
+    let mut h = harness(w, WIDE);
+    answered(&mut h);
+    options(&h, "Text and documents")[0].click();
+    settle(&mut h);
+    let name = "2026-10-27-140512.vwsession";
+    h.get_by_role_and_label(Role::Button, &format!("Play at 01:12 {name}"))
+        .click();
+    asked(&asked_, &mut h, &Ask::Play(session.into(), 72));
+    h.get_by_role_and_label(Role::Button, &format!("Open transcript {name}"))
+        .click();
+    asked(&asked_, &mut h, &Ask::Open(session.into(), 0));
+}
+
+#[test]
+fn a_media_result_names_the_time_it_plays_from() {
+    let clip = found("/srv/v/trip.mkv", Kind::Image, "", "second", 754, 1);
+    assert!(clip.timed());
+    assert_eq!(clip.place(), "12:34");
+    let long = found("/srv/v/film.mkv", Kind::Image, "", "second", 3723, 1);
+    assert_eq!(long.place(), "1:02:03");
+    // The start of the file is a place too, as line 0 never is.
+    let start = found("/srv/v/trip.mkv", Kind::Image, "", "second", 0, 1);
+    assert_eq!(start.place(), "00:00");
+    let note = found("/srv/n/a.md", Kind::Text, "x", "line", 0, 1);
+    assert!(!note.timed());
+    assert_eq!(note.place(), "");
 }
 
 #[test]

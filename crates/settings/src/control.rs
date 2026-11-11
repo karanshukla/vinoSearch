@@ -155,10 +155,16 @@ impl Status {
             sessions_unread: signed(status::SESSIONS_UNREAD),
             media_files: signed(status::MEDIA_FILES),
             media_chunks: signed(status::MEDIA_CHUNKS),
-            ffmpeg: flag(status::FFMPEG),
+            // A service from before the key says nothing: no warning then.
+            ffmpeg: !matches!(get(status::FFMPEG), Some(Variant::Bool(false))),
             roots,
             model_present: flag(status::MODEL_PRESENT),
-            images_model_present: flag(status::IMAGES_MODEL_PRESENT),
+            // A service from before the key reports the vision encoder in
+            // `model_present`, when images are on.
+            images_model_present: match get(status::IMAGES_MODEL_PRESENT) {
+                Some(Variant::Bool(b)) => *b,
+                _ => flag(status::MODEL_PRESENT),
+            },
             media_model_present: flag(status::MEDIA_MODEL_PRESENT),
             fetching: flag(status::FETCHING),
             fetch_done: unsigned(status::FETCH_DONE),
@@ -326,12 +332,15 @@ fn call(conn: &mut Option<zbus::Connection>, request: &Request) -> Result<(), St
     result.map_err(|e| explain(conn, e))
 }
 
+/// What a call answers when nothing owns or can start the service's name.
+pub const NOT_INSTALLED: &str = "The search service isn't installed. Turn it on under Integration.";
+
 /// The runner's own message for a refusal; otherwise what went wrong on the
 /// bus, after which the next call reconnects.
 fn explain(conn: &mut Option<zbus::Connection>, e: zbus::Error) -> String {
     match e {
         zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("ServiceUnknown") => {
-            "The search service isn't installed. Turn it on under Integration.".to_owned()
+            NOT_INSTALLED.to_owned()
         }
         zbus::Error::MethodError(_, Some(message), _) => message,
         other => {
@@ -345,6 +354,27 @@ fn explain(conn: &mut Option<zbus::Connection>, e: zbus::Error) -> String {
 mod tests {
     use super::*;
     use zbus::Array;
+
+    #[test]
+    fn an_older_service_without_the_newer_keys_raises_no_warning() {
+        let mut map = HashMap::new();
+        map.insert(
+            status::MODEL_PRESENT.to_owned(),
+            OwnedVariant::try_from(Variant::Bool(true)).unwrap(),
+        );
+        let old = Status::parse(&map);
+        assert!(old.images_model_present && old.ffmpeg);
+        assert!(!old.media_model_present);
+        // A service that sends them is believed.
+        for key in [status::IMAGES_MODEL_PRESENT, status::FFMPEG] {
+            map.insert(
+                key.to_owned(),
+                OwnedVariant::try_from(Variant::Bool(false)).unwrap(),
+            );
+        }
+        let new = Status::parse(&map);
+        assert!(!new.images_model_present && !new.ffmpeg);
+    }
 
     #[test]
     fn status_reads_every_key_and_tolerates_missing_ones() {

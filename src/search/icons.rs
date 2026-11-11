@@ -12,6 +12,17 @@ use std::sync::OnceLock;
 
 const SESSION_ICON: &str = "io.github.karanshukla.vinowhisper";
 
+/// Whether `path` is a sound file by its extension; an `ogg` can hold video,
+/// and is nearly always sound.
+fn sound_only(path: &Path) -> bool {
+    const SOUND: &[&str] = &[
+        "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "wma",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SOUND.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// The best icon name for `path`, then the generic one for its kind.
 pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
     static ICONS: OnceLock<HashMap<String, String>> = OnceLock::new();
@@ -20,6 +31,7 @@ pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
         Kind::Image => "image-x-generic",
         Kind::Document => "x-office-document",
         Kind::Code => "text-x-script",
+        Kind::Media if sound_only(path) => "audio-x-generic",
         Kind::Media => "video-x-generic",
         // What vinoWhisper registers for the type (vinoWhisper#123), so a
         // result looks as the file does in a file manager.
@@ -143,6 +155,19 @@ fn icon_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sound_file_falls_back_to_the_audio_icon() {
+        assert!(sound_only(Path::new("/m/talk.MP3")));
+        assert!(!sound_only(Path::new("/m/talk.mkv")));
+        assert!(!sound_only(Path::new("/m/talk")));
+        // Every sound extension is one media indexing takes.
+        for e in [
+            "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "wma",
+        ] {
+            assert!(crate::config::MEDIA_EXTENSIONS.contains(&e), "{e}");
+        }
+    }
 
     #[test]
     fn extensions_take_the_heaviest_type_with_an_installed_icon() {

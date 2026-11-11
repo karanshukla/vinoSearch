@@ -507,8 +507,14 @@ impl Config {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
-        fs::write(&tmp, doc.to_string()).with_context(|| tmp.display().to_string())?;
-        fs::rename(&tmp, path).with_context(|| path.display().to_string())
+        let saved = fs::write(&tmp, doc.to_string())
+            .with_context(|| tmp.display().to_string())
+            .and_then(|()| fs::rename(&tmp, path).with_context(|| path.display().to_string()));
+        if saved.is_err() {
+            // Each save has its own name, so nothing else would clear it.
+            let _ = fs::remove_file(&tmp);
+        }
+        saved
     }
 
     pub fn excludes(&self) -> Result<Excludes> {

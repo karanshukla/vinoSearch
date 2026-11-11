@@ -576,7 +576,11 @@ fn run(cli: Cli) -> Result<bool> {
             Ok(true)
         }
         Command::Menu { launcher } => {
-            menu::run(launcher.as_deref(), s.file.editor.as_deref())?;
+            menu::run(
+                launcher.as_deref(),
+                s.file.editor.as_deref(),
+                s.file.player.as_deref(),
+            )?;
             Ok(true)
         }
         Command::Watch => {

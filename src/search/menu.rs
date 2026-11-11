@@ -96,7 +96,7 @@ fn ask(cmd: &[String], choices: &[String]) -> Result<Option<String>> {
 struct Row {
     path: String,
     line: String,
-    /// Where it matched, from the match's `line` or `page`.
+    /// Where it matched, from the match's `line`, `page` or `second`.
     at: Option<At>,
 }
 
@@ -121,6 +121,11 @@ fn tilde(path: &str, home: Option<&str>) -> String {
         },
         _ => path.to_owned(),
     }
+}
+
+/// A media match's second: 0 is a place there, as it never is for a line.
+fn second(props: &HashMap<String, OwnedVariant>) -> Option<u32> {
+    props.get("second").and_then(|v| u32::try_from(v).ok())
 }
 
 /// The runner's matches as launcher rows, best first. A row is the file name
@@ -151,8 +156,20 @@ fn rows(mut matches: Vec<Match>, home: Option<&str>) -> Vec<Row> {
             };
             let at = number("line")
                 .map(At::Line)
-                .or_else(|| number("page").map(At::Page));
-            Row { path, line, at }
+                .or_else(|| number("page").map(At::Page))
+                .or_else(|| second(&props).map(At::Second));
+            // A transcript hit whose recording is indexed plays it (#188).
+            let play = props
+                .get("play")
+                .and_then(|v| String::try_from(v.try_clone().ok()?).ok());
+            match (play, second(&props)) {
+                (Some(file), Some(s)) => Row {
+                    path: file,
+                    line,
+                    at: Some(At::Second(s)),
+                },
+                _ => Row { path, line, at },
+            }
         })
         .collect()
 }
@@ -185,7 +202,7 @@ fn search(query: &str) -> Result<Vec<Match>> {
     }
 }
 
-pub fn run(given: Option<&str>, editor: Option<&str>) -> Result<()> {
+pub fn run(given: Option<&str>, editor: Option<&str>, player: Option<&str>) -> Result<()> {
     let cmd = launcher(given, on_path)?;
     let Some(query) = ask(&cmd, &[])? else {
         return Ok(());
@@ -204,7 +221,7 @@ pub fn run(given: Option<&str>, editor: Option<&str>) -> Result<()> {
     let Some(row) = rows.iter().find(|r| r.line == picked) else {
         return Ok(());
     };
-    crate::search::open::open(Path::new(&row.path), row.at, editor);
+    crate::search::open::open(Path::new(&row.path), row.at, editor, player);
     Ok(())
 }
 
@@ -268,9 +285,23 @@ mod tests {
             "page".to_owned(),
             OwnedVariant::try_from(Variant::from(3u32)).unwrap(),
         );
-        let r = rows(vec![text, pdf, m("/c.png", "c.png", 0.3, "/")], None);
+        // A media match's second can be 0, the start of the file.
+        let mut clip = m("/d.mkv", "d.mkv", 0.35, "/, heard at 00:00");
+        clip.5.insert(
+            "second".to_owned(),
+            OwnedVariant::try_from(Variant::from(0u32)).unwrap(),
+        );
+        let r = rows(vec![text, pdf, clip, m("/c.png", "c.png", 0.3, "/")], None);
         let at: Vec<Option<At>> = r.iter().map(|r| r.at).collect();
-        assert_eq!(at, [Some(At::Line(12)), Some(At::Page(3)), None]);
+        assert_eq!(
+            at,
+            [
+                Some(At::Line(12)),
+                Some(At::Page(3)),
+                Some(At::Second(0)),
+                None
+            ]
+        );
     }
 
     #[test]

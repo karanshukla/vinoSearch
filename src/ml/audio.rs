@@ -55,6 +55,12 @@ pub fn log_mel(samples: &[f32]) -> Result<Features> {
         "{} samples, more than a {WINDOW_SAMPLES}-sample window",
         samples.len()
     );
+    // A float file can hold NaN or infinity, which would go through every
+    // bin to the encoder and come back as no embedding at all.
+    ensure!(
+        samples.iter().all(|x| x.is_finite()),
+        "samples that are not numbers"
+    );
     let t = tables();
     let frames = valid_frames(samples.len());
     let mut mel = vec![0f32; FRAMES * MELS];
@@ -233,6 +239,15 @@ mod tests {
     #[test]
     fn more_than_a_window_is_refused() {
         assert!(log_mel(&vec![0.0; WINDOW_SAMPLES + 1]).is_err());
+    }
+
+    #[test]
+    fn samples_that_are_not_numbers_are_refused() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut samples = vec![0.1; SAMPLE_RATE];
+            samples[777] = bad;
+            assert!(log_mel(&samples).is_err(), "{bad}");
+        }
     }
 
     #[test]

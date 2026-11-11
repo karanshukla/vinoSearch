@@ -9,7 +9,9 @@
 //! battery is read from sysfs every BATTERY_EVERY, as `sched::Pace` does.
 //!
 //! Held work waits in the worker with what a PauseIndexing holds, and a
-//! `Job::Retry` runs it once nothing holds it any more.
+//! `Job::Retry` runs it once nothing holds it any more. Audio and video wait
+//! for a charger whatever `index_on_battery` says (#192), so plugging one in
+//! sends a Retry too.
 
 use crate::service::sched;
 use crate::service::worker::{Job, Status};
@@ -86,20 +88,23 @@ impl State {
         )
     }
 
-    /// Apply `change`; true when that released held indexing, which then
-    /// needs a Retry.
+    /// Apply `change`; true when that released held indexing, or with
+    /// nothing held brought a charger, which media waits for: either needs
+    /// a Retry.
     fn update(&self, change: impl FnOnce(&Self)) -> bool {
         let _guard = self.lock.lock().unwrap();
         let before = self.hold();
+        let was_on_battery = self.on_battery();
         change(self);
         let after = self.hold();
+        let plugged_in = was_on_battery && !self.on_battery();
         if before != after {
             match after {
                 Some(h) => eprintln!("indexing held: {}", h.says()),
                 None => eprintln!("indexing resumed"),
             }
         }
-        before.is_some() && after.is_none()
+        (before.is_some() || plugged_in) && after.is_none()
     }
 
     /// On battery now, whatever `index_on_battery` says: media waits for AC
@@ -309,6 +314,23 @@ mod tests {
         // Unplugged again, then the setting turned back on.
         assert!(!s.set_on_battery(true));
         assert!(s.set_index_on_battery(true));
+    }
+
+    #[test]
+    fn a_charger_asks_for_a_retry_even_when_nothing_was_held() {
+        // index_on_battery on, the default: nothing is held on battery, but
+        // media waits for the charger.
+        let s = State::default();
+        assert!(!s.set_on_battery(true));
+        assert_eq!(s.hold(), None);
+        assert!(s.set_on_battery(false));
+        // Still plugged in, and unplugging: nothing new to run.
+        assert!(!s.set_on_battery(false));
+        assert!(!s.set_on_battery(true));
+        // A charger under power saver: the Retry comes when that ends.
+        assert!(!s.set_power_saver(true));
+        assert!(!s.set_on_battery(false));
+        assert!(s.set_power_saver(false));
     }
 
     #[test]

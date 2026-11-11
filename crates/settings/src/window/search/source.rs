@@ -28,7 +28,8 @@ pub struct Found {
     pub score: f64,
     /// The matching text, flattened; empty for a photo.
     pub snippet: String,
-    /// What `at` counts: "line", "page", "slide", ...; empty for nothing.
+    /// What `at` counts: "line", "page", "slide", ..., "second" for audio
+    /// and video (from 0); empty for nothing.
     pub unit: String,
     /// Where the match is, from 1; 0 for nowhere in particular.
     pub at: u32,
@@ -48,9 +49,23 @@ impl Found {
         Path::new(&self.path).parent().unwrap_or(Path::new("/"))
     }
 
-    /// "page 4", "line 12"; empty when the match has no place to name.
+    /// Whether the match is a time in an audio or video file, or in the
+    /// recording a session was made from (#188).
+    pub fn timed(&self) -> bool {
+        self.unit == "second"
+    }
+
+    /// "page 4", "line 12", "04:05" into a media file; empty when the match
+    /// has no place to name.
     pub fn place(&self) -> String {
-        if self.unit.is_empty() || self.at == 0 {
+        if self.timed() {
+            let (h, m, s) = (self.at / 3600, self.at / 60 % 60, self.at % 60);
+            if h > 0 {
+                format!("{h}:{m:02}:{s:02}")
+            } else {
+                format!("{m:02}:{s:02}")
+            }
+        } else if self.unit.is_empty() || self.at == 0 {
             String::new()
         } else {
             format!("{} {}", self.unit, self.at)
@@ -73,6 +88,8 @@ pub trait Source: Send + 'static {
     fn roots(&mut self) -> Result<Vec<String>, String>;
     /// Open `path` at `at` (0 for the top), as KRunner opens a match.
     fn open(&mut self, path: &str, at: u32) -> Result<(), String>;
+    /// Play `path`, or the recording a session was made from, at `second`.
+    fn play(&mut self, path: &str, second: u32) -> Result<(), String>;
     fn open_folder(&mut self, path: &str) -> Result<(), String>;
     /// Put `path` on the clipboard as a file.
     fn copy(&mut self, path: &str) -> Result<(), String>;
@@ -83,6 +100,7 @@ pub enum Ask {
     /// The query, and a number the answer comes back with.
     Search(u64, String),
     Open(String, u32),
+    Play(String, u32),
     OpenFolder(String),
     Copy(String),
 }
@@ -163,6 +181,7 @@ fn run(source: &mut impl Source, out: &Mutex<Answers>, ask: Ask) {
             return;
         }
         Ask::Open(path, at) => (source.open(&path, at), None),
+        Ask::Play(path, second) => (source.play(&path, second), None),
         Ask::OpenFolder(path) => (source.open_folder(&path), None),
         Ask::Copy(path) => {
             let done = format!("Copied {}", name(&path));
@@ -273,6 +292,11 @@ impl Source for Runner {
 
     fn open(&mut self, path: &str, at: u32) -> Result<(), String> {
         let done: zbus::Result<()> = self.invoke("Open", &(path, at));
+        done.map_err(|e| self.explain(e))
+    }
+
+    fn play(&mut self, path: &str, second: u32) -> Result<(), String> {
+        let done: zbus::Result<()> = self.invoke("Play", &(path, second));
         done.map_err(|e| self.explain(e))
     }
 
