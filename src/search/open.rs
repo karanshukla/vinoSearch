@@ -125,28 +125,41 @@ fn args(style: Style, file: &Path, at: At) -> Option<Vec<String>> {
     })
 }
 
-/// The command for the `editor` setting: a template when it has `{file}`
-/// (each word on its own, `{line}` replaced too), else a known editor with
-/// its line flag, else the command with the file and no line. Words are
-/// split on whitespace, never through a shell.
-fn editor_argv(editor: &str, file: &Path, line: u32) -> Option<Vec<String>> {
-    let words: Vec<&str> = editor.split_whitespace().collect();
+/// The command for a setting like `editor` or `player`: a template when it
+/// has `{file}` (each word on its own, every `fields` placeholder replaced
+/// too), else the command with what `place` gives for its program, else the
+/// command with the file alone. Words are split on whitespace, never through
+/// a shell, so a path with spaces or quotes stays one argument.
+fn setting_argv(
+    setting: &str,
+    file: &Path,
+    fields: &[(&str, String)],
+    place: impl FnOnce(&str) -> Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let words: Vec<&str> = setting.split_whitespace().collect();
     let program = *words.first()?;
     let f = file.display().to_string();
     if words.iter().any(|w| w.contains("{file}")) {
-        return Some(
-            words
+        let fill = |w: &str| {
+            let w = fields
                 .iter()
-                .map(|w| w.replace("{line}", &line.to_string()).replace("{file}", &f))
-                .collect(),
-        );
+                .fold(w.to_owned(), |w, (key, value)| w.replace(key, value));
+            w.replace("{file}", &f)
+        };
+        return Some(words.iter().map(|w| fill(w)).collect());
     }
     let mut argv: Vec<String> = words.iter().map(|&w| w.to_owned()).collect();
-    match style(program).and_then(|s| args(s, file, At::Line(line))) {
-        Some(a) => argv.extend(a),
-        None => argv.push(f),
-    }
+    argv.extend(place(program).unwrap_or_else(|| vec![f]));
     Some(argv)
+}
+
+/// The command for the `editor` setting: a template with `{file}` and
+/// `{line}`, else a known editor with its line flag, else the command with
+/// the file and no line.
+fn editor_argv(editor: &str, file: &Path, line: u32) -> Option<Vec<String>> {
+    setting_argv(editor, file, &[("{line}", line.to_string())], |program| {
+        args(style(program)?, file, At::Line(line))
+    })
 }
 
 /// A desktop file's `Exec` and `Terminal`.
@@ -282,16 +295,21 @@ fn xdg_mime(args: &[&std::ffi::OsStr]) -> Option<String> {
     (out.status.success() && !line.is_empty() && !line.contains('\n')).then_some(line)
 }
 
-/// The default app's desktop entry for `file`. A text subtype with no
-/// default of its own (`text/rust`) takes text/plain's, as xdg-open does.
+/// The default app's desktop entry for `file` at `at`.
 fn default_entry(file: &Path, at: At) -> Option<Entry> {
     let mime = match at {
         At::Page(_) => "application/pdf".to_owned(),
         At::Line(_) => xdg_mime(&["query".as_ref(), "filetype".as_ref(), file.as_os_str()])?,
         At::Session(..) => return None,
     };
+    default_app(&mime)
+}
+
+/// The default app's desktop entry for `mime`. A text subtype with no
+/// default of its own (`text/rust`) takes text/plain's, as xdg-open does.
+fn default_app(mime: &str) -> Option<Entry> {
     let default = |m: &str| xdg_mime(&["query".as_ref(), "default".as_ref(), m.as_ref()]);
-    let id = match default(&mime) {
+    let id = match default(mime) {
         Some(id) => id,
         None if mime.starts_with("text/") => default("text/plain")?,
         None => return None,
@@ -300,23 +318,26 @@ fn default_entry(file: &Path, at: At) -> Option<Entry> {
 }
 
 /// The command a picked editor's entry gives: at the line when it is an app
-/// known to take one, else the file alone, as the app's own `Exec`. A
-/// Flatpak's file goes inside its `@@u ... @@`, which hands it to the
-/// sandbox. None for a terminal app.
+/// known to take one, else the file alone, as the app's own `Exec`. None for
+/// a terminal app.
 fn picked_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
     if entry.terminal {
         return None;
     }
-    app_argv(entry, file, at).or_else(|| {
-        let mut argv = entry.exec.clone();
-        let f = file.display().to_string();
-        let opened = argv.iter().position(|w| w == "@@u" || w == "@@f");
-        match opened.and_then(|o| argv[o..].iter().position(|w| w == "@@").map(|c| o + c)) {
-            Some(close) => argv.insert(close, f),
-            None => argv.push(f),
-        }
-        Some(argv)
-    })
+    app_argv(entry, file, at).or_else(|| Some(exec_with_file(entry, file)))
+}
+
+/// An entry's `Exec` with `file` where its `%U` was: inside a Flatpak's
+/// `@@u ... @@`, which hands it to the sandbox, else at the end.
+fn exec_with_file(entry: &Entry, file: &Path) -> Vec<String> {
+    let mut argv = entry.exec.clone();
+    let f = file.display().to_string();
+    let opened = argv.iter().position(|w| w == "@@u" || w == "@@f");
+    match opened.and_then(|o| argv[o..].iter().position(|w| w == "@@").map(|c| o + c)) {
+        Some(close) => argv.insert(close, f),
+        None => argv.push(f),
+    }
+    argv
 }
 
 /// The command that opens `file` at `at`, if anything known can.
@@ -328,6 +349,118 @@ fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
         return editor_argv(e, file, l);
     }
     app_argv(&default_entry(file, at)?, file, at)
+}
+
+/// A media player known to start a file at a time (#188), by how it takes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Player {
+    /// `--start=S`
+    Mpv,
+    /// `--start-time=S`, parsed with `us_atof`, so a decimal point in any locale.
+    Vlc,
+    /// `--mpv-start=S`, which Celluloid hands to mpv as `--start`.
+    Celluloid,
+}
+
+/// The player `program` (a name or path) is, by its file name. Haruna and
+/// Totem/Showtime aren't here: no flag that starts a file at a time could be
+/// confirmed for them (Totem's hidden `--seek` is never read for a file).
+fn player(program: &str) -> Option<Player> {
+    Some(match Path::new(program).file_name()?.to_str()? {
+        "mpv" => Player::Mpv,
+        "vlc" => Player::Vlc,
+        "celluloid" => Player::Celluloid,
+        _ => return None,
+    })
+}
+
+/// `seconds`, 0 when negative or not a number.
+fn clamped(seconds: f64) -> f64 {
+    if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// `seconds` to the millisecond, without trailing zeros (`754`, `754.5`). All
+/// three known players take a decimal, and a window can start mid-second.
+fn decimal_seconds(seconds: f64) -> String {
+    let s = format!("{:.3}", clamped(seconds));
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// `seconds` rounded down to a whole second, for a template's `{seconds}`:
+/// its program is unknown and may not take a decimal, and rounding down never
+/// skips past the matched words.
+fn whole_seconds(seconds: f64) -> String {
+    // Truncating is the floor here, as the value is never negative.
+    (clamped(seconds) as u64).to_string()
+}
+
+/// The option that starts `player` at `seconds`.
+fn start_flag(player: Player, seconds: f64) -> String {
+    let s = decimal_seconds(seconds);
+    match player {
+        Player::Mpv => format!("--start={s}"),
+        Player::Vlc => format!("--start-time={s}"),
+        Player::Celluloid => format!("--mpv-start={s}"),
+    }
+}
+
+/// The command a player's desktop entry gives for `file` at `seconds`, if it
+/// is a known player that isn't a terminal app (a Flatpak's `Exec` is
+/// `flatpak run ...`, so it isn't one). The start flag goes before a `--`,
+/// as mpv's desktop file has, after which it would be taken for a file.
+fn entry_play_argv(entry: &Entry, file: &Path, seconds: f64) -> Option<Vec<String>> {
+    if entry.terminal {
+        return None;
+    }
+    let flag = start_flag(player(&entry.exec[0])?, seconds);
+    let mut argv = entry.exec.clone();
+    let at = argv.iter().position(|w| w == "--").unwrap_or(argv.len());
+    argv.insert(at, flag);
+    argv.push(file.display().to_string());
+    Some(argv)
+}
+
+/// The command for the `player` setting: an app's desktop entry id, a
+/// template with `{file}` and `{seconds}` (whole seconds), a known player
+/// with its start flag, or any other command with the file and no time.
+/// None when blank, or for a desktop entry id not found or run in a terminal.
+fn player_argv(setting: &str, file: &Path, seconds: f64) -> Option<Vec<String>> {
+    if vinosearch_shared::apps::is_entry_id(setting) {
+        let entry = find_entry(setting.trim())?;
+        if entry.terminal {
+            return None;
+        }
+        return entry_play_argv(&entry, file, seconds)
+            .or_else(|| Some(exec_with_file(&entry, file)));
+    }
+    let fields = [("{seconds}", whole_seconds(seconds))];
+    setting_argv(setting, file, &fields, |program| {
+        let flag = start_flag(player(program)?, seconds);
+        Some(vec![flag, file.display().to_string()])
+    })
+}
+
+/// The command that plays the media `file` from `seconds` in (#188): the
+/// `player` setting, else the default app for the file's type when it is a
+/// known player, else `xdg-open`, which can't seek. Looking up the default
+/// app runs `xdg-mime`, so call this off the bus.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once Play at lands in the front ends (#188)")
+)]
+pub fn play_argv(file: &Path, seconds: f64, player: Option<&str>) -> Vec<String> {
+    player
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| player_argv(p, file, seconds))
+        .or_else(|| {
+            let mime = xdg_mime(&["query".as_ref(), "filetype".as_ref(), file.as_os_str()])?;
+            entry_play_argv(&default_app(&mime)?, file, seconds)
+        })
+        .unwrap_or_else(|| vec!["xdg-open".into(), file.display().to_string()])
 }
 
 /// `argv` in a scope of its own when this runs as a systemd unit, so the app
@@ -795,5 +928,114 @@ mod tests {
             argv_at(f, At::Line(9), Some("kate")).as_deref(),
             Some([k, ..]) if k == "kate"
         ));
+    }
+
+    fn play(exec: &str, file: &str, seconds: f64) -> Option<Vec<String>> {
+        entry_play_argv(
+            &parse_entry(&entry(exec)).unwrap(),
+            Path::new(file),
+            seconds,
+        )
+    }
+
+    #[test]
+    fn known_players_start_at_the_time() {
+        // mpv's own desktop file ends its options with `--`.
+        assert_eq!(
+            play(
+                "mpv --player-operation-mode=pseudo-gui -- %U",
+                "/v/a.mkv",
+                754.0
+            )
+            .unwrap(),
+            [
+                "mpv",
+                "--player-operation-mode=pseudo-gui",
+                "--start=754",
+                "--",
+                "/v/a.mkv"
+            ]
+        );
+        assert_eq!(
+            play("/usr/bin/vlc --started-from-file %U", "/v/a.mkv", 754.0).unwrap(),
+            [
+                "/usr/bin/vlc",
+                "--started-from-file",
+                "--start-time=754",
+                "/v/a.mkv"
+            ]
+        );
+        assert_eq!(
+            play("celluloid --new-window %U", "/v/a.mkv", 754.0).unwrap(),
+            ["celluloid", "--new-window", "--mpv-start=754", "/v/a.mkv"]
+        );
+    }
+
+    #[test]
+    fn other_players_open_without_a_time() {
+        for exec in [
+            "haruna %u",
+            "totem %U",
+            "showtime %U",
+            "/usr/bin/flatpak run --command=mpv io.mpv.Mpv @@u %U @@",
+        ] {
+            assert_eq!(play(exec, "/v/a.mkv", 754.0), None, "{exec}");
+        }
+        let terminal = "[Desktop Entry]\nExec=mpv %U\nTerminal=true\n";
+        assert_eq!(
+            entry_play_argv(&parse_entry(terminal).unwrap(), Path::new("/v/a.mkv"), 7.0),
+            None
+        );
+    }
+
+    #[test]
+    fn known_players_take_the_time_to_the_millisecond() {
+        let flag = |s| play("mpv %U", "/a.mkv", s).unwrap()[1].clone();
+        assert_eq!(flag(754.5), "--start=754.5");
+        assert_eq!(flag(1.0 / 3.0), "--start=0.333");
+        assert_eq!(flag(59.9996), "--start=60");
+        assert_eq!(flag(0.0), "--start=0");
+        assert_eq!(flag(-3.0), "--start=0");
+        assert_eq!(flag(f64::NAN), "--start=0");
+    }
+
+    #[test]
+    fn the_player_setting() {
+        let f = Path::new("/v/it's a \"film\".mkv");
+        let name = f.display().to_string();
+        // A template: whole seconds, rounded down, and the path one argument.
+        assert_eq!(
+            player_argv("mpv --start={seconds} {file}", f, 754.9).unwrap(),
+            ["mpv", "--start=754", name.as_str()]
+        );
+        assert_eq!(
+            player_argv("ffplay -ss {seconds} -i {file}", f, 61.0).unwrap(),
+            ["ffplay", "-ss", "61", "-i", name.as_str()]
+        );
+        // A known player without a template gets its own flag.
+        assert_eq!(
+            player_argv("vlc", f, 754.5).unwrap(),
+            ["vlc", "--start-time=754.5", name.as_str()]
+        );
+        assert_eq!(
+            player_argv("/usr/bin/celluloid --new-window", f, 3.0).unwrap(),
+            [
+                "/usr/bin/celluloid",
+                "--new-window",
+                "--mpv-start=3",
+                name.as_str()
+            ]
+        );
+        // Unknown player, no template: the file, without a time.
+        assert_eq!(
+            player_argv("haruna", f, 754.0).unwrap(),
+            ["haruna", name.as_str()]
+        );
+        assert_eq!(player_argv("  ", f, 1.0), None);
+        // The setting wins over the default app, without asking xdg-mime.
+        assert_eq!(
+            play_argv(f, 2.0, Some("mpv")),
+            ["mpv", "--start=2", name.as_str()]
+        );
     }
 }

@@ -95,6 +95,7 @@ exclude = ["~/Downloads"]   # never indexed or watched, even under an indexed ro
 device = "NPU"
 idle_unload_minutes = 5     # free the model after this long idle; 0 keeps it loaded
 editor = "code"             # opens text results at their line [default: the default app]; or "org.kde.kate.desktop", or "foot -e nvim +{line} {file}"
+player = "mpv"              # plays media results at their time (mpv, vlc or celluloid) [default: the default app]; or "mpv --start={seconds} {file}"
 
 [formats.text]
 min_score = 0.65            # lower it for more, looser results
