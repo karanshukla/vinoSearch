@@ -20,6 +20,7 @@ fn kind(h: &Hit) -> &'static str {
         Kind::Text => results::TEXT,
         Kind::Code => results::CODE,
         Kind::Session => results::SESSION,
+        Kind::Media => results::MEDIA,
         Kind::Document if crate::extract::is_document(Path::new(&h.path)) => results::DOCUMENT,
         Kind::Document | Kind::Image => results::IMAGE,
     }
@@ -27,10 +28,10 @@ fn kind(h: &Hit) -> &'static str {
 
 /// Best chunk per file, files at or above their kind's `floor`, at most
 /// `limit` files of each of the window's kinds: text, then documents, then
-/// sessions, then images, best first within each.
+/// sessions, then audio and video, then images, best first within each.
 pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 5] = Default::default();
+    let mut groups: [Vec<Hit>; 6] = Default::default();
     for h in hits {
         if h.score < floor(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -39,8 +40,9 @@ pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> 
             results::TEXT => 0,
             results::DOCUMENT => 1,
             results::SESSION => 2,
-            results::IMAGE => 3,
-            _ => 4,
+            results::MEDIA => 3,
+            results::IMAGE => 4,
+            _ => 5,
         }];
         group.push(h);
     }
@@ -74,7 +76,7 @@ pub fn found(h: Hit) -> Option<Found> {
         u32::try_from(h.line).unwrap_or(0)
     };
     let snippet = match h.kind {
-        Kind::Image => String::new(),
+        Kind::Image | Kind::Media => String::new(),
         _ => crate::snippet(&h.text),
     };
     Some((

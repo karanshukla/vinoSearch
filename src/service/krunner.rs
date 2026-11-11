@@ -63,6 +63,7 @@ pub(crate) struct Floors {
     text: f32,
     image: f32,
     code: f32,
+    media: f32,
 }
 
 impl Floors {
@@ -84,6 +85,9 @@ impl Floors {
             code: formats
                 .code_min_score()
                 .unwrap_or(crate::config::DEFAULT_CODE_MIN_SCORE),
+            media: formats
+                .media_min_score()
+                .unwrap_or(crate::config::DEFAULT_MEDIA_MIN_SCORE),
         }
     }
 
@@ -92,6 +96,7 @@ impl Floors {
             Kind::Text | Kind::Document | Kind::Session => self.text,
             Kind::Image => self.image,
             Kind::Code => self.code,
+            Kind::Media => self.media,
         }
     }
 }
@@ -167,6 +172,15 @@ fn describe(h: &Hit) -> (String, String) {
             session_place(h).unwrap_or(dir),
             crate::snippet(&h.text)
         ),
+        Kind::Media => {
+            let (track, second) = crate::extract::media::Track::of(h.line);
+            let what = match track {
+                crate::extract::media::Track::Sound => "heard",
+                crate::extract::media::Track::Picture => "seen",
+            };
+            let at = crate::extract::media::stamp(second);
+            format!("{dir}, {what} at {at}{copies}")
+        }
     };
     (name, description)
 }
@@ -225,6 +239,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
         Kind::Code => "vinoSearch Code",
         Kind::Session => "vinoWhisper sessions",
+        Kind::Media => "vinoSearch Audio and Video",
     };
     props.insert("category".into(), owned(Variant::from(category)));
     // Without it KRunner offers every action on every match.
@@ -545,9 +560,12 @@ fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
 }
 
 impl Control {
-    /// Images are on in the config file as it is now; off if it doesn't parse.
-    fn images_enabled(&self) -> bool {
-        Config::load(&self.config).is_ok_and(|c| c.formats.images_enabled())
+    /// What the formats on in the config file as it is now need; nothing
+    /// extra if it doesn't parse.
+    fn model_wants(&self) -> model::Wants {
+        Config::load(&self.config)
+            .map(|c| model::Wants::of(&c.formats))
+            .unwrap_or_default()
     }
 
     fn send(&self, job: Job) -> zbus::fdo::Result<()> {
@@ -628,7 +646,7 @@ impl Control {
         );
         out.insert(key::FILES.into(), owned(Variant::from(files)));
         out.insert(key::CHUNKS.into(), owned(Variant::from(chunks)));
-        let [text, documents, images, code, sessions] =
+        let [text, documents, images, code, sessions, media] =
             index::counts_by_kind(&db).map_err(failed)?;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
@@ -640,6 +658,8 @@ impl Control {
             (key::CODE_CHUNKS, code.1),
             (key::SESSION_FILES, sessions.0),
             (key::SESSION_CHUNKS, sessions.1),
+            (key::MEDIA_FILES, media.0),
+            (key::MEDIA_CHUNKS, media.1),
             (
                 key::SESSIONS_UNREAD,
                 index::unread_sessions(&db).map_err(failed)?,
@@ -673,9 +693,14 @@ impl Control {
         let model_dir = model::default_dir().map_err(failed)?;
         let vision_dir = model::vision_dir().map_err(failed)?;
         let ocr_dir = model::ocr_dir().map_err(failed)?;
-        // The vision encoder and OCR count while images are on.
+        // The vision encoder and OCR count while images are on, and the
+        // vision and audio encoders while media is.
+        let wants = self.model_wants();
         let present = model::present(&model_dir)
-            && (!self.images_enabled() || model::images_present(&model_dir, &vision_dir, &ocr_dir));
+            && (!wants.images || model::images_present(&model_dir, &vision_dir, &ocr_dir))
+            && (!wants.media
+                || (model::vision_present(&model_dir, &vision_dir)
+                    && model::audio_present(&model_dir, &model::audio_dir().map_err(failed)?)));
         out.insert(key::MODEL_PRESENT.into(), owned(Variant::from(present)));
         let db_path = index::default_db().map_err(failed)?;
         let index_bytes: u64 = ["", "-wal", "-shm"]
@@ -870,12 +895,12 @@ impl Control {
         let jobs = self.jobs.lock().unwrap().clone();
         *status.fetch_error.lock().unwrap() = String::new();
         status.fetch_done.store(0, Ordering::Relaxed);
-        let images = self.images_enabled();
+        let wants = self.model_wants();
         status
             .fetch_total
-            .store(model::total_bytes(images), Ordering::Relaxed);
+            .store(model::total_bytes(wants), Ordering::Relaxed);
         std::thread::spawn(move || {
-            let result = model::fetch(images, &mut |_, done, _| {
+            let result = model::fetch(wants, &mut |_, done, _| {
                 status.fetch_done.store(done, Ordering::Relaxed);
             });
             match result {
@@ -948,12 +973,13 @@ const IMAGE_GAP: f32 = 0.06;
 
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then vinoWhisper sessions, then
-/// images, less images too far below the best of the others (IMAGE_GAP),
-/// then code (only ever on its own, for `code:`). Near-duplicate images
-/// are one result (#78).
+/// audio and video, then images, less images too far below the best of the
+/// others (IMAGE_GAP), then code (only ever on its own, for `code:`).
+/// Near-duplicate images are one result (#78).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
+    const IMAGES: usize = 4;
     let mut seen = HashSet::new();
-    let mut groups: [Vec<Hit>; 5] = Default::default();
+    let mut groups: [Vec<Hit>; 6] = Default::default();
     for h in hits {
         if h.score < floors.of(h.kind) || !seen.insert(h.path.clone()) {
             continue;
@@ -962,22 +988,23 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
             Kind::Text => 0,
             Kind::Document => 1,
             Kind::Session => 2,
-            Kind::Image => 3,
-            Kind::Code => 4,
+            Kind::Media => 3,
+            Kind::Image => IMAGES,
+            Kind::Code => 5,
         }];
         group.push(h);
     }
     // Before the cut, so a burst folded into one leaves room for others.
-    groups[3] = crate::search::dupes::collapse(std::mem::take(&mut groups[3]));
+    groups[IMAGES] = crate::search::dupes::collapse(std::mem::take(&mut groups[IMAGES]));
     for group in &mut groups {
         group.truncate(RESULTS);
     }
-    let best = groups[..3]
+    let best = groups[..IMAGES]
         .iter()
         .flatten()
         .map(|h| h.score)
         .fold(f32::NEG_INFINITY, f32::max);
-    groups[3].retain(|h| h.score >= best - IMAGE_GAP);
+    groups[IMAGES].retain(|h| h.score >= best - IMAGE_GAP);
     groups.into_iter().flatten().collect()
 }
 
@@ -1689,6 +1716,7 @@ mod tests {
         text: 0.65,
         image: 0.63,
         code: 0.6,
+        media: 0.62,
     };
 
     fn paths(hits: Vec<Hit>) -> Vec<String> {

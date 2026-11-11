@@ -53,6 +53,9 @@ pub mod status {
     pub const SESSION_FILES: &str = "session_files";
     pub const SESSION_CHUNKS: &str = "session_chunks";
     pub const SESSIONS_UNREAD: &str = "sessions_unread";
+    /// Audio and video files (#187), and their sound windows and frames.
+    pub const MEDIA_FILES: &str = "media_files";
+    pub const MEDIA_CHUNKS: &str = "media_chunks";
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";
@@ -136,5 +139,7 @@ pub mod results {
     pub const CODE: &str = "code";
     /// A vinoWhisper session's transcript or summary (#143).
     pub const SESSION: &str = "session";
+    /// An audio or video file, by its sound or picture (#187).
+    pub const MEDIA: &str = "media";
     pub const MAX: u32 = 100;
 }

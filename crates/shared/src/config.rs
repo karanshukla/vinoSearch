@@ -28,6 +28,10 @@
 //! [formats.sessions]
 //! enabled = true
 //!
+//! [formats.media]
+//! enabled = true
+//! max_hours = 3
+//!
 //! [encryption]
 //! enabled = true
 //! ```
@@ -73,6 +77,15 @@ pub const DEFAULT_CODE_MIN_SCORE: f32 = 0.72;
 /// "tax return") and 0.63 for 38%, while 99.8% of captions still found their
 /// own image. On ~/Pictures, right matches scored from 0.61, so not higher yet.
 pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.63;
+/// Provisional: the #187 spike's right windows scored 0.67 to 0.75 and its
+/// wrong ones up to 0.05 less. To be tuned on a real library.
+pub const DEFAULT_MEDIA_MIN_SCORE: f32 = 0.62;
+pub const DEFAULT_MEDIA_MAX_HOURS: f32 = 3.0;
+/// Audio and video files, by extension (#187). Not `ts`: TypeScript has it.
+pub const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "wmv", "mp3", "m4a", "aac", "flac",
+    "ogg", "oga", "opus", "wav", "wma",
+];
 /// HEIC, HEIF and AVIF need libheif's heif-convert installed (#79); without
 /// it they are counted and skipped.
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
@@ -164,6 +177,7 @@ pub struct Formats {
     pub documents: DocumentFormat,
     pub code: CodeFormat,
     pub sessions: SessionFormat,
+    pub media: MediaFormat,
 }
 
 /// Text is always indexed for now.
@@ -223,6 +237,22 @@ pub struct SessionFormat {
     pub enabled: Option<bool>,
 }
 
+/// Audio and video files (#187), by their sound and picture: 10 s windows
+/// of sound and a frame per shot, so "a dog barking" or "a whiteboard"
+/// finds the moment. Needs ffmpeg, and the vision and audio encoders.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaFormat {
+    /// Index audio and video. Off by default: an hour of film is minutes of
+    /// the NPU's time, and the audio encoder is a 295 MB download, the
+    /// vision encoder's 671 MB besides [default: false].
+    pub enabled: Option<bool>,
+    /// Results scoring below this are left out [default: 0.62].
+    pub min_score: Option<f32>,
+    /// Longer files are left out [default: 3].
+    pub max_hours: Option<f32>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -262,6 +292,23 @@ impl Formats {
 
     pub fn sessions_enabled(&self) -> bool {
         self.sessions.enabled.unwrap_or(false)
+    }
+
+    pub fn media_enabled(&self) -> bool {
+        self.media.enabled.unwrap_or(false)
+    }
+
+    pub fn media_min_score(&self) -> Result<f32> {
+        min_score(self.media.min_score, DEFAULT_MEDIA_MIN_SCORE)
+    }
+
+    /// The longest file indexed, in seconds.
+    pub fn media_max_seconds(&self) -> Result<f64> {
+        let h = self.media.max_hours.unwrap_or(DEFAULT_MEDIA_MAX_HOURS);
+        if !(h > 0.0 && h <= 24.0) {
+            bail!("max_hours must be over 0 and at most 24");
+        }
+        Ok(f64::from(h) * 3600.0)
     }
 
     pub fn code_min_score(&self) -> Result<f32> {
@@ -420,6 +467,14 @@ impl Config {
             "enabled",
             f.sessions.enabled.map(toml_edit::value),
         );
+        set(
+            &mut doc,
+            "media",
+            "enabled",
+            f.media.enabled.map(toml_edit::value),
+        );
+        set(&mut doc, "media", "min_score", f.media.min_score.map(score));
+        set(&mut doc, "media", "max_hours", f.media.max_hours.map(score));
         let e = &self.encryption;
         set_table(
             &mut doc,
@@ -772,6 +827,21 @@ mod tests {
         assert!(!Config::default().formats.sessions_enabled());
         let c: Config = toml::from_str("[formats.sessions]\nenabled = true\n").unwrap();
         assert!(c.formats.sessions_enabled());
+        // Media too (#187), held to 3 h unless set.
+        let d = Config::default().formats;
+        assert!(!d.media_enabled());
+        assert_eq!(d.media_max_seconds().unwrap(), 3.0 * 3600.0);
+        let c: Config =
+            toml::from_str("[formats.media]\nenabled = true\nmax_hours = 0.5\nmin_score = 0.7\n")
+                .unwrap();
+        assert!(c.formats.media_enabled());
+        assert_eq!(c.formats.media_max_seconds().unwrap(), 1800.0);
+        assert_eq!(c.formats.media_min_score().unwrap(), 0.7);
+        for bad in ["0", "-1", "25", "nan"] {
+            let c: Config =
+                toml::from_str(&format!("[formats.media]\nmax_hours = {bad}\n")).unwrap();
+            assert!(c.formats.media_max_seconds().is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -791,6 +861,8 @@ mod tests {
         c.formats.code.enabled = Some(true);
         c.formats.code.min_score = Some(0.6);
         c.formats.sessions.enabled = Some(true);
+        c.formats.media.enabled = Some(true);
+        c.formats.media.max_hours = Some(1.5);
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("enabled = true # big download"), "{text}");
@@ -805,6 +877,10 @@ mod tests {
         );
         assert!(
             text.contains("[formats.sessions]\nenabled = true"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[formats.media]\nenabled = true\nmax_hours = 1.5"),
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), c);

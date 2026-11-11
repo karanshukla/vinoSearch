@@ -35,6 +35,8 @@ const CODE_QUERY_PREFIX: &str = "task: code retrieval | query: ";
 /// An image's prompt, `<bos> <|image> <|image|> x tokens <image|> <eos>`,
 /// padded to this: SOFT_TOKENS + 4 rounded up to 16, model_image_140's shape.
 const IMAGE_LEN: usize = 144;
+/// Tokens `model_audio_250.onnx` takes: 250 audio tokens and four around them.
+const AUDIO_LEN: usize = 256;
 
 pub fn document_text(title: &str, text: &str) -> String {
     format!("title: {title} | text: {text}")
@@ -61,6 +63,18 @@ struct ImageStage {
     cache: PathBuf,
 }
 
+/// The audio encoder and the text model taking its output (#190).
+struct AudioStage {
+    _audio: CompiledModel,
+    audio: InferRequest,
+    _text: CompiledModel,
+    text: InferRequest,
+    /// `<bos>`, `<|audio>`, `<|audio|>`, `<audio|>`, `<eos>`.
+    ids: [i64; 5],
+    fresh: bool,
+    cache: PathBuf,
+}
+
 /// Query stage up front; the document and image stages compile on first
 /// use, so a process that only answers queries never holds a second copy of
 /// the model.
@@ -75,6 +89,7 @@ pub struct Embedder {
     query: Stage,
     docs: Option<Stage>,
     images: Option<ImageStage>,
+    audio: Option<AudioStage>,
     ocr: Option<crate::ml::ocr::Ocr>,
     docs_share: f64,
 }
@@ -141,6 +156,11 @@ fn stages() -> Vec<(&'static str, String)> {
         (crate::ml::model::REVISION, DOC_LEN.to_string()),
         (crate::ml::model::REVISION, format!("image{tokens}")),
         (crate::ml::model::VISION_REVISION, format!("vision{tokens}")),
+        (crate::ml::model::AUDIO_REVISION, "audio".to_owned()),
+        (
+            crate::ml::model::AUDIO_TEXT_REVISION,
+            "audio_text".to_owned(),
+        ),
     ];
     out.extend(
         crate::ml::ocr::stages()
@@ -432,6 +452,94 @@ impl ImageStage {
     }
 }
 
+/// A token's id, or an error naming it.
+fn token_id(tok: &Tokenizer, t: &str) -> Result<i64> {
+    tok.token_to_id(t)
+        .map(i64::from)
+        .with_context(|| format!("{t} is not in the tokenizer"))
+}
+
+impl AudioStage {
+    fn new(
+        core: &mut Core,
+        model_dir: &Path,
+        device: &str,
+        cache_root: &Path,
+        tok: &Tokenizer,
+    ) -> Result<Self> {
+        let audio_dir = crate::ml::model::audio_dir()?;
+        ensure!(
+            crate::ml::model::audio_present(model_dir, &audio_dir),
+            "the audio encoder is not in {}; run: vinosearch fetch-model",
+            audio_dir.display()
+        );
+        let cache = cache_root.join(stage_key(crate::ml::model::AUDIO_REVISION, device, "audio"));
+        let path = crate::ml::model::audio_path(&audio_dir);
+        let (mut audio, audio_fresh) = compile_cached(core, device, &cache, |core| {
+            compile_file(core, &path, device)
+        })?;
+        let cache = cache_root.join(stage_key(
+            crate::ml::model::AUDIO_TEXT_REVISION,
+            device,
+            "audio_text",
+        ));
+        let path = crate::ml::model::audio_text_path(model_dir);
+        let (mut text, text_fresh) = compile_cached(core, device, &cache, |core| {
+            compile_file(core, &path, device)
+        })?;
+        Ok(Self {
+            audio: audio.create_infer_request()?,
+            _audio: audio,
+            text: text.create_infer_request()?,
+            _text: text,
+            ids: [
+                token_id(tok, "<bos>")?,
+                token_id(tok, "<|audio>")?,
+                token_id(tok, "<|audio|>")?,
+                token_id(tok, "<audio|>")?,
+                token_id(tok, "<eos>")?,
+            ],
+            fresh: audio_fresh || text_fresh,
+            cache,
+        })
+    }
+
+    fn run(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
+        use crate::ml::audio::{FRAMES, MELS};
+        let tokens = f.tokens();
+        ensure!(tokens > 0, "no audio");
+        let mut values = Tensor::new(
+            ElementType::F32,
+            &Shape::new(&[1, FRAMES as i64, MELS as i64])?,
+        )?;
+        values.get_data_mut::<f32>()?.copy_from_slice(&f.mel);
+        let mut mask = Tensor::new(ElementType::Boolean, &Shape::new(&[1, FRAMES as i64])?)?;
+        // OpenVINO's boolean is a byte, 0 or 1.
+        let bytes: Vec<u8> = f.mask().into_iter().map(u8::from).collect();
+        mask.get_data_mut::<u8>()?.copy_from_slice(&bytes);
+        self.audio.set_tensor("input_features", &values)?;
+        self.audio.set_tensor("input_features_mask", &mask)?;
+        self.audio.infer()?;
+        // All 250 rows; the text model merges the first `tokens`.
+        let features = self.audio.get_tensor("audio_features")?;
+        let [bos, boa, audio, eoa, eos] = self.ids;
+        let mut ids = vec![bos, boa];
+        ids.extend(std::iter::repeat_n(audio, tokens));
+        ids.extend([eoa, eos]);
+        let mut mask = vec![1; ids.len()];
+        ids.resize(AUDIO_LEN, 0);
+        mask.resize(AUDIO_LEN, 0);
+        let dims = [1, AUDIO_LEN as i64];
+        self.text
+            .set_tensor("input_ids", &i64_tensor(&dims, &ids)?)?;
+        self.text
+            .set_tensor("attention_mask", &i64_tensor(&dims, &mask)?)?;
+        self.text.set_tensor("audio_features", &features)?;
+        self.text.infer()?;
+        Stage::read(&self.text)
+    }
+}
+
 /// A compiled stage, as `checked` sees it.
 trait Compiled {
     fn fresh(&self) -> bool;
@@ -448,6 +556,15 @@ impl Compiled for Stage {
 }
 
 impl Compiled for ImageStage {
+    fn fresh(&self) -> bool {
+        self.fresh
+    }
+    fn cache(&self) -> &Path {
+        &self.cache
+    }
+}
+
+impl Compiled for AudioStage {
     fn fresh(&self) -> bool {
         self.fresh
     }
@@ -548,6 +665,7 @@ impl Embedder {
             query,
             docs: None,
             images: None,
+            audio: None,
             ocr: None,
             docs_share: 1.0,
         })
@@ -614,13 +732,14 @@ impl Embedder {
     /// query) or image compiles them again, from the cache.
     pub fn release_documents(&mut self) -> bool {
         let images = self.images.take().is_some();
+        let audio = self.audio.take().is_some();
         let ocr = self.ocr.take().is_some();
-        self.docs.take().is_some() || images || ocr
+        self.docs.take().is_some() || images || audio || ocr
     }
 
     /// The document or image stage is compiled.
     pub fn has_documents(&self) -> bool {
-        self.docs.is_some() || self.images.is_some() || self.ocr.is_some()
+        self.docs.is_some() || self.images.is_some() || self.audio.is_some() || self.ocr.is_some()
     }
 
     /// The OCR model's files are fetched.
@@ -667,6 +786,24 @@ impl Embedder {
         Ok(v)
     }
 
+    /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
+    /// Not held to a CPU reference yet: there is none checked in for audio.
+    pub fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
+        if self.audio.is_none() {
+            self.audio = Some(AudioStage::new(
+                &mut self.core,
+                &self.model_dir,
+                &self.device,
+                &self.cache,
+                &self.tok,
+            )?);
+        }
+        let t0 = Instant::now();
+        let v = self.audio.as_mut().unwrap().run(f)?;
+        yield_device(t0, self.docs_share);
+        Ok(v)
+    }
+
     /// Embed documents already formatted with [`document_text`].
     pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.prepare_documents()?;
@@ -682,6 +819,8 @@ pub trait Embed {
     fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     /// Embed an image, prepared by [`crate::ml::vision::prepare`].
     fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>>;
+    /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
+    fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>>;
     /// The OCR model's files are fetched.
     fn can_read_text(&self) -> bool;
     /// The lines of text in `img`.
@@ -705,6 +844,10 @@ impl Embed for Embedder {
 
     fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         Embedder::image(self, px)
+    }
+
+    fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
+        Embedder::audio(self, f)
     }
 
     fn can_read_text(&self) -> bool {
@@ -746,6 +889,7 @@ impl Embed for Embedder {
 pub(crate) struct FakeEmbed {
     pub documents: usize,
     pub images: usize,
+    pub audio: usize,
     pub on_document: Option<OnDocument>,
 }
 
@@ -789,6 +933,11 @@ impl Embed for FakeEmbed {
     fn image(&mut self, _px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         self.images += 1;
         Ok(Self::vector("image"))
+    }
+
+    fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
+        self.audio += 1;
+        Ok(Self::vector(&format!("sound {}", f.frames)))
     }
 
     fn can_read_text(&self) -> bool {

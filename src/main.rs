@@ -396,15 +396,18 @@ fn run(cli: Cli) -> Result<bool> {
         Command::FetchModel => {
             let mut last = String::new();
             let mut shown = 0;
-            model::fetch(s.file.formats.images_enabled(), &mut |name, done, total| {
-                // A line per file, then a percentage every 10%.
-                let pct = done * 100 / total.max(1);
-                if name != last || pct >= shown + 10 {
-                    eprintln!("{pct:3}%  {name}");
-                    last = name.to_owned();
-                    shown = pct - pct % 10;
-                }
-            })?;
+            model::fetch(
+                model::Wants::of(&s.file.formats),
+                &mut |name, done, total| {
+                    // A line per file, then a percentage every 10%.
+                    let pct = done * 100 / total.max(1);
+                    if name != last || pct >= shown + 10 {
+                        eprintln!("{pct:3}%  {name}");
+                        last = name.to_owned();
+                        shown = pct - pct % 10;
+                    }
+                },
+            )?;
             eprintln!("model ready: {}", model::default_dir()?.display());
             Ok(true)
         }
@@ -611,6 +614,14 @@ fn run(cli: Cli) -> Result<bool> {
                     index::Kind::Session => match extract::session::Part::of(h.line) {
                         (extract::session::Part::Transcript, l) => format!(", transcript:{l}"),
                         (extract::session::Part::Summary, l) => format!(", summary:{l}"),
+                    },
+                    index::Kind::Media => match extract::media::Track::of(h.line) {
+                        (extract::media::Track::Sound, s) => {
+                            format!(", heard at {}", extract::media::stamp(s))
+                        }
+                        (extract::media::Track::Picture, s) => {
+                            format!(", seen at {}", extract::media::stamp(s))
+                        }
                     },
                     _ => format!(":{}", h.line),
                 };

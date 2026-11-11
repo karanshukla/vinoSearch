@@ -338,7 +338,7 @@ fn code_is_indexed_apart_and_found_only_with_the_code_prefix() {
     );
     assert_eq!(
         counts_by_kind(&conn).unwrap(),
-        [(1, 1), (0, 0), (0, 0), (1, 1), (0, 0)]
+        [(1, 1), (0, 0), (0, 0), (1, 1), (0, 0), (0, 0)]
     );
     // Code chunks carry their line, for opening an editor there.
     let line: i64 = conn
@@ -412,7 +412,7 @@ fn code_indexed_as_text_moves_to_its_own_kind_once() {
     assert_eq!(names_of(&conn), ["a.rs", "b.md", "c.py"]);
     assert_eq!(
         counts_by_kind(&conn).unwrap(),
-        [(1, 1), (0, 0), (0, 0), (2, 2), (0, 0)]
+        [(1, 1), (0, 0), (0, 0), (2, 2), (0, 0), (0, 0)]
     );
     // Vectors loaded before catch the new kinds up from the log.
     vectors.refresh(&conn).unwrap();
@@ -520,4 +520,212 @@ fn a_session_of_an_unknown_format_is_kept_unread_and_counted() {
     assert_eq!(unread_sessions(&conn).unwrap(), 2);
     // Turned off, sessions leave the index.
     assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 2);
+}
+
+/// Media on, as if ffmpeg were installed, held to `max_seconds`.
+fn media_on(max_seconds: f64) -> FileTypes {
+    FileTypes::default().with_media(true, max_seconds)
+}
+
+/// 330 s of tiny video, red until 200 s then blue, under a tone silent from
+/// 100 to 110 s. None without ffmpeg.
+fn film(t: &Tree, name: &str) -> Option<PathBuf> {
+    if !crate::extract::media::ffmpeg() {
+        eprintln!("no ffmpeg; skipped");
+        return None;
+    }
+    let path = t.root().join(name);
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "color=red:s=64x48:r=2:d=200"])
+        .args(["-f", "lavfi", "-i", "color=blue:s=64x48:r=2:d=130"])
+        .args(["-f", "lavfi", "-i", "sine=f=440:r=16000:d=330"])
+        .args(["-filter_complex"])
+        .arg("[0:v][1:v]concat=n=2:v=1:a=0[v];[2:a]volume='if(between(t,100,110),0,0.5)':eval=frame[a]")
+        .args(["-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .args(["-c:a", "aac"])
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    Some(path)
+}
+
+/// (track, second) of every chunk of `path`, in order.
+fn media_chunks(conn: &Connection, path: &Path) -> Vec<(crate::extract::media::Track, i64)> {
+    conn.prepare(
+        "SELECT c.start_line FROM chunks c JOIN files f ON f.id = c.file_id
+         WHERE f.path = ?1 AND c.kind = 5 ORDER BY c.start_line",
+    )
+    .unwrap()
+    .query_map([path.to_str().unwrap()], |r| r.get::<_, i64>(0))
+    .unwrap()
+    .map(|n| crate::extract::media::Track::of(n.unwrap()))
+    .collect()
+}
+
+#[test]
+fn media_goes_in_by_slices_from_index_rest() {
+    use crate::extract::media::Track;
+    let t = Tree::new("media");
+    let Some(path) = film(&t, "walk.mp4") else {
+        return;
+    };
+    let types = media_on(3600.0);
+    let mut conn = t.db();
+    let mut emb = FakeEmbed::default();
+    let st = index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &types,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    // Recorded, nothing embedded yet; waits for AC.
+    assert_eq!((st.files_embedded, st.chunks), (1, 0));
+    assert_eq!(partial(&conn, 10).unwrap()[0].2, 330);
+    assert!(!has_partial(&conn, false).unwrap());
+    assert!(has_partial(&conn, true).unwrap());
+
+    // A stop mid-slice keeps nothing of it.
+    let mut n = 0;
+    let stopped = index_rest(&mut conn, &mut emb, &types, &mut |_, _| {
+        n += 1;
+        if n == 3 { bail!("stop") } else { Ok(()) }
+    });
+    assert!(stopped.is_err());
+    assert!(media_chunks(&conn, &path).is_empty());
+    assert_eq!(partial(&conn, 10).unwrap()[0].1, 0);
+
+    let first = index_rest(&mut conn, &mut emb, &types, &mut |_, _| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            first,
+            Rest::Parts {
+                done: 300,
+                total: 330,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    let rest = index_rest(&mut conn, &mut emb, &types, &mut |_, _| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            rest,
+            Rest::Parts {
+                done: 330,
+                total: 330,
+                ..
+            }
+        ),
+        "{rest:?}"
+    );
+    assert!(!has_partial(&conn, true).unwrap());
+
+    let chunks = media_chunks(&conn, &path);
+    let sound: Vec<i64> = chunks
+        .iter()
+        .filter(|c| c.0 == Track::Sound)
+        .map(|c| c.1)
+        .collect();
+    let picture: Vec<i64> = chunks
+        .iter()
+        .filter(|c| c.0 == Track::Picture)
+        .map(|c| c.1)
+        .collect();
+    // Every 5 s but the one window that is all silence.
+    let want: Vec<i64> = (0..65).map(|i| i * 5).filter(|&s| s != 100).collect();
+    assert_eq!(sound, want);
+    // The first frame, one per 30 s, the cut to blue, and the second
+    // slice's first.
+    assert_eq!(
+        picture,
+        [0, 30, 60, 90, 120, 150, 180, 200, 230, 260, 290, 300]
+    );
+    // Less the three windows the stopped run embedded and threw away.
+    assert_eq!((emb.audio - 3, emb.images), (sound.len(), picture.len()));
+
+    // Moved: the same chunks, nothing embedded again.
+    let moved = t.root().join("trips/walk.mp4");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(&path, &moved).unwrap();
+    let embedded = (emb.audio, emb.images);
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &types,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!((emb.audio, emb.images), embedded);
+    assert_eq!(media_chunks(&conn, &moved), chunks);
+    assert!(!has_partial(&conn, true).unwrap());
+
+    // Deleted: gone.
+    fs::remove_file(&moved).unwrap();
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &types,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(counts(&conn).unwrap(), (0, 0));
+}
+
+#[test]
+fn media_waits_for_documents_and_long_files_are_left_out() {
+    let t = Tree::new("media-order");
+    let Some(path) = film(&t, "walk.mp4") else {
+        return;
+    };
+    let line = format!("{}\n", "lorem ipsum dolor sit amet ".repeat(3));
+    let book = t.write("book.txt", &line.repeat(1500));
+    let mut conn = t.db();
+    let mut emb = FakeEmbed::default();
+    let types = media_on(3600.0);
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &types,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    // The book's id may come after the film's: taken first anyway.
+    assert!(has_partial(&conn, false).unwrap());
+    let next = index_rest(&mut conn, &mut emb, &types, &mut |_, _| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(next, Rest::Parts { ref path, .. } if path == book.to_str().unwrap()));
+
+    // Over the longest allowed: a row, no chunks, no partial.
+    let short = media_on(60.0);
+    fs::remove_file(&book).unwrap();
+    let mut conn = Tree::new("media-long").db();
+    let st = index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &short,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(st.files_embedded, 0);
+    assert!(partial(&conn, 10).unwrap().is_empty());
+    assert!(is_indexed(&conn, path.to_str().unwrap()).unwrap());
 }

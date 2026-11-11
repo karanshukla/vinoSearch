@@ -102,6 +102,12 @@ impl State {
         before.is_some() && after.is_none()
     }
 
+    /// On battery now, whatever `index_on_battery` says: media waits for AC
+    /// either way (#192).
+    pub fn on_battery(&self) -> bool {
+        self.on_battery.load(Ordering::Relaxed)
+    }
+
     pub fn set_index_on_battery(&self, on: bool) -> bool {
         self.update(|s| s.charger_only.store(!on, Ordering::Relaxed))
     }

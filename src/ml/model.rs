@@ -1,7 +1,7 @@
 //! The embedding model: EmbeddingGemma 2's text model, rotary-fixed and INT8,
-//! and for images its vision encoder with static shapes; and the OCR model
-//! for the text in images and scans (#106). Each is pinned by Hugging Face
-//! commit and SHA-256.
+//! for images its vision encoder with static shapes, and for audio its audio
+//! encoder, static and INT8 (#190); and the OCR model for the text in images
+//! and scans (#106). Each is pinned by Hugging Face commit and SHA-256.
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -14,6 +14,12 @@ const REPO: &str = "arankays/embeddinggemma-2-text-int8-cw-onnx";
 pub(crate) const REVISION: &str = "88aed926c26344fa2ffed5f44d016fb36e2fcce3";
 const VISION_REPO: &str = "arankays/embeddinggemma-2-vision-static-onnx";
 pub(crate) const VISION_REVISION: &str = "16414206c27ee4bc435a7c03467155063fee1d9f";
+const AUDIO_REPO: &str = "arankays/embeddinggemma-2-audio-static-onnx";
+pub(crate) const AUDIO_REVISION: &str = "c6d60dee133087e72c58a9ac802ad7ef430e30cf";
+/// The text repo's commit adding `model_audio_250.onnx`. Its other files are
+/// REVISION's byte for byte, so REVISION stays the pin for them, and the
+/// vectors of every other kind stay valid.
+pub(crate) const AUDIO_TEXT_REVISION: &str = "1e53edbfc9581825c13a0e057e098418dbab5196";
 const OCR_REPO: &str = "arankays/pp-ocrv6-small-onnx";
 pub(crate) const OCR_REVISION: &str = "5bc17817a3879e7e494cd71b43d66b7b608abfac";
 
@@ -72,6 +78,29 @@ const VISION_FILES: &[(&str, &str, u64)] = &[
     ),
 ];
 
+/// The audio encoder, fetched only while media is indexed.
+const AUDIO_FILES: &[(&str, &str, u64)] = &[
+    (
+        "onnx/audio_encoder_static_10s_int8.onnx",
+        "859067ce6112f3c56240cfb7e6d2db6031954ae5f342a3d1869ea5a06bed1e03",
+        240_579,
+    ),
+    (
+        "onnx/audio_encoder_static_10s_int8.onnx_data",
+        "b70b84ac5b467e84e265cc44e0a117d623cdd7f6310e141aa580d03dcccd492e",
+        295_154_176,
+    ),
+];
+
+/// `model_text.onnx` taking the audio encoder's output, from the text repo
+/// at AUDIO_TEXT_REVISION, into the text model's directory: it reads
+/// `model.onnx_data` beside it.
+const AUDIO_TEXT_FILES: &[(&str, &str, u64)] = &[(
+    "onnx/model_audio_250.onnx",
+    "fe1196496d5e8db24d2621a2fdd090856a19984398e2d032ec46a38e2c6effb6",
+    713_476,
+)];
+
 /// PP-OCRv6 small, as RapidOCR 3.10.0 publishes it, and its dict. Small, so
 /// fetched whether or not images are on: scanned PDFs need it too.
 const OCR_FILES: &[(&str, &str, u64)] = &[
@@ -92,11 +121,42 @@ const OCR_FILES: &[(&str, &str, u64)] = &[
     ),
 ];
 
-/// Bytes the model takes on disk once fetched, the vision encoder included
-/// if `images`.
-pub fn total_bytes(images: bool) -> u64 {
+/// The encoders the formats switched on need, besides the text model and OCR.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Wants {
+    pub images: bool,
+    pub media: bool,
+}
+
+impl Wants {
+    pub fn of(formats: &crate::config::Formats) -> Self {
+        Self {
+            images: formats.images_enabled(),
+            media: formats.media_enabled(),
+        }
+    }
+
+    /// Images, and video's frames.
+    fn vision(self) -> bool {
+        self.images || self.media
+    }
+}
+
+/// Bytes the model takes on disk once fetched, with what `wants` adds.
+pub fn total_bytes(wants: Wants) -> u64 {
     let size = |files: &[(&str, &str, u64)]| files.iter().map(|(_, _, size)| size).sum::<u64>();
-    size(FILES) + size(OCR_FILES) + if images { size(VISION_FILES) } else { 0 }
+    size(FILES)
+        + size(OCR_FILES)
+        + if wants.vision() {
+            size(VISION_FILES)
+        } else {
+            0
+        }
+        + if wants.media {
+            size(AUDIO_FILES) + size(AUDIO_TEXT_FILES)
+        } else {
+            0
+        }
 }
 
 fn models_dir() -> Result<PathBuf> {
@@ -117,6 +177,28 @@ pub fn vision_dir() -> Result<PathBuf> {
 
 pub fn ocr_dir() -> Result<PathBuf> {
     Ok(models_dir()?.join("pp-ocrv6-small-onnx"))
+}
+
+pub fn audio_dir() -> Result<PathBuf> {
+    Ok(models_dir()?.join("embeddinggemma-2-audio-static-onnx"))
+}
+
+/// The audio encoder, in `audio_dir()`.
+pub fn audio_path(dir: &Path) -> PathBuf {
+    dir.join(AUDIO_FILES[0].0)
+}
+
+/// The text model taking audio features, in `default_dir()`.
+pub fn audio_text_path(dir: &Path) -> PathBuf {
+    dir.join(AUDIO_TEXT_FILES[0].0)
+}
+
+/// What embedding sound needs, besides the text model, is present.
+pub fn audio_present(dir: &Path, audio_dir: &Path) -> bool {
+    audio_text_path(dir).is_file()
+        && AUDIO_FILES
+            .iter()
+            .all(|(name, _, _)| audio_dir.join(name).is_file())
 }
 
 pub fn ocr_det_path(dir: &Path) -> PathBuf {
@@ -185,13 +267,13 @@ fn hub(repo: &str, revision: &str) -> String {
     format!("{HUB}/{repo}/resolve/{revision}")
 }
 
-/// Download whatever is missing or does not match its pinned hash, the vision
-/// encoder too if `images`. Files are hashed as they stream and only renamed
+/// Download whatever is missing or does not match its pinned hash, with
+/// what `wants` adds. Files are hashed as they stream and only renamed
 /// into place once they match; one larger than its pinned size is abandoned
 /// as it streams. `progress` gets (bytes done, bytes in total) across all
 /// files, files already in place included.
-pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<()> {
-    let total = total_bytes(images);
+pub fn fetch(wants: Wants, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<()> {
+    let total = total_bytes(wants);
     let mut done = 0;
     fetch_files(
         &hub(REPO, REVISION),
@@ -209,11 +291,29 @@ pub fn fetch(images: bool, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
         total,
         progress,
     )?;
-    if images {
+    if wants.vision() {
         fetch_files(
             &hub(VISION_REPO, VISION_REVISION),
             VISION_FILES,
             &vision_dir()?,
+            &mut done,
+            total,
+            progress,
+        )?;
+    }
+    if wants.media {
+        fetch_files(
+            &hub(REPO, AUDIO_TEXT_REVISION),
+            AUDIO_TEXT_FILES,
+            &default_dir()?,
+            &mut done,
+            total,
+            progress,
+        )?;
+        fetch_files(
+            &hub(AUDIO_REPO, AUDIO_REVISION),
+            AUDIO_FILES,
+            &audio_dir()?,
             &mut done,
             total,
             progress,
@@ -321,10 +421,10 @@ pub fn images_present(dir: &Path, vision_dir: &Path, ocr_dir: &Path) -> bool {
     vision_present(dir, vision_dir) && ocr_present(ocr_dir)
 }
 
-/// Remove the model's files, the vision encoder's and OCR's included. The
+/// Remove the model's files, the vision, audio and OCR models' included. The
 /// caller makes sure nothing has them loaded.
 pub fn delete() -> Result<()> {
-    for dir in [default_dir()?, vision_dir()?, ocr_dir()?] {
+    for dir in [default_dir()?, vision_dir()?, ocr_dir()?, audio_dir()?] {
         match fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -525,6 +625,21 @@ mod tests {
             hub(REPO, REVISION),
             format!("https://huggingface.co/{REPO}/resolve/{REVISION}")
         );
-        assert!(total_bytes(true) > total_bytes(false));
+        let none = total_bytes(Wants::default());
+        let images = total_bytes(Wants {
+            images: true,
+            media: false,
+        });
+        let media = total_bytes(Wants {
+            images: false,
+            media: true,
+        });
+        let both = total_bytes(Wants {
+            images: true,
+            media: true,
+        });
+        assert!(none < images && images < media);
+        // Images and video's frames share the vision encoder.
+        assert_eq!(both, media);
     }
 }

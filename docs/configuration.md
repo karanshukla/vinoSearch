@@ -40,7 +40,17 @@ min_score = 0.72
 
 [formats.sessions]
 enabled = true              # off by default; vinoWhisper's saved transcripts and summaries
+
+[formats.media]
+enabled = true              # off by default; audio and video by sound and picture, needs ffmpeg
+min_score = 0.62            # provisional, to be tuned on a real library
+max_hours = 3               # longer files are left out
 ```
+
+Audio and video ([#187](https://github.com/karanshukla/vinoSearch/issues/187)) are indexed after everything else, on AC
+only, five minutes of media at a time: 10 s windows of sound every 5 s, quiet ones skipped, and a frame per shot. An hour
+of film is about 6.5 to 9 minutes of the NPU's time, most of it frames. Turning it on downloads the audio encoder (295 MB) and the vision
+encoder (671 MB) if images haven't already.
 
 Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda
 installs are excluded by default; [what gets indexed](how-it-works.md#what-gets-indexed) has the list.

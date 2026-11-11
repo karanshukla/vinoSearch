@@ -47,8 +47,47 @@ const FRAME_SIDE: u32 = 768;
 /// QUIET_DBFS (#192).
 const QUIET_DBFS: f32 = -50.0;
 const QUIET_SHARE: f32 = 0.95;
-/// A last window shorter than this is dropped.
+/// Windows start every 5 s, so each moment is whole in one of them. Without
+/// the overlap the #187 spike's dog, bells and speech fell across windows
+/// and lost to others; with it audio is still ~1.2 NPU min an hour (#190).
+const HOP_SAMPLES: usize = 5 * SAMPLE_RATE;
+/// A file shorter than this has no window, and at the end a last hop
+/// shorter than this adds none. A last hop longer is a window ending at the
+/// end: a second of sound padded with nine of silence embeds as little but
+/// silence, and outscored every real window in the #187 spike.
 const MIN_WINDOW_SAMPLES: usize = SAMPLE_RATE;
+
+/// A media file's frames are numbered from here up by their second; its
+/// sound's windows below, by theirs.
+pub const FRAME_LINES: usize = 1 << 32;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Track {
+    Sound,
+    Picture,
+}
+
+impl Track {
+    /// The track a chunk numbered `n` came from, and its second in it.
+    pub fn of(n: i64) -> (Track, i64) {
+        if n >= FRAME_LINES as i64 {
+            (Track::Picture, n - FRAME_LINES as i64)
+        } else {
+            (Track::Sound, n)
+        }
+    }
+}
+
+/// `seconds` as a player shows it: 04:05, or 1:02:03 past an hour.
+pub fn stamp(seconds: i64) -> String {
+    let s = seconds.max(0);
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
 
 /// ffmpeg and ffprobe, if both are on PATH. Looked up once.
 pub fn ffmpeg() -> bool {
@@ -142,11 +181,13 @@ impl Window {
     }
 }
 
-/// The first audio stream from second `from`, in 10 s windows with no
-/// overlap.
+/// The first audio stream from second `from`, in 10 s windows every 5 s.
 pub struct Audio {
     decoder: Decoder,
-    next: u32,
+    from: u32,
+    /// The last window given, and where it started, in samples from `from`.
+    window: Vec<f32>,
+    at: usize,
     done: bool,
 }
 
@@ -160,9 +201,29 @@ pub fn audio(path: &Path, from: u32, probe: &Probe) -> Result<Audio> {
         .args(["-ar", &SAMPLE_RATE.to_string(), "pipe:1"]);
     Ok(Audio {
         decoder: Decoder::spawn(cmd, STALL, |_| None)?,
-        next: from,
+        from,
+        window: Vec::new(),
+        at: 0,
         done: false,
     })
+}
+
+impl Audio {
+    /// Up to `n` samples; fewer only at the end, when ffmpeg is checked.
+    fn read(&mut self, n: usize) -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; n * 4];
+        let got = self.decoder.read_up_to(&mut bytes)?;
+        if got < bytes.len() {
+            self.done = true;
+            self.decoder.finish()?;
+        }
+        Ok(bytes[..got - got % 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
 }
 
 impl Iterator for Audio {
@@ -172,32 +233,33 @@ impl Iterator for Audio {
         if self.done {
             return None;
         }
-        let mut bytes = vec![0u8; WINDOW_SAMPLES * 4];
-        let got = match self.decoder.read_up_to(&mut bytes) {
-            Ok(n) => n,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(e));
+        if self.window.is_empty() {
+            // The first: a whole window, or what there is of a short file.
+            let samples = match self.read(WINDOW_SAMPLES) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            if samples.len() < MIN_WINDOW_SAMPLES {
+                return None;
             }
-        };
-        if got < bytes.len() {
-            self.done = true;
-            if let Err(e) = self.decoder.finish() {
-                return Some(Err(e));
+            self.window = samples;
+        } else {
+            // Then HOP on, the last of them filled out from the one before.
+            let new = match self.read(HOP_SAMPLES) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            if new.len() < MIN_WINDOW_SAMPLES || self.window.len() < WINDOW_SAMPLES {
+                return None;
             }
+            self.window.drain(..new.len());
+            self.window.extend(new.iter());
+            self.at += new.len();
         }
-        let samples: Vec<f32> = bytes[..got - got % 4]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
-        if samples.len() < MIN_WINDOW_SAMPLES {
-            return None;
-        }
-        let start = self.next;
-        self.next += (WINDOW_SAMPLES / SAMPLE_RATE) as u32;
-        Some(Ok(Window { start, samples }))
+        Some(Ok(Window {
+            start: self.from + (self.at / SAMPLE_RATE) as u32,
+            samples: self.window.clone(),
+        }))
     }
 }
 
@@ -575,16 +637,17 @@ mod tests {
         let p = probe(&path).unwrap();
         let windows: Vec<Window> = audio(&path, 0, &p).unwrap().map(|w| w.unwrap()).collect();
         let starts: Vec<u32> = windows.iter().map(|w| w.start).collect();
-        assert_eq!(starts, [0, 10, 20]);
-        assert_eq!(windows[0].samples.len(), WINDOW_SAMPLES);
+        assert_eq!(starts, [0, 5, 10, 15]);
+        assert!(windows.iter().all(|w| w.samples.len() == WINDOW_SAMPLES));
+        // Only 10 to 20 s is all silence.
         let quiet: Vec<bool> = windows.iter().map(Window::quiet).collect();
-        assert_eq!(quiet, [false, true, false]);
+        assert_eq!(quiet, [false, false, true, false]);
 
         let resumed: Vec<u32> = audio(&path, 10, &p)
             .unwrap()
             .map(|w| w.unwrap().start)
             .collect();
-        assert_eq!(resumed, [10, 20]);
+        assert_eq!(resumed, [10, 15]);
     }
 
     #[test]
@@ -709,7 +772,19 @@ mod tests {
             .unwrap()
             .map(|w| w.unwrap().start)
             .collect();
-        assert_eq!(windows, (0..10).map(|i| i * 10).collect::<Vec<_>>());
+        // 91 s: every 5 s to 80, then the last 10 s.
+        let mut want: Vec<u32> = (0..17).map(|i| i * 5).collect();
+        want.push(81);
+        assert_eq!(windows, want);
+    }
+
+    #[test]
+    fn chunks_say_their_track_and_second() {
+        assert_eq!(Track::of(30), (Track::Sound, 30));
+        assert_eq!(Track::of(FRAME_LINES as i64 + 12), (Track::Picture, 12));
+        assert_eq!(stamp(0), "00:00");
+        assert_eq!(stamp(245), "04:05");
+        assert_eq!(stamp(3723), "1:02:03");
     }
 
     #[test]

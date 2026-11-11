@@ -31,6 +31,13 @@ const TEXT_BYTES_PER_CHUNK: u64 = 800;
 /// C and shell in 795 files made 12,550 chunks, 643 bytes each. 600 puts
 /// that estimate 7% high, as text's is.
 const CODE_BYTES_PER_CHUNK: u64 = 600;
+/// Media file bytes per chunk, a guess: video at about 1 GB an hour makes
+/// some 360 sound windows and 240 to 360 frames an hour (#192), so ~1.5 MB
+/// a chunk. Audio alone is far smaller per hour, so its estimate errs long.
+const MEDIA_BYTES_PER_CHUNK: u64 = 1_500_000;
+/// NPU seconds per media chunk: about 0.1 s a sound window (#190) and 1.3 s
+/// a frame, taken half and half.
+const SECS_PER_MEDIA_CHUNK: f64 = 0.7;
 
 /// The share of a document's file that comes out as text. Guesses, not
 /// measured, set high so the estimate errs long: a PDF is mostly fonts,
@@ -58,6 +65,7 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
     let text = match kind {
         Kind::Image => return 1,
         Kind::Code => return bytes.div_ceil(CODE_BYTES_PER_CHUNK),
+        Kind::Media => return bytes.div_ceil(MEDIA_BYTES_PER_CHUNK),
         Kind::Text => bytes,
         // Text past MAX_FILE_BYTES is skipped, so a document makes at most
         // that much.
@@ -72,6 +80,7 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
 fn secs_of(kind: Kind, chunks: u64) -> f64 {
     match kind {
         Kind::Image => chunks as f64 * SECS_PER_IMAGE,
+        Kind::Media => chunks as f64 * SECS_PER_MEDIA_CHUNK,
         Kind::Text | Kind::Document | Kind::Code | Kind::Session => chunks as f64 / CHUNKS_PER_SEC,
     }
 }
@@ -87,8 +96,8 @@ pub struct Tally {
 #[derive(Debug, Default)]
 pub struct Estimate {
     pub root: PathBuf,
-    /// In `Kind::ALL`'s order: text, documents, images, code, sessions.
-    pub kinds: [Tally; 5],
+    /// In `Kind::ALL`'s order: text, documents, images, code, sessions, media.
+    pub kinds: [Tally; 6],
     /// Files already indexed and unchanged since, which cost nothing.
     pub up_to_date: u64,
     /// The subfolders taking longest, longest first: (folder, seconds, files).
@@ -151,6 +160,7 @@ impl Estimate {
                     Kind::Image => "images",
                     Kind::Code => "code",
                     Kind::Session => "sessions",
+                    Kind::Media => "media",
                 };
                 (
                     name.to_owned(),
@@ -481,6 +491,7 @@ mod tests {
                 Tally::default(),
                 Tally::default(),
                 Tally::default(),
+                Tally::default(),
             ],
             ..Estimate::default()
         };
@@ -499,6 +510,7 @@ mod tests {
                     bytes: 0,
                     chunks: 113_341,
                 },
+                Tally::default(),
                 Tally::default(),
                 Tally::default(),
                 Tally::default(),
