@@ -239,7 +239,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Kind::Image => "vinoSearch Images",
         Kind::Code => "vinoSearch Code",
         Kind::Session => "vinoWhisper sessions",
-        Kind::Media => "vinoSearch Audio and Video",
+        Kind::Media => "vinoSearch Media",
     };
     props.insert("category".into(), owned(Variant::from(category)));
     // Without it KRunner offers every action on every match.

@@ -26,8 +26,16 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # The media decode tests (#187) make their clips with ffmpeg.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install ffmpeg
+        # The media tests (#187) make their clips with ffmpeg and skip without
+        # it. Ubuntu's mirrors failing to resolve on the runner shouldn't fail
+        # CI, so this retries, then warns and goes on.
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg && exit 0
+            sleep $((i * 20))
+          done
+          echo "::warning::ffmpeg didn't install; the media tests that need it are skipped"
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
@@ -56,7 +64,16 @@ jobs:
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-llvm-cov
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install ffmpeg
+        # The media tests (#187) make their clips with ffmpeg and skip without
+        # it. Ubuntu's mirrors failing to resolve on the runner shouldn't fail
+        # CI, so this retries, then warns and goes on.
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg && exit 0
+            sleep $((i * 20))
+          done
+          echo "::warning::ffmpeg didn't install; the media tests that need it are skipped"
       - run: cargo llvm-cov --locked --workspace --no-report
       - run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Summary
