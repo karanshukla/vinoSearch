@@ -18,7 +18,7 @@ use vinosearch_shared::config::{
 use vinosearch_shared::dbus::{hold, seal};
 use vinosearch_shared::models;
 
-use crate::control::{Link, Partial, Request, Status};
+use crate::control::{Link, NOT_INSTALLED, Partial, Request, Status};
 use crate::{doctor, integration, portal};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,95 @@ enum Pick {
     Custom,
 }
 
+/// One "which app opens these" setting's rows.
+struct AppPicker<'a> {
+    label: &'a str,
+    help: &'a str,
+    command_help: &'a str,
+    /// The custom command's placeholder.
+    hint: &'a str,
+    apps: &'a [App],
+}
+
+/// A dropdown of the default app, the installed `apps` and a custom command,
+/// with the command's field under it when that is picked. `setting` is the
+/// config value, `draft` the command as typed until Enter or leaving the
+/// field, and `custom` keeps the field showing while it is empty. Whether
+/// `setting` changed.
+fn app_picker(
+    ui: &mut egui::Ui,
+    picker: &AppPicker,
+    setting: &mut Option<String>,
+    draft: &mut Option<String>,
+    custom: &mut bool,
+) -> bool {
+    let mut changed = false;
+    let current = setting.clone();
+    let mut pick = match &current {
+        Some(e) if apps::is_entry_id(e) && !*custom => Pick::App(e.trim().to_owned()),
+        Some(_) => Pick::Custom,
+        None if *custom => Pick::Custom,
+        None => Pick::Default,
+    };
+    Row::new(picker.label)
+        .help(picker.help)
+        .show(ui, |ui, named| {
+            let before = pick.clone();
+            let label = |pick: &Pick| match pick {
+                Pick::Default => "Default app".to_owned(),
+                Pick::App(id) => picker
+                    .apps
+                    .iter()
+                    .find(|a| &a.id == id)
+                    .map_or_else(|| id.clone(), |a| a.name.clone()),
+                Pick::Custom => "Custom command…".to_owned(),
+            };
+            let id = picker.label.to_lowercase();
+            let combo = widgets::combo(ui, &id, label(&pick), 200.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut pick, Pick::Default, label(&Pick::Default));
+                for a in picker.apps {
+                    ui.selectable_value(&mut pick, Pick::App(a.id.clone()), &a.name);
+                }
+                ui.separator();
+                ui.selectable_value(&mut pick, Pick::Custom, label(&Pick::Custom));
+            });
+            named(combo.response);
+            if pick != before {
+                *custom = pick == Pick::Custom;
+                *draft = None;
+                let next = match &pick {
+                    Pick::Default => None,
+                    Pick::App(id) => Some(id.clone()),
+                    // Kept until a command is typed, unless it was an app.
+                    Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
+                };
+                if next != *setting {
+                    *setting = next;
+                    changed = true;
+                }
+            }
+        });
+    if pick == Pick::Custom {
+        Row::new(&format!("{} command", picker.label))
+            .help(picker.command_help)
+            .show(ui, |ui, named| {
+                let text = draft.get_or_insert(setting.clone().unwrap_or_default());
+                let width = ui.available_width().min(260.0);
+                let response = named(ui.add(widgets::field(text, picker.hint, width)));
+                if response.lost_focus() {
+                    let typed = text.trim();
+                    let next = (!typed.is_empty()).then(|| typed.to_owned());
+                    if next != *setting {
+                        *setting = next;
+                        changed = true;
+                    }
+                    *draft = None;
+                }
+            });
+    }
+    changed
+}
+
 /// A destructive action waiting for a second click.
 #[derive(Clone, PartialEq)]
 enum Confirm {
@@ -139,6 +228,10 @@ struct SettingsWindow {
     custom_editor: bool,
     /// The apps the editor can be, read when the Search page first shows.
     editors: Option<Vec<App>>,
+    /// The same three for the `player` setting (#188).
+    player: Option<String>,
+    custom_player: bool,
+    players: Option<Vec<App>>,
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
@@ -218,6 +311,9 @@ impl SettingsWindow {
             editor: None,
             custom_editor: false,
             editors: None,
+            player: None,
+            custom_player: false,
+            players: None,
             picked: Arc::new(Mutex::new(None)),
             picking: false,
             confirm: None,
@@ -777,8 +873,8 @@ impl SettingsWindow {
         });
     }
 
-    /// The models on disk while the runner can't be reached: nothing has them loaded or is
-    /// downloading, so they're deleted from here.
+    /// The models on disk while the search service isn't installed: nothing has them loaded
+    /// or is downloading, so they're deleted from here.
     fn model_files(&mut self, ui: &mut egui::Ui) {
         let Some(dir) = self.models_dir.clone() else {
             return;
@@ -843,7 +939,9 @@ impl SettingsWindow {
             }
             None => None,
         };
-        if s.is_none() && status.is_some() {
+        // Only with no service at all: one that answers with an error may
+        // have the models loaded, or be downloading them.
+        if matches!(&status, Some(Err(why)) if why == NOT_INSTALLED) {
             self.model_files(ui);
         }
         if let Some(s) = s {
@@ -1210,7 +1308,7 @@ impl SettingsWindow {
             let media = self.config.formats.media_enabled();
             Row::new("Media")
                 .help(
-                    "Audio and video, by what's heard and seen. Plugged in only. 295 MB download.",
+                    "Audio and video, by what's heard and seen. Plugged in only. 295 MB download, and 671 MB more with photos off.",
                 )
                 .show(ui, |ui, _| {
                     let mut on = media;
@@ -1277,76 +1375,34 @@ impl SettingsWindow {
 
         widgets::group_label(ui, "Opening results");
         let editors = self.editors.get_or_insert_with(apps::editors).clone();
-        let current = self.config.editor.clone();
-        let mut pick = match &current {
-            Some(e) if apps::is_entry_id(e) && !self.custom_editor => {
-                Pick::App(e.trim().to_owned())
-            }
-            Some(_) => Pick::Custom,
-            None if self.custom_editor => Pick::Custom,
-            None => Pick::Default,
-        };
+        let players = self.players.get_or_insert_with(apps::players).clone();
         widgets::group(ui, |ui| {
-            Row::new("Editor")
-                .help("Opens at the matching line.")
-                .show(ui, |ui, named| {
-                    let before = pick.clone();
-                    let label = |pick: &Pick| match pick {
-                        Pick::Default => "Default app".to_owned(),
-                        Pick::App(id) => editors
-                            .iter()
-                            .find(|a| &a.id == id)
-                            .map_or_else(|| id.clone(), |a| a.name.clone()),
-                        Pick::Custom => "Custom command…".to_owned(),
-                    };
-                    let combo =
-                        widgets::combo(ui, "editor", label(&pick), 200.0).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut pick, Pick::Default, label(&Pick::Default));
-                            for a in editors.iter() {
-                                ui.selectable_value(&mut pick, Pick::App(a.id.clone()), &a.name);
-                            }
-                            ui.separator();
-                            ui.selectable_value(&mut pick, Pick::Custom, label(&Pick::Custom));
-                        });
-                    named(combo.response);
-                    if pick != before {
-                        self.custom_editor = pick == Pick::Custom;
-                        self.editor = None;
-                        let next = match &pick {
-                            Pick::Default => None,
-                            Pick::App(id) => Some(id.clone()),
-                            // Kept until a command is typed, unless it was an app.
-                            Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
-                        };
-                        if next != self.config.editor {
-                            self.config.editor = next;
-                            changed = true;
-                        }
-                    }
-                });
-            if pick == Pick::Custom {
-                Row::new("Command")
-                    .help("With {file} and {line} in it, run without a shell.")
-                    .show(ui, |ui, named| {
-                        let current = self.config.editor.clone().unwrap_or_default();
-                        let text = self.editor.get_or_insert(current);
-                        let width = ui.available_width().min(260.0);
-                        let response = named(ui.add(widgets::field(
-                            text,
-                            "foot -e nvim +{line} {file}",
-                            width,
-                        )));
-                        if response.lost_focus() {
-                            let typed = text.trim();
-                            let next = (!typed.is_empty()).then(|| typed.to_owned());
-                            if next != self.config.editor {
-                                self.config.editor = next;
-                                changed = true;
-                            }
-                            self.editor = None;
-                        }
-                    });
-            }
+            changed |= app_picker(
+                ui,
+                &AppPicker {
+                    label: "Editor",
+                    help: "Opens at the matching line.",
+                    command_help: "With {file} and {line} in it, run without a shell.",
+                    hint: "foot -e nvim +{line} {file}",
+                    apps: &editors,
+                },
+                &mut self.config.editor,
+                &mut self.editor,
+                &mut self.custom_editor,
+            );
+            changed |= app_picker(
+                ui,
+                &AppPicker {
+                    label: "Player",
+                    help: "Plays audio and video from the matching time: mpv, VLC or Celluloid.",
+                    command_help: "With {file} and {seconds} in it, run without a shell.",
+                    hint: "mpv --start={seconds} {file}",
+                    apps: &players,
+                },
+                &mut self.config.player,
+                &mut self.player,
+                &mut self.custom_player,
+            );
         });
 
         widgets::group_label(ui, "How close results must be");

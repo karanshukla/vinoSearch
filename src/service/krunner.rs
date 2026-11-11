@@ -206,7 +206,7 @@ fn session_place(h: &Hit) -> Option<String> {
 }
 
 /// The actions a match offers: the other part of a session (#143) as well.
-fn match_actions(h: &Hit) -> Vec<&'static str> {
+fn match_actions(h: &Hit, plays: bool) -> Vec<&'static str> {
     let mut out = vec![OPEN_FOLDER, SHOW_ALL];
     if h.kind == Kind::Session {
         let other = match Part::of(h.line).0 {
@@ -217,15 +217,53 @@ fn match_actions(h: &Hit) -> Vec<&'static str> {
                 .then_some(OPEN_SUMMARY),
         };
         out.splice(0..0, other);
+        // The default action plays the recording, so the transcript is offered.
+        if plays {
+            out.insert(0, OPEN_TRANSCRIPT);
+        }
     }
     out
+}
+
+/// A recording, and the second in it a transcript hit is at.
+type Play = (PathBuf, u32);
+
+/// The indexed recording the session `id` was transcribed from (#188), by
+/// the SHA-256 its attestation gives. None for a live session, or while the
+/// recording isn't indexed (media is off, or the file is outside the roots).
+fn session_recording(db: &Db, id: &str) -> Option<PathBuf> {
+    let bytes = session::load(Path::new(id)).ok()?;
+    let sha = session::about(&bytes).ok()?.source_sha256?;
+    let file = db
+        .lock()
+        .and_then(|c| index::media_with_hash(&c, &sha))
+        .ok()??;
+    let file = PathBuf::from(file);
+    file.is_file().then_some(file)
+}
+
+/// What a hit at `line` of the session `id`'s transcript plays: its
+/// recording, from the stamp of the paragraph that matched.
+fn recording_at(db: &Db, id: &str, line: u32) -> Option<Play> {
+    let bytes = session::load(Path::new(id)).ok()?;
+    let text = session::text(&bytes, Part::Transcript).ok()?;
+    let stamp = session::stamp_at(&text, line as usize)?;
+    Some((session_recording(db, id)?, session::seconds(&stamp)?))
+}
+
+/// What `h` plays, if it is a transcript hit with a recording to play.
+fn recording(db: &Db, h: &Hit) -> Option<Play> {
+    match at(h) {
+        Some(At::Session(Part::Transcript, line)) => recording_at(db, &h.path, line),
+        _ => None,
+    }
 }
 
 fn owned(v: Variant<'_>) -> OwnedVariant {
     v.try_into().expect("string values have no fds")
 }
 
-fn to_match(h: Hit, floors: Floors) -> Match {
+fn to_match(h: Hit, floors: Floors, play: Option<&Play>) -> Match {
     let (name, subtext) = describe(&h);
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Variant::from(subtext)));
@@ -243,7 +281,10 @@ fn to_match(h: Hit, floors: Floors) -> Match {
     };
     props.insert("category".into(), owned(Variant::from(category)));
     // Without it KRunner offers every action on every match.
-    props.insert("actions".into(), owned(Variant::from(match_actions(&h))));
+    props.insert(
+        "actions".into(),
+        owned(Variant::from(match_actions(&h, play.is_some()))),
+    );
     // For vinosearch menu, which opens the pick itself; KRunner ignores keys
     // it doesn't know.
     match at(&h) {
@@ -255,6 +296,12 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         }
         Some(At::Second(s)) => drop(props.insert("second".into(), owned(Variant::from(s)))),
         Some(At::Session(Part::Summary, _)) | None => {}
+    }
+    // A transcript hit's recording: what the menu plays instead.
+    if let Some((file, second)) = play {
+        let file = file.display().to_string();
+        props.insert("play".into(), owned(Variant::from(file)));
+        props.insert("second".into(), owned(Variant::from(*second)));
     }
     let (icon, _) = crate::search::icons::for_path(Path::new(&h.path), h.kind);
     let relevance = relevance(&h, floors);
@@ -322,6 +369,20 @@ fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     std::thread::spawn(move || {
         crate::search::open::open(&path, at, editor.as_deref(), player.as_deref());
     });
+}
+
+/// The default action on the indexed file `id` at `at`: a transcript hit
+/// whose recording is indexed plays the recording from its stamp (#188);
+/// anything else opens as `open` does.
+fn open_or_play(db: &Db, config: &Path, id: &str, at: Option<At>) {
+    if let Some(At::Session(Part::Transcript, line)) = at
+        && indexed(db, id, "opening")
+        && let Some((file, second)) = recording_at(db, id, line)
+    {
+        let file = file.display().to_string();
+        return open(db, config, &file, Some(At::Second(second)), false);
+    }
+    open(db, config, id, at, false);
 }
 
 /// The last search's places, by result id, for opening a result there.
@@ -404,7 +465,12 @@ impl Runner {
         query.clone_into(&mut self.query.lock().unwrap());
         let hits = search(&self.jobs, floors, query).await;
         remember(&self.places, &hits);
-        hits.into_iter().map(|h| to_match(h, floors)).collect()
+        hits.into_iter()
+            .map(|h| {
+                let play = recording(&self.db, &h);
+                to_match(h, floors, play.as_ref())
+            })
+            .collect()
     }
 
     /// At the match's line or page when it is from the last search; at the
@@ -416,24 +482,29 @@ impl Runner {
             launch_settings(&["--search", &query]);
             return;
         }
-        let at = match action_id.as_str() {
-            OPEN_SUMMARY => Some(At::Session(Part::Summary, 0)),
-            OPEN_TRANSCRIPT => Some(At::Session(Part::Transcript, 0)),
-            _ => self
-                .places
-                .lock()
-                .unwrap()
-                .get(&match_id)
-                .copied()
-                .flatten(),
-        };
-        open(
-            &self.db,
-            &self.config,
-            &match_id,
-            at,
-            action_id == OPEN_FOLDER,
-        );
+        let place = self
+            .places
+            .lock()
+            .unwrap()
+            .get(&match_id)
+            .copied()
+            .flatten();
+        match action_id.as_str() {
+            OPEN_SUMMARY => {
+                let at = Some(At::Session(Part::Summary, 0));
+                open(&self.db, &self.config, &match_id, at, false);
+            }
+            // At the line that matched, when it was the transcript's.
+            OPEN_TRANSCRIPT => {
+                let at = match place {
+                    Some(at @ At::Session(Part::Transcript, _)) => at,
+                    _ => At::Session(Part::Transcript, 0),
+                };
+                open(&self.db, &self.config, &match_id, Some(at), false);
+            }
+            OPEN_FOLDER => open(&self.db, &self.config, &match_id, place, true),
+            _ => open_or_play(&self.db, &self.config, &match_id, place),
+        }
     }
 
     #[zbus(name = "Teardown")]
@@ -515,7 +586,7 @@ impl Gnome {
     #[zbus(name = "ActivateResult")]
     fn activate(&self, id: String, _terms: Vec<String>, _timestamp: u32) {
         let at = self.last.lock().unwrap().get(&id).and_then(at);
-        open(&self.db, &self.config, &id, at, false);
+        open_or_play(&self.db, &self.config, &id, at);
     }
 
     /// Clicking the provider's icon: the search window with the query
@@ -869,7 +940,16 @@ impl Control {
         Ok(
             crate::search::results::every_file(hits, |k| floors.of(k), limit)
                 .into_iter()
-                .filter_map(crate::search::results::found)
+                .filter_map(|h| {
+                    let play = recording(&self.db, &h);
+                    let mut found = crate::search::results::found(h)?;
+                    // A transcript hit plays its recording from this second.
+                    if let Some((_, second)) = play {
+                        found.4 = "second".to_owned();
+                        found.5 = second;
+                    }
+                    Some(found)
+                })
                 .collect(),
         )
     }
@@ -882,6 +962,30 @@ impl Control {
         let at = index::openable_kind(Path::new(&path))
             .and_then(|kind| At::of(kind, Path::new(&path), i64::from(line)));
         open(&self.db, &self.config, &path, at, false);
+        Ok(())
+    }
+
+    /// Play an indexed audio or video file from `second`, or the recording
+    /// an indexed session was transcribed from (#188).
+    fn play(&self, path: String, second: u32) -> zbus::fdo::Result<()> {
+        self.is_indexed(&path)?;
+        let file = if crate::extract::is_session(Path::new(&path)) {
+            session_recording(&self.db, &path)
+                .ok_or_else(|| failed(format!("{path}: its recording is not indexed")))?
+                .display()
+                .to_string()
+        } else if index::openable_kind(Path::new(&path)) == Some(Kind::Media) {
+            path
+        } else {
+            return Err(failed(format!("{path} is not audio or video")));
+        };
+        open(
+            &self.db,
+            &self.config,
+            &file,
+            Some(At::Second(second)),
+            false,
+        );
         Ok(())
     }
 
@@ -1407,7 +1511,13 @@ fn systemctl(args: &[&str]) -> bool {
 /// first and refuses during a download; from disk otherwise. True when the
 /// runner was asked, which deletes them once its worker takes the request.
 pub fn delete_models() -> Result<bool> {
-    if !runner_running() {
+    // Without a session bus no runner can be running. A bus that doesn't
+    // answer is an error: deleting under a runner mid-download would leave
+    // half a model.
+    if !matches!(
+        runner_owned().context("asking whether the service is running")?,
+        Some(true)
+    ) {
         model::delete()?;
         return Ok(false);
     }
@@ -1429,16 +1539,20 @@ pub fn delete_models() -> Result<bool> {
     Ok(true)
 }
 
+/// Whether something owns the runner's bus name; None without a session bus.
+fn runner_owned() -> Result<Option<bool>> {
+    zbus::block_on(async {
+        let Ok(conn) = zbus::Connection::session().await else {
+            return Ok(None);
+        };
+        let bus = zbus::fdo::DBusProxy::new(&conn).await?;
+        Ok(Some(bus.name_has_owner(SERVICE.try_into()?).await?))
+    })
+}
+
 /// Whether something already owns the runner's bus name.
 fn runner_running() -> bool {
-    let owned = || -> Result<bool> {
-        zbus::block_on(async {
-            let conn = zbus::Connection::session().await?;
-            let bus = zbus::fdo::DBusProxy::new(&conn).await?;
-            Ok::<bool, anyhow::Error>(bus.name_has_owner(SERVICE.try_into()?).await?)
-        })
-    };
-    owned().unwrap_or(false)
+    matches!(runner_owned(), Ok(Some(true)))
 }
 
 /// Install the service and the search places for the running desktop;
@@ -1653,7 +1767,7 @@ mod tests {
     #[test]
     fn text_read_in_an_image_is_listed_with_the_images() {
         let category = |kind, path| {
-            let m = to_match(hit(kind, 0.9, path), FLOORS);
+            let m = to_match(hit(kind, 0.9, path), FLOORS, None);
             match m.5.get("category").map(|v| String::try_from(v.clone())) {
                 Some(Ok(c)) => c,
                 other => panic!("{other:?}"),
@@ -1672,7 +1786,7 @@ mod tests {
         let mut h = hit(Kind::Code, 0.7, "/src/net.rs");
         h.line = 24;
         h.text = "pub fn check_url(url: &str) -> Result<()> {".into();
-        let m = to_match(h, FLOORS);
+        let m = to_match(h, FLOORS, None);
         let get = |k: &str| m.5.get(k).cloned();
         assert_eq!(
             get("category").map(|v| String::try_from(v).unwrap()),
@@ -1697,7 +1811,7 @@ mod tests {
         let session = |line: i64| {
             let mut h = hit(Kind::Session, 0.8, path.to_str().unwrap());
             h.line = line;
-            let m = to_match(h, FLOORS);
+            let m = to_match(h, FLOORS, None);
             let get = |k: &str| m.5.get(k).cloned().unwrap();
             (
                 String::try_from(get("category")).unwrap(),
@@ -1721,7 +1835,7 @@ mod tests {
         assert_eq!(actions, [OPEN_TRANSCRIPT, OPEN_FOLDER, SHOW_ALL]);
         assert_eq!(line, None);
         // Anything else offers neither.
-        let m = to_match(hit(Kind::Text, 0.8, "/n.md"), FLOORS);
+        let m = to_match(hit(Kind::Text, 0.8, "/n.md"), FLOORS, None);
         let actions = Vec::<String>::try_from(m.5.get("actions").cloned().unwrap()).unwrap();
         assert_eq!(actions, [OPEN_FOLDER, SHOW_ALL]);
         fs::remove_dir_all(&dir).unwrap();

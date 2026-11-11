@@ -45,6 +45,10 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
         id: "org.kde.kate.desktop".into(),
         name: "Kate".into(),
     }]);
+    w.players = Some(vec![App {
+        id: "mpv.desktop".into(),
+        name: "mpv Media Player".into(),
+    }]);
     w.integration = Arc::new(Mutex::new(integration::State::default()));
     w.doctor = Arc::new(Mutex::new(doctor::State {
         running: false,
@@ -434,8 +438,50 @@ fn an_editor_is_picked_from_the_installed_apps() {
         "{saved}"
     );
     assert!(
-        h.query_by_role_and_label(Role::TextInput, "Command")
+        h.query_by_role_and_label(Role::TextInput, "Editor command")
             .is_none()
+    );
+}
+
+#[test]
+fn a_player_is_picked_or_typed_as_the_editor_is() {
+    let (w, _requests) = window(Page::Search, "player");
+    let mut h = harness(w, WIDE, Theme::Light);
+    let player = h.get_by_role_and_label(Role::ComboBox, "Player");
+    assert_eq!(
+        player.accesskit_node().value().as_deref(),
+        Some("Default app")
+    );
+    player.click();
+    settle(&mut h);
+    h.get_by_label("mpv Media Player").click();
+    settle(&mut h);
+    assert_eq!(h.state().config.player.as_deref(), Some("mpv.desktop"));
+    assert_eq!(h.state().config.editor, None);
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(saved.contains("player = \"mpv.desktop\""), "{saved}");
+
+    h.get_by_role_and_label(Role::ComboBox, "Player").click();
+    settle(&mut h);
+    h.get_by_label("Custom command…").click();
+    settle(&mut h);
+    // The app is dropped; nothing is saved until a command is typed.
+    assert_eq!(h.state().config.player, None);
+    assert!(
+        h.query_by_role_and_label(Role::TextInput, "Editor command")
+            .is_none()
+    );
+    h.get_by_role_and_label(Role::TextInput, "Player command")
+        .focus();
+    settle(&mut h);
+    h.get_by_role_and_label(Role::TextInput, "Player command")
+        .type_text("mpv --start={seconds} {file}");
+    settle(&mut h);
+    h.key_press(Key::Enter);
+    settle(&mut h);
+    assert_eq!(
+        h.state().config.player.as_deref(),
+        Some("mpv --start={seconds} {file}")
     );
 }
 
@@ -448,9 +494,10 @@ fn a_custom_editor_command_is_saved_when_the_field_is_left() {
     h.get_by_label("Custom command…").click();
     settle(&mut h);
     assert_eq!(h.state().config.editor, None);
-    h.get_by_role_and_label(Role::TextInput, "Command").focus();
+    h.get_by_role_and_label(Role::TextInput, "Editor command")
+        .focus();
     settle(&mut h);
-    h.get_by_role_and_label(Role::TextInput, "Command")
+    h.get_by_role_and_label(Role::TextInput, "Editor command")
         .type_text("foot -e nvim +{line} {file}");
     settle(&mut h);
     h.key_press(Key::Enter);
@@ -568,6 +615,19 @@ fn without_the_service_the_models_are_deleted_from_disk() {
     assert!(!models.exists());
     h.get_by_label("Not downloaded");
     assert!(sent(&requests).is_empty());
+}
+
+#[test]
+fn a_service_that_answers_with_an_error_keeps_its_models() {
+    // It may have them loaded, or be downloading: only it may delete them.
+    let (w, _requests) = window(Page::Model, "erroring");
+    w.link.shared.lock().unwrap().status = Some(Err("the index is locked".into()));
+    let models = w.models_dir.clone().unwrap();
+    std::fs::create_dir_all(models.join(models::ALL[0])).unwrap();
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("the index is locked");
+    assert!(h.query_by_role_and_label(Role::Button, "Delete…").is_none());
+    assert!(models.exists());
 }
 
 #[test]

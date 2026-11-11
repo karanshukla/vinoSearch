@@ -67,6 +67,15 @@ struct Session {
     /// RFC 3339, to the second.
     started: String,
     duration_s: u64,
+    /// Only on a session made from a recording (vinoWhisper#162).
+    #[serde(default)]
+    file: Option<SourceFile>,
+}
+
+#[derive(serde::Deserialize)]
+struct SourceFile {
+    /// Hex, of the whole file.
+    sha256: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -82,6 +91,9 @@ pub struct About {
     pub has_summary: bool,
     /// The attestation marks the summary as written by a model.
     pub ai_summary: bool,
+    /// The SHA-256 of the recording it was transcribed from, for a session
+    /// made from a file: its stamps are times in that file (#188).
+    pub source_sha256: Option<Vec<u8>>,
 }
 
 impl About {
@@ -253,6 +265,11 @@ pub fn about(bytes: &[u8]) -> Result<About> {
     Ok(About {
         has_summary: has(&zip, SUMMARY),
         ai_summary: att.files.get(SUMMARY).and_then(|m| m.made_by.as_deref()) == Some(AI_SUMMARY),
+        source_sha256: att
+            .session
+            .file
+            .and_then(|f| hex::decode(f.sha256).ok())
+            .filter(|h| h.len() == 32),
         started: att.session.started,
         duration_s: att.session.duration_s,
     })
@@ -273,6 +290,15 @@ pub fn stamp_at(transcript: &str, line: usize) -> Option<String> {
         .filter_map(stamp)
         .last()
         .map(str::to_owned)
+}
+
+/// A stamp's seconds: "61:05" is 3665.
+pub fn seconds(stamp: &str) -> Option<u32> {
+    let (m, s) = stamp.split_once(':')?;
+    m.parse::<u32>()
+        .ok()?
+        .checked_mul(60)?
+        .checked_add(s.parse().ok()?)
 }
 
 /// `[MM:SS] ` starting `line`, minutes 2 digits or more: its "MM:SS".
@@ -297,10 +323,15 @@ pub(crate) mod tests {
         [61:05] Past the hour now.\n";
 
     pub fn attestation(format: &str) -> String {
+        attestation_of(format, "")
+    }
+
+    /// `file` is the session's `"file": {{...}},` member, or empty for a live one.
+    fn attestation_of(format: &str, file: &str) -> String {
         format!(
             r#"{{"format": "{format}",
               "generator": {{"name": "vinoWhisper", "version": "1.1.0"}},
-              "session": {{"started": "2026-10-27T14:05:12-04:00", "duration_s": 2530,
+              "session": {{"started": "2026-10-27T14:05:12-04:00", "duration_s": 2530, {file}
                            "source": "system audio", "language": "en", "task": "transcribe"}},
               "files": {{"transcript.txt": {{"sha256": "00", "made_by": "speech-to-text", "model": null}},
                          "summary.md": {{"sha256": "00", "made_by": "ai-generated-summary"}}}}}}"#
@@ -310,6 +341,16 @@ pub(crate) mod tests {
     /// A bundle as vinoWhisper writes one: `mimetype` first and stored, the
     /// rest deflated in any order.
     pub fn bundle(summary: Option<&str>, format: &str) -> Vec<u8> {
+        bundle_with(summary, &attestation(format))
+    }
+
+    /// A bundle made from a recording with this SHA-256 (hex).
+    pub fn bundle_from(sha256: &str) -> Vec<u8> {
+        let file = format!(r#""file": {{"name": "talk.mkv", "sha256": "{sha256}", "bytes": 1}},"#);
+        bundle_with(None, &attestation_of("vinowhisper-session/1", &file))
+    }
+
+    fn bundle_with(summary: Option<&str>, attestation: &str) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let stored =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -317,7 +358,7 @@ pub(crate) mod tests {
         w.write_all(MIMETYPE).unwrap();
         let deflated = SimpleFileOptions::default();
         w.start_file(ATTESTATION, deflated).unwrap();
-        w.write_all(attestation(format).as_bytes()).unwrap();
+        w.write_all(attestation.as_bytes()).unwrap();
         if let Some(s) = summary {
             w.start_file(SUMMARY, deflated).unwrap();
             w.write_all(s.as_bytes()).unwrap();
@@ -406,6 +447,27 @@ pub(crate) mod tests {
             ..a
         };
         assert_eq!(long.when(), "2026-10-27 14:05, 1 h 02 min");
+    }
+
+    #[test]
+    fn a_session_made_from_a_file_names_its_hash() {
+        let live = about(&bundle(None, "vinowhisper-session/1")).unwrap();
+        assert_eq!(live.source_sha256, None);
+        let sha = "ab".repeat(32);
+        let made = about(&bundle_from(&sha)).unwrap();
+        assert_eq!(made.source_sha256, Some(vec![0xab; 32]));
+        // Not a SHA-256: no file to look for.
+        assert_eq!(about(&bundle_from("zz")).unwrap().source_sha256, None);
+        assert_eq!(about(&bundle_from("abcd")).unwrap().source_sha256, None);
+    }
+
+    #[test]
+    fn a_stamp_is_its_seconds() {
+        assert_eq!(seconds("01:12"), Some(72));
+        assert_eq!(seconds("61:05"), Some(3665));
+        assert_eq!(seconds("00:00"), Some(0));
+        assert_eq!(seconds("1h"), None);
+        assert_eq!(seconds("99999999999:00"), None);
     }
 
     /// Bundles vinoWhisper's own writer made (vinoWhisper#123, b244bb8).

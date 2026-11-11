@@ -620,6 +620,14 @@ fn run_with<E: Embed>(
     // Whether the rest of long documents may run when nothing else waits:
     // not after it failed to, until a Retry or a load succeeds.
     let mut rest_ready = true;
+    // Runs of the rest that failed in a row. One file the model can't take
+    // goes behind the others (`index::media::rest`), so the next run is
+    // tried; a second failure straight after is taken for the device.
+    let mut rest_failures = 0;
+    // Whether the models audio and video need were there when last looked:
+    // without them media waits for a Retry (a fetch sends one) instead of
+    // loading the model to find out again.
+    let mut media_models = true;
     // What this run of indexing (since the worker last had nothing to do)
     // has done, for Status and one line in the log; and whether it did
     // anything at all.
@@ -748,8 +756,9 @@ fn run_with<E: Embed>(
             status.work.take(waiting_model).or_else(|| {
                 // The first pass over everything is done; the rest of long
                 // documents is what's left, a run of parts at a time, then
-                // audio and video, on AC only (#192).
-                let media = !status.power.on_battery();
+                // audio and video, on AC only (#192): `power` sends a
+                // Retry when a charger comes.
+                let media = media_models && !status.power.on_battery();
                 (rest_ready && !waiting_model && index::has_partial(&conn, media).unwrap_or(false))
                     .then_some(Item::Rest)
             })
@@ -827,6 +836,7 @@ fn run_with<E: Embed>(
                 Job::Wake => {}
                 Job::Retry => {
                     rest_ready = true;
+                    media_models = true;
                     status.waiting_model.store(false, Ordering::Relaxed);
                 }
             }
@@ -883,6 +893,9 @@ fn run_with<E: Embed>(
             eprintln!("compiling the document model: {e:#}");
         }
         emb.set_document_share(pace.share());
+        // `index_rest` leaves media waiting without them, and so must the
+        // choice of the next item, or it would be Rest again for nothing.
+        media_models = emb.can_embed_media();
         let idle = sched::Idle::enter();
         let mut retried = false;
         // Between chunks: stop for a pause or a hold, or for settings and
@@ -936,6 +949,7 @@ fn run_with<E: Embed>(
                             }
                             _ => {}
                         }
+                        rest_failures = 0;
                         status.last_indexed.store(unix_now(), Ordering::Relaxed);
                     }
                     Ok(None) => {}
@@ -944,7 +958,11 @@ fn run_with<E: Embed>(
                     Err(_) if interrupted(&r) => {}
                     Err(e) => {
                         eprintln!("indexing the rest of a long document: {e:#}");
-                        rest_ready = false;
+                        rest_failures += 1;
+                        if rest_failures >= 2 {
+                            rest_failures = 0;
+                            rest_ready = false;
+                        }
                     }
                 }
             }
@@ -953,6 +971,7 @@ fn run_with<E: Embed>(
         drop(idle);
         if retried {
             rest_ready = true;
+            media_models = true;
         }
         if before != (run.files_embedded, run.removed, run.duplicates) {
             status.last_indexed.store(unix_now(), Ordering::Relaxed);
@@ -1306,5 +1325,59 @@ mod tests {
         assert!(h.status.indexing());
         h.status.waiting_model.store(true, Ordering::Relaxed);
         assert!(!h.status.indexing());
+    }
+
+    #[test]
+    fn media_without_its_models_waits_and_the_model_is_loaded_once_to_see() {
+        let h = Harness::new("media-no-models");
+        let clip = h.write("clip.wav", "not decoded in this test");
+        let (mtime, size) = index::stamp_of(&fs::metadata(&clip).unwrap()).unwrap();
+        // Recorded and waiting, as a check on AC leaves it.
+        let conn = index::open(&h.db()).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, mtime, size, sha256) VALUES (1, ?1, ?2, ?3, x'aa')",
+            rusqlite::params![clip.to_str().unwrap(), mtime, size],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO partial (file_id, done, total, media) VALUES (1, 0, 40, 1)",
+            [],
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let file = Config::default();
+        let opts = Options {
+            openvino_dir: None,
+            device: "CPU".into(),
+            idle: None,
+            excludes: file.excludes().unwrap(),
+            types: FileTypes::new(&file.formats)
+                .unwrap()
+                .with_media(true, 3600.0),
+            config: h.dir.join("config.toml"),
+            file,
+            pinned: Pinned::default(),
+            status: h.status.clone(),
+            db: h.db(),
+        };
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counted = loads.clone();
+        let worker = std::thread::spawn(move || {
+            run_with(rx, opts, move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(FakeEmbed {
+                    no_media_models: true,
+                    ..FakeEmbed::default()
+                })
+            })
+        });
+        // A Retry (a charger, a fetch that brought something else) has it
+        // look once more, and no more than that.
+        tx.send(Job::Retry).unwrap();
+        drop(tx);
+        // Returns: the worker went idle with the file still waiting.
+        worker.join().unwrap().unwrap();
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(index::partial(&conn, 10).unwrap().len(), 1);
     }
 }

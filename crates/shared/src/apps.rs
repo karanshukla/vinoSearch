@@ -1,13 +1,13 @@
-//! Installed apps, from their desktop entries: the editors the settings app
-//! offers for the `editor` setting, and where the runner finds the entry an
-//! `editor = "org.kde.kate.desktop"` names.
+//! Installed apps, from their desktop entries: the editors and players the
+//! settings app offers for the `editor` and `player` settings, and where the
+//! runner finds the entry an `editor = "org.kde.kate.desktop"` names.
 
 use std::path::PathBuf;
 
-/// An app that opens text files, as the settings app lists it.
+/// An app that opens text files, or plays media, as the settings app lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct App {
-    /// The desktop entry id, `org.kde.kate.desktop`: what `editor` is set to.
+    /// The desktop entry id, `org.kde.kate.desktop`: what the setting is set to.
     pub id: String,
     pub name: String,
 }
@@ -47,6 +47,16 @@ pub fn is_entry_id(editor: &str) -> bool {
 /// in the menu; hidden entries and terminal apps (which need a terminal to
 /// run in) are left out.
 pub fn editors_in(dirs: &[PathBuf]) -> Vec<App> {
+    apps_in(dirs, for_text)
+}
+
+/// Every app that says it plays video or audio files, as `editors_in` lists
+/// editors.
+pub fn players_in(dirs: &[PathBuf]) -> Vec<App> {
+    apps_in(dirs, for_media)
+}
+
+fn apps_in(dirs: &[PathBuf], wanted: fn(&str, &str) -> bool) -> Vec<App> {
     let mut seen = std::collections::HashSet::new();
     let mut apps = Vec::new();
     for dir in dirs {
@@ -66,7 +76,7 @@ pub fn editors_in(dirs: &[PathBuf]) -> Vec<App> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if let Some(name) = editor_name(&text) {
+            if let Some(name) = app_name(&text, wanted) {
                 apps.push(App { id, name });
             }
         }
@@ -79,10 +89,32 @@ pub fn editors() -> Vec<App> {
     editors_in(&data_dirs())
 }
 
-/// The entry's Name when it is a shown, graphical app for text.
-fn editor_name(text: &str) -> Option<String> {
+pub fn players() -> Vec<App> {
+    players_in(&data_dirs())
+}
+
+/// Whether a desktop entry's `key=value` says it opens text.
+fn for_text(key: &str, value: &str) -> bool {
+    match key {
+        "MimeType" => value.split(';').any(|m| m == "text/plain"),
+        "Categories" => value.split(';').any(|c| c == "TextEditor"),
+        _ => false,
+    }
+}
+
+/// Whether a desktop entry's `key=value` says it plays media files. A
+/// `Player` category alone isn't enough: a streaming client has it too.
+fn for_media(key: &str, value: &str) -> bool {
+    key == "MimeType"
+        && value
+            .split(';')
+            .any(|m| m.starts_with("video/") || m.starts_with("audio/"))
+}
+
+/// The entry's Name when it is a shown, graphical app `wanted` accepts.
+fn app_name(text: &str, wanted: fn(&str, &str) -> bool) -> Option<String> {
     let mut in_entry = false;
-    let (mut name, mut for_text, mut app) = (None, false, false);
+    let (mut name, mut fits, mut app) = (None, false, false);
     for line in text.lines().map(str::trim) {
         if line.starts_with('[') {
             in_entry = line == "[Desktop Entry]";
@@ -91,17 +123,16 @@ fn editor_name(text: &str) -> Option<String> {
         let Some((key, value)) = line.split_once('=').filter(|_| in_entry) else {
             continue;
         };
-        let value = value.trim();
-        match key.trim() {
+        let (key, value) = (key.trim(), value.trim());
+        fits |= wanted(key, value);
+        match key {
             "Name" => name = Some(value.to_owned()),
             "Type" => app = value == "Application",
-            "MimeType" => for_text |= value.split(';').any(|m| m == "text/plain"),
-            "Categories" => for_text |= value.split(';').any(|c| c == "TextEditor"),
             "NoDisplay" | "Hidden" | "Terminal" if value == "true" => return None,
             _ => {}
         }
     }
-    name.filter(|n| app && for_text && !n.is_empty())
+    name.filter(|n| app && fits && !n.is_empty())
 }
 
 #[cfg(test)]
@@ -164,6 +195,43 @@ mod tests {
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Code (mine)", "Kate", "Visual Studio Code"]);
         assert_eq!(apps[1].id, "org.kde.kate.desktop");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn players_are_shown_graphical_apps_for_video_or_audio() {
+        let root = std::env::temp_dir().join(format!("vinosearch-players-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let write = |id: &str, body: &str| {
+            fs::create_dir_all(root.join("applications")).unwrap();
+            fs::write(
+                root.join("applications").join(id),
+                format!("[Desktop Entry]\nType=Application\n{body}"),
+            )
+            .unwrap();
+        };
+        write(
+            "mpv.desktop",
+            "Name=mpv Media Player\nMimeType=video/mp4;audio/mpeg;\n",
+        );
+        write(
+            "org.kde.elisa.desktop",
+            "Name=Elisa\nMimeType=audio/flac;\n",
+        );
+        write("org.kde.kate.desktop", "Name=Kate\nMimeType=text/plain;\n");
+        // A streaming client plays nothing from disk.
+        write(
+            "stream.desktop",
+            "Name=Stream\nCategories=AudioVideo;Player;\n",
+        );
+        write(
+            "cli.desktop",
+            "Name=Terminal player\nTerminal=true\nMimeType=video/mp4;\n",
+        );
+        let apps = players_in(std::slice::from_ref(&root));
+        let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Elisa", "mpv Media Player"]);
+        assert_eq!(apps[1].id, "mpv.desktop");
         fs::remove_dir_all(&root).unwrap();
     }
 

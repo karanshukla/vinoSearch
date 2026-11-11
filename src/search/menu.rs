@@ -158,7 +158,18 @@ fn rows(mut matches: Vec<Match>, home: Option<&str>) -> Vec<Row> {
                 .map(At::Line)
                 .or_else(|| number("page").map(At::Page))
                 .or_else(|| second(&props).map(At::Second));
-            Row { path, line, at }
+            // A transcript hit whose recording is indexed plays it (#188).
+            let play = props
+                .get("play")
+                .and_then(|v| String::try_from(v.try_clone().ok()?).ok());
+            match (play, second(&props)) {
+                (Some(file), Some(s)) => Row {
+                    path: file,
+                    line,
+                    at: Some(At::Second(s)),
+                },
+                _ => Row { path, line, at },
+            }
         })
         .collect()
 }

@@ -375,48 +375,109 @@ pub fn open(path: &Path) -> Result<Connection> {
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256);
-         -- A file whose content another file already has keeps no chunks of
-         -- its own. When the one holding them goes (deleted, changed,
-         -- forgotten), they pass to a copy instead of being dropped. Chunk
-         -- ids don't change, so loaded Vectors stay valid.
-         CREATE TRIGGER IF NOT EXISTS files_hand_over BEFORE DELETE ON files
-         WHEN OLD.sha256 IS NOT NULL
-         BEGIN
-             UPDATE chunks
-             SET file_id = (SELECT id FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id LIMIT 1)
-             WHERE file_id = OLD.id
-               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
-         END;
          -- Long documents indexed in part (#108): `done` of their `total`
          -- parts have chunks, the rest wait for `index_rest`. Gone once the
          -- last part is in, and with the file. A copy takes it over with
-         -- the chunks.
+         -- the chunks (`hand_over`).
          CREATE TABLE IF NOT EXISTS partial (
              file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
              done INTEGER NOT NULL,
              total INTEGER NOT NULL
          );
-         CREATE TRIGGER IF NOT EXISTS partial_hand_over BEFORE DELETE ON files
+         -- How long each audio or video file runs (#187), and whether it is
+         -- left out for running over `formats.media.max_hours`, so a change
+         -- to that setting reaches files already seen (`media::fit`).
+         CREATE TABLE IF NOT EXISTS media (
+             file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+             seconds REAL NOT NULL,
+             too_long INTEGER NOT NULL DEFAULT 0
+         );",
+    )?;
+    // Media in part (#187) waits for every document's rest, and only on AC.
+    // `tries` counts the times the model failed on a file's next run: one
+    // that keeps failing goes behind the others instead of ahead of them.
+    for (column, sql) in [
+        ("media", "media INTEGER NOT NULL DEFAULT 0"),
+        ("tries", "tries INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let has: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('partial') WHERE name = ?1",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE partial ADD COLUMN {sql}"))?;
+        }
+    }
+    hand_over(&conn)?;
+    words_table(&conn)?;
+    code_apart(&conn)?;
+    Ok(conn)
+}
+
+/// A file whose content another file already has keeps no chunks of its
+/// own. When the one holding them goes (deleted, changed, forgotten), they
+/// pass to a copy instead of being dropped, and so does its partial row.
+/// Chunk ids don't change, so loaded Vectors stay valid.
+///
+/// One trigger, so both go to the same copy, and only when no copy holds
+/// chunks or a partial row of its own: the heir would hold every chunk
+/// twice, or two partial rows. That can't come about any more, since a file
+/// waiting in `partial` counts as holding its content (`holder_of`), but
+/// before it did two copies of a film each got a row (#187), and deleting
+/// either failed on `partial.file_id`. Those indexes have the two triggers
+/// this replaces: they go, and of files with the same content that each
+/// hold it, all but the first become plain copies.
+fn hand_over(conn: &Connection) -> Result<()> {
+    let old: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+         AND name IN ('files_hand_over', 'partial_hand_over')",
+        [],
+        |r| r.get(0),
+    )?;
+    if old > 0 {
+        let holds = |f: &str| {
+            format!(
+                "(EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = {f}.id)
+                  OR EXISTS (SELECT 1 FROM partial p WHERE p.file_id = {f}.id))"
+            )
+        };
+        conn.execute_batch(&format!(
+            "BEGIN;
+             DROP TRIGGER IF EXISTS files_hand_over;
+             DROP TRIGGER IF EXISTS partial_hand_over;
+             CREATE TEMP TABLE second_holders AS
+                 SELECT f.id FROM files f
+                 WHERE f.sha256 IS NOT NULL AND {}
+                   AND EXISTS (SELECT 1 FROM files g
+                               WHERE g.sha256 = f.sha256 AND g.id < f.id AND {});
+             DELETE FROM chunks WHERE file_id IN (SELECT id FROM second_holders);
+             DELETE FROM partial WHERE file_id IN (SELECT id FROM second_holders);
+             DROP TABLE second_holders;
+             COMMIT;",
+            holds("f"),
+            holds("g"),
+        ))?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS hand_over BEFORE DELETE ON files
          WHEN OLD.sha256 IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM files f WHERE f.sha256 = OLD.sha256 AND f.id != OLD.id
+                 AND (EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+                      OR EXISTS (SELECT 1 FROM partial p WHERE p.file_id = f.id)))
          BEGIN
+             UPDATE chunks
+             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
+             WHERE file_id = OLD.id
+               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
              UPDATE partial
-             SET file_id = (SELECT id FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id LIMIT 1)
+             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
              WHERE file_id = OLD.id
                AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
          END;",
     )?;
-    // Media in part (#187) waits for every document's rest, and only on AC.
-    let has_media: bool = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('partial') WHERE name = 'media'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_media {
-        conn.execute_batch("ALTER TABLE partial ADD COLUMN media INTEGER NOT NULL DEFAULT 0")?;
-    }
-    words_table(&conn)?;
-    code_apart(&conn)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// Code indexed as text before it was a kind of its own (#110), moved over
@@ -739,6 +800,25 @@ pub fn index_file<E: Embed>(
     if unchanged && known.as_ref().is_some_and(|k| k.3.is_some()) {
         return Ok(Outcome::Unchanged);
     }
+    // Media is probed before it is hashed, so a film over the longest
+    // indexed is never read whole: it keeps a row with no hash, and that
+    // row stands while the file and the limit do.
+    let probed = match (kind, &known) {
+        (Kind::Media, Some(k))
+            if unchanged && media::left_out(conn, k.0, types.max_media_seconds)? =>
+        {
+            return Ok(Outcome::Unchanged);
+        }
+        (Kind::Media, _) => match media::probe(path, types.max_media_seconds) {
+            media::Probed::TooLong(seconds) => {
+                media::leave_out(conn, (key, mtime, size), seconds)?;
+                return Ok(Outcome::Unreadable { no_decoder: false });
+            }
+            media::Probed::Ok(p) => Some(p),
+            media::Probed::Unreadable => None,
+        },
+        _ => None,
+    };
     let read = match kind {
         Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
         Kind::Image | Kind::Document | Kind::Session => fs::read(path),
@@ -750,9 +830,10 @@ pub fn index_file<E: Embed>(
         return Ok(Outcome::Skipped);
     };
     let hash = match kind {
-        Kind::Media => match media::hash(path) {
-            Ok(h) => h,
-            Err(_) => {
+        // An error is `between`'s: a stop, which leaves the file as it was.
+        Kind::Media => match media::hash(path, &mut || between(conn, emb))? {
+            Some(h) => h,
+            None => {
                 remove(conn, path)?;
                 return Ok(Outcome::Skipped);
             }
@@ -795,15 +876,13 @@ pub fn index_file<E: Embed>(
     };
     if holder.is_some() {
         record(conn)?;
+        if let Some(p) = &probed {
+            media::note(conn, key, p)?;
+        }
         return Ok(Outcome::Duplicate);
     }
     if kind == Kind::Media {
-        return media::start(
-            conn,
-            path,
-            (key, mtime, size, &hash),
-            types.max_media_seconds,
-        );
+        return media::start(conn, (key, mtime, size, &hash), probed);
     }
     let title = title_of(path);
     let (first, vectors, kinds) = match kind {
@@ -1060,14 +1139,17 @@ enum Next {
     Again(String),
 }
 
-/// The long document indexed in part longest ago, and what to do with it.
-fn next_rest(conn: &Connection) -> Result<Option<Next>> {
+/// The long document indexed in part longest ago, and what to do with it:
+/// documents before media, which is taken only if `media`, and a file the
+/// model failed on after those it hasn't.
+fn next_rest(conn: &Connection, media: bool) -> Result<Option<Next>> {
     let row: Option<(i64, String, i64, i64, i64, i64)> = conn
         .query_row(
             "SELECT f.id, f.path, f.mtime, f.size, p.done, p.total
              FROM partial p JOIN files f ON f.id = p.file_id
-             ORDER BY p.media, p.file_id LIMIT 1",
-            [],
+             WHERE p.media = 0 OR ?1
+             ORDER BY p.media, p.tries, p.file_id LIMIT 1",
+            [media],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -1116,7 +1198,7 @@ fn store_rest(
         tx.execute("DELETE FROM partial WHERE file_id = ?1", [id])?;
     } else {
         tx.execute(
-            "UPDATE partial SET done = ?1 WHERE file_id = ?2",
+            "UPDATE partial SET done = ?1, tries = 0 WHERE file_id = ?2",
             params![done as i64, id],
         )?;
     }
@@ -1142,13 +1224,15 @@ pub enum Rest {
 /// The next run of parts of the long document indexed in part longest ago
 /// (#108), or None when every document is in whole. The parser's limits
 /// apply to the run, as in `index_file`, and `between` after each chunk.
+/// Media is left waiting, as if there were none, while the models it needs
+/// are not fetched: every slice would be decoded only to fail.
 pub fn index_rest<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
     types: &FileTypes,
     between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Option<Rest>> {
-    let Some(next) = next_rest(conn)? else {
+    let Some(next) = next_rest(conn, emb.can_embed_media())? else {
         return Ok(None);
     };
     let again = |conn: &mut Connection,
@@ -1272,18 +1356,21 @@ pub fn has_partial(conn: &Connection, media: bool) -> Result<bool> {
 pub fn partial(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT f.path, p.done, p.total FROM partial p JOIN files f ON f.id = p.file_id
-         ORDER BY p.file_id LIMIT ?1",
+         ORDER BY p.media, p.tries, p.file_id LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Another file with content `hash` that holds its chunks, if there is one.
+/// Another file with content `hash` that holds its chunks, if there is one,
+/// or that waits in `partial` to: a media file has no chunks until
+/// `index_rest` gets to it, and a copy found meanwhile is still a copy.
 fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
             "SELECT f.id FROM files f WHERE f.sha256 = ?1 AND f.path != ?2
-             AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id) LIMIT 1",
+             AND (EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+                  OR EXISTS (SELECT 1 FROM partial p WHERE p.file_id = f.id)) LIMIT 1",
             params![hash, except],
             |r| r.get(0),
         )
@@ -1358,7 +1445,8 @@ pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
 }
 
 /// Drop every indexed file `types` no longer takes (images, once turned
-/// off). Returns files removed.
+/// off), and hold media to the longest it now allows (`media::fit`).
+/// Returns files removed.
 pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
     let paths: Vec<String> = conn
         .prepare("SELECT path FROM files")?
@@ -1370,7 +1458,12 @@ pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
         n += tx.execute("DELETE FROM files WHERE path = ?1", [p])?;
     }
     tx.commit()?;
-    if n > 0 {
+    let left_out = if types.media {
+        media::fit(conn, types.max_media_seconds)?.0
+    } else {
+        0
+    };
+    if n + left_out > 0 {
         compact(conn)?;
     }
     Ok(n)
@@ -1751,6 +1844,20 @@ pub fn openable_kind(path: &Path) -> Option<Kind> {
             .contains(&ext.as_str())
             .then_some(Kind::Media)
     })
+}
+
+/// An indexed audio or video file whose contents hash to `sha256`, for a
+/// session's recording (#188). None while media isn't indexed.
+pub fn media_with_hash(conn: &Connection, sha256: &[u8]) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE sha256 = ?1 ORDER BY path")?;
+    let paths = stmt.query_map([sha256], |r| r.get::<_, String>(0))?;
+    for path in paths {
+        let path = path?;
+        if openable_kind(Path::new(&path)) == Some(Kind::Media) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 /// Indexed text files and documents, newest first by the mtime the index
@@ -3049,16 +3156,16 @@ mod tests {
             from,
             total: 70,
         };
-        assert_eq!(next_rest(&conn).unwrap(), Some(parts(30)));
+        assert_eq!(next_rest(&conn, true).unwrap(), Some(parts(30)));
         let run = [(31, "second".to_owned())];
         store_rest(&mut conn, id, Kind::Text, 60, 70, &run, &[vec![0.0; DIM]]).unwrap();
         // A restart picks it up from there.
         drop(conn);
         let mut conn = open(&db).unwrap();
-        assert_eq!(next_rest(&conn).unwrap(), Some(parts(60)));
+        assert_eq!(next_rest(&conn, true).unwrap(), Some(parts(60)));
         let run = [(61, "third".to_owned())];
         store_rest(&mut conn, id, Kind::Text, 70, 70, &run, &[vec![0.0; DIM]]).unwrap();
-        assert_eq!(next_rest(&conn).unwrap(), None);
+        assert_eq!(next_rest(&conn, true).unwrap(), None);
         assert!(!has_partial(&conn, true).unwrap());
         // Still one file, with every run's chunks.
         assert_eq!(counts(&conn).unwrap(), (1, 3));
@@ -3075,9 +3182,12 @@ mod tests {
         let key = book.to_str().unwrap().to_owned();
         let id = add_partial(&conn, &book, 30, 70);
         fs::write(&book, "a longer book").unwrap();
-        assert_eq!(next_rest(&conn).unwrap(), Some(Next::Again(key.clone())));
+        assert_eq!(
+            next_rest(&conn, true).unwrap(),
+            Some(Next::Again(key.clone()))
+        );
         fs::remove_file(&book).unwrap();
-        assert_eq!(next_rest(&conn).unwrap(), Some(Next::Again(key)));
+        assert_eq!(next_rest(&conn, true).unwrap(), Some(Next::Again(key)));
         // Indexed again, the old row and its partial row go.
         conn.execute("DELETE FROM files WHERE id = ?1", [id])
             .unwrap();

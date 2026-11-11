@@ -11,8 +11,11 @@ nav_order: 3
 - **Terminal:** see [the CLI](#the-cli).
 
 Results need 3 or more characters. Enter opens the file: a text file at the matching line in your
-editor, a PDF at the matching page in Okular, Evince, Papers or Zathura. Other files, and apps that
-can't be told where, open at the top. [The D-Bus page](dbus.md#opening-at-the-match) has which
+editor, a PDF at the matching page in Okular, Evince, Papers or Zathura, an audio or video file from
+the matching time in mpv, VLC or Celluloid. A vinoWhisper session made from a recording plays that
+recording from the matching stamp when the recording is indexed too; **Open transcript** opens the
+text instead. Other files, and apps that can't be told where (Haruna, Totem and Showtime take no
+start time), open at the top. [The D-Bus page](dbus.md#opening-at-the-match) has which
 editors and viewers count.
 
 ## All results

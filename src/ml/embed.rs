@@ -786,6 +786,14 @@ impl Embedder {
         Ok(v)
     }
 
+    /// The audio and vision models are fetched: what audio and video need
+    /// besides the text model.
+    pub fn can_embed_media(&self) -> bool {
+        crate::ml::model::vision_present(&self.model_dir, &self.vision_dir)
+            && crate::ml::model::audio_dir()
+                .is_ok_and(|dir| crate::ml::model::audio_present(&self.model_dir, &dir))
+    }
+
     /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
     /// Not held to a CPU reference yet: there is none checked in for audio.
     pub fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
@@ -821,6 +829,8 @@ pub trait Embed {
     fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>>;
     /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
     fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>>;
+    /// The models audio and video need are fetched.
+    fn can_embed_media(&self) -> bool;
     /// The OCR model's files are fetched.
     fn can_read_text(&self) -> bool;
     /// The lines of text in `img`.
@@ -848,6 +858,10 @@ impl Embed for Embedder {
 
     fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
         Embedder::audio(self, f)
+    }
+
+    fn can_embed_media(&self) -> bool {
+        Embedder::can_embed_media(self)
     }
 
     fn can_read_text(&self) -> bool {
@@ -890,6 +904,10 @@ pub(crate) struct FakeEmbed {
     pub documents: usize,
     pub images: usize,
     pub audio: usize,
+    /// As if the audio or vision model were not fetched.
+    pub no_media_models: bool,
+    /// Sound embeds fail, as on a device that is down.
+    pub audio_fails: bool,
     pub on_document: Option<OnDocument>,
 }
 
@@ -936,8 +954,13 @@ impl Embed for FakeEmbed {
     }
 
     fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
+        ensure!(!self.audio_fails, "degenerate embedding (norm NaN)");
         self.audio += 1;
         Ok(Self::vector(&format!("sound {}", f.frames)))
+    }
+
+    fn can_embed_media(&self) -> bool {
+        !self.no_media_models
     }
 
     fn can_read_text(&self) -> bool {

@@ -371,9 +371,11 @@ enum Player {
     Celluloid,
 }
 
-/// The player `program` (a name or path) is, by its file name. Haruna and
-/// Totem/Showtime aren't here: no flag that starts a file at a time could be
-/// confirmed for them (Totem's hidden `--seek` is never read for a file).
+/// The player `program` (a name or path) is, by its file name. Haruna, Totem
+/// and Showtime (#188) aren't here because none takes a start time, read
+/// from their sources on 2026-11-11: Haruna's only option is
+/// `--ytdl-format-selection`, Showtime's is `--new-window`, and Totem
+/// declares a hidden `--seek` that nothing reads. They get the file alone.
 fn player(program: &str) -> Option<Player> {
     Some(match Path::new(program).file_name()?.to_str()? {
         "mpv" => Player::Mpv,
@@ -1053,6 +1055,13 @@ mod tests {
             ["haruna", name.as_str()]
         );
         assert_eq!(player_argv("  ", f, 1.0), None);
+        // No start-time option to give: the file alone.
+        for program in ["haruna", "totem", "showtime"] {
+            assert_eq!(
+                player_argv(program, f, 9.0),
+                Some(vec![program.to_owned(), name.clone()])
+            );
+        }
         // The setting wins over the default app, without asking xdg-mime.
         assert_eq!(
             play_argv(f, 2.0, Some("mpv")),

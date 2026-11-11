@@ -9,7 +9,8 @@ nav_order: 4
 
 Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and lets
 you add folders and exclusions, turn images, documents and code on, set how close a result has to be
-and pick the editor that opens text results from your installed apps, pick the NPU, GPU or CPU, and
+and pick the editor that opens text results and the player that plays audio and video from your
+installed apps, pick the NPU, GPU or CPU, and
 turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no
 restart. [How it works](how-it-works.md#each-setting) goes through each setting.
 
@@ -45,7 +46,7 @@ enabled = true              # off by default; vinoWhisper's saved transcripts an
 [formats.media]
 enabled = true              # off by default; audio and video by sound and picture, needs ffmpeg
 min_score = 0.62            # provisional, to be tuned on a real library
-max_hours = 3               # longer files are left out
+max_hours = 3               # longer files are left out; a change applies to files already seen
 ```
 
 Audio and video ([#187](https://github.com/karanshukla/vinoSearch/issues/187)) are indexed after everything else, on AC

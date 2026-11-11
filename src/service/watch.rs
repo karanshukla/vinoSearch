@@ -320,8 +320,12 @@ pub fn spawn(
                 match Config::load(&config)
                     .and_then(|c| Ok((c.excludes()?, FileTypes::new(&c.formats)?, c)))
                 {
-                    Ok((ex, types, c)) if c != file => {
-                        eprintln!("{}: changed", config.display());
+                    // The types also follow what is installed: media starts
+                    // once ffmpeg is there, with the file as it was.
+                    Ok((ex, types, c)) if c != file || types != st.types => {
+                        if c != file {
+                            eprintln!("{}: changed", config.display());
+                        }
                         let old = std::mem::replace(&mut st.excludes, ex);
                         // Directories no longer excluded need watches now.
                         for dir in old.paths() {
