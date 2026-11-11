@@ -13,6 +13,11 @@ use std::path::Path;
 use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once Kind::Media lands (#187)")
+)]
+pub mod media;
 mod ole;
 mod rtf;
 pub mod session;
