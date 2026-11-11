@@ -674,8 +674,10 @@ mod tests {
 
     #[test]
     fn a_decoder_that_hangs_is_killed() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        // Not through sh: dash forks the sleep, which then holds the pipe
+        // open after sh is killed. ffmpeg doesn't fork.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
         let started = Instant::now();
         let mut d = Decoder::spawn(cmd, Duration::from_secs(1), |_| None).unwrap();
         assert_eq!(d.read_up_to(&mut [0u8; 16]).unwrap(), 0);
