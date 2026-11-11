@@ -12,7 +12,7 @@ use vinosearch_shared::apps::{self, App};
 use vinosearch_shared::config::{
     self, Config, DEFAULT_CODE_MIN_SCORE, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
     DEFAULT_IMAGE_EXTENSIONS, DEFAULT_IMAGE_MIN_SCORE, DEFAULT_INDEX_BUSY_PERCENT,
-    DEFAULT_TEXT_MIN_SCORE,
+    DEFAULT_MEDIA_MIN_SCORE, DEFAULT_TEXT_MIN_SCORE,
 };
 
 use vinosearch_shared::dbus::{hold, seal};
@@ -370,20 +370,42 @@ impl SettingsWindow {
                         (s.document_chunks, "Documents"),
                         (s.image_files, "Images"),
                         (s.code_chunks, "Code"),
+                        (s.session_chunks, "Sessions"),
+                        (s.media_chunks, "Media"),
                     ];
+                    let colors = kind_colors(p, ui.visuals().dark_mode);
                     let bar: Vec<(f32, egui::Color32)> = shares
                         .iter()
-                        .zip(p.kinds)
+                        .zip(colors)
                         .map(|((n, _), color)| (*n as f32 / total, color))
                         .collect();
                     ui.add_space(4.0);
                     widgets::share_bar(ui, &bar, 8.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 16.0;
-                        for ((n, name), color) in shares.iter().zip(p.kinds) {
+                        for ((n, name), color) in shares.iter().zip(colors) {
                             if *n > 0 {
-                                let pct = (*n as f64 * 100.0 / f64::from(total)).round();
-                                widgets::legend(ui, color, &format!("{name} {pct:.0}%"));
+                                let pct = *n as f64 * 100.0 / f64::from(total);
+                                let text = if pct < 0.5 {
+                                    format!("{name} <1%")
+                                } else {
+                                    format!("{name} {:.0}%", pct.round())
+                                };
+                                // The legend's label wraps rather than move to the next
+                                // row, so one that won't fit starts a row of its own.
+                                let width = LEGEND_SWATCH
+                                    + ui.painter()
+                                        .layout_no_wrap(
+                                            text.clone(),
+                                            egui::FontId::proportional(12.5),
+                                            p.muted,
+                                        )
+                                        .size()
+                                        .x;
+                                if width > ui.available_size_before_wrap().x {
+                                    ui.end_row();
+                                }
+                                widgets::legend(ui, color, &text);
                             }
                         }
                     });
@@ -1110,11 +1132,13 @@ impl SettingsWindow {
                     }
                 });
             let media = self.config.formats.media_enabled();
-            Row::new("Audio and video")
-                .help("By what's heard and seen. Plugged in only. 295 MB download.")
+            Row::new("Media")
+                .help(
+                    "Audio and video, by what's heard and seen. Plugged in only. 295 MB download.",
+                )
                 .show(ui, |ui, _| {
                     let mut on = media;
-                    if widgets::switch(ui, &mut on, "Index audio and video").changed() {
+                    if widgets::switch(ui, &mut on, "Index media").changed() {
                         self.config.formats.media.enabled = on.then_some(true);
                         changed = true;
                     }
@@ -1265,6 +1289,11 @@ impl SettingsWindow {
             let code = self.config.formats.code.min_score;
             if let Some(v) = score_row(ui, "Code", code, DEFAULT_CODE_MIN_SCORE, 0.45..=0.85) {
                 self.config.formats.code.min_score = v;
+                self.idle_dirty = true;
+            }
+            let media = self.config.formats.media.min_score;
+            if let Some(v) = score_row(ui, "Media", media, DEFAULT_MEDIA_MIN_SCORE, 0.45..=0.80) {
+                self.config.formats.media.min_score = v;
                 self.idle_dirty = true;
             }
         });
@@ -1675,6 +1704,29 @@ fn size(bytes: u64) -> String {
 /// A minimum score as a slider, strict on the left and loose on the right,
 /// with a way back to the default. Some(new value) when it changed, None
 /// meaning the default.
+/// A legend entry's swatch and the gap after it, before its text.
+const LEGEND_SWATCH: f32 = 8.0 + 6.0;
+
+/// The share bar's colours, in Status's order: the palette's four, then
+/// sessions (teal) and media (amber), which vino-user-interface's
+/// palette has no colour for yet. Shades as dark against the light theme's
+/// card, and as light against the dark one's, as the palette's own.
+fn kind_colors(p: &theme::Palette, dark: bool) -> [egui::Color32; 6] {
+    let [text, documents, images, code] = p.kinds;
+    let (sessions, media) = if dark {
+        (
+            egui::Color32::from_rgb(0x4f, 0xc8, 0xc0),
+            egui::Color32::from_rgb(0xe8, 0xa8, 0x4a),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(0x16, 0x84, 0x7c),
+            egui::Color32::from_rgb(0xa8, 0x62, 0x0c),
+        )
+    };
+    [text, documents, images, code, sessions, media]
+}
+
 fn score_row(
     ui: &mut egui::Ui,
     label: &str,
