@@ -18,9 +18,11 @@
 #                  config.toml if it doesn't set a device already). With
 #                  no Intel NPU and no device set, the CPU.
 #   --no-settings  skip the settings window (vinosearch-settings)
-#   --uninstall    remove the service, KRunner / GNOME files and binaries
-#   --purge        with --uninstall, also delete the index, model, compiled
-#                  cache and runtime (config.toml is kept)
+#   --uninstall    remove the service, KRunner / GNOME files and binaries,
+#                  and delete the models and their compiled cache. The
+#                  index, config.toml and the OpenVINO runtime are kept.
+#   --purge        with --uninstall, also delete the index and the runtime
+#                  (config.toml is kept)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -57,7 +59,7 @@ while [ $# -gt 0 ]; do
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -79,14 +81,22 @@ if [ "$uninstall" = 1 ]; then
         if [ -x "$CARGO_BIN/$b" ]; then cargo uninstall "$b"; fi
         if [ -x "$LOCAL_BIN/$b" ]; then rm -f -- "$LOCAL_BIN/$b" && echo "removed $LOCAL_BIN/$b"; fi
     done
+    # After `krunner --uninstall`: the service is stopped, so nothing has
+    # the models loaded. Only vinoSearch's own directories; ovfetch's and
+    # OpenVINO's are shared with other apps.
+    step "Deleting the models and their compiled cache"
+    for d in "$DATA/models" "$CACHE/ov-cache" "$CACHE/scratch"; do
+        if [ -e "$d" ]; then rm -rf -- "$d" && echo "removed $d"; fi
+    done
+    rmdir -- "$CACHE" 2>/dev/null || true
     if [ "$purge" = 1 ]; then
-        step "Deleting the index, model, compiled cache and runtime"
+        step "Deleting the index and runtime"
         for d in "$DATA" "$CACHE" "$RUNTIME"; do
             if [ -e "$d" ]; then rm -rf -- "$d" && echo "removed $d"; fi
         done
         echo "kept $CONFIG and ovfetch"
     else
-        echo "kept the index, model and runtime; --uninstall --purge deletes them"
+        echo "kept the index, $CONFIG and the runtime; --uninstall --purge deletes the index and runtime"
     fi
     exit 0
 fi

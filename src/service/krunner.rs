@@ -720,9 +720,7 @@ impl Control {
         out.insert(key::INDEX_BYTES.into(), owned(Variant::from(index_bytes)));
         out.insert(
             key::MODEL_BYTES.into(),
-            owned(Variant::from(
-                disk_bytes(&model_dir) + disk_bytes(&vision_dir),
-            )),
+            owned(Variant::from(model::bytes().map_err(failed)?)),
         );
         for (k, at) in [
             (key::LAST_CHECKED, &st.last_checked),
@@ -1398,6 +1396,32 @@ fn systemctl(args: &[&str]) -> bool {
             false
         }
     }
+}
+
+/// Delete the models: through the runner while it runs, so it unloads them
+/// first and refuses during a download; from disk otherwise. True when the
+/// runner was asked, which deletes them once its worker takes the request.
+pub fn delete_models() -> Result<bool> {
+    if !runner_running() {
+        model::delete()?;
+        return Ok(false);
+    }
+    zbus::block_on(async {
+        let conn = zbus::Connection::session().await?;
+        conn.call_method(
+            Some(SERVICE),
+            CONTROL,
+            Some(vinosearch_shared::dbus::CONTROL_INTERFACE),
+            "DeleteModel",
+            &(),
+        )
+        .await
+    })
+    .map_err(|e| match e {
+        zbus::Error::MethodError(_, Some(why), _) => anyhow::anyhow!("the service refused: {why}"),
+        other => other.into(),
+    })?;
+    Ok(true)
 }
 
 /// Whether something already owns the runner's bus name.

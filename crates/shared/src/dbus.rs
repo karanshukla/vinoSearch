@@ -81,7 +81,8 @@ pub mod status {
     pub const FETCH_DONE: &str = "fetch_done";
     pub const FETCH_TOTAL: &str = "fetch_total";
     pub const FETCH_ERROR: &str = "fetch_error";
-    /// Bytes on disk: the index database, the model, the compiled-model cache.
+    /// Bytes on disk: the index database, every model (text, vision, OCR and
+    /// audio), the compiled-model cache.
     pub const INDEX_BYTES: &str = "index_bytes";
     pub const MODEL_BYTES: &str = "model_bytes";
     pub const CACHE_BYTES: &str = "cache_bytes";

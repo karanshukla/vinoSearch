@@ -44,6 +44,9 @@ enum Command {
     Doctor,
     /// Download the embedding model, checking every file against its pinned SHA-256.
     FetchModel,
+    /// Delete the downloaded models (text, vision, OCR and audio). A running service is asked
+    /// to, so it unloads them first. The index is kept; search needs fetch-model again.
+    DeleteModel,
     /// Index text files under each path. Unchanged files are skipped. Says first how long it
     /// will take and, at a terminal, asks.
     Index {
@@ -409,6 +412,25 @@ fn run(cli: Cli) -> Result<bool> {
                 },
             )?;
             eprintln!("model ready: {}", model::default_dir()?.display());
+            Ok(true)
+        }
+        Command::DeleteModel => {
+            let bytes = model::bytes()?;
+            let dir = model::default_dir()?;
+            let dir = dir.parent().unwrap_or(&dir);
+            if krunner::delete_models()? {
+                eprintln!(
+                    "asked the running service to delete {} MB of models in {}",
+                    bytes / 1_000_000,
+                    dir.display()
+                );
+            } else {
+                eprintln!(
+                    "deleted {} MB of models in {}",
+                    bytes / 1_000_000,
+                    dir.display()
+                );
+            }
             Ok(true)
         }
         Command::Index { paths, yes } => {
