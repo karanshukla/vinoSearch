@@ -392,8 +392,8 @@ fn search_page_controls_are_named_by_their_row_labels() {
         saved.contains("[formats.sessions]\nenabled = true"),
         "{saved}"
     );
-    // And audio and video (#187).
-    let media = h.get_by_role_and_label(Role::Switch, "Index audio and video");
+    // And media, audio and video (#187).
+    let media = h.get_by_role_and_label(Role::Switch, "Index media");
     assert_eq!(
         media.accesskit_node().toggled(),
         Some(accesskit::Toggled::False)
@@ -403,7 +403,7 @@ fn search_page_controls_are_named_by_their_row_labels() {
     assert!(h.state().config.formats.media_enabled());
     let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
     assert!(saved.contains("[formats.media]\nenabled = true"), "{saved}");
-    for row in ["Text", "Images", "Code"] {
+    for row in ["Text", "Images", "Code", "Media"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);
     }
@@ -760,4 +760,21 @@ fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
         .click();
     settle(&mut h);
     assert!(sent(&requests).iter().any(|r| matches!(r, Request::Rekey)));
+}
+
+#[test]
+fn the_index_bar_shows_every_kind_indexed() {
+    let (w, _requests) = window(Page::Index, "bar");
+    if let Some(Ok(s)) = w.link.shared.lock().unwrap().status.as_mut() {
+        s.chunks = 400;
+        s.text_chunks = 200;
+        s.code_chunks = 100;
+        s.session_chunks = 40;
+        s.media_chunks = 60;
+    }
+    let mut h = harness(w, WIDE, Theme::Light);
+    settle(&mut h);
+    for legend in ["Text 50%", "Code 25%", "Sessions 10%", "Media 15%"] {
+        h.get_by_label(legend);
+    }
 }
