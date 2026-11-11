@@ -340,6 +340,21 @@ fn the_filter_menus_open_and_pick_from_the_keyboard() {
 }
 
 #[test]
+fn a_media_result_names_the_time_it_plays_from() {
+    let clip = found("/srv/v/trip.mkv", Kind::Image, "", "second", 754, 1);
+    assert!(clip.timed());
+    assert_eq!(clip.place(), "12:34");
+    let long = found("/srv/v/film.mkv", Kind::Image, "", "second", 3723, 1);
+    assert_eq!(long.place(), "1:02:03");
+    // The start of the file is a place too, as line 0 never is.
+    let start = found("/srv/v/trip.mkv", Kind::Image, "", "second", 0, 1);
+    assert_eq!(start.place(), "00:00");
+    let note = found("/srv/n/a.md", Kind::Text, "x", "line", 0, 1);
+    assert!(!note.timed());
+    assert_eq!(note.place(), "");
+}
+
+#[test]
 fn a_selected_result_opens_at_its_match_its_folder_or_copies() {
     let (w, asked_, dir) = window("camping", "actions");
     let mut h = harness(w, WIDE);

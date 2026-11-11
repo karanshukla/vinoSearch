@@ -253,6 +253,7 @@ fn to_match(h: Hit, floors: Floors) -> Match {
         Some(At::Session(Part::Transcript, l)) => {
             drop(props.insert("line".into(), owned(Variant::from(l))))
         }
+        Some(At::Second(s)) => drop(props.insert("second".into(), owned(Variant::from(s)))),
         Some(At::Session(Part::Summary, _)) | None => {}
     }
     let (icon, _) = crate::search::icons::for_path(Path::new(&h.path), h.kind);
@@ -315,8 +316,12 @@ fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
         std::thread::spawn(move || crate::search::open::xdg_open(path.parent().unwrap_or(&path)));
         return;
     }
-    let editor = Config::load(config).ok().and_then(|c| c.editor);
-    std::thread::spawn(move || crate::search::open::open(&path, at, editor.as_deref()));
+    let (editor, player) = Config::load(config)
+        .map(|c| (c.editor, c.player))
+        .unwrap_or_default();
+    std::thread::spawn(move || {
+        crate::search::open::open(&path, at, editor.as_deref(), player.as_deref());
+    });
 }
 
 /// The last search's places, by result id, for opening a result there.
@@ -874,7 +879,7 @@ impl Control {
     #[zbus(name = "Open")]
     fn open_file(&self, path: String, line: u32) -> zbus::fdo::Result<()> {
         self.is_indexed(&path)?;
-        let at = index::readable_kind(Path::new(&path))
+        let at = index::openable_kind(Path::new(&path))
             .and_then(|kind| At::of(kind, Path::new(&path), i64::from(line)));
         open(&self.db, &self.config, &path, at, false);
         Ok(())

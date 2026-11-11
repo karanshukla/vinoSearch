@@ -377,7 +377,9 @@ impl SearchWindow {
                         tile(ui, &f, 20.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let named = |r| a11y::for_what(r, f.name());
-                            let open = if f.place().is_empty() {
+                            let open = if f.timed() {
+                                format!("Play at {}", f.place())
+                            } else if f.place().is_empty() {
                                 "Open".to_owned()
                             } else {
                                 format!("Open at {}", f.place())

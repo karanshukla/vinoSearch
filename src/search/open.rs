@@ -12,6 +12,9 @@
 //! A vinoWhisper session (#143) is a zip no editor opens: it goes to
 //! vinoWhisper's settings window, or without vinoWhisper, the part that
 //! matched is copied out to a private file and that is opened.
+//!
+//! An audio or video file (#188) plays from the second that matched, in the
+//! `player` setting or the default app when it is a known player.
 
 use crate::extract::session::{self, Part};
 use crate::index::Kind;
@@ -30,6 +33,8 @@ pub enum At {
     Page(u32),
     /// A vinoWhisper session's part, at a line of it (0 for the top).
     Session(Part, u32),
+    /// An audio or video file's second, from 0.
+    Second(u32),
 }
 
 impl At {
@@ -41,6 +46,10 @@ impl At {
         if kind == Kind::Session {
             let (part, n) = Part::of(line);
             return Some(At::Session(part, u32::try_from(n).unwrap_or(0)));
+        }
+        if kind == Kind::Media {
+            let (_, second) = crate::extract::media::Track::of(line);
+            return Some(At::Second(u32::try_from(second).unwrap_or(0)));
         }
         let n = u32::try_from(line).ok().filter(|&n| n > 0)?;
         match kind {
@@ -300,7 +309,7 @@ fn default_entry(file: &Path, at: At) -> Option<Entry> {
     let mime = match at {
         At::Page(_) => "application/pdf".to_owned(),
         At::Line(_) => xdg_mime(&["query".as_ref(), "filetype".as_ref(), file.as_os_str()])?,
-        At::Session(..) => return None,
+        At::Session(..) | At::Second(_) => return None,
     };
     default_app(&mime)
 }
@@ -448,10 +457,6 @@ fn player_argv(setting: &str, file: &Path, seconds: f64) -> Option<Vec<String>> 
 /// `player` setting, else the default app for the file's type when it is a
 /// known player, else `xdg-open`, which can't seek. Looking up the default
 /// app runs `xdg-mime`, so call this off the bus.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once Play at lands in the front ends (#188)")
-)]
 pub fn play_argv(file: &Path, seconds: f64, player: Option<&str>) -> Vec<String> {
     player
         .filter(|p| !p.trim().is_empty())
@@ -535,9 +540,10 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Open `file` at `at` in the editor or default app, else with `xdg-open`.
-/// Looking up the default app runs `xdg-mime`, so call this off the bus.
-pub fn open(file: &Path, at: Option<At>, editor: Option<&str>) {
+/// Open `file` at `at` in the editor, player or default app, else with
+/// `xdg-open`. Looking up the default app runs `xdg-mime`, so call this off
+/// the bus.
+pub fn open(file: &Path, at: Option<At>, editor: Option<&str>, player: Option<&str>) {
     if crate::extract::is_session(file) {
         let (part, line) = match at {
             Some(At::Session(part, line)) => (part, line),
@@ -550,7 +556,12 @@ pub fn open(file: &Path, at: Option<At>, editor: Option<&str>) {
         }
         return;
     }
-    if let Some(argv) = at.and_then(|at| argv_at(file, at, editor)) {
+    let argv = match at {
+        Some(At::Second(s)) => Some(play_argv(file, f64::from(s), player)),
+        Some(at) => argv_at(file, at, editor),
+        None => None,
+    };
+    if let Some(argv) = argv {
         let program = argv[0].clone();
         match spawn(argv) {
             Ok(()) => return,
@@ -612,7 +623,7 @@ fn open_session(file: &Path, part: Part, line: u32, editor: Option<&str>) -> Res
         return Ok(());
     }
     let copy = copy_out(file, part, &text)?;
-    open(&copy, (line > 0).then_some(At::Line(line)), editor);
+    open(&copy, (line > 0).then_some(At::Line(line)), editor, None);
     Ok(())
 }
 
@@ -668,6 +679,16 @@ mod tests {
         assert_eq!(At::of(Kind::Document, &p("/a.pptx"), 3), None);
         assert_eq!(At::of(Kind::Document, &p("/a.srt"), 3), None);
         assert_eq!(At::of(Kind::Image, &p("/a.jpg"), 0), None);
+        assert_eq!(
+            At::of(Kind::Media, &p("/a.mkv"), 754),
+            Some(At::Second(754))
+        );
+        assert_eq!(At::of(Kind::Media, &p("/a.mkv"), 0), Some(At::Second(0)));
+        let frame = crate::extract::media::FRAME_LINES as i64 + 12;
+        assert_eq!(
+            At::of(Kind::Media, &p("/a.mkv"), frame),
+            Some(At::Second(12))
+        );
         assert_eq!(At::of(Kind::Text, &p("/a.rs"), 0), None);
         assert_eq!(
             At::of(Kind::Session, &p("/s.vwsession"), 7),

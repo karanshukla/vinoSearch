@@ -1743,6 +1743,16 @@ pub fn readable_kind(path: &Path) -> Option<Kind> {
     }
 }
 
+/// The kind `path` opens as, by its name: one read aloud, or audio or video.
+pub fn openable_kind(path: &Path) -> Option<Kind> {
+    readable_kind(path).or_else(|| {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        crate::config::MEDIA_EXTENSIONS
+            .contains(&ext.as_str())
+            .then_some(Kind::Media)
+    })
+}
+
 /// Indexed text files and documents, newest first by the mtime the index
 /// recorded: at most `limit`, less those `exists` says are gone.
 pub fn recent_files(

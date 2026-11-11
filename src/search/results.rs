@@ -10,7 +10,8 @@ use vinosearch_shared::dbus::results;
 
 /// One file as `Control1.Search` returns it: path, kind (`results::*`),
 /// score, snippet, unit ("line", "page", "slide", ... or empty), the match's
-/// number in that unit (0 for none), and mtime in Unix seconds.
+/// number in that unit (0 for none), and mtime in Unix seconds. A media
+/// file's unit is "second", counted from 0.
 pub type Found = (String, String, f64, String, String, u32, i64);
 
 /// The window's kind for a hit: text OCR read in an image is an image, as
@@ -68,12 +69,13 @@ pub fn found(h: Hit) -> Option<Found> {
         results::TEXT if !crate::extract::is_html(path) => "line",
         results::CODE => "line",
         results::DOCUMENT => crate::extract::unit(path),
+        results::MEDIA => "second",
         _ => "",
     };
-    let at = if unit.is_empty() {
-        0
-    } else {
-        u32::try_from(h.line).unwrap_or(0)
+    let at = match h.kind {
+        Kind::Media => u32::try_from(crate::extract::media::Track::of(h.line).1).unwrap_or(0),
+        _ if unit.is_empty() => 0,
+        _ => u32::try_from(h.line).unwrap_or(0),
     };
     let snippet = match h.kind {
         Kind::Image | Kind::Media => String::new(),
@@ -175,6 +177,15 @@ mod tests {
             found(hit(Kind::Document, 0.8, photo.to_str().unwrap())).unwrap();
         assert_eq!((kind.as_str(), unit.as_str(), at), ("image", "", 0));
         assert_eq!(snippet, "some matching text");
+
+        // A frame's number is past FRAME_LINES; the window gets its second.
+        let clip = dir.join("clip.mkv");
+        std::fs::write(&clip, "x").unwrap();
+        let mut seen = hit(Kind::Media, 0.8, clip.to_str().unwrap());
+        seen.line = crate::extract::media::FRAME_LINES as i64 + 754;
+        let (_, kind, _, snippet, unit, at, _) = found(seen).unwrap();
+        assert_eq!((kind.as_str(), unit.as_str(), at), ("media", "second", 754));
+        assert_eq!(snippet, "");
 
         assert!(found(hit(Kind::Text, 0.8, "/nonexistent/gone.md")).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
