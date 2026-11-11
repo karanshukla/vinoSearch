@@ -22,6 +22,8 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     link.shared.lock().unwrap().status = Some(Ok(Status {
         model_loaded: true,
         model_present: true,
+        images_model_present: true,
+        media_model_present: true,
         indexing: true,
         indexed_files: 12,
         device: "CPU".into(),
@@ -390,6 +392,17 @@ fn search_page_controls_are_named_by_their_row_labels() {
         saved.contains("[formats.sessions]\nenabled = true"),
         "{saved}"
     );
+    // And audio and video (#187).
+    let media = h.get_by_role_and_label(Role::Switch, "Index audio and video");
+    assert_eq!(
+        media.accesskit_node().toggled(),
+        Some(accesskit::Toggled::False)
+    );
+    media.click();
+    settle(&mut h);
+    assert!(h.state().config.formats.media_enabled());
+    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    assert!(saved.contains("[formats.media]\nenabled = true"), "{saved}");
     for row in ["Text", "Images", "Code"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);

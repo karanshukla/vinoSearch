@@ -502,7 +502,11 @@ impl Config {
         );
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-        let tmp = path.with_extension("toml.tmp");
+        // A name of its own per save: two settings windows saving at once
+        // shared `config.toml.tmp`, and the second rename found it gone.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
         fs::write(&tmp, doc.to_string()).with_context(|| tmp.display().to_string())?;
         fs::rename(&tmp, path).with_context(|| path.display().to_string())
     }
@@ -865,6 +869,27 @@ mod tests {
                 toml::from_str(&format!("[formats.media]\nmax_hours = {bad}\n")).unwrap();
             assert!(c.formats.media_max_seconds().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn saves_at_once_dont_trip_over_each_other() {
+        let dir = std::env::temp_dir().join(format!("vinosearch-race-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        let c = Config::default();
+        std::thread::scope(|s| {
+            let saves: Vec<_> = (0..8).map(|_| s.spawn(|| c.save(&path))).collect();
+            for save in saves {
+                save.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(Config::load(&path).unwrap(), c);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a temp file left behind"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
