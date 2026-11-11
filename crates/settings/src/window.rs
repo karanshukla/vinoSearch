@@ -385,8 +385,27 @@ impl SettingsWindow {
                         ui.spacing_mut().item_spacing.x = 16.0;
                         for ((n, name), color) in shares.iter().zip(colors) {
                             if *n > 0 {
-                                let pct = (*n as f64 * 100.0 / f64::from(total)).round();
-                                widgets::legend(ui, color, &format!("{name} {pct:.0}%"));
+                                let pct = *n as f64 * 100.0 / f64::from(total);
+                                let text = if pct < 0.5 {
+                                    format!("{name} <1%")
+                                } else {
+                                    format!("{name} {:.0}%", pct.round())
+                                };
+                                // The legend's label wraps rather than move to the next
+                                // row, so one that won't fit starts a row of its own.
+                                let width = LEGEND_SWATCH
+                                    + ui.painter()
+                                        .layout_no_wrap(
+                                            text.clone(),
+                                            egui::FontId::proportional(12.5),
+                                            p.muted,
+                                        )
+                                        .size()
+                                        .x;
+                                if width > ui.available_size_before_wrap().x {
+                                    ui.end_row();
+                                }
+                                widgets::legend(ui, color, &text);
                             }
                         }
                     });
@@ -1685,6 +1704,9 @@ fn size(bytes: u64) -> String {
 /// A minimum score as a slider, strict on the left and loose on the right,
 /// with a way back to the default. Some(new value) when it changed, None
 /// meaning the default.
+/// A legend entry's swatch and the gap after it, before its text.
+const LEGEND_SWATCH: f32 = 8.0 + 6.0;
+
 /// The share bar's colours, in Status's order: the palette's four, then
 /// sessions (teal) and media (amber), which vino-user-interface's
 /// palette has no colour for yet. Shades as dark against the light theme's

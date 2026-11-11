@@ -769,12 +769,19 @@ fn the_index_bar_shows_every_kind_indexed() {
         s.chunks = 400;
         s.text_chunks = 200;
         s.code_chunks = 100;
-        s.session_chunks = 40;
-        s.media_chunks = 60;
+        s.session_chunks = 1;
+        s.media_chunks = 99;
     }
-    let mut h = harness(w, WIDE, Theme::Light);
+    // Narrow, so the legend runs onto a second row.
+    let mut h = harness(w, [420.0, 900.0], Theme::Light);
     settle(&mut h);
-    for legend in ["Text 50%", "Code 25%", "Sessions 10%", "Media 15%"] {
+    for legend in ["Text 50%", "Code 25%", "Sessions <1%", "Media 25%"] {
         h.get_by_label(legend);
+    }
+    // Each entry on one line: a label squeezed into the row's end wraps a
+    // character a line, and stands far taller than it is wide.
+    for legend in ["Text 50%", "Code 25%", "Sessions <1%", "Media 25%"] {
+        let rect = h.get_by_label(legend).rect();
+        assert!(rect.height() < 24.0, "{legend} is {rect:?}");
     }
 }
