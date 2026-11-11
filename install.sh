@@ -7,7 +7,7 @@
 #
 #   vN          that release instead of the newest
 #   anything else is passed to the release's scripts/install.sh:
-#               --index DIR, --device NPU|GPU|CPU, --no-settings, --uninstall
+#               --index DIR, --device NPU|GPU|CPU, --no-settings, --uninstall [--purge]
 #
 # It downloads the release's tarball and its .sha256, refuses the tarball
 # unless the checksum matches, unpacks it into a private temporary directory

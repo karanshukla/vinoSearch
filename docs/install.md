@@ -85,4 +85,10 @@ can't be reached from the container, `install.sh` prints the one command to run 
 ## Uninstalling
 
 `vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the
-binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
+binaries, and deletes the models (`~/.local/share/vinosearch/models`) and their compiled cache
+(`~/.cache/vinosearch/ov-cache`). The index, `config.toml` and the OpenVINO runtime are kept. Add
+`--purge` to also delete the index and the runtime; `config.toml` is still kept.
+
+To delete only the models, use **Delete…** on the settings window's Model page, or run
+`vinosearch delete-model`. Search and indexing need `vinosearch fetch-model` (or Download) again
+afterwards. With the service not running, the Model page deletes the files itself.

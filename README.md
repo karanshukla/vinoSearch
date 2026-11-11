@@ -30,7 +30,7 @@ That downloads the latest release, checks it against its `.sha256`, installs the
 
 To upgrade, use **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (a release tag like `vinosearch-upgrade v6` installs that one). It skips whatever is already done and restarts the service.
 
-`curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --uninstall` removes the service, the KRunner and GNOME files and the binaries. Add `--purge` to also delete the index, model, compiled cache and runtime.
+`curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --uninstall` removes the service, the KRunner and GNOME files and the binaries, and deletes the models and their compiled cache. Your index and settings stay; add `--purge` to also delete the index and the OpenVINO runtime. To delete only the models, use **Delete…** on the settings window's Model page, or `vinosearch delete-model`.
 
 <details>
 <summary>From source instead</summary>
