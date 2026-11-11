@@ -6,7 +6,8 @@
 <audio dir> holds onnx/audio_encoder.onnx (upstream, the reference) and the
 static graphs static_audio.py wrote; <text dir> holds onnx/model_text.onnx,
 onnx/model_audio_250.onnx and tokenizer.json. <clips.f32> is 16 kHz mono
-float32; CLIPS below names spans of it. Prints, for each graph and runtime,
+float32; CLIPS below names spans of it, which are the spike's clip
+(av_spike/make_clip.sh writes it as audio.f32). Prints, for each graph and runtime,
 the cosine of its audio_features to the reference's (mean and worst row),
 then each clip's sentence embedding against the reference's, then text
 queries against the int8 graph's clips. device is an OpenVINO device (CPU).
