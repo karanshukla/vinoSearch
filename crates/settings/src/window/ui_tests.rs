@@ -22,6 +22,8 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     link.shared.lock().unwrap().status = Some(Ok(Status {
         model_loaded: true,
         model_present: true,
+        images_model_present: true,
+        media_model_present: true,
         indexing: true,
         indexed_files: 12,
         device: "CPU".into(),

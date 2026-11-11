@@ -522,6 +522,32 @@ fn a_session_of_an_unknown_format_is_kept_unread_and_counted() {
     assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 2);
 }
 
+#[test]
+fn a_copy_of_a_session_is_not_unread() {
+    use crate::extract::session::tests::bundle;
+    let t = Tree::new("session-copy");
+    let b = bundle(None, SESSION_V1);
+    // As test fixtures sit in several repos.
+    for name in ["a/s.vwsession", "b/s.vwsession", "c/s.vwsession"] {
+        let p = t.root().join(name);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, &b).unwrap();
+    }
+    let mut conn = t.db();
+    let mut emb = FakeEmbed::default();
+    index(
+        &mut conn,
+        &mut emb,
+        &t.root(),
+        &Excludes::default(),
+        &sessions_on(),
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(paths(&conn).len(), 3);
+    assert_eq!(unread_sessions(&conn).unwrap(), 0);
+}
+
 /// Media on, as if ffmpeg were installed, held to `max_seconds`.
 fn media_on(max_seconds: f64) -> FileTypes {
     FileTypes::default().with_media(true, max_seconds)

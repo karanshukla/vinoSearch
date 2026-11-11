@@ -696,12 +696,18 @@ impl Control {
         // The vision encoder and OCR count while images are on, and the
         // vision and audio encoders while media is.
         let wants = self.model_wants();
-        let present = model::present(&model_dir)
-            && (!wants.images || model::images_present(&model_dir, &vision_dir, &ocr_dir))
-            && (!wants.media
-                || (model::vision_present(&model_dir, &vision_dir)
-                    && model::audio_present(&model_dir, &model::audio_dir().map_err(failed)?)));
+        let images = model::images_present(&model_dir, &vision_dir, &ocr_dir);
+        let media = model::vision_present(&model_dir, &vision_dir)
+            && model::audio_present(&model_dir, &model::audio_dir().map_err(failed)?);
+        let present =
+            model::present(&model_dir) && (!wants.images || images) && (!wants.media || media);
         out.insert(key::MODEL_PRESENT.into(), owned(Variant::from(present)));
+        // Per format, so the settings window says which download is missing.
+        out.insert(
+            key::IMAGES_MODEL_PRESENT.into(),
+            owned(Variant::from(images)),
+        );
+        out.insert(key::MEDIA_MODEL_PRESENT.into(), owned(Variant::from(media)));
         out.insert(
             key::FFMPEG.into(),
             owned(Variant::from(crate::extract::media::ffmpeg())),

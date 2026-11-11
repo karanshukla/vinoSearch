@@ -986,7 +986,7 @@ impl SettingsWindow {
                 });
             if images
                 && let Some(s) = s
-                && !s.model_present
+                && !s.images_model_present
             {
                 Row::new("").tint(p.warn_tint).custom(
                     ui,
@@ -1134,7 +1134,7 @@ impl SettingsWindow {
                     .show(ui, |_, _| {});
             } else if media
                 && let Some(s) = s
-                && !s.model_present
+                && !s.media_model_present
             {
                 Row::new("").tint(p.warn_tint).custom(
                     ui,

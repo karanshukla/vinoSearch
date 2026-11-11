@@ -42,6 +42,9 @@ pub struct Status {
     pub ffmpeg: bool,
     pub roots: Vec<String>,
     pub model_present: bool,
+    /// What images and media each need besides the text model.
+    pub images_model_present: bool,
+    pub media_model_present: bool,
     pub fetching: bool,
     pub fetch_done: u64,
     pub fetch_total: u64,
@@ -155,6 +158,8 @@ impl Status {
             ffmpeg: flag(status::FFMPEG),
             roots,
             model_present: flag(status::MODEL_PRESENT),
+            images_model_present: flag(status::IMAGES_MODEL_PRESENT),
+            media_model_present: flag(status::MEDIA_MODEL_PRESENT),
             fetching: flag(status::FETCHING),
             fetch_done: unsigned(status::FETCH_DONE),
             fetch_total: unsigned(status::FETCH_TOTAL),

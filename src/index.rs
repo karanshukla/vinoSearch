@@ -1810,7 +1810,12 @@ pub fn unread_sessions(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM files f
          WHERE f.path LIKE '%.vwsession'
-           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)",
+           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+           -- A copy keeps no chunks of its own: the file it copies holds them.
+           AND NOT EXISTS (
+               SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
+               WHERE g.sha256 = f.sha256 AND g.id != f.id
+           )",
         [],
         |r| r.get(0),
     )?)

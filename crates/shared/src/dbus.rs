@@ -56,6 +56,10 @@ pub mod status {
     /// Audio and video files (#187), and their sound windows and frames.
     pub const MEDIA_FILES: &str = "media_files";
     pub const MEDIA_CHUNKS: &str = "media_chunks";
+    /// What images (the vision encoder and OCR) and media (the vision and
+    /// audio encoders) need is downloaded, whether or not they're on.
+    pub const IMAGES_MODEL_PRESENT: &str = "images_model_present";
+    pub const MEDIA_MODEL_PRESENT: &str = "media_model_present";
     /// ffmpeg and ffprobe are on the service's PATH; media needs both.
     pub const FFMPEG: &str = "ffmpeg";
     pub const ROOTS: &str = "roots";
