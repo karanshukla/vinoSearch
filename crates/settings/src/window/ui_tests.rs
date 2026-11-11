@@ -39,6 +39,8 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     link.shared.lock().unwrap().largest = Some(vec![("/srv/notes/build".into(), 200)]);
     let mut w = SettingsWindow::with(Some(page), link, dir.join("config.toml"));
     w.estimator = estimated;
+    // Never the user's own models.
+    w.models_dir = Some(dir.join("models"));
     w.editors = Some(vec![App {
         id: "org.kde.kate.desktop".into(),
         name: "Kate".into(),
@@ -500,6 +502,72 @@ fn model_page_controls_are_named_and_delete_asks_first() {
     let sent = sent(&requests);
     assert!(sent.iter().any(|r| matches!(r, Request::Unload)));
     assert!(sent.iter().any(|r| matches!(r, Request::DeleteModel)));
+}
+
+#[test]
+fn a_partial_download_can_be_deleted() {
+    let (w, requests) = window(Page::Model, "partial");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        // Images are on and only the text model came down.
+        s.model_present = false;
+        s.images_model_present = false;
+        s.model_loaded = false;
+        s.model_bytes = 306_000_000;
+    }
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Incomplete, 306 MB");
+    h.get_by_role_and_label(Role::Button, "Delete…").click();
+    settle(&mut h);
+    h.get_by_label_contains("Deletes 306 MB of models.");
+    h.get_by_role_and_label(Role::Button, "Delete the model")
+        .click();
+    settle(&mut h);
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::DeleteModel))
+    );
+}
+
+#[test]
+fn nothing_downloaded_has_nothing_to_delete() {
+    let (w, _requests) = window(Page::Model, "none");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.model_present = false;
+        s.model_loaded = false;
+        s.model_bytes = 0;
+    }
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Not downloaded");
+    assert!(
+        h.get_by_role_and_label(Role::Button, "Delete…")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn without_the_service_the_models_are_deleted_from_disk() {
+    let (w, requests) = window(Page::Model, "offline");
+    w.link.shared.lock().unwrap().status = Some(Err(
+        "The search service isn't installed. Turn it on under Integration.".into(),
+    ));
+    let models = w.models_dir.clone().unwrap();
+    for name in models::ALL {
+        std::fs::create_dir_all(models.join(name)).unwrap();
+        std::fs::write(models.join(name).join("m.onnx"), vec![0u8; 250_000]).unwrap();
+    }
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("On disk, 1.0 MB");
+    h.get_by_role_and_label(Role::Button, "Delete…").click();
+    settle(&mut h);
+    assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused());
+    h.get_by_role_and_label(Role::Button, "Delete the model")
+        .click();
+    settle(&mut h);
+    assert!(!models.exists());
+    h.get_by_label("Not downloaded");
+    assert!(sent(&requests).is_empty());
 }
 
 #[test]

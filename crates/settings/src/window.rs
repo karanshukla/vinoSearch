@@ -16,6 +16,7 @@ use vinosearch_shared::config::{
 };
 
 use vinosearch_shared::dbus::{hold, seal};
+use vinosearch_shared::models;
 
 use crate::control::{Link, Partial, Request, Status};
 use crate::{doctor, integration, portal};
@@ -168,6 +169,8 @@ struct SettingsWindow {
     text_scale: f32,
     /// The About page's Updates row.
     updater: vino_ui::update::Updater,
+    /// Where the models are downloaded, to delete them while the runner can't be asked.
+    models_dir: Option<PathBuf>,
 }
 
 /// The release installer leaves itself as `~/.local/bin/vinosearch-upgrade`; with it,
@@ -232,6 +235,7 @@ impl SettingsWindow {
             kde_header: theme::kde_header(),
             text_scale: 1.0,
             updater: updater(),
+            models_dir: models::dir().ok(),
         };
         window.reload_config();
         window
@@ -751,6 +755,61 @@ impl SettingsWindow {
         });
     }
 
+    /// The models on disk while the runner can't be reached: nothing has them loaded or is
+    /// downloading, so they're deleted from here.
+    fn model_files(&mut self, ui: &mut egui::Ui) {
+        let Some(dir) = self.models_dir.clone() else {
+            return;
+        };
+        let p = theme::palette(ui.ctx());
+        let bytes = models::bytes(&dir);
+        let deleting = self.confirm == Some(Confirm::DeleteModel);
+        widgets::group_label(ui, "EmbeddingGemma 2");
+        widgets::group(ui, |ui| {
+            let warning = format!(
+                "Deletes {} of models. Search and indexing need them downloaded again.",
+                size(bytes)
+            );
+            let row = if deleting {
+                Row::new("Download")
+                    .help(&warning)
+                    .tint(p.error_tint)
+                    .tone(Tone::Error)
+            } else {
+                Row::new("Download").help("Downloading needs the search service running.")
+            };
+            row.show(ui, |ui, _| {
+                if deleting {
+                    if ui
+                        .add(Button::destructive("Delete the model").small())
+                        .clicked()
+                    {
+                        if let Err(e) = models::delete(&dir) {
+                            self.notice = Some(format!("Couldn't delete the model: {e:#}"));
+                        }
+                        self.confirm = None;
+                    }
+                    if self.cancel_button(ui).clicked() {
+                        self.confirm = None;
+                    }
+                    return;
+                }
+                if ui
+                    .add_enabled(bytes > 0, Button::secondary("Delete…"))
+                    .clicked()
+                {
+                    self.confirm = Some(Confirm::DeleteModel);
+                    self.focus_cancel = true;
+                }
+                if bytes > 0 {
+                    widgets::chip(ui, ChipKind::Neutral, &format!("On disk, {}", size(bytes)));
+                } else {
+                    widgets::chip(ui, ChipKind::Warn, "Not downloaded");
+                }
+            });
+        });
+    }
+
     fn model(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
         let p = theme::palette(ui.ctx());
         let s = match status {
@@ -762,15 +821,25 @@ impl SettingsWindow {
             }
             None => None,
         };
+        if s.is_none() && status.is_some() {
+            self.model_files(ui);
+        }
         if let Some(s) = s {
             widgets::group_label(ui, "EmbeddingGemma 2");
             let deleting = self.confirm == Some(Confirm::DeleteModel);
             widgets::group(ui, |ui| {
-                let row = Row::new("Download").help("Needed for search and indexing.");
+                let warning = format!(
+                    "Deletes {} of models. Search and indexing stop until you download them \
+                     again.",
+                    size(s.model_bytes)
+                );
                 let row = if deleting {
-                    row.tint(p.error_tint)
+                    Row::new("Download")
+                        .help(&warning)
+                        .tint(p.error_tint)
+                        .tone(Tone::Error)
                 } else {
-                    row
+                    Row::new("Download").help("Needed for search and indexing.")
                 };
                 row.show(ui, |ui, _| {
                     if deleting {
@@ -786,7 +855,8 @@ impl SettingsWindow {
                         }
                         return;
                     }
-                    let deletable = s.model_present && !s.fetching;
+                    // Whatever is on disk, a partial set included.
+                    let deletable = s.model_bytes > 0 && !s.fetching;
                     if ui
                         .add_enabled(deletable, Button::secondary("Delete…"))
                         .clicked()
@@ -819,6 +889,12 @@ impl SettingsWindow {
                             ui,
                             ChipKind::Ok,
                             &format!("Downloaded, {}", size(s.model_bytes)),
+                        );
+                    } else if s.model_bytes > 0 {
+                        widgets::chip(
+                            ui,
+                            ChipKind::Warn,
+                            &format!("Incomplete, {}", size(s.model_bytes)),
                         );
                     } else {
                         widgets::chip(ui, ChipKind::Warn, "Not downloaded");

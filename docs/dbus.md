@@ -55,7 +55,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `ResumeIndexing` | `() → ()` | Run the indexing held since `PauseIndexing`. Unchanged files are skipped by mtime and size, so it carries on where it stopped. |
 | `Unload` | `() → ()` | Free the model now instead of after the idle timeout. |
 | `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (340 MB with the OCR model, plus the 671 MB vision encoder while images are on; every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
-| `DeleteModel` | `() → ()` | Unload the model and delete its files. Fails while a download runs. Queries and indexing fail until it is fetched again. |
+| `DeleteModel` | `() → ()` | Unload the model and delete its files, the vision, OCR and audio models included. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
 | `ApplyEncryption` | `() → ()` | Read `[encryption]` from the config file now and encrypt or decrypt the index to match, rather than at the next 30-second read; after a refusal, try again ([#4](https://github.com/karanshukla/vinoSearch/issues/4)). Queued behind an indexing job, which it stops. `encrypted`, `seal` and `encryption_error` say how it went. Fails if the config file doesn't parse. |
 | `Rekey` | `() → ()` | Seal a new key and encrypt the index again under it. Fails while it isn't encrypted. |
@@ -88,7 +88,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `fetch_done`, `fetch_total` | `t` | Bytes of the model in place so far, and in total, for a progress bar. |
 | `fetch_error` | `s` | Why the last download failed; empty when it did not, cleared when one starts. |
 | `index_bytes` | `t` | The index database on disk, WAL included. |
-| `model_bytes` | `t` | The model on disk, the vision encoder included. |
+| `model_bytes` | `t` | Every model on disk: text, vision, OCR and audio, a partial download included. |
 | `cache_bytes` | `t` | OpenVINO's compiled-model cache on disk (one blob per stage, ~270 MB each on the NPU). |
 | `last_checked` | `t` | Unix seconds when every root was last compared with the index (at startup, hourly, after a resume, after dropped inotify events, or on `CheckNow`); 0 before the first. |
 | `last_indexed` | `t` | Unix seconds when an indexing job last embedded or removed a file; 0 for not since the runner started. |

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use vinosearch_shared::models;
 
 const HUB: &str = "https://huggingface.co";
 const REPO: &str = "arankays/embeddinggemma-2-text-int8-cw-onnx";
@@ -160,27 +161,28 @@ pub fn total_bytes(wants: Wants) -> u64 {
 }
 
 fn models_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    };
-    Ok(base.join("vinosearch/models"))
+    models::dir()
 }
 
 pub fn default_dir() -> Result<PathBuf> {
-    Ok(models_dir()?.join("embeddinggemma-2-text-int8-cw-onnx"))
+    Ok(models_dir()?.join(models::TEXT))
 }
 
 pub fn vision_dir() -> Result<PathBuf> {
-    Ok(models_dir()?.join("embeddinggemma-2-vision-static-onnx"))
+    Ok(models_dir()?.join(models::VISION))
 }
 
 pub fn ocr_dir() -> Result<PathBuf> {
-    Ok(models_dir()?.join("pp-ocrv6-small-onnx"))
+    Ok(models_dir()?.join(models::OCR))
 }
 
 pub fn audio_dir() -> Result<PathBuf> {
-    Ok(models_dir()?.join("embeddinggemma-2-audio-static-onnx"))
+    Ok(models_dir()?.join(models::AUDIO))
+}
+
+/// Bytes of every model on disk, a partial download's included.
+pub fn bytes() -> Result<u64> {
+    Ok(models::bytes(&models_dir()?))
 }
 
 /// The audio encoder, in `audio_dir()`.
@@ -424,14 +426,7 @@ pub fn images_present(dir: &Path, vision_dir: &Path, ocr_dir: &Path) -> bool {
 /// Remove the model's files, the vision, audio and OCR models' included. The
 /// caller makes sure nothing has them loaded.
 pub fn delete() -> Result<()> {
-    for dir in [default_dir()?, vision_dir()?, ocr_dir()?, audio_dir()?] {
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| dir.display().to_string()),
-        }
-    }
-    Ok(())
+    models::delete(&models_dir()?)
 }
 
 #[cfg(test)]
