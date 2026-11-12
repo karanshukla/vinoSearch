@@ -527,6 +527,26 @@ fn a_score_slider_moves_from_the_keyboard() {
         moved.is_some_and(|v| v > DEFAULT_TEXT_MIN_SCORE + 0.001),
         "{moved:?}"
     );
+    // Text now has its Default button and Images hasn't, yet both bars and number boxes
+    // still line up (#203), and the hidden button isn't there for a screen reader.
+    for role in [Role::Slider, Role::SpinButton] {
+        let text = h.get_by_role_and_label(role, "Text").rect();
+        let images = h.get_by_role_and_label(role, "Images").rect();
+        assert!(
+            (text.min.x - images.min.x).abs() < 0.5,
+            "{text:?} {images:?}"
+        );
+        assert!(
+            (text.max.x - images.max.x).abs() < 0.5,
+            "{text:?} {images:?}"
+        );
+    }
+    let resets: Vec<_> = h
+        .get_all_by_role(Role::Button)
+        .filter_map(|n| n.accesskit_node().label())
+        .filter(|l| l.starts_with("Default"))
+        .collect();
+    assert_eq!(resets.len(), 1, "{resets:?}");
 }
 
 #[test]
