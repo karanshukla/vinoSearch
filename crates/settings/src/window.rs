@@ -1833,9 +1833,6 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// A minimum score as a slider, strict on the left and loose on the right,
-/// with a way back to the default. Some(new value) when it changed, None
-/// meaning the default.
 /// A legend entry's swatch and the gap after it, before its text.
 const LEGEND_SWATCH: f32 = 8.0 + 6.0;
 
@@ -1859,6 +1856,9 @@ fn kind_colors(p: &theme::Palette, dark: bool) -> [egui::Color32; 6] {
     [text, documents, images, code, sessions, media]
 }
 
+/// A minimum score as a slider, strict on the left and loose on the right,
+/// with a way back to the default. Some(new value) when it changed, None
+/// meaning the default.
 fn score_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1881,9 +1881,9 @@ fn score_row(
             )
         };
         // Right to left: Default, the number, Closer, the bar, Looser.
-        if current.is_some()
-            && a11y::for_what(ui.add(Button::ghost("Default").small()), label).clicked()
-        {
+        // Default keeps its space when hidden, so every row's bar lines up (#203).
+        let reset = ui.add_visible(current.is_some(), Button::ghost("Default").small());
+        if current.is_some() && a11y::for_what(reset, label).clicked() {
             out = Some(None);
         }
         let number = egui::DragValue::new(&mut v)
