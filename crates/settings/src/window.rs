@@ -794,19 +794,30 @@ impl SettingsWindow {
                     ui,
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        ui.horizontal(|ui| {
-                            widgets::mono(ui, &entry);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                widgets::small(
-                                    ui,
-                                    format!(
-                                        "{} chunks · {:.0}%",
-                                        count(*chunks as i64),
-                                        share * 100.0
-                                    ),
+                        // The count first, whole and on one line; the path
+                        // has what is left and is cut short to fit. Path
+                        // first, a long one left the count a sliver to wrap in.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 18.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "{} chunks · {:.0}%",
+                                            count(*chunks as i64),
+                                            share * 100.0
+                                        ))
+                                        .size(12.5)
+                                        .color(p.muted),
+                                    )
+                                    .extend(),
                                 );
-                            });
-                        });
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    widgets::mono(ui, &entry);
+                                });
+                            },
+                        );
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), 4.0),
                             egui::Sense::hover(),
