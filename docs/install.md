@@ -86,15 +86,38 @@ session starts the service from the same autostart entry.
 
 A `.flatpak` bundle holds the service, the CLI and the settings window, with OpenVINO and Intel's
 NPU and GPU drivers inside it, so the host needs only the kernel's NPU driver (`intel_vpu`) and
-its firmware:
+its firmware. Each release has it as `vinosearch-x86_64.flatpak`, with its checksum:
 
 ```bash
-flatpak install --user vinosearch.flatpak
+curl -fLO https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64.flatpak
+curl -fLO https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64.flatpak.sha256
+sha256sum -c vinosearch-x86_64.flatpak.sha256
+flatpak install --user vinosearch-x86_64.flatpak
 ```
 
-Open vinoSearch from the app menu once: it starts the service, asks the desktop to start it at
+The runtime (`org.freedesktop.Platform` 26.08) comes from Flathub if it isn't installed yet. Open
+vinoSearch from the app menu once: it starts the service, asks the desktop to start it at
 login (the Background portal), turns on the running desktop's search, and its Model page downloads
-the model. GNOME Shell's search finds it from the next login. To build the bundle from a checkout:
+the model. GNOME Shell's search finds it from the next login.
+
+To update, use **Update** on the settings window's About page. It downloads the new release's
+bundle and checksum, refuses the bundle unless the checksum matches, has the host's `flatpak`
+install it where this one is installed, and restarts the service if it was running, so the next
+search runs the new build. Reopen the settings window to run its new version too. A system-wide
+install (`flatpak install --system`) asks for an administrator's password first, as any system
+Flatpak install does. By hand, download and check the new bundle as above and run the same
+`flatpak install --user vinosearch-x86_64.flatpak`: a newer build replaces the installed one, and a
+running service keeps the old build until it stops. Restart it with:
+
+```bash
+busctl --user call dev.vinosearch.VinoSearch.Runner /control dev.vinosearch.Control1 Quit
+```
+
+The next search starts it again. Only a release bundle (branch `stable`) updates itself; a bundle
+built from a checkout (branch `master`) links to the release page instead. To move from one to a
+release, run `flatpak uninstall dev.vinosearch.VinoSearch//master` first (the index, models and
+config under `~/.var/app` stay) and install the release's bundle. To build the bundle from a
+checkout:
 
 ```bash
 flatpak install --user flathub org.flatpak.Builder org.freedesktop.Sdk//26.08 \
@@ -115,7 +138,7 @@ What it is allowed, and why:
 | `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | the host's app entries: which app opens a file at its line, page or second, and the editor and player lists |
 | `--share=network` | downloading the models |
 | `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | the settings and search windows |
-| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, and turning search places on and off in the host's settings (`flatpak-spawn --host`) |
+| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, turning search places on and off in the host's settings, and installing an update (`flatpak-spawn --host`) |
 | `--system-talk-name=net.hadess.PowerProfiles` | holding indexing while power saver is on |
 
 What differs from the native install:
