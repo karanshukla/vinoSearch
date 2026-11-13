@@ -103,7 +103,7 @@ min_score = 0.65            # lower it for more, looser results
 [formats.images]
 enabled = true              # off by default: the vision encoder is a 671 MB download
 extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif"]
-min_score = 0.63
+min_score = 0.68
 
 [formats.code]
 enabled = true              # off by default; found only by queries starting "code:"
