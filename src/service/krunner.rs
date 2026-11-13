@@ -1224,7 +1224,22 @@ pub fn serve(opts: Options) -> Result<()> {
             eprintln!("asked to quit");
             Ok(())
         };
-        futures_lite::future::or(worker, quit).await
+        // The bus gone (a session that ended under a runner that outlived
+        // it): nothing can reach this one again, and it would hold the
+        // instance lock against the next session's. NameLost is only what
+        // the stream is on; it ends when the connection does.
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender("org.freedesktop.DBus")
+            .member("NameLost")
+            .build()?;
+        let mut bus = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
+        let gone = async {
+            use futures_lite::StreamExt;
+            while let Some(Ok(_)) = bus.next().await {}
+            bail!("the session bus went away")
+        };
+        futures_lite::future::or(futures_lite::future::or(worker, quit), gone).await
     })
 }
 

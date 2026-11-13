@@ -158,9 +158,10 @@ fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
 }
 
 fn supervised(mut worker: Command) -> Result<ExitStatus> {
+    // No HOME to keep one under: output stays where it was going.
     let log = (!std::io::stderr().is_terminal())
-        .then(log_path)
-        .transpose()?;
+        .then(|| log_path().ok())
+        .flatten();
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: prctl and getppid are async-signal-safe, and nothing allocates.
     unsafe {
@@ -177,8 +178,11 @@ fn supervised(mut worker: Command) -> Result<ExitStatus> {
     }
     let mut wait = None;
     loop {
-        if let Some(log) = &log {
-            log_to(log)?;
+        // A full or read-only disk costs the log, not search.
+        if let Some(log) = &log
+            && let Err(e) = log_to(log)
+        {
+            eprintln!("no log at {}: {e:#}", log.display());
         }
         let started = Instant::now();
         let status = worker.status().context("starting the runner")?;
