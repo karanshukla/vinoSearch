@@ -641,6 +641,17 @@ fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(e.to_string())
 }
 
+/// `f` of the index, or nothing while its key can't be had (`db` None).
+fn or_waiting<T: Default>(
+    db: Option<&rusqlite::Connection>,
+    f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
+) -> zbus::fdo::Result<T> {
+    db.map(f)
+        .transpose()
+        .map_err(failed)
+        .map(Option::unwrap_or_default)
+}
+
 impl Control {
     /// What the formats on in the config file as it is now need; nothing
     /// extra if it doesn't parse.
@@ -693,10 +704,16 @@ impl Control {
     /// State, storage and progress; keys in vinosearch_shared::dbus::status,
     /// described in docs/dbus.md.
     fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedVariant>> {
-        let db = self.db.lock().map_err(failed)?;
-        let (files, chunks) = index::counts(&db).map_err(failed)?;
-        let roots: Vec<String> = index::roots(&db)
-            .map_err(failed)?
+        // Still answered while the index's key can't be had yet, its counts
+        // empty: `seal_waiting` says why (#4).
+        let db = match self.db.lock() {
+            Ok(db) => Some(db),
+            Err(e) if crate::index::seal::is_unavailable(&e) => None,
+            Err(e) => return Err(failed(e)),
+        };
+        let db = db.as_deref();
+        let (files, chunks) = or_waiting(db, index::counts)?;
+        let roots: Vec<String> = or_waiting(db, index::roots)?
             .into_iter()
             .map(|r| r.display().to_string())
             .collect();
@@ -729,7 +746,7 @@ impl Control {
         out.insert(key::FILES.into(), owned(Variant::from(files)));
         out.insert(key::CHUNKS.into(), owned(Variant::from(chunks)));
         let [text, documents, images, code, sessions, media] =
-            index::counts_by_kind(&db).map_err(failed)?;
+            or_waiting(db, index::counts_by_kind)?;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
             (key::TEXT_CHUNKS, text.1),
@@ -744,7 +761,7 @@ impl Control {
             (key::MEDIA_CHUNKS, media.1),
             (
                 key::SESSIONS_UNREAD,
-                index::unread_sessions(&db).map_err(failed)?,
+                or_waiting(db, index::unread_sessions)?,
             ),
         ] {
             out.insert(k.into(), owned(Variant::from(n)));
@@ -814,14 +831,14 @@ impl Control {
             key::INDEXING_REST.into(),
             owned(Variant::from(st.indexing_rest.load(Ordering::Relaxed))),
         );
-        let partial: Vec<(String, String, u64, u64)> = index::partial(&db, key::PARTIAL_MAX)
-            .map_err(failed)?
-            .into_iter()
-            .map(|(path, done, total)| {
-                let unit = crate::extract::part_unit(Path::new(&path)).to_owned();
-                (path, unit, done as u64, total as u64)
-            })
-            .collect();
+        let partial: Vec<(String, String, u64, u64)> =
+            or_waiting(db, |c| index::partial(c, key::PARTIAL_MAX))?
+                .into_iter()
+                .map(|(path, done, total)| {
+                    let unit = crate::extract::part_unit(Path::new(&path)).to_owned();
+                    (path, unit, done as u64, total as u64)
+                })
+                .collect();
         out.insert(key::PARTIAL.into(), owned(Variant::from(partial)));
         out.insert(
             key::MODEL_CHANGED.into(),
@@ -830,7 +847,7 @@ impl Control {
         // Counted from the index: with a decoder installed, they are retried
         // at the next start and the count would mislead until then.
         let no_decoder = match crate::ml::vision::heif_convert() {
-            None => index::undecodable(&db).map_err(failed)?,
+            None => or_waiting(db, index::undecodable)?,
             Some(_) => 0,
         };
         out.insert(key::NO_DECODER.into(), owned(Variant::from(no_decoder)));
@@ -851,6 +868,16 @@ impl Control {
             owned(Variant::from(enc.error)),
         );
         out.insert(key::SEAL_BROKEN.into(), owned(Variant::from(enc.broken)));
+        out.insert(key::SEAL_WAITING.into(), owned(Variant::from(enc.waiting)));
+        out.insert(
+            key::NEW_SEAL.into(),
+            // Looked at here rather than at start, which it would slow.
+            owned(Variant::from(
+                crate::index::seal::Sealer::default()
+                    .new_seal(st.tpm.load(Ordering::Relaxed))
+                    .name(),
+            )),
+        );
         Ok(out)
     }
 

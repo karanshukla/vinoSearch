@@ -17,10 +17,11 @@
 
 use crate::config::{self, Config, Excludes};
 use crate::index::encryption::{self, Want};
+use crate::index::seal::{self, Sealer};
 use crate::index::{self, FileTypes, Hit, Kind, Outcome, Vectors};
 use crate::ml::embed::Embed;
 use crate::service::sched;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use futures_channel::oneshot;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,23 @@ impl Pending {
         let mut p = self.inner.lock().unwrap();
         let generation = self.generation.load(Ordering::Relaxed);
         (generation, p.0.take(), std::mem::take(&mut p.1))
+    }
+
+    /// Take the encryption requests alone, leaving the rest for the worker
+    /// once the index's key is had: the last Want asked for, if any.
+    fn take_encryption(&self) -> Option<Want> {
+        let mut p = self.inner.lock().unwrap();
+        let mut want = None;
+        p.1.retain(|r| match r {
+            Request::Encryption(w) => {
+                want = Some(*w);
+                false
+            }
+            // Nothing to re-key until the key is had.
+            Request::Rekey => false,
+            _ => true,
+        });
+        want
     }
 }
 
@@ -321,29 +339,48 @@ impl Status {
 /// photos skipped for want of a decoder that is installed now, #79; scans
 /// OCR can read now, #106; files of a format read differently now, #97), so
 /// that first comparison finds it, and say so in `status` for the Index page.
+///
+/// A key that can't be had yet (a locked keyring) isn't asked for with a
+/// prompt here, so the runner is on the bus at once to say so; the worker
+/// asks, and waits for it (`wait_for_key`), and does the rest then.
 pub fn prepare(status: &Status, file: &Config) -> Result<()> {
     let db = index::default_db()?;
     encryption::hold_shared(&db)?;
-    status
-        .tpm
-        .store(crate::index::seal::tpm_available(), Ordering::Relaxed);
-    apply_encryption(status, &db, Want::of(file), false);
-    let conn = index::open(&db)?;
-    let purged = index::purge_other_models(&conn)?;
+    status.tpm.store(seal::tpm_available(), Ordering::Relaxed);
+    apply_encryption(
+        status,
+        &db,
+        Want::of(file),
+        false,
+        &Sealer::default().quiet(),
+    );
+    match index::open(&db) {
+        Ok(conn) => prepare_index(status, &conn),
+        Err(e) if seal::is_unavailable(&e) => {
+            eprintln!("waiting for the index's key: {e:#}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `prepare`'s part that needs the index open.
+fn prepare_index(status: &Status, conn: &rusqlite::Connection) -> Result<()> {
+    let purged = index::purge_other_models(conn)?;
     if let Some(why) = model_changed(&purged) {
         eprintln!("{why}");
         *status.model_changed.lock().unwrap() = why;
     }
-    let retry = index::retry_undecodable(&conn)?;
+    let retry = index::retry_undecodable(conn)?;
     if retry > 0 {
         eprintln!("a HEIF decoder is installed now: {retry} photos will be indexed");
     }
     let ocr = crate::ml::model::ocr_dir().is_ok_and(|d| crate::ml::model::ocr_present(&d));
-    let scans = index::retry_scans(&conn, ocr)?;
+    let scans = index::retry_scans(conn, ocr)?;
     if scans > 0 {
         eprintln!("{scans} PDFs with no text will be read by OCR");
     }
-    let reread = index::reread_formats(&conn)?;
+    let reread = index::reread_formats(conn)?;
     if reread > 0 {
         eprintln!("{reread} files are read differently now and will be indexed again");
     }
@@ -352,10 +389,14 @@ pub fn prepare(status: &Status, file: &Config) -> Result<()> {
 
 /// `encryption::apply`, its outcome logged and kept for Status. A rebuild
 /// reported earlier stays until a later one replaces it.
-fn apply_encryption(status: &Status, db: &std::path::Path, want: Want, rekey: bool) {
-    let st = encryption::apply(db, want, rekey, &crate::index::seal::Sealer::default());
+fn apply_encryption(status: &Status, db: &Path, want: Want, rekey: bool, sealer: &Sealer) {
+    let st = encryption::apply(db, want, rekey, sealer);
     if !st.error.is_empty() {
         eprintln!("encryption: {}", st.error);
+    }
+    let before = status.encryption.lock().unwrap().waiting.clone();
+    if st.waiting != before && !st.waiting.is_empty() {
+        eprintln!("encryption: waiting for the index's key: {}", st.waiting);
     }
     let mut kept = status.encryption.lock().unwrap();
     let broken = if st.broken.is_empty() {
@@ -364,6 +405,73 @@ fn apply_encryption(status: &Status, db: &std::path::Path, want: Want, rekey: bo
         st.broken.clone()
     };
     *kept = encryption::State { broken, ..st };
+}
+
+/// How often a key that can't be had (a locked keyring) is looked for again,
+/// without a prompt.
+const KEY_RETRY: Duration = Duration::from_secs(30);
+
+/// The index's key can't be had yet (a locked keyring): ask for it once with
+/// a prompt (bounded by `seal::PROMPT_WAIT`), then look again quietly every
+/// `KEY_RETRY`, and with a prompt whenever ApplyEncryption asks. Queries
+/// find nothing meanwhile; Status says why (`seal_waiting`).
+fn wait_for_key(
+    jobs: &mpsc::Receiver<Job>,
+    status: &Status,
+    db: &Path,
+    want: &mut Want,
+) -> Result<rusqlite::Connection> {
+    let sealer = Sealer::default();
+    let mut ask = true;
+    loop {
+        let s = if ask { sealer.clone() } else { sealer.quiet() };
+        let w = *want;
+        // A prompt may wait a minute on the user: queries are answered (with
+        // nothing) meanwhile, not held behind it.
+        let stopping = std::thread::scope(|scope| {
+            let asking = scope.spawn(|| apply_encryption(status, db, w, false, &s));
+            while !asking.is_finished() {
+                match jobs.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Job::Match { reply, .. }) => {
+                        let _ = reply.send(Vec::new());
+                    }
+                    Ok(Job::Wake | Job::Retry) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+                }
+            }
+            false
+        });
+        if stopping {
+            bail!("the runner is stopping");
+        }
+        match index::open(db) {
+            Ok(conn) => {
+                eprintln!("the index's key is had: indexing and search resume");
+                prepare_index(status, &conn)?;
+                return Ok(conn);
+            }
+            Err(e) if seal::is_unavailable(&e) => {}
+            Err(e) => return Err(e),
+        }
+        ask = false;
+        let until = Instant::now() + KEY_RETRY;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match jobs.recv_timeout(left) {
+                Ok(Job::Match { reply, .. }) => {
+                    let _ = reply.send(Vec::new());
+                }
+                Ok(Job::Wake | Job::Retry) => {
+                    if let Some(w) = status.pending.take_encryption() {
+                        *want = w;
+                        ask = true;
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the runner is stopping"),
+            }
+        }
+    }
 }
 
 /// One sentence on what `purge_other_models` dropped, for the Index page;
@@ -562,8 +670,11 @@ fn run_with<E: Embed>(
     mut load_model: impl FnMut(&str) -> Result<E>,
 ) -> Result<()> {
     let db = opts.db.clone();
-    let mut conn = index::open(&db)?;
     let mut want = Want::of(&opts.file);
+    let mut conn = match index::open(&db) {
+        Err(e) if seal::is_unavailable(&e) => wait_for_key(&jobs, &opts.status, &db, &mut want)?,
+        conn => conn?,
+    };
     let mut rules = Rules {
         excludes: opts.excludes.clone(),
         types: opts.types.clone(),
@@ -603,7 +714,7 @@ fn run_with<E: Embed>(
                      rekey: bool|
      -> Result<()> {
         *conn = rusqlite::Connection::open_in_memory()?;
-        apply_encryption(status, &db, want, rekey);
+        apply_encryption(status, &db, want, rekey, &Sealer::default());
         *conn = index::open(&db)?;
         if let Some(l) = loaded.as_mut() {
             l.vectors = Vectors::load(conn)?;
