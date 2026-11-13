@@ -27,9 +27,36 @@ fn kind(h: &Hit) -> &'static str {
     }
 }
 
+/// Audio and video further than this below the best text, document or
+/// session result are left out, and images further below the best of those
+/// or audio and video. Their floors alone let them through for queries text
+/// answers well: "bills", a document at 0.704 and a photo at 0.632;
+/// "valorant", sessions at 0.79 and unrelated videos and photos at 0.66.
+/// Not yet checked against a query where text and a photo are both right.
+pub const GAP: f32 = 0.06;
+
+/// Leaves out the audio, video and images in `hits` more than GAP below the
+/// best of the kinds shown before them. Alone, they need only their floor.
+pub fn drop_far_below(hits: &mut Vec<Hit>) {
+    let best = |hits: &[Hit], kinds: &[Kind]| {
+        hits.iter()
+            .filter(|h| kinds.contains(&h.kind))
+            .map(|h| h.score)
+            .fold(f32::NEG_INFINITY, f32::max)
+    };
+    let words = best(hits, &[Kind::Text, Kind::Document, Kind::Session]);
+    hits.retain(|h| h.kind != Kind::Media || h.score >= words - GAP);
+    let others = best(
+        hits,
+        &[Kind::Text, Kind::Document, Kind::Session, Kind::Media],
+    );
+    hits.retain(|h| h.kind != Kind::Image || h.score >= others - GAP);
+}
+
 /// Best chunk per file, files at or above their kind's `floor`, at most
 /// `limit` files of each of the window's kinds: text, then documents, then
-/// sessions, then audio and video, then images, best first within each.
+/// sessions, then audio and video, then images, best first within each,
+/// less those [`drop_far_below`] leaves out.
 pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 6] = Default::default();
@@ -51,7 +78,9 @@ pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> 
         group.sort_by(|a, b| b.score.total_cmp(&a.score));
         group.truncate(limit);
     }
-    groups.into_iter().flatten().collect()
+    let mut kept = groups.into_iter().flatten().collect();
+    drop_far_below(&mut kept);
+    kept
 }
 
 /// What the window shows of `h`; None for a file gone since it was indexed.
@@ -133,23 +162,38 @@ mod tests {
             .into_iter()
             .map(|h| h.path)
             .collect();
-        assert_eq!(
-            paths,
-            [
-                "/n/b.md",
-                "/n/a.md",
-                "/d/scan.pdf",
-                "/p/shot.png",
-                "/p/cat.jpg"
-            ]
-        );
+        assert_eq!(paths, ["/n/b.md", "/n/a.md", "/d/scan.pdf", "/p/shot.png",]);
+    }
+
+    #[test]
+    fn audio_video_and_images_far_below_a_session_are_left_out() {
+        let hits = vec![
+            hit(Kind::Session, 0.79, "/s/match.vwsession"),
+            hit(Kind::Media, 0.75, "/v/close.mp4"),
+            hit(Kind::Media, 0.66, "/v/clip.mp4"),
+            hit(Kind::Image, 0.66, "/p/photo.png"),
+        ];
+        let paths: Vec<_> = every_file(hits, floor, 10)
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+        assert_eq!(paths, ["/s/match.vwsession", "/v/close.mp4"]);
+    }
+
+    #[test]
+    fn images_alone_need_only_their_floor() {
+        let hits = vec![
+            hit(Kind::Image, 0.80, "/p/best.jpg"),
+            hit(Kind::Image, 0.62, "/p/cat.jpg"),
+        ];
+        assert_eq!(every_file(hits, floor, 10).len(), 2);
     }
 
     #[test]
     fn at_most_limit_of_each_kind() {
         let hits = (0..5)
             .map(|i| hit(Kind::Text, 0.9 - i as f32 * 0.01, &format!("/n/{i}.md")))
-            .chain((0..5).map(|i| hit(Kind::Image, 0.7, &format!("/p/{i}.jpg"))))
+            .chain((0..5).map(|i| hit(Kind::Image, 0.88, &format!("/p/{i}.jpg"))))
             .collect();
         let kept = every_file(hits, floor, 2);
         assert_eq!(kept.len(), 4);

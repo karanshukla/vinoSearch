@@ -34,7 +34,7 @@ min_score = 0.65            # lower it for more, looser results
 [formats.images]
 enabled = true              # off by default: the vision encoder is a 671 MB download
 extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif"]
-min_score = 0.63
+min_score = 0.68
 
 [formats.code]
 enabled = true              # off by default; found only by queries starting "code:"
@@ -45,7 +45,7 @@ enabled = true              # off by default; vinoWhisper's saved transcripts an
 
 [formats.media]
 enabled = true              # off by default; audio and video by sound and picture, needs ffmpeg
-min_score = 0.62            # provisional, to be tuned on a real library
+min_score = 0.68
 max_hours = 3               # longer files are left out; a change applies to files already seen
 ```
 

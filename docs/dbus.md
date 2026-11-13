@@ -121,7 +121,7 @@ min_score = 0.65
 [formats.images]
 enabled = true
 extensions = ["jpg", "png"]
-min_score = 0.63
+min_score = 0.68
 
 [formats.code]
 enabled = true
@@ -147,7 +147,7 @@ A running runner re-reads the file every 30 seconds and applies what changed:
 | `formats.images.enabled`, `formats.images.extensions` | at once, stopping an indexing job to apply them: images no longer wanted are dropped from the index, and every root is checked for the ones now wanted. Default off, and `extensions` defaults to jpg, jpeg, png, webp, gif, bmp, tif, tiff, heic, heif, avif |
 | `formats.code.enabled` | as `formats.images.enabled`: code no longer wanted is dropped, and every root is checked for code once it's on. Default off |
 | `formats.sessions.enabled` | as `formats.images.enabled`, and vinoWhisper's `$XDG_DATA_HOME/vinowhisper/transcripts` becomes a root while it's on (forgotten once it's off). Default off |
-| `formats.text.min_score`, `formats.images.min_score`, `formats.code.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65, 0.63 and 0.72) |
+| `formats.text.min_score`, `formats.images.min_score`, `formats.code.min_score` | from the next query: KRunner and GNOME leave out results of that kind scoring lower (cosine, defaults 0.65, 0.68 and 0.72) |
 | `encryption.enabled`, `encryption.allow_host_key` | at once (`ApplyEncryption` makes it straight away), stopping an indexing job: the index is converted in place, encrypted or decrypted, nothing indexed again. Default off. Without a TPM, turning it on is refused unless `allow_host_key = true` |
 
 A setting given as a flag or environment variable (`--device`, `--idle-unload-minutes`, `VINOSEARCH_IDLE_UNLOAD_MINUTES`, or baked into the service by `krunner --install --device ...`) wins over the file, so file changes to it are ignored until the runner restarts without the flag. A file that fails to parse, or has an invalid `exclude`, changes nothing; an invalid `idle_unload_minutes` keeps the current timeout.

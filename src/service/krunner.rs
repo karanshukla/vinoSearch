@@ -1082,16 +1082,11 @@ fn disk_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-/// Images further than this below the best text or document result are left
-/// out. Their floor alone lets photos through for queries text answers well:
-/// "bills" here: a document at 0.704 and a photo at 0.632, a gap of 0.072.
-/// Not yet checked against a query where text and a photo are both right.
-const IMAGE_GAP: f32 = 0.06;
-
 /// Best chunk per file, files at or above their kind's floor, best RESULTS
 /// of each kind: text, then documents, then vinoWhisper sessions, then
-/// audio and video, then images, less images too far below the best of the
-/// others (IMAGE_GAP), then code (only ever on its own, for `code:`).
+/// audio and video, then images, less audio, video and images too far below
+/// the best of the others (results::far_below), then code (only ever on its
+/// own, for `code:`).
 /// Near-duplicate images are one result (#78).
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     const IMAGES: usize = 4;
@@ -1116,13 +1111,9 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     for group in &mut groups {
         group.truncate(RESULTS);
     }
-    let best = groups[..IMAGES]
-        .iter()
-        .flatten()
-        .map(|h| h.score)
-        .fold(f32::NEG_INFINITY, f32::max);
-    groups[IMAGES].retain(|h| h.score >= best - IMAGE_GAP);
-    groups.into_iter().flatten().collect()
+    let mut kept = groups.into_iter().flatten().collect();
+    crate::search::results::drop_far_below(&mut kept);
+    kept
 }
 
 pub fn serve(opts: Options) -> Result<()> {
@@ -1893,6 +1884,25 @@ mod tests {
             hit(Kind::Image, 0.64, "/blurry.jpg"),
         ];
         assert_eq!(paths(hits), ["/wedding-plan.md", "/wedding.jpg"]);
+    }
+
+    #[test]
+    fn audio_and_video_far_below_a_session_are_dropped() {
+        let hits = vec![
+            hit(Kind::Session, 0.793, "/s/valorant.vwsession"),
+            hit(Kind::Media, 0.661, "/v/promo.mp4"),
+            hit(Kind::Image, 0.668, "/p/wallpaper.webp"),
+        ];
+        assert_eq!(paths(hits), ["/s/valorant.vwsession"]);
+    }
+
+    #[test]
+    fn audio_and_video_alone_need_only_their_floor() {
+        let hits = vec![
+            hit(Kind::Text, 0.60, "/below-floor.md"),
+            hit(Kind::Media, 0.66, "/v/dog-barking.mp4"),
+        ];
+        assert_eq!(paths(hits), ["/v/dog-barking.mp4"]);
     }
 
     #[test]
