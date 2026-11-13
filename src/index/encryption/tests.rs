@@ -63,8 +63,10 @@ impl Setup {
     fn apply(&self, on: bool, allow_host: bool, rekey: bool) -> State {
         retry(|| {
             let st = apply(&self.db(), Want { on, allow_host }, rekey, &self.sealer);
+            // Named in the error, which is what `retry` looks at: a busy
+            // tool run on the host is reported as waiting, with no error.
             if st.error.contains("Text file busy") || st.waiting.contains("Text file busy") {
-                bail!("{}", st.error);
+                bail!("Text file busy: {} {}", st.error, st.waiting);
             }
             Ok(st)
         })
