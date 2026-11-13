@@ -413,9 +413,14 @@ fn a_keyring_item_gone_is_waited_for_until_encryption_starts_over() {
     let st = apply(&s.db(), off, false, &s.sealer.quiet());
     assert!(!st.waiting.is_empty() && st.broken.is_empty(), "{st:?}");
     assert_eq!(s.on_disk(), before);
+    // Nor at a try that may prompt but that nobody asked for: the start,
+    // `vinosearch index`.
+    let st = apply(&s.db(), off, false, &s.sealer);
+    assert!(!st.waiting.is_empty() && st.broken.is_empty(), "{st:?}");
+    assert_eq!(s.on_disk(), before);
     // Turned off (the Security page's switch): started over, plaintext,
     // without the old key, the folders kept.
-    let st = s.apply(false, false, false);
+    let st = apply(&s.db(), off, false, &s.sealer.asked());
     assert!(st.broken.contains("no item"), "{st:?}");
     assert_eq!((st.waiting.as_str(), st.encrypted), ("", false));
     assert!(s.plain_sqlite_reads());

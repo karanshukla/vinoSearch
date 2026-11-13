@@ -422,9 +422,16 @@ fn wait_for_key(
     want: &mut Want,
 ) -> Result<rusqlite::Connection> {
     let sealer = Sealer::default();
-    let mut ask = true;
+    // The first try prompts, as the start of a session does; one the user
+    // asks for prompts too and may start over.
+    let mut ask = Some(sealer.clone());
     loop {
-        let s = if ask { sealer.clone() } else { sealer.quiet() };
+        // Asked while the last try was still prompting.
+        if let Some(w) = status.pending.take_encryption() {
+            *want = w;
+            ask = Some(sealer.asked());
+        }
+        let s = ask.take().unwrap_or_else(|| sealer.quiet());
         let w = *want;
         // A prompt may wait a minute on the user: queries are answered (with
         // nothing) meanwhile, not held behind it.
@@ -453,7 +460,6 @@ fn wait_for_key(
             Err(e) if seal::is_unavailable(&e) => {}
             Err(e) => return Err(e),
         }
-        ask = false;
         let until = Instant::now() + KEY_RETRY;
         while let Some(left) = until.checked_duration_since(Instant::now()) {
             match jobs.recv_timeout(left) {
@@ -463,7 +469,7 @@ fn wait_for_key(
                 Ok(Job::Wake | Job::Retry) => {
                     if let Some(w) = status.pending.take_encryption() {
                         *want = w;
-                        ask = true;
+                        ask = Some(sealer.asked());
                         break;
                     }
                 }
@@ -714,7 +720,7 @@ fn run_with<E: Embed>(
                      rekey: bool|
      -> Result<()> {
         *conn = rusqlite::Connection::open_in_memory()?;
-        apply_encryption(status, &db, want, rekey, &Sealer::default());
+        apply_encryption(status, &db, want, rekey, &Sealer::default().asked());
         *conn = index::open(&db)?;
         if let Some(l) = loaded.as_mut() {
             l.vectors = Vectors::load(conn)?;

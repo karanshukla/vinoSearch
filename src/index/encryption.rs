@@ -309,11 +309,12 @@ fn apply_inner(
         }
         Ok(k)
     });
-    // Encryption turned off while the key can't be had, even after asking
-    // with a prompt: the way to start over, and the user's choice, so the
-    // index is rebuilt as a lost key's would be. Never at a quiet try (the
-    // start), which a locked keyring alone mustn't cost the index.
-    let start_over = |e: &anyhow::Error| !want.on && sealer.prompts() && seal::is_unavailable(e);
+    // Encryption turned off by the user now while the key can't be had: the
+    // way to start over, and their choice, so the index is rebuilt as a lost
+    // key's would be. Never at the start or from `vinosearch index`, where a
+    // keyring that is locked or not up yet mustn't cost the index.
+    let start_over =
+        |e: &anyhow::Error| !want.on && sealer.starts_over() && seal::is_unavailable(e);
     let current = match current {
         Ok(k) => k,
         Err(e) if is_unusable(&e) || start_over(&e) => {

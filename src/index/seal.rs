@@ -240,6 +240,9 @@ pub struct Sealer {
     /// None for none at all.
     creds: Option<Creds>,
     keyring: Keyring,
+    /// The user asked for this now (ApplyEncryption, the config file), so
+    /// turning encryption off while the key can't be had starts over.
+    start_over: bool,
 }
 
 #[derive(Clone)]
@@ -258,6 +261,7 @@ impl Default for Sealer {
                 address: None,
                 prompt: Some(PROMPT_WAIT),
             },
+            start_over: false,
         }
     }
 }
@@ -291,6 +295,7 @@ impl Sealer {
         Sealer {
             creds: Some(Creds::At(program.to_owned())),
             keyring: Keyring::default(),
+            start_over: false,
         }
     }
 
@@ -300,6 +305,7 @@ impl Sealer {
         Sealer {
             creds: None,
             keyring,
+            start_over: false,
         }
     }
 
@@ -326,9 +332,17 @@ impl Sealer {
         }
     }
 
-    /// Whether a locked keyring gets its unlock prompt.
-    pub fn prompts(&self) -> bool {
-        self.keyring.prompt.is_some()
+    /// Whether turning encryption off without the key may rebuild the index.
+    pub fn starts_over(&self) -> bool {
+        self.start_over
+    }
+
+    /// The same, for a change the user asked for now: see `start_over`.
+    pub fn asked(&self) -> Self {
+        Sealer {
+            start_over: true,
+            ..self.clone()
+        }
     }
 
     /// The same, but a locked keyring is `Unavailable` at once rather than
@@ -393,7 +407,9 @@ impl Sealer {
                 .keyring
                 .fetch(credential)
                 .context("reading the key from the keyring")?;
-            return Key::from_slice(&out);
+            // An item that isn't a key is the keyring's oddity, waited out
+            // like the rest: never a lost key, which rebuilds the index.
+            return Key::from_slice(&out).map_err(|e| Unavailable(format!("{e:#}")).into());
         }
         // Not the key's fault: waited for, never taken for a lost key.
         let program = self.unsealing().ok_or_else(|| {
