@@ -4,24 +4,26 @@
 //!
 //! The keyring is unlocked at login and then readable by anything running as
 //! this user in the session; it is not bound to a TPM. On disk it is
-//! encrypted with the login password, so a backup or a disk taken out needs
-//! that password.
+//! encrypted with the keyring's password, so a backup or a disk taken out
+//! needs that password.
 //!
 //! `index.key` names the item (`HEAD` and a random id) and holds no key. The
-//! session is `dh-ietf1024-sha256-aes128-cbc-pkcs7`, so the key crosses the
-//! bus encrypted, never in zbus's buffers in the clear. A sandboxed build
-//! would go through `org.freedesktop.portal.Secret` instead, under a
-//! `index.key` head of its own.
+//! `secret-service` crate opens the session as
+//! `dh-ietf1024-sha256-aes128-cbc-pkcs7` (`EncryptionType::Dh`), so the key
+//! crosses the bus encrypted. Unlocking is done here rather than by the
+//! crate, so its prompt is bounded and dismissed when nobody answers. A
+//! sandboxed build would go through `org.freedesktop.portal.Secret` instead,
+//! under an `index.key` head of its own.
 
 use super::{Unavailable, random};
-use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_lite::StreamExt;
-use num_bigint::BigUint;
+use secret_service::{EncryptionType, Item, SecretService};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::mpsc;
 use std::time::Duration;
-use zbus::{OwnedObjectPath, OwnedVariant as OwnedValue, Variant as Value};
+use zbus::{OwnedObjectPath, OwnedVariant};
 use zeroize::Zeroizing;
 
 /// What `index.key` starts with for a key in the keyring. Not base64 (the
@@ -34,19 +36,12 @@ const LABEL: &str = "vinoSearch index key";
 const BUS: &str = "org.freedesktop.secrets";
 const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 const SERVICE: &str = "org.freedesktop.Secret.Service";
-const ITEM: &str = "org.freedesktop.Secret.Item";
 const PROMPT: &str = "org.freedesktop.Secret.Prompt";
-const ALGORITHM: &str = "dh-ietf1024-sha256-aes128-cbc-pkcs7";
 /// A call the Secret Service doesn't answer in this long (activating
 /// included) is taken as no Secret Service.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// RFC 2409's second Oakley group, the Secret Service spec's: 1024-bit MODP,
-/// generator 2.
-const PRIME: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74\
-                     020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437\
-                     4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
-                     EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF";
+const NONE: &str =
+    "no Secret Service (a keyring such as gnome-keyring or KWallet) on the session bus";
 
 /// The Secret Service on the session bus (or `address`, for tests).
 #[derive(Clone, Debug, Default)]
@@ -57,9 +52,6 @@ pub struct Keyring {
     pub prompt: Option<Duration>,
 }
 
-/// `(session, parameters (the IV), value, content type)`.
-type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
-
 impl Keyring {
     /// Store `secret` as a new item in the default collection; what
     /// `index.key` holds for it.
@@ -68,36 +60,28 @@ impl Keyring {
         random(&mut id)?;
         let id: String = id.iter().map(|b| format!("{b:02x}")).collect();
         self.block(async |c: &Client| {
-            let collection: OwnedObjectPath = c.service("ReadAlias", &("default",)).await?;
-            if collection.as_str() == "/" {
-                bail!(Unavailable(
-                    "the keyring has no default collection to keep the key in".into()
-                ));
+            let collection = c.ss.get_default_collection().await.map_err(failed)?;
+            if collection.is_locked().await.map_err(failed)? {
+                c.unlock(&collection.collection_path).await?;
             }
-            c.unlock(vec![collection.clone()]).await?;
             let attributes = HashMap::from([("xdg:schema", SCHEMA), ("id", id.as_str())]);
-            let props = HashMap::from([
-                ("org.freedesktop.Secret.Item.Label", Value::from(LABEL)),
-                (
-                    "org.freedesktop.Secret.Item.Attributes",
-                    Value::from(attributes),
-                ),
-            ]);
-            let (iv, value) = c.session.encrypt(secret)?;
-            let secret: (&OwnedObjectPath, Vec<u8>, Vec<u8>, &str) =
-                (&c.session.path, iv, value, "application/octet-stream");
-            let (item, prompt): (OwnedObjectPath, OwnedObjectPath) = c
-                .call(
-                    collection.as_str(),
-                    "org.freedesktop.Secret.Collection",
-                    "CreateItem",
-                    &(props, secret, false),
-                )
-                .await?;
-            if item.as_str() == "/" {
-                c.prompt(&prompt).await?;
+            let create = collection.create_item(
+                LABEL,
+                attributes,
+                secret,
+                false,
+                "application/octet-stream",
+            );
+            // A prompt here (only for a locked collection, unlocked above) is
+            // the crate's: bounded, but it can't be dismissed from here.
+            let wait = c.prompt.unwrap_or(CALL_TIMEOUT);
+            match within(wait, create).await {
+                Some(r) => r.map(drop).map_err(failed),
+                None => bail!(Unavailable(format!(
+                    "the keyring didn't store the key within {} s",
+                    wait.as_secs()
+                ))),
             }
-            Ok(())
         })?;
         Ok(format!("{HEAD}{id}\n").into_bytes())
     }
@@ -109,18 +93,15 @@ impl Keyring {
     pub fn fetch(&self, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let id = id_of(blob).context("not a keyring key file")?;
         self.block(async |c: &Client| {
-            let item = c.find(id).await?;
-            let item = item.ok_or_else(|| {
+            let item = c.find(id).await?.ok_or_else(|| {
                 Unavailable(
                     "this keyring has no item for the index's key; it may be in another \
                      keyring, or deleted"
                         .into(),
                 )
             })?;
-            let (_, iv, value, _): Secret = c
-                .call(item.as_str(), ITEM, "GetSecret", &(&c.session.path,))
-                .await?;
-            c.session.decrypt(&iv, &value)
+            // Decrypted by the crate into a Vec of its own, wiped from here on.
+            Ok(Zeroizing::new(item.get_secret().await.map_err(failed)?))
         })
     }
 
@@ -133,7 +114,10 @@ impl Keyring {
         };
         quiet.block(async |c: &Client| {
             if let Some(item) = c.find(id).await? {
-                let _prompt: OwnedObjectPath = c.call(item.as_str(), ITEM, "Delete", &()).await?;
+                within(CALL_TIMEOUT, item.delete())
+                    .await
+                    .context("the keyring didn't delete the old key in time")?
+                    .map_err(failed)?;
             }
             Ok(())
         })
@@ -147,16 +131,7 @@ impl Keyring {
             s.spawn(|| {
                 zbus::block_on(async {
                     let c = Client::open(self).await?;
-                    let r = f(&c).await;
-                    let _ = c
-                        .call::<_, ()>(
-                            c.session.path.as_str(),
-                            "org.freedesktop.Secret.Session",
-                            "Close",
-                            &(),
-                        )
-                        .await;
-                    r
+                    f(&c).await
                 })
             })
             .join()
@@ -175,7 +150,7 @@ pub fn id_of(blob: &[u8]) -> Option<&str> {
 
 struct Client {
     conn: zbus::Connection,
-    session: Session,
+    ss: SecretService<'static>,
     prompt: Option<Duration>,
 }
 
@@ -183,8 +158,6 @@ struct Client {
 /// waiting out, never a reason to drop the index.
 fn transient(e: zbus::Error) -> anyhow::Error {
     use zbus::fdo::Error as Fdo;
-    const NONE: &str =
-        "no Secret Service (a keyring such as gnome-keyring or KWallet) on the session bus";
     let why = match &e {
         zbus::Error::FDO(f) => match &**f {
             Fdo::ServiceUnknown(_)
@@ -209,6 +182,42 @@ fn transient(e: zbus::Error) -> anyhow::Error {
     Unavailable(why).into()
 }
 
+/// The crate's errors, all `Unavailable` as `transient`'s are.
+fn failed(e: secret_service::Error) -> anyhow::Error {
+    use secret_service::Error as E;
+    match e {
+        E::Zbus(e) => transient(e),
+        E::ZbusFdo(f) => transient(zbus::Error::FDO(Box::new(f))),
+        E::Locked => Unavailable("the keyring is locked".into()).into(),
+        E::Prompt => Unavailable("unlocking the keyring was dismissed".into()).into(),
+        E::Unavailable => Unavailable(NONE.into()).into(),
+        E::NoResult => {
+            Unavailable("the keyring has no default collection to keep the key in".into()).into()
+        }
+        E::Crypto(why) => Unavailable(format!("the keyring's secret didn't decrypt: {why}")).into(),
+        e => Unavailable(format!("the keyring: {e}")).into(),
+    }
+}
+
+/// `fut`, or None once `wait` has passed. The timer is a thread: zbus's own
+/// is private. Dropping `cancel` ends it early.
+async fn within<T>(wait: Duration, fut: impl Future<Output = T>) -> Option<T> {
+    let (cancel, timer) = mpsc::channel::<()>();
+    let (fire, fired) = futures_channel::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        if timer.recv_timeout(wait) == Err(mpsc::RecvTimeoutError::Timeout) {
+            let _ = fire.send(());
+        }
+    });
+    let out = futures_lite::future::or(async { Some(fut.await) }, async {
+        let _ = fired.await;
+        None
+    })
+    .await;
+    drop(cancel);
+    out
+}
+
 impl Client {
     async fn open(k: &Keyring) -> Result<Client> {
         let builder = match &k.address {
@@ -220,10 +229,12 @@ impl Client {
             .build()
             .await
             .map_err(|e| Unavailable(format!("no session bus: {e}")))?;
-        let session = Session::open(&conn).await?;
+        let ss = SecretService::connect_with_existing(EncryptionType::Dh, conn.clone())
+            .await
+            .map_err(failed)?;
         Ok(Client {
             conn,
-            session,
+            ss,
             prompt: k.prompt,
         })
     }
@@ -241,34 +252,28 @@ impl Client {
         reply.body().deserialize().map_err(transient)
     }
 
-    async fn service<B, R>(&self, method: &str, body: &B) -> Result<R>
-    where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
-        R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
-    {
-        self.call(SERVICE_PATH, SERVICE, method, body).await
-    }
-
     /// The item for `id`, unlocked (prompting if allowed); None if there is
     /// none.
-    async fn find(&self, id: &str) -> Result<Option<OwnedObjectPath>> {
+    async fn find(&self, id: &str) -> Result<Option<Item<'_>>> {
         let attributes = HashMap::from([("xdg:schema", SCHEMA), ("id", id)]);
-        let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
-            self.service("SearchItems", &(attributes,)).await?;
-        if let Some(item) = unlocked.into_iter().next() {
+        let found = self.ss.search_items(attributes).await.map_err(failed)?;
+        if let Some(item) = found.unlocked.into_iter().next() {
             return Ok(Some(item));
         }
-        let Some(item) = locked.into_iter().next() else {
+        let Some(item) = found.locked.into_iter().next() else {
             return Ok(None);
         };
-        self.unlock(vec![item.clone()]).await?;
+        self.unlock(&item.item_path).await?;
         Ok(Some(item))
     }
 
-    async fn unlock(&self, objects: Vec<OwnedObjectPath>) -> Result<()> {
-        let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
-            self.service("Unlock", &(&objects,)).await?;
-        if unlocked.len() < objects.len() {
+    /// Unlock `object` with its prompt bounded: the crate's own unlock waits
+    /// on the prompt for as long as it takes.
+    async fn unlock(&self, object: &OwnedObjectPath) -> Result<()> {
+        let (unlocked, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = self
+            .call(SERVICE_PATH, SERVICE, "Unlock", &(vec![object],))
+            .await?;
+        if unlocked.is_empty() {
             self.prompt(&prompt).await?;
         }
         Ok(())
@@ -294,34 +299,23 @@ impl Client {
             .await
             .map_err(transient)?;
         let () = self.call(prompt.as_str(), PROMPT, "Prompt", &("",)).await?;
-        let answer = async {
+        let answer = within(wait, async {
             match completed.next().await {
                 Some(Ok(m)) => {
-                    let (dismissed, _): (bool, OwnedValue) =
+                    let (dismissed, _): (bool, OwnedVariant) =
                         m.body().deserialize().map_err(transient)?;
-                    anyhow::Ok(Some(dismissed))
+                    anyhow::Ok(dismissed)
                 }
-                _ => Ok(None),
+                _ => bail!(Unavailable(
+                    "the keyring went away during its unlock prompt".into()
+                )),
             }
-        };
-        let (cancel, timer) = mpsc::channel::<()>();
-        let (fire, fired) = futures_channel::oneshot::channel::<()>();
-        // A thread for the timer: zbus's own is private. Dropping `cancel`
-        // ends it early.
-        std::thread::spawn(move || {
-            if timer.recv_timeout(wait) == Err(mpsc::RecvTimeoutError::Timeout) {
-                let _ = fire.send(());
-            }
-        });
-        let out: Result<Option<bool>> = futures_lite::future::or(answer, async {
-            let _ = fired.await;
-            Ok(None)
         })
         .await;
-        drop(cancel);
-        match out? {
-            Some(false) => Ok(()),
-            Some(true) => bail!(Unavailable("unlocking the keyring was dismissed".into())),
+        match answer {
+            Some(Ok(false)) => Ok(()),
+            Some(Ok(true)) => bail!(Unavailable("unlocking the keyring was dismissed".into())),
+            Some(Err(e)) => Err(e),
             None => {
                 let _: Result<()> = self.call(prompt.as_str(), PROMPT, "Dismiss", &()).await;
                 bail!(Unavailable(format!(
@@ -330,78 +324,6 @@ impl Client {
                 )))
             }
         }
-    }
-}
-
-/// An encrypted Secret Service session: its path and the AES key agreed for it.
-struct Session {
-    path: OwnedObjectPath,
-    aes: Zeroizing<[u8; 16]>,
-}
-
-impl Session {
-    async fn open(conn: &zbus::Connection) -> Result<Session> {
-        let p = BigUint::parse_bytes(PRIME.as_bytes(), 16).expect("the prime is hex");
-        let mut x = Zeroizing::new([0u8; 128]);
-        random(&mut x[..])?;
-        // The exponent and the shared secret pass through BigUint, which
-        // doesn't wipe its limbs.
-        let x = BigUint::from_bytes_be(&x[..]);
-        let public = BigUint::from(2u32).modpow(&x, &p).to_bytes_be();
-        let reply = conn
-            .call_method(
-                Some(BUS),
-                SERVICE_PATH,
-                Some(SERVICE),
-                "OpenSession",
-                &(ALGORITHM, Value::from(public)),
-            )
-            .await
-            .map_err(transient)?;
-        let (output, path): (OwnedValue, OwnedObjectPath) =
-            reply.body().deserialize().map_err(transient)?;
-        let theirs = BigUint::from_bytes_be(
-            &Vec::<u8>::try_from(output).context("the keyring's session key")?,
-        );
-        if theirs <= BigUint::from(1u32) || theirs >= &p - 1u32 {
-            bail!("the keyring offered a degenerate session key");
-        }
-        let shared = theirs.modpow(&x, &p).to_bytes_be();
-        // Left-padded to the prime's length, as libsecret and gnome-keyring do.
-        let mut ikm = Zeroizing::new([0u8; 128]);
-        ikm[128 - shared.len()..].copy_from_slice(&shared);
-        let mut aes = Zeroizing::new([0u8; 16]);
-        hkdf::Hkdf::<sha2::Sha256>::new(None, &ikm[..])
-            .expand(&[], &mut aes[..])
-            .map_err(|_| anyhow!("HKDF"))?;
-        Ok(Session { path, aes })
-    }
-
-    /// `(IV, ciphertext)`.
-    fn encrypt(&self, plain: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        let mut iv = [0u8; 16];
-        random(&mut iv)?;
-        let mut buf = Zeroizing::new(vec![0u8; plain.len() + 16 - plain.len() % 16]);
-        buf[..plain.len()].copy_from_slice(plain);
-        let n = cbc::Encryptor::<aes::Aes128>::new((&*self.aes).into(), &iv.into())
-            .encrypt_padded::<Pkcs7>(&mut buf, plain.len())
-            .map_err(|_| anyhow!("padding"))?
-            .len();
-        Ok((iv.to_vec(), buf[..n].to_vec()))
-    }
-
-    fn decrypt(&self, iv: &[u8], value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let iv: [u8; 16] = iv
-            .try_into()
-            .map_err(|_| Unavailable("the keyring sent a secret without a 16-byte IV".into()))?;
-        let mut buf = Zeroizing::new(value.to_vec());
-        let n = cbc::Decryptor::<aes::Aes128>::new((&*self.aes).into(), &iv.into())
-            .decrypt_padded::<Pkcs7>(&mut buf)
-            // Not the item's fault: never a reason to drop the index.
-            .map_err(|_| Unavailable("the keyring's secret didn't decrypt".into()))?
-            .len();
-        buf.truncate(n);
-        Ok(buf)
     }
 }
 
@@ -429,21 +351,6 @@ mod tests {
         // Never read as a systemd-creds credential, nor one as this.
         assert_eq!(sealed_with(&blob(ID)), Some(Seal::Keyring));
         assert_eq!(sealed_with(b"secret-service 1 junk"), None);
-    }
-
-    #[test]
-    fn session_crypto_round_trips() {
-        let s = Session {
-            path: OwnedObjectPath::try_from("/s").unwrap(),
-            aes: Zeroizing::new([7; 16]),
-        };
-        for n in [0, 15, 16, 32] {
-            let plain = vec![0xa5; n];
-            let (iv, ct) = s.encrypt(&plain).unwrap();
-            assert_eq!(ct.len(), n + 16 - n % 16);
-            assert!(!ct.windows(n.max(1)).any(|w| n > 0 && w == &plain[..]));
-            assert_eq!(*s.decrypt(&iv, &ct).unwrap(), plain);
-        }
     }
 
     #[test]

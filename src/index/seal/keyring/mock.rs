@@ -1,9 +1,11 @@
 //! A stand-in Secret Service on a private `dbus-daemon` of its own, with no
 //! service files, so nothing on it can start a real keyring: one collection,
 //! locked or not, and a prompt that unlocks, is dismissed or is never
-//! answered.
+//! answered. Its side of the session's crypto is its own, test-only: the
+//! client's is the `secret-service` crate's, checked against libsecret and
+//! ksecretd by hand (see `real_secret_service`).
 
-use super::{ALGORITHM, PRIME, Session};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use num_bigint::BigUint;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +17,29 @@ use zeroize::Zeroizing;
 
 const COLLECTION: &str = "/org/freedesktop/secrets/collection/login";
 const PROMPT_PATH: &str = "/org/freedesktop/secrets/prompt/p";
+const ALGORITHM: &str = "dh-ietf1024-sha256-aes128-cbc-pkcs7";
+/// RFC 2409's second Oakley group: 1024-bit MODP, generator 2.
+const PRIME: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74\
+                     020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437\
+                     4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+                     EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF";
+
+/// `(IV, ciphertext)` of `plain` under a session's AES key.
+fn encrypt(aes: &[u8; 16], plain: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut iv = [0u8; 16];
+    super::random(&mut iv).unwrap();
+    let ct = cbc::Encryptor::<aes::Aes128>::new(aes.into(), &iv.into())
+        .encrypt_padded_vec::<Pkcs7>(plain);
+    (iv.to_vec(), ct)
+}
+
+fn decrypt(aes: &[u8; 16], iv: &[u8], ct: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let iv: [u8; 16] = iv.try_into().ok()?;
+    cbc::Decryptor::<aes::Aes128>::new(aes.into(), &iv.into())
+        .decrypt_padded_vec::<Pkcs7>(ct)
+        .ok()
+        .map(Zeroizing::new)
+}
 
 /// What the prompt does when shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -125,6 +150,11 @@ type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 #[zbus::interface(name = "org.freedesktop.Secret.Collection")]
 impl Collection {
+    #[zbus(property)]
+    fn locked(&self) -> bool {
+        state(&self.0).locked
+    }
+
     async fn create_item(
         &self,
         properties: HashMap<String, OwnedVariant>,
@@ -146,13 +176,8 @@ impl Collection {
                 .get(secret.0.as_str())
                 .ok_or_else(|| failed("no such session"))?
                 .clone();
-            let s = Session {
-                path: secret.0.clone(),
-                aes,
-            };
-            let plain = s
-                .decrypt(&secret.1, &secret.2)
-                .map_err(|e| failed(&e.to_string()))?;
+            let plain =
+                decrypt(&aes, &secret.1, &secret.2).ok_or_else(|| failed("didn't decrypt"))?;
             let path = format!("{COLLECTION}/{}", st.items.len());
             let id = attributes.get("id").cloned().unwrap_or_default();
             st.items.push((id, plain, path.clone()));
@@ -172,6 +197,11 @@ struct Item(Shared, String);
 
 #[zbus::interface(name = "org.freedesktop.Secret.Item")]
 impl Item {
+    #[zbus(property)]
+    fn locked(&self) -> bool {
+        state(&self.0).locked
+    }
+
     fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<Secret> {
         let st = state(&self.0);
         if st.locked {
@@ -187,11 +217,7 @@ impl Item {
             .get(session.as_str())
             .ok_or_else(|| failed("no such session"))?
             .clone();
-        let s = Session {
-            path: session.clone(),
-            aes,
-        };
-        let (iv, value) = s.encrypt(plain).unwrap();
+        let (iv, value) = encrypt(&aes, plain);
         Ok((session, iv, value, "application/octet-stream".into()))
     }
 

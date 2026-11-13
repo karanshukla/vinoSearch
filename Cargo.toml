@@ -33,13 +33,11 @@ ovfetch = { version = "0.6.0", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 # Wipes the index key from memory when it's dropped.
 zeroize = "1.8"
-# The Secret Service's encrypted session, for a key kept in the desktop
-# keyring where systemd-creds can't seal it: 1024-bit Diffie-Hellman, HKDF,
-# AES-128-CBC. aes and cbc come with lopdf already.
-num-bigint = "0.4"
-hkdf = "0.13"
-aes = "0.9"
-cbc = "0.2"
+# The desktop keyring (Secret Service), for the index key where systemd-creds
+# can't seal it: zbus 6, its encrypted (Dh) session in RustCrypto rather than
+# OpenSSL, and the default runtime, zbus's own. Pinned exactly because 6.0.0
+# is a release candidate; the first 6.x for zbus 6 and Rust 1.89.
+secret-service = { version = "=6.0.0-rc.1", features = ["crypto-rust"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -65,6 +63,14 @@ rbook = { version = "0.7", default-features = false }
 cfb = "0.15"
 encoding_rs = "0.8"
 codepage = "0.1"
+
+# The stand-in Secret Service's side of the session (keyring/mock.rs); all
+# already in the tree through secret-service and lopdf.
+[dev-dependencies]
+num-bigint = "0.4"
+hkdf = "0.13"
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
 
 # Core::compile_model_from_file, until intel/openvino-rs#202 is released.
 # Pinned by commit; all three come from the same tree because openvino-sys
