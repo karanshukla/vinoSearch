@@ -82,6 +82,62 @@ the host: the home directory is shared, so the host runs the same binaries and i
 session starts the service from the same autostart entry.
 `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
 
+## Flatpak
+
+A `.flatpak` bundle holds the service, the CLI and the settings window, with OpenVINO and Intel's
+NPU and GPU drivers inside it, so the host needs only the kernel's NPU driver (`intel_vpu`) and
+its firmware:
+
+```bash
+flatpak install --user vinosearch.flatpak
+```
+
+Open vinoSearch from the app menu once: it starts the service, asks the desktop to start it at
+login (the Background portal), turns on the running desktop's search, and its Model page downloads
+the model. GNOME Shell's search finds it from the next login. To build the bundle from a checkout:
+
+```bash
+flatpak install --user flathub org.flatpak.Builder org.freedesktop.Sdk//26.08 \
+  org.freedesktop.Sdk.Extension.rust-stable//26.08
+flatpak run --filesystem=$HOME org.flatpak.Builder --user --install --force-clean \
+  --repo=repo build packaging/flatpak/dev.vinosearch.VinoSearch.yml
+flatpak build-bundle repo vinosearch.flatpak dev.vinosearch.VinoSearch
+```
+
+The CLI is `flatpak run dev.vinosearch.VinoSearch` (for example `... doctor` or `... index ~/Documents`).
+
+What it is allowed, and why:
+
+| Permission | For |
+|---|---|
+| `--device=all` | the NPU (`/dev/accel`), which nothing narrower exposes, and the GPU |
+| `--filesystem=home` | the files it indexes |
+| `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | the host's app entries: which app opens a file at its line, page or second, and the editor and player lists |
+| `--share=network` | downloading the models |
+| `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | the settings and search windows |
+| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, and turning search places on and off in the host's settings (`flatpak-spawn --host`) |
+| `--system-talk-name=net.hadess.PowerProfiles` | holding indexing while power saver is on |
+
+What differs from the native install:
+
+- Its config, index, models and log are its own, under `~/.var/app/dev.vinosearch.VinoSearch`
+  (`config/vinosearch/config.toml`, `data/vinosearch`, `.local/state/vinosearch/service.log`), so it
+  can sit beside a native install; `doctor` prints the log's path. Its bus name is
+  `dev.vinosearch.VinoSearch.Runner`.
+- The KRunner plugin, GNOME Shell provider and D-Bus activation file come with it. Flatpak leaves
+  exported search providers off, so the Integration page's switches (and `integrate kde|gnome`)
+  turn them on and off in the desktop's own setting, the one its search settings page shows. The
+  search window is the **Search Files** action of the app menu entry rather than an entry of its
+  own.
+- The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
+  through the Background portal, with the running desktop's search place.
+- With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).
+- Encrypting the index needs `systemd-creds`, which isn't in the sandbox, so it isn't available.
+- HEIC and AVIF photos aren't indexed: the runtime has no `heif-convert`.
+
+`flatpak uninstall dev.vinosearch.VinoSearch` removes it; add `--delete-data` to delete its index,
+models and config too.
+
 ## Uninstalling
 
 `vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the

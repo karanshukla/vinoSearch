@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.vinosearch.VinoSearch</id>
+  <name>vinoSearch</name>
+  <summary>Semantic file search for KDE and GNOME</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <launchable type="desktop-id">dev.vinosearch.VinoSearch.desktop</launchable>
+  <url type="homepage">https://github.com/karanshukla/vinoSearch</url>
+  <description>
+    <p>
+      Finds files by what is in them, from KRunner and GNOME Shell's search.
+      The models run on an Intel NPU through OpenVINO, or on the GPU or CPU.
+    </p>
+  </description>
+  <provides>
+    <dbus type="user">dev.vinosearch.VinoSearch.Runner</dbus>
+  </provides>
+  <content_rating type="oars-1.1"/>
+</component>
