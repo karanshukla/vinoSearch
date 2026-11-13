@@ -98,7 +98,9 @@ jobs:
       # build offers to install the next release's bundle over itself.
       - name: Build
         run: |
-          flatpak run --filesystem="$HOME" org.flatpak.Builder --user --force-clean \
+          # Under a session bus: the Builder app asks the host's flatpak for
+          # the SDK through it, and a runner has none, so it found no SDK.
+          dbus-run-session -- flatpak run --filesystem="$HOME" org.flatpak.Builder --user --force-clean \
             --disable-rofiles-fuse --default-branch=stable --repo="$RUNNER_TEMP/repo" \
             --state-dir "$RUNNER_TEMP/flatpak-state" "$RUNNER_TEMP/flatpak-build" \
             "packaging/flatpak/$APP.yml"
