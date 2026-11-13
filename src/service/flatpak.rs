@@ -188,8 +188,8 @@ fn set_place(place: Place, on: bool) -> Result<()> {
 }
 
 fn print_log() {
-    if let Ok(log) = start::log_path() {
-        println!("its log: {}", log.display());
+    if let Ok(log) = start::log_where() {
+        println!("its log: {log}");
     }
 }
 

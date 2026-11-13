@@ -51,7 +51,21 @@ pub fn data_home() -> Result<PathBuf> {
     })
 }
 
-/// Where the runner's output goes when it isn't started from a terminal.
+/// The journal's entries for the runner, whichever unit systemd ran it in:
+/// one per D-Bus activation, one for the autostart entry.
+const JOURNAL: &str = "journalctl --user -u '*dev.vinosearch*'";
+
+/// Where to read the runner's output, for someone to be told: the journal
+/// where systemd starts it, the file anywhere else.
+pub fn log_where() -> Result<String> {
+    Ok(format!(
+        "{JOURNAL}, or {} where systemd doesn't start it",
+        log_path()?.display()
+    ))
+}
+
+/// Where the runner's output goes when neither a terminal nor the journal
+/// has it.
 pub fn log_path() -> Result<PathBuf> {
     let state = match std::env::var_os("XDG_STATE_HOME") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
@@ -166,8 +180,11 @@ fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
 }
 
 fn supervised(mut worker: Command) -> Result<ExitStatus> {
-    // No HOME to keep one under: output stays where it was going.
-    let log = (!std::io::stderr().is_terminal())
+    // Started by systemd (D-Bus activation, the autostart entry), stderr is
+    // the journal's already: timestamps, rotation and a rate limit for
+    // nothing. A file only where there is neither that nor a terminal, and
+    // with no HOME to keep one under, output stays where it was going.
+    let log = (!std::io::stderr().is_terminal() && !systemd_journal_logger::connected_to_journal())
         .then(|| log_path().ok())
         .flatten();
     let parent = std::process::id() as libc::pid_t;

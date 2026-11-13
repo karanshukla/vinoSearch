@@ -454,7 +454,7 @@ fn run(cli: Cli) -> Result<bool> {
             print_parity(&s.device)?;
             // The service's, not this command's: in the Flatpak it is under
             // ~/.var/app.
-            println!("log:       {}", service::start::log_path()?.display());
+            println!("log:       {}", service::start::log_where()?);
             Ok(ok)
         }
         Command::FetchModel => {

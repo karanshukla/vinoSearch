@@ -144,9 +144,10 @@ What it is allowed, and why:
 
 What differs from the native install:
 
-- Its config, index, models and log are its own, under `~/.var/app/dev.vinosearch.VinoSearch`
-  (`config/vinosearch/config.toml`, `data/vinosearch`, `.local/state/vinosearch/service.log`), so it
-  can sit beside a native install; `doctor` prints the log's path. Its bus name is
+- Its config, index and models are its own, under `~/.var/app/dev.vinosearch.VinoSearch`
+  (`config/vinosearch/config.toml`, `data/vinosearch`), so it can sit beside a native install. Its
+  log is the journal's where systemd starts it, and `.local/state/vinosearch/service.log` under
+  that folder elsewhere; `doctor` says where to read it. Its bus name is
   `dev.vinosearch.VinoSearch.Runner`.
 - The KRunner plugin, GNOME Shell provider and D-Bus activation file come with it. Flatpak leaves
   exported search providers off, so the Integration page's switches (and `integrate kde|gnome`)

@@ -1807,8 +1807,8 @@ fn restart_runner() {
         Ok(false) => println!("started {service}"),
         Err(e) => println!("not started now ({e:#}); it starts at the next login"),
     }
-    if let Ok(log) = start::log_path() {
-        println!("its log: {}", log.display());
+    if let Ok(log) = start::log_where() {
+        println!("its log: {log}");
     }
 }
 

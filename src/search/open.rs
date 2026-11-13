@@ -540,14 +540,8 @@ fn env_pairs(entries: Vec<String>) -> Vec<(String, String)> {
 fn manager_env() -> zbus::Result<Vec<(String, String)>> {
     zbus::block_on(async {
         let bus = zbus::Connection::session().await?;
-        let manager = zbus::Proxy::new(
-            &bus,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .await?;
-        Ok(env_pairs(manager.get_property("Environment").await?))
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&bus).await?;
+        Ok(env_pairs(manager.environment().await?))
     })
 }
 
