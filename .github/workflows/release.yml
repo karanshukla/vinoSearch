@@ -65,3 +65,61 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # install.sh on its own too, for releases/latest/download/install.sh.
         run: gh release upload "$TAG" vinosearch-x86_64-linux.tar.gz vinosearch-x86_64-linux.tar.gz.sha256 install.sh --clobber
+
+  # The Flatpak bundle, built from the same tag once the tarball is up. The
+  # Flatpak's Update button downloads these two assets by name.
+  flatpak:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      APP: dev.vinosearch.VinoSearch
+      BUNDLE: vinosearch-x86_64.flatpak
+    steps:
+      # The manifest builds the checkout it sits in: this one, at the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Install Flatpak Builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak dbus-bin dbus-daemon
+          # Ubuntu 24.04 lets only programs with an AppArmor profile create
+          # user namespaces, which bwrap (every Flatpak sandbox) needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.flatpak.Builder \
+            org.freedesktop.Platform//26.08 org.freedesktop.Sdk//26.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//26.08
+      # Branch stable: a build from a checkout is master, and only a stable
+      # build offers to install the next release's bundle over itself.
+      - name: Build
+        run: |
+          flatpak run --filesystem="$HOME" org.flatpak.Builder --user --force-clean \
+            --disable-rofiles-fuse --default-branch=stable --repo="$RUNNER_TEMP/repo" \
+            --state-dir "$RUNNER_TEMP/flatpak-state" "$RUNNER_TEMP/flatpak-build" \
+            "packaging/flatpak/$APP.yml"
+          flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            "$RUNNER_TEMP/repo" "$BUNDLE" "$APP" stable
+          sha256sum "$BUNDLE" > "$BUNDLE.sha256"
+      # The bundle as a user gets it: installed from the file, on branch
+      # stable, the tag's version, and running on the CPU (no NPU or GPU here).
+      - name: Smoke test
+        run: |
+          sha256sum -c "$BUNDLE.sha256"
+          flatpak install --user -y --noninteractive --bundle "$BUNDLE"
+          flatpak list --user --app --columns=ref | grep -Fx "$APP/x86_64/stable"
+          version=$(dbus-run-session -- flatpak run --command=vinosearch "$APP" --version)
+          echo "$version"
+          case "$version" in
+            "vinosearch ${TAG#v}" | "vinosearch ${TAG#v}.0" | "vinosearch ${TAG#v}.0.0") ;;
+            *) echo "the $TAG bundle is $version"; exit 1 ;;
+          esac
+          dbus-run-session -- flatpak run "$APP" doctor --device CPU
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$BUNDLE" "$BUNDLE.sha256" --clobber
