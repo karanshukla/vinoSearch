@@ -28,7 +28,7 @@ struct Cli {
     /// Settings file [default: ~/.config/vinosearch/config.toml]
     #[arg(long, global = true, env = "VINOSEARCH_CONFIG")]
     config: Option<PathBuf>,
-    /// Device the model runs on [default: config, else NPU]
+    /// Device the model runs on [default: config, else the first of NPU, GPU and CPU found]
     #[arg(long, global = true)]
     device: Option<String>,
     /// Free the model after this many minutes without a query; 0 keeps it loaded [default: config, else 5]
@@ -245,6 +245,9 @@ struct Settings {
     path: PathBuf,
     file: config::Config,
     device: String,
+    /// What a config file with no device means: the best device found, for
+    /// commands that load a model.
+    default_device: String,
     idle_unload_minutes: f64,
     excludes: config::Excludes,
     types: index::FileTypes,
@@ -262,12 +265,18 @@ fn settings(cli: &Cli) -> Result<Settings> {
         .or(file.idle_unload_minutes)
         .unwrap_or(config::DEFAULT_IDLE_UNLOAD_MINUTES);
     config::idle_unload(idle_unload_minutes)?;
+    let default_device = if loads_model(&cli.command) && cli.device.is_none() {
+        runtime::best_device(&runtime::default_prefix(cli.openvino_dir.clone())?)
+    } else {
+        config::DEFAULT_DEVICE.into()
+    };
     Ok(Settings {
         device: cli
             .device
             .clone()
             .or(file.device.clone())
-            .unwrap_or_else(|| config::DEFAULT_DEVICE.into()),
+            .unwrap_or_else(|| default_device.clone()),
+        default_device,
         idle_unload_minutes,
         excludes: file.excludes()?,
         types: index::FileTypes::new(&file.formats)?,
@@ -280,11 +289,34 @@ fn settings(cli: &Cli) -> Result<Settings> {
     })
 }
 
+/// Whether `command` runs a model, so needs a device. The device isn't
+/// looked for otherwise: finding it starts OpenVINO.
+fn loads_model(command: &Command) -> bool {
+    match command {
+        Command::Doctor
+        | Command::Index { .. }
+        | Command::Estimate { .. }
+        | Command::Watch
+        | Command::Search { .. }
+        | Command::Similar { .. }
+        | Command::Eval { .. }
+        | Command::ReadText { .. } => true,
+        Command::Krunner { worker, .. } => *worker,
+        Command::FetchModel
+        | Command::DeleteModel
+        | Command::Integrate { .. }
+        | Command::Menu { .. }
+        | Command::Extract { .. }
+        | Command::FlatpakExports { .. } => false,
+    }
+}
+
 fn worker_options(cli: &Cli, s: Settings) -> Result<worker::Options> {
     Ok(worker::Options {
         openvino_dir: cli.openvino_dir.clone(),
         status: std::sync::Arc::new(worker::Status::new(&s.device)),
         device: s.device,
+        default_device: s.default_device,
         idle: config::idle_unload(s.idle_unload_minutes).expect("checked in settings()"),
         excludes: s.excludes,
         types: s.types,

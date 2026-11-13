@@ -1062,7 +1062,7 @@ impl SettingsWindow {
         let mut changed = false;
         widgets::group(ui, |ui| {
             Row::new("Device")
-                .help("The NPU is fastest and uses the least power.")
+                .help("The NPU is fastest and uses the least power. Without one, NPU means the GPU, else the CPU.")
                 .show(ui, |ui, _| {
                     let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
                     let mut picked = DEVICES

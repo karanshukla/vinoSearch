@@ -537,6 +537,9 @@ struct Rules {
 pub struct Options {
     pub openvino_dir: Option<PathBuf>,
     pub device: String,
+    /// The device when the config file names none: the best one found at
+    /// start.
+    pub default_device: String,
     pub idle: Option<Duration>,
     pub excludes: Excludes,
     pub types: FileTypes,
@@ -817,7 +820,7 @@ fn run_with<E: Embed>(
                 Err(e) => eprintln!("file types not applied: {e:#}"),
             }
             if !opts.pinned.device {
-                let new = file.device.as_deref().unwrap_or(config::DEFAULT_DEVICE);
+                let new = file.device.as_deref().unwrap_or(&opts.default_device);
                 if new != device {
                     eprintln!("device changed to {new}");
                     device = new.to_owned();
@@ -1278,6 +1281,7 @@ mod tests {
             let opts = Options {
                 openvino_dir: None,
                 device: "CPU".into(),
+                default_device: "CPU".into(),
                 idle: None,
                 excludes: file.excludes().unwrap(),
                 types: FileTypes::new(&file.formats).unwrap(),
@@ -1486,6 +1490,7 @@ mod tests {
         let opts = Options {
             openvino_dir: None,
             device: "CPU".into(),
+            default_device: "CPU".into(),
             idle: None,
             excludes: file.excludes().unwrap(),
             types: FileTypes::new(&file.formats)
