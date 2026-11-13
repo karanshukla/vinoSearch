@@ -999,12 +999,7 @@ impl SettingsWindow {
                         self.link.send(Request::FetchModel);
                     }
                     if s.fetching {
-                        let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
-                        widgets::small(
-                            ui,
-                            format!("{} of {}", size(s.fetch_done), size(s.fetch_total)),
-                        );
-                        widgets::progress(ui, fraction, 120.0);
+                        fetch_progress(ui, s);
                     } else if s.model_present {
                         widgets::chip(
                             ui,
@@ -1198,10 +1193,9 @@ impl SettingsWindow {
                         None
                     },
                     |ui, _| {
-                        if ui
-                            .add_enabled(!s.fetching, Button::primary("Download").small())
-                            .clicked()
-                        {
+                        if s.fetching {
+                            fetch_progress(ui, s);
+                        } else if ui.add(Button::primary("Download").small()).clicked() {
                             self.link.send(Request::FetchModel);
                         }
                     },
@@ -1351,10 +1345,9 @@ impl SettingsWindow {
                         None
                     },
                     |ui, _| {
-                        if ui
-                            .add_enabled(!s.fetching, Button::primary("Download").small())
-                            .clicked()
-                        {
+                        if s.fetching {
+                            fetch_progress(ui, s);
+                        } else if ui.add(Button::primary("Download").small()).clicked() {
                             self.link.send(Request::FetchModel);
                         }
                     },
@@ -1862,6 +1855,17 @@ fn partial_line(d: &Partial) -> String {
         count(d.done as i64),
         count(d.total as i64)
     )
+}
+
+/// How far a model download has got: wherever a Download button was
+/// pressed, so the press is seen to have done something.
+fn fetch_progress(ui: &mut egui::Ui, s: &Status) {
+    let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
+    widgets::small(
+        ui,
+        format!("{} of {}", size(s.fetch_done), size(s.fetch_total)),
+    );
+    widgets::progress(ui, fraction, 120.0);
 }
 
 /// Decimal units, as the README and `fetch-model` give sizes.
