@@ -390,7 +390,7 @@ fn prepare_index(status: &Status, conn: &rusqlite::Connection) -> Result<()> {
 /// `encryption::apply`, its outcome logged and kept for Status. A rebuild
 /// reported earlier stays until a later one replaces it.
 fn apply_encryption(status: &Status, db: &Path, want: Want, rekey: bool, sealer: &Sealer) {
-    let st = apply_or_refuse(db, want, rekey, sealer);
+    let st = encryption::apply(db, want, rekey, sealer);
     if !st.error.is_empty() {
         eprintln!("encryption: {}", st.error);
     }
@@ -477,26 +477,6 @@ fn wait_for_key(
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the runner is stopping"),
             }
         }
-    }
-}
-
-/// Why the index can't be encrypted here: in the Flatpak, whose sandbox has
-/// no systemd-creds to seal the key with.
-pub fn encryption_unavailable() -> Option<&'static str> {
-    vinosearch_shared::sandbox::flatpak_id().map(|_| {
-        "encrypting the index isn't available in the Flatpak: its key is sealed with \
-         systemd-creds, which the sandbox doesn't have"
-    })
-}
-
-/// `encryption::apply`, refused up front where it can't work.
-pub fn apply_or_refuse(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> encryption::State {
-    match encryption_unavailable() {
-        Some(why) if want.on => encryption::State {
-            error: why.to_owned(),
-            ..encryption::State::default()
-        },
-        _ => encryption::apply(db, want, rekey, sealer),
     }
 }
 

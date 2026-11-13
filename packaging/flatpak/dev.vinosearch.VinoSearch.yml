@@ -31,10 +31,14 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --share=ipc
-  # flatpak-spawn --host: results open in the host's apps, as natively, and
-  # the search places are turned on in the host's settings (krunnerrc,
-  # gsettings): Flatpak exports search providers turned off.
+  # flatpak-spawn --host: results open in the host's apps, as natively, the
+  # search places are turned on in the host's settings (krunnerrc,
+  # gsettings): Flatpak exports search providers turned off, and the index
+  # key is sealed by the host's systemd-creds, to its TPM.
   - --talk-name=org.freedesktop.Flatpak
+  # The index key in the desktop keyring, where the host has no
+  # systemd-creds to seal it with.
+  - --talk-name=org.freedesktop.secrets
   # Holding indexing while power saver is on (src/service/power.rs).
   - --system-talk-name=net.hadess.PowerProfiles
   - --env=VINOSEARCH_OPENVINO_DIR=/app/lib/vinosearch/openvino

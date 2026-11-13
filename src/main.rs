@@ -508,7 +508,7 @@ fn run(cli: Cli) -> Result<bool> {
             let db = index::default_db()?;
             // As the config file asks before anything is written (#4); held
             // meanwhile, so the runner doesn't convert it underneath.
-            let enc = worker::apply_or_refuse(
+            let enc = encryption::apply(
                 &db,
                 encryption::Want::of(&s.file),
                 false,

@@ -138,7 +138,8 @@ What it is allowed, and why:
 | `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | the host's app entries: which app opens a file at its line, page or second, and the editor and player lists |
 | `--share=network` | downloading the models |
 | `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | the settings and search windows |
-| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, turning search places on and off in the host's settings, and installing an update (`flatpak-spawn --host`) |
+| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, turning search places on and off in the host's settings, installing an update, and sealing the index key with the host's `systemd-creds` (`flatpak-spawn --host`) |
+| `--talk-name=org.freedesktop.secrets` | keeping the index key in the desktop keyring, on a host without `systemd-creds` |
 | `--system-talk-name=net.hadess.PowerProfiles` | holding indexing while power saver is on |
 
 What differs from the native install:
@@ -155,7 +156,13 @@ What differs from the native install:
 - The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
   through the Background portal, with the running desktop's search place.
 - With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).
-- Encrypting the index needs `systemd-creds`, which isn't in the sandbox, so it isn't available.
+- Encrypting the index works as natively. Its key is sealed by the host's `systemd-creds`, run
+  with `flatpak-spawn --host`, to the host's TPM; a key the native install sealed opens in the
+  Flatpak and the other way round, so `index.sqlite` and `index.key` can be moved between them.
+  On a host without `systemd-creds` the key goes in the desktop keyring. Starting with an
+  encrypted index takes about 10 ms more than natively, for the trip to the host. If the host
+  can't be reached (the `org.freedesktop.Flatpak` permission taken away with `flatpak override`),
+  the index is kept and waited for, as with a locked keyring, never moved to the keyring.
 - HEIC and AVIF photos aren't indexed: the runtime has no `heif-convert`.
 
 `flatpak uninstall dev.vinosearch.VinoSearch` removes it; add `--delete-data` to delete its index,
