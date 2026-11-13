@@ -286,6 +286,7 @@ impl SettingsWindow {
         let config_path = config::default_path().unwrap_or_default();
         let mut window = SettingsWindow::with(page, Link::start(ctx), config_path);
         window.follow_text_scale(ctx);
+        integration::first_run(&window.integration, ctx);
         window
     }
 
@@ -1681,6 +1682,7 @@ impl SettingsWindow {
     fn integration(&mut self, ui: &mut egui::Ui) {
         let state = self.integration.lock().unwrap().clone();
         let (kde, gnome) = integration::desktops();
+        let fixed = integration::menu_fixed();
         widgets::group_label(ui, "Search places");
         widgets::group_help(
             ui,
@@ -1698,6 +1700,10 @@ impl SettingsWindow {
             };
             Row::new(label).help(&help).show(ui, |ui, _| {
                 let on = state.is_on(switch);
+                if fixed && switch == integration::Switch::Menu {
+                    widgets::chip(ui, ChipKind::Ok, "On");
+                    return;
+                }
                 let button = if on { "Turn off" } else { "Turn on" };
                 let button = ui.add_enabled(!state.running, Button::secondary(button));
                 if a11y::for_what(button, label).clicked() {
@@ -1723,14 +1729,22 @@ impl SettingsWindow {
             switch_row(
                 ui,
                 "GNOME Shell",
-                "The overview's search, from the next login.",
+                if fixed {
+                    "The overview's search."
+                } else {
+                    "The overview's search, from the next login."
+                },
                 integration::Switch::Gnome,
                 (!gnome).then_some("GNOME isn't running in this session."),
             );
             switch_row(
                 ui,
                 "App menu",
-                "The search window as an app of its own.",
+                if fixed {
+                    "The search window: Search Files, in vinoSearch's menu entry's actions."
+                } else {
+                    "The search window as an app of its own."
+                },
                 integration::Switch::Menu,
                 None,
             );
@@ -1740,7 +1754,11 @@ impl SettingsWindow {
             switch_row(
                 ui,
                 "Search service",
-                "Runs at login. Turning it off removes every search place too.",
+                if fixed {
+                    "Runs at login. Turning it off turns every search place off too."
+                } else {
+                    "Runs at login. Turning it off removes every search place too."
+                },
                 integration::Switch::Service,
                 None,
             );

@@ -6,7 +6,7 @@ mod proc;
 mod search;
 mod service;
 
-use index::{encryption, estimate, seal};
+use index::{encryption, estimate};
 use ml::{embed, model, ocr, parity, runtime, vision};
 use search::menu;
 use service::{krunner, power, watch, worker};
@@ -161,6 +161,14 @@ enum Command {
         from: usize,
         #[arg(long, default_value_t = usize::MAX)]
         count: usize,
+    },
+    /// Write the files the Flatpak exports (the app menu entry, icon, D-Bus
+    /// activation file and search places) under SHARE, for the manifest.
+    #[command(hide = true)]
+    FlatpakExports {
+        share: PathBuf,
+        #[arg(long)]
+        app_id: String,
     },
 }
 
@@ -393,12 +401,19 @@ fn run(cli: Cli) -> Result<bool> {
         extract::child_main(path, *from, *count)?;
         return Ok(true);
     }
+    if let Command::FlatpakExports { share, app_id } = &cli.command {
+        service::flatpak::export(share, app_id)?;
+        return Ok(true);
+    }
     let s = settings(&cli)?;
     match cli.command {
         Command::Doctor => {
             let prefix = runtime::default_prefix(cli.openvino_dir)?;
             let ok = runtime::doctor(&prefix, &s.device)?;
             print_parity(&s.device)?;
+            // The service's, not this command's: in the Flatpak it is under
+            // ~/.var/app.
+            println!("log:       {}", service::start::log_path()?.display());
             Ok(ok)
         }
         Command::FetchModel => {
@@ -452,11 +467,11 @@ fn run(cli: Cli) -> Result<bool> {
             let db = index::default_db()?;
             // As the config file asks before anything is written (#4); held
             // meanwhile, so the runner doesn't convert it underneath.
-            let enc = encryption::apply(
+            let enc = worker::apply_or_refuse(
                 &db,
                 encryption::Want::of(&s.file),
                 false,
-                &seal::Sealer::default(),
+                &index::seal::Sealer::default(),
             );
             for msg in [&enc.broken, &enc.error] {
                 if !msg.is_empty() {
@@ -805,7 +820,9 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Command::Extract { .. } => unreachable!("handled before the settings"),
+        Command::Extract { .. } | Command::FlatpakExports { .. } => {
+            unreachable!("handled before the settings")
+        }
     }
 }
 

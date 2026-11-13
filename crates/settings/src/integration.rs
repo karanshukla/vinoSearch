@@ -1,13 +1,19 @@
 //! Turning each search place, and the service, on and off, by running what
 //! the CLI does: `vinosearch integrate kde|gnome [--off]`, and `vinosearch
 //! krunner --install` / `--uninstall` for the service with everything (#45).
+//!
+//! In the Flatpak a place's files come with it, and its switch is the
+//! desktop's own setting for the place; the service switch is that and
+//! starting at login, through the Background portal. The window turns the
+//! service on the first time it opens, as installing does natively.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use vinosearch_shared::dbus::{DBUS_SERVICE_FILE, GNOME_PROVIDER, KRUNNER_PLUGIN, SEARCH_ENTRY};
+use vinosearch_shared::dbus::names;
+use vinosearch_shared::sandbox;
 
 /// One switch on the Integration page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,12 +41,26 @@ pub struct State {
 
 impl State {
     pub fn read() -> Self {
+        let n = names();
+        if let Some(app) = sandbox::flatpak_id() {
+            let autostart = sandbox::host_autostart_entry(app);
+            // Asking gsettings runs a command on the host: only where GNOME is.
+            let gnome = desktops().1
+                && sandbox::gnome_providers("enabled").is_some_and(|l| l.contains(&n.desktop_id));
+            return State {
+                kde: sandbox::krunner_plugin_on(&n.krunner_plugin_id),
+                gnome,
+                menu: true,
+                service: autostart.is_some_and(|p| p.exists()),
+                ..State::default()
+            };
+        }
         let on = |file: &str| data_home().is_some_and(|d| d.join(file).exists());
         State {
-            kde: on(KRUNNER_PLUGIN),
-            gnome: on(GNOME_PROVIDER),
-            menu: on(SEARCH_ENTRY),
-            service: on(DBUS_SERVICE_FILE),
+            kde: on(&n.krunner_plugin),
+            gnome: on(&n.gnome_provider),
+            menu: n.search_entry.as_deref().is_some_and(on),
+            service: on(&n.dbus_service_file),
             ..State::default()
         }
     }
@@ -52,6 +72,23 @@ impl State {
             Switch::Menu => self.menu,
             Switch::Service => self.service,
         }
+    }
+}
+
+/// Whether the search window comes with the app menu entry (the Flatpak's)
+/// rather than having a switch.
+pub fn menu_fixed() -> bool {
+    sandbox::flatpak_id().is_some()
+}
+
+/// In the Flatpak, turn the service on (start at login, and started now) the
+/// first time the window opens, as installing does natively.
+pub fn first_run(state: &Arc<Mutex<State>>, ctx: &egui::Context) {
+    let Some(asked) = sandbox::flatpak_id().and(sandbox::autostart_asked_path()) else {
+        return;
+    };
+    if !asked.exists() {
+        run(Arc::clone(state), ctx, Switch::Service, true);
     }
 }
 

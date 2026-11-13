@@ -7,3 +7,4 @@ pub mod config;
 pub mod dbus;
 pub mod limits;
 pub mod models;
+pub mod sandbox;

@@ -1,32 +1,85 @@
 //! Names on the session bus. See `docs/dbus.md` for the methods.
 
-/// Well-known name the runner owns; D-Bus activation starts it on first use.
-pub const SERVICE: &str = "dev.vinosearch.Runner";
+/// The names vinoSearch goes by on the bus and in the desktop's files. A
+/// native install's are fixed; the Flatpak's start with its app id, as
+/// Flatpak exports only such files and lets an app own only such names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Names {
+    /// Well-known name the runner owns; D-Bus activation starts it on first
+    /// use.
+    pub service: String,
+    /// The desktop entry GNOME Shell shows the provider's results under. It
+    /// also launches the settings window, whose Wayland app id is `app_id`,
+    /// so the window gets the entry's icon.
+    pub desktop_id: String,
+    pub app_id: String,
+    /// Icon name, installed under hicolor/scalable/apps.
+    pub icon: String,
+    /// KRunner's plugin file, under the XDG data directory. Its presence is
+    /// the KDE search place being on (#45).
+    pub krunner_plugin: String,
+    /// The plugin's id in KRunner's settings.
+    pub krunner_plugin_id: String,
+    /// GNOME Shell's search provider file, under the XDG data directory. A
+    /// native install's is in a directory of ours that environment.d adds to
+    /// XDG_DATA_DIRS, and its presence is the GNOME search place being on.
+    pub gnome_provider: String,
+    /// The app menu entry for the search window, under the XDG data
+    /// directory. Its presence is the menu place being on; off by default.
+    /// None in the Flatpak, whose launcher has the search window as an
+    /// action instead.
+    pub search_entry: Option<String>,
+    /// The D-Bus activation file, under the XDG data directory: the service
+    /// is installed while it exists.
+    pub dbus_service_file: String,
+}
+
+impl Names {
+    pub fn native() -> Names {
+        Names {
+            service: "dev.vinosearch.Runner".into(),
+            desktop_id: "dev.vinosearch.desktop".into(),
+            app_id: "dev.vinosearch".into(),
+            icon: "dev.vinosearch".into(),
+            krunner_plugin: "krunner/dbusplugins/vinosearch.desktop".into(),
+            krunner_plugin_id: "vinosearch".into(),
+            gnome_provider:
+                "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini"
+                    .into(),
+            search_entry: Some("applications/dev.vinosearch.search.desktop".into()),
+            dbus_service_file: "dbus-1/services/dev.vinosearch.Runner.service".into(),
+        }
+    }
+
+    /// The Flatpak with app id `app`.
+    pub fn flatpak(app: &str) -> Names {
+        Names {
+            service: format!("{app}.Runner"),
+            desktop_id: format!("{app}.desktop"),
+            app_id: app.into(),
+            icon: app.into(),
+            krunner_plugin: format!("krunner/dbusplugins/{app}.desktop"),
+            krunner_plugin_id: app.into(),
+            gnome_provider: format!("gnome-shell/search-providers/{app}.search-provider.ini"),
+            search_entry: None,
+            dbus_service_file: format!("dbus-1/services/{app}.Runner.service"),
+        }
+    }
+}
+
+/// The names this process goes by: the Flatpak's inside its sandbox.
+pub fn names() -> &'static Names {
+    static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| match crate::sandbox::flatpak_id() {
+        Some(app) => Names::flatpak(app),
+        None => Names::native(),
+    })
+}
+
 /// KRunner's interface (`org.kde.krunner1`) lives here.
 pub const RUNNER_PATH: &str = "/runner";
 /// GNOME Shell's org.gnome.Shell.SearchProvider2 lives here.
 pub const GNOME_PATH: &str = "/gnome";
-/// The desktop entry GNOME Shell shows the provider's results under. It also
-/// launches the settings window, whose Wayland app id is the same name, so
-/// the window gets the entry's icon.
-pub const DESKTOP_ID: &str = "dev.vinosearch.desktop";
-pub const SETTINGS_APP_ID: &str = "dev.vinosearch";
-/// Icon name, installed under hicolor/scalable/apps.
-pub const ICON: &str = "dev.vinosearch";
-/// KRunner's plugin file, under the XDG data directory. Its presence is the
-/// KDE search place being on (#45).
-pub const KRUNNER_PLUGIN: &str = "krunner/dbusplugins/vinosearch.desktop";
-/// GNOME Shell's search provider file, under the XDG data directory, in a
-/// directory of ours that environment.d adds to XDG_DATA_DIRS. Its presence
-/// is the GNOME search place being on.
-pub const GNOME_PROVIDER: &str =
-    "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini";
-/// The app menu entry for the search window, under the XDG data directory.
-/// Its presence is the menu place being on; off by default.
-pub const SEARCH_ENTRY: &str = "applications/dev.vinosearch.search.desktop";
-/// The D-Bus activation file, under the XDG data directory: the service is
-/// installed while it exists.
-pub const DBUS_SERVICE_FILE: &str = "dbus-1/services/dev.vinosearch.Runner.service";
 /// The settings app's interface lives here.
 pub const CONTROL_PATH: &str = "/control";
 pub const CONTROL_INTERFACE: &str = "dev.vinosearch.Control1";
@@ -161,4 +214,30 @@ pub mod results {
     /// An audio or video file, by its sound or picture (#187).
     pub const MEDIA: &str = "media";
     pub const MAX: u32 = 100;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_flatpak_name_starts_with_the_app_id() {
+        let app = "dev.vinosearch.VinoSearch";
+        let n = Names::flatpak(app);
+        let file = |p: &str| p.rsplit('/').next().unwrap().to_owned();
+        for name in [
+            n.service.clone(),
+            n.desktop_id.clone(),
+            n.app_id.clone(),
+            n.icon.clone(),
+            file(&n.krunner_plugin),
+            file(&n.gnome_provider),
+            file(&n.dbus_service_file),
+        ] {
+            assert!(name.starts_with(app), "{name}");
+        }
+        // The activation file is named after the bus name it starts.
+        assert_eq!(file(&n.dbus_service_file), format!("{}.service", n.service));
+        assert_ne!(n.service, Names::native().service);
+    }
 }

@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use zbus::OwnedVariant;
 
 use crate::search::open::At;
-use vinosearch_shared::dbus::{RUNNER_PATH, SERVICE};
+use vinosearch_shared::dbus::{RUNNER_PATH, names};
 
 /// Launchers tried in order when none is given: each speaks dmenu (choices
 /// on stdin, the pick or the typed text on stdout) and runs on Wayland.
@@ -182,7 +182,7 @@ fn search(query: &str) -> Result<Vec<Match>> {
             .context("no session bus")?;
         Ok::<_, anyhow::Error>(
             conn.call_method(
-                Some(SERVICE),
+                Some(names().service.as_str()),
                 RUNNER_PATH,
                 Some("org.kde.krunner1"),
                 "Match",

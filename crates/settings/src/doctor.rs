@@ -75,6 +75,7 @@ fn parse(stdout: &str) -> Vec<(String, String)> {
                 "devices" => "Devices",
                 "probe" => "Probe",
                 "parity" => "Parity",
+                "log" => "Service log",
                 other => other,
             };
             let mut value = value.trim();

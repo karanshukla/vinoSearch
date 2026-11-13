@@ -51,8 +51,18 @@ pub fn load(prefix: &Path) -> Result<()> {
         );
     }
     openvino_sys::library::load_from(lib).map_err(anyhow::Error::msg)?;
-    preload_npu(ovfetch::detect::default_npu_prefix().as_deref())?;
+    preload_npu(npu_prefix().as_deref())?;
     Ok(())
+}
+
+/// What `ovfetch npu install` made under the home, if anything. Never in
+/// the Flatpak, which ships its own driver: libraries built for the host
+/// would load against the runtime's.
+fn npu_prefix() -> Option<PathBuf> {
+    if vinosearch_shared::sandbox::flatpak_id().is_some() {
+        return None;
+    }
+    ovfetch::detect::default_npu_prefix()
 }
 
 /// Load the libraries `ovfetch npu install` put in `npu_prefix`: the NPU
@@ -156,7 +166,11 @@ pub fn doctor(prefix: &Path, device: &str) -> Result<bool> {
             "missing (`ovfetch npu install` fetches Intel's)"
         }
     );
-    if let Some(p) = &machine.npu_prefix {
+    if let Some(p) = machine
+        .npu_prefix
+        .as_ref()
+        .filter(|_| npu_prefix().is_some())
+    {
         println!("npu prefix: {p} (from `ovfetch npu install`, preloaded)");
     }
     if let Some(c) = &status.openvino_ceiling {

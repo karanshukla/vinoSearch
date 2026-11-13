@@ -22,10 +22,10 @@ need no quotes).
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, None),
-        ["--page", page] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, Some(page)),
+        [] => window::run(&vinosearch_shared::dbus::names().app_id, None),
+        ["--page", page] => window::run(&vinosearch_shared::dbus::names().app_id, Some(page)),
         ["--search", ref query @ ..] => {
-            window::search::run(vinosearch_shared::dbus::SETTINGS_APP_ID, &query.join(" "))
+            window::search::run(&vinosearch_shared::dbus::names().app_id, &query.join(" "))
         }
         ["-h" | "--help"] => {
             print!("{USAGE}");

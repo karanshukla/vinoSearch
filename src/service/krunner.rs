@@ -12,6 +12,7 @@ use crate::extract::session::{self, Part};
 use crate::index::{self, Hit, Kind};
 use crate::ml::model;
 use crate::search::open::At;
+use crate::service::flatpak;
 use crate::service::start::{self, config_home, data_home};
 use crate::service::watch;
 use crate::service::worker::{self, Job, Options, Request, Status};
@@ -23,12 +24,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
+use vinosearch_shared::sandbox;
 use zbus::interface;
 use zbus::{OwnedVariant, Variant};
 
 use vinosearch_shared::dbus::{
-    CONTROL_PATH as CONTROL, DBUS_SERVICE_FILE, DESKTOP_ID, GNOME_PATH as GNOME, GNOME_PROVIDER,
-    ICON, KRUNNER_PLUGIN, RUNNER_PATH as OBJECT, SEARCH_ENTRY, SERVICE, SETTINGS_APP_ID, recent,
+    CONTROL_PATH as CONTROL, GNOME_PATH as GNOME, Names, RUNNER_PATH as OBJECT, names, recent,
     results, status as key,
 };
 /// Files of each kind shown.
@@ -615,7 +616,12 @@ fn launch_settings(args: &[&str]) {
     match settings {
         Ok(s) if s.is_file() => {
             let program = s.display().to_string();
-            let argv = std::iter::once(program.clone())
+            // In the Flatpak, a sandbox of its own (the Flatpak portal's
+            // Spawn): one started in ours would go when the runner does.
+            let spawn = sandbox::flatpak_id().map(|_| "flatpak-spawn".to_owned());
+            let argv = spawn
+                .into_iter()
+                .chain(std::iter::once(program.clone()))
                 .chain(args.iter().map(ToString::to_string))
                 .collect();
             std::thread::spawn(move || {
@@ -1210,7 +1216,7 @@ pub fn serve(opts: Options) -> Result<()> {
     });
     zbus::block_on(async {
         let conn = zbus::connection::Builder::session()
-            .name(SERVICE)
+            .name(names().service.as_str())
             .serve_at(
                 OBJECT,
                 Runner {
@@ -1235,7 +1241,7 @@ pub fn serve(opts: Options) -> Result<()> {
             .await
             .context("registering on the session bus")
             .map_err(NotStarted)?;
-        eprintln!("{SERVICE} on {OBJECT}");
+        eprintln!("{} on {OBJECT}", names().service);
         // The worker only returns on a startup error or when the channel closes.
         let worker = async {
             finished
@@ -1247,7 +1253,7 @@ pub fn serve(opts: Options) -> Result<()> {
                 std::future::pending::<()>().await;
             }
             // Before exiting, so Quit's reply goes out first.
-            let _ = conn.release_name(SERVICE).await;
+            let _ = conn.release_name(names().service.as_str()).await;
             eprintln!("asked to quit");
             Ok(())
         };
@@ -1333,7 +1339,7 @@ fn gnome_files() -> Result<GnomeFiles> {
     let data = data_home()?;
     let xdg = data.join("vinosearch/xdg");
     Ok(GnomeFiles {
-        provider: data.join(GNOME_PROVIDER),
+        provider: data.join(&names().gnome_provider),
         environment: config_home()?.join("environment.d/60-vinosearch.conf"),
         xdg,
     })
@@ -1362,7 +1368,7 @@ fn refresh_menu() {
 }
 
 fn launcher_path() -> Result<PathBuf> {
-    Ok(data_home()?.join("applications").join(DESKTOP_ID))
+    Ok(data_home()?.join("applications").join(&names().desktop_id))
 }
 
 /// The app menu entry. It belongs to the install, not to a search place:
@@ -1383,21 +1389,33 @@ fn install_launcher() -> Result<PathBuf> {
         "xdg-open https://github.com/karanshukla/vinoSearch#readme".to_owned()
     };
     fs::create_dir_all(launcher.parent().unwrap())?;
-    fs::write(
-        &launcher,
-        format!(
-            "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
-             Comment=Semantic file search on the NPU\nIcon={ICON}\nExec={exec}\n\
-             StartupWMClass={SETTINGS_APP_ID}\nCategories=Utility;Settings;\nTerminal=false\n"
-        ),
-    )?;
+    fs::write(&launcher, launcher_entry(names(), &exec, None))?;
     Ok(launcher)
+}
+
+/// The app menu entry, running `exec`. With `search`, the command that opens
+/// the search window, which it offers as an action: the Flatpak's, in place
+/// of a menu place of its own.
+pub(crate) fn launcher_entry(n: &Names, exec: &str, search: Option<&str>) -> String {
+    let mut entry = format!(
+        "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
+         Comment=Semantic file search on the NPU\nIcon={}\nExec={exec}\n\
+         StartupWMClass={}\nCategories=Utility;Settings;\nTerminal=false\n",
+        n.icon, n.app_id
+    );
+    if let Some(search) = search {
+        entry.push_str(&format!(
+            "Keywords=find;files;photos;documents;\nActions=search;\n\n\
+             [Desktop Action search]\nName=Search Files\nExec={search}\n"
+        ));
+    }
+    entry
 }
 
 /// The search window's app menu entry. It needs vinosearch-settings beside
 /// us. No StartupWMClass: the window's app id is the settings entry's.
 fn install_search_entry() -> Result<()> {
-    let entry = data_home()?.join(SEARCH_ENTRY);
+    let entry = search_entry_path()?;
     let settings = std::env::current_exe()?.with_file_name("vinosearch-settings");
     if !settings.is_file() {
         bail!("{}: not installed", settings.display());
@@ -1412,12 +1430,47 @@ fn install_search_entry() -> Result<()> {
     Ok(())
 }
 
+fn search_entry_path() -> Result<PathBuf> {
+    let entry = names()
+        .search_entry
+        .as_ref()
+        .context("no search window entry of its own here")?;
+    Ok(data_home()?.join(entry))
+}
+
 fn search_entry(settings: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
          Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
-         Icon={ICON}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n"
+         Icon={}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n",
+        names().icon
     )
+}
+
+/// GNOME Shell's search provider file.
+pub(crate) fn gnome_provider(n: &Names) -> String {
+    format!(
+        "[Shell Search Provider]\nDesktopId={}\nBusName={}\nObjectPath={GNOME}\nVersion=2\n",
+        n.desktop_id, n.service
+    )
+}
+
+/// KRunner's D-Bus plugin file.
+pub(crate) fn krunner_plugin(n: &Names) -> String {
+    format!(
+        "[Desktop Entry]\nName=vinoSearch\nComment=Semantic file search on the NPU\n\
+         X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon={}\n\
+         X-KDE-PluginInfo-Name={}\nX-KDE-PluginInfo-EnabledByDefault=true\n\
+         X-Plasma-API=DBus\nX-Plasma-DBusRunner-Service={}\nX-Plasma-DBusRunner-Path={OBJECT}\n\
+         X-Plasma-Request-Actions-Once=true\nX-Plasma-Runner-Min-Letter-Count=3\n\
+         X-Plasma-Runner-Unique-Results=true\n",
+        n.icon, n.krunner_plugin_id, n.service
+    )
+}
+
+/// The D-Bus activation file, running `exec`, a command line already quoted.
+pub(crate) fn dbus_service(n: &Names, exec: &str) -> String {
+    format!("[D-BUS Service]\nName={}\nExec={exec}\n", n.service)
 }
 
 fn install_gnome() -> Result<()> {
@@ -1429,13 +1482,7 @@ fn install_gnome() -> Result<()> {
     for p in [&g.provider, &g.environment] {
         fs::create_dir_all(p.parent().unwrap())?;
     }
-    fs::write(
-        &g.provider,
-        format!(
-            "[Shell Search Provider]\nDesktopId={DESKTOP_ID}\nBusName={SERVICE}\n\
-             ObjectPath={GNOME}\nVersion=2\n"
-        ),
-    )?;
+    fs::write(&g.provider, gnome_provider(names()))?;
     let launcher = install_launcher()?;
     // Appended, so it never shadows anything the system provides. The
     // default is the XDG spec's, for sessions that leave the variable unset.
@@ -1453,19 +1500,9 @@ fn install_gnome() -> Result<()> {
 }
 
 fn install_kde() -> Result<()> {
-    let plugin = data_home()?.join(KRUNNER_PLUGIN);
+    let plugin = data_home()?.join(&names().krunner_plugin);
     fs::create_dir_all(plugin.parent().unwrap())?;
-    fs::write(
-        &plugin,
-        format!(
-            "[Desktop Entry]\nName=vinoSearch\nComment=Semantic file search on the NPU\n\
-             X-KDE-ServiceTypes=Plasma/Runner\nType=Service\nIcon={ICON}\n\
-             X-KDE-PluginInfo-Name=vinosearch\nX-KDE-PluginInfo-EnabledByDefault=true\n\
-             X-Plasma-API=DBus\nX-Plasma-DBusRunner-Service={SERVICE}\nX-Plasma-DBusRunner-Path={OBJECT}\n\
-             X-Plasma-Request-Actions-Once=true\nX-Plasma-Runner-Min-Letter-Count=3\n\
-             X-Plasma-Runner-Unique-Results=true\n"
-        ),
-    )?;
+    fs::write(&plugin, krunner_plugin(names()))?;
     println!("wrote {}", plugin.display());
     restart_krunner();
     Ok(())
@@ -1493,7 +1530,7 @@ fn restart_krunner() {
 /// with no flags: a plugin pointing at a bus name nothing activates would
 /// search nothing.
 pub fn install_place(place: Place) -> Result<()> {
-    if !data_home()?.join(DBUS_SERVICE_FILE).exists() {
+    if !data_home()?.join(&names().dbus_service_file).exists() {
         install_service(None, None, None)?;
     }
     match place {
@@ -1509,12 +1546,12 @@ pub fn install_place(place: Place) -> Result<()> {
 /// and the settings app.
 pub fn uninstall_place(place: Place) -> Result<()> {
     let files = match place {
-        Place::Kde => vec![data_home()?.join(KRUNNER_PLUGIN)],
+        Place::Kde => vec![data_home()?.join(&names().krunner_plugin)],
         Place::Gnome => {
             let g = gnome_files()?;
             vec![g.provider, g.environment]
         }
-        Place::Menu => vec![data_home()?.join(SEARCH_ENTRY)],
+        Place::Menu => vec![search_entry_path()?],
     };
     let mut removed = 0;
     for p in files {
@@ -1536,6 +1573,9 @@ pub fn uninstall_place(place: Place) -> Result<()> {
 
 /// Turn one place on or off (`vinosearch integrate kde|gnome [--off]`).
 pub fn integrate(place: Place, on: bool) -> Result<()> {
+    if sandbox::flatpak_id().is_some() {
+        return flatpak::integrate(place, on);
+    }
     if on {
         install_place(place)?;
     } else {
@@ -1548,10 +1588,14 @@ pub fn integrate(place: Place, on: bool) -> Result<()> {
 /// The vinoPilot landing page's vinoSearch mark, with the viewBox cropped to
 /// a 2 px margin: the page's 4 px left the tile visibly smaller than other
 /// apps' icons in a task manager.
-const ICON_SVG: &str = include_str!("../../data/dev.vinosearch.svg");
+pub(crate) const ICON_SVG: &str = include_str!("../../data/dev.vinosearch.svg");
 
 fn icon_path() -> Result<PathBuf> {
-    Ok(data_home()?.join(format!("icons/hicolor/scalable/apps/{ICON}.svg")))
+    Ok(data_home()?.join(icon_file(names())))
+}
+
+pub(crate) fn icon_file(n: &Names) -> String {
+    format!("icons/hicolor/scalable/apps/{}.svg", n.icon)
 }
 
 /// Delete the models: through the runner while it runs, so it unloads them
@@ -1571,7 +1615,7 @@ pub fn delete_models() -> Result<bool> {
     zbus::block_on(async {
         let conn = zbus::Connection::session().await?;
         conn.call_method(
-            Some(SERVICE),
+            Some(names().service.as_str()),
             CONTROL,
             Some(vinosearch_shared::dbus::CONTROL_INTERFACE),
             "DeleteModel",
@@ -1593,7 +1637,10 @@ fn runner_owned() -> Result<Option<bool>> {
             return Ok(None);
         };
         let bus = zbus::fdo::DBusProxy::new(&conn).await?;
-        Ok(Some(bus.name_has_owner(SERVICE.try_into()?).await?))
+        Ok(Some(
+            bus.name_has_owner(names().service.as_str().try_into()?)
+                .await?,
+        ))
     })
 }
 
@@ -1604,6 +1651,16 @@ pub fn install(
     device: Option<&str>,
     idle_unload_minutes: Option<f64>,
 ) -> Result<()> {
+    if sandbox::flatpak_id().is_some() {
+        let mut args = Vec::new();
+        if let Some(d) = device {
+            args.extend(["--device".into(), d.to_owned()]);
+        }
+        if let Some(m) = idle_unload_minutes {
+            args.extend(["--idle-unload-minutes".into(), m.to_string()]);
+        }
+        return flatpak::install(&args);
+    }
     install_service(openvino_dir, device, idle_unload_minutes)?;
     let places = current_places();
     if places.is_empty() {
@@ -1652,7 +1709,7 @@ fn install_service(
         }
     }
     let data = data_home()?;
-    let service = data.join(DBUS_SERVICE_FILE);
+    let service = data.join(&names().dbus_service_file);
     let autostart = start::autostart_path()?;
     let icon = icon_path()?;
     for p in [&service, &autostart, &icon] {
@@ -1662,10 +1719,7 @@ fn install_service(
     let launcher = install_launcher()?;
     fs::write(
         &service,
-        format!(
-            "[D-BUS Service]\nName={SERVICE}\nExec={}\n",
-            command_line(&args, dbus_quote)
-        ),
+        dbus_service(names(), &command_line(&args, dbus_quote)),
     )?;
     fs::write(
         &autostart,
@@ -1693,12 +1747,13 @@ fn install_service(
 /// ssh) it starts at the next login.
 fn restart_runner() {
     let restarted = start::stop_runner().and_then(|was| {
-        start::start(SERVICE)?;
+        start::start(&names().service)?;
         Ok(was)
     });
+    let service = &names().service;
     match restarted {
-        Ok(true) => println!("restarted {SERVICE}"),
-        Ok(false) => println!("started {SERVICE}"),
+        Ok(true) => println!("restarted {service}"),
+        Ok(false) => println!("started {service}"),
         Err(e) => println!("not started now ({e:#}); it starts at the next login"),
     }
     if let Ok(log) = start::log_path() {
@@ -1742,20 +1797,24 @@ fn desktop_quote(arg: &str) -> String {
 /// Everything off: both places, the service, the icon, the app menu entry.
 /// The systemd unit an older install wrote goes too.
 pub fn uninstall() -> Result<()> {
+    if let Some(app) = sandbox::flatpak_id() {
+        return flatpak::uninstall(app);
+    }
     let data = data_home()?;
     if let Some(unit) = start::remove_old_unit()? {
         println!("removed {}", unit.display());
     }
+    let service = &names().service;
     match start::stop_runner() {
-        Ok(true) => println!("stopped {SERVICE}"),
+        Ok(true) => println!("stopped {service}"),
         Ok(false) => {}
-        Err(e) => eprintln!("stopping {SERVICE}: {e:#}"),
+        Err(e) => eprintln!("stopping {service}: {e:#}"),
     }
     for place in Place::ALL {
         uninstall_place(place)?;
     }
     for p in [
-        data.join(DBUS_SERVICE_FILE),
+        data.join(&names().dbus_service_file),
         start::autostart_path()?,
         icon_path()?,
         launcher_path()?,

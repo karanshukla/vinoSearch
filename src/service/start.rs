@@ -18,7 +18,8 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
-use vinosearch_shared::dbus::{CONTROL_INTERFACE, CONTROL_PATH, ICON, SERVICE};
+use vinosearch_shared::dbus::{CONTROL_INTERFACE, CONTROL_PATH, names};
+use vinosearch_shared::sandbox;
 
 /// The systemd user unit installs before this one wrote and enabled.
 const OLD_UNIT: &str = "vinosearch.service";
@@ -68,8 +69,9 @@ pub fn autostart_entry(exec: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
          Comment=Semantic file search: keeps the index current and answers searches\n\
-         Icon={ICON}\nExec={exec}\nTerminal=false\nNoDisplay=true\n\
-         X-GNOME-Autostart-enabled=true\n"
+         Icon={}\nExec={exec}\nTerminal=false\nNoDisplay=true\n\
+         X-GNOME-Autostart-enabled=true\n",
+        names().icon
     )
 }
 
@@ -84,16 +86,22 @@ pub fn supervise(worker: Command) -> Result<Option<ExitStatus>> {
     supervised(worker).map(Some)
 }
 
-/// `$XDG_RUNTIME_DIR`, which logind empties at logout, else the cache.
+/// `$XDG_RUNTIME_DIR`, which logind empties at logout, else the cache. In
+/// the Flatpak, its `app/<id>` directory: the rest of the sandbox's
+/// XDG_RUNTIME_DIR is a tmpfs of each instance's own, which another instance
+/// (the autostart entry's, an activation's) would never see the lock in.
 fn instance_lock_path() -> Result<PathBuf> {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
+        Some(d) if !d.is_empty() => match sandbox::flatpak_id() {
+            Some(app) => PathBuf::from(d).join("app").join(app),
+            None => PathBuf::from(d),
+        },
         _ => match std::env::var_os("XDG_CACHE_HOME") {
             Some(d) if !d.is_empty() => PathBuf::from(d),
             _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".cache"),
         },
     };
-    Ok(dir.join(format!("{SERVICE}.lock")))
+    Ok(dir.join(format!("{}.lock", names().service)))
 }
 
 /// The instance lock, held while the file is open; None once the runner
@@ -123,7 +131,7 @@ fn single_instance(path: &Path, wait: Duration) -> Result<Option<File>> {
         }
         // An activation that started this one is answered once the other's
         // runner owns the name: exiting before then would fail it.
-        if Instant::now() >= deadline || owned(SERVICE) == Some(true) {
+        if Instant::now() >= deadline || owned(&names().service) == Some(true) {
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -288,7 +296,7 @@ pub fn stop(name: &str, quit: (&str, &str, &str)) -> Result<bool> {
 
 /// Stop the runner, through Control1's Quit.
 pub fn stop_runner() -> Result<bool> {
-    stop(SERVICE, (CONTROL_PATH, CONTROL_INTERFACE, "Quit"))
+    stop(&names().service, (CONTROL_PATH, CONTROL_INTERFACE, "Quit"))
 }
 
 /// Have the bus start `name` from its activation file, rereading the files
@@ -299,8 +307,11 @@ pub fn start(name: &str) -> Result<()> {
         let conn = zbus::Connection::session().await?;
         let bus = zbus::fdo::DBusProxy::new(&conn).await?;
         // dbus-broker rereads them only when asked; dbus-daemon also on its
-        // own.
-        let _ = bus.reload_config().await;
+        // own. Not from the Flatpak, whose bus proxy refuses it (and whose
+        // file is installed with it).
+        if sandbox::flatpak_id().is_none() {
+            let _ = bus.reload_config().await;
+        }
         bus.start_service_by_name(name.try_into()?, 0).await?;
         Ok::<_, zbus::Error>(())
     })?;
