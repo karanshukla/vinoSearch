@@ -12,9 +12,9 @@
 //! user's processes can connect to that bus, and any of them can ask the
 //! unlocked keyring for the item itself, so an encrypted session would hide
 //! it from no one this backend defends against. zbus's message buffers
-//! aren't wiped; the key is, on our side, once dropped. A sandboxed build
-//! would go through `org.freedesktop.portal.Secret` instead, under an
-//! `index.key` head of its own.
+//! aren't wiped; the key is, on our side, once dropped. The Flatpak talks to
+//! the same Secret Service (`--talk-name=org.freedesktop.secrets`), not the
+//! Secret portal.
 
 use super::{Unavailable, random};
 use anyhow::{Context, Result, anyhow, bail};

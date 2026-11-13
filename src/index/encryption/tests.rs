@@ -5,7 +5,7 @@
 use super::*;
 use crate::config::{Excludes, Formats};
 use crate::index::seal::keyring::mock::{Answer, Mock};
-use crate::index::seal::tests::{Fake, HOST_HEAD, TPM_HEAD, creds_body, retry};
+use crate::index::seal::tests::{Fake, HOST, HOST_HEAD, TPM_HEAD, creds_body, retry, spawner};
 use crate::index::{FileTypes, Kind, Vectors, Words};
 use crate::ml::embed::FakeEmbed;
 use std::time::Duration;
@@ -63,7 +63,7 @@ impl Setup {
     fn apply(&self, on: bool, allow_host: bool, rekey: bool) -> State {
         retry(|| {
             let st = apply(&self.db(), Want { on, allow_host }, rekey, &self.sealer);
-            if st.error.contains("Text file busy") {
+            if st.error.contains("Text file busy") || st.waiting.contains("Text file busy") {
                 bail!("{}", st.error);
             }
             Ok(st)
@@ -434,6 +434,51 @@ fn a_keyring_item_gone_is_waited_for_until_encryption_starts_over() {
     assert_eq!(mock.state().items.len(), 1);
     s.index();
     assert!(s.finds_the_note());
+}
+
+#[test]
+fn from_the_flatpak_a_host_out_of_reach_is_waited_for_and_the_index_kept() {
+    let mut s = Setup::new("hostgone", TPM_HEAD);
+    s.index();
+    s.apply(true, false, false);
+    let before = s.on_disk();
+    let file = fs::read(key_file(&s.db())).unwrap();
+    // The next start, in the Flatpak: flatpak-spawn can't reach the host.
+    hold(&s.db(), None);
+    let creds = s.fake.tool(&creds_body(TPM_HEAD));
+    let gone = spawner(
+        &s.fake,
+        "echo 'Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1",
+    );
+    s.sealer = Sealer::on_host(&gone, &creds, Duration::from_secs(10));
+    let st = s.apply(true, false, false);
+    assert!(st.waiting.contains("Portal call failed"), "{st:?}");
+    assert_eq!((st.error.as_str(), st.broken.as_str()), ("", ""));
+    assert_eq!(st.seal, "tpm");
+    assert_eq!(s.on_disk(), before);
+    assert_eq!(fs::read(key_file(&s.db())).unwrap(), file);
+    let e = index::open(&s.db()).unwrap_err();
+    assert!(seal::is_unavailable(&e) && !is_unusable(&e), "{e:#}");
+    // Back: opens as it was.
+    s.sealer = Sealer::on_host(&spawner(&s.fake, HOST), &creds, Duration::from_secs(10));
+    let st = s.apply(true, false, false);
+    assert_eq!((st.waiting.as_str(), st.broken.as_str()), ("", ""));
+    assert!(s.finds_the_note());
+}
+
+#[test]
+fn from_the_flatpak_a_host_out_of_reach_leaves_a_plaintext_index_plaintext() {
+    let mut s = Setup::new("hostoff", TPM_HEAD);
+    s.index();
+    let creds = s.fake.tool(&creds_body(TPM_HEAD));
+    let gone = spawner(&s.fake, "echo \"Can't find bus\" >&2; exit 1");
+    s.sealer = Sealer::on_host(&gone, &creds, Duration::from_secs(10));
+    // Not in the keyring instead, nor with the host key: refused, and said so.
+    let st = s.apply(true, true, false);
+    assert!(st.error.contains("Can't find bus"), "{st:?}");
+    assert!(!st.encrypted);
+    assert!(!key_file(&s.db()).exists());
+    assert!(s.plain_sqlite_reads());
 }
 
 #[test]
