@@ -84,16 +84,17 @@ pub fn install(args: &[String]) -> Result<()> {
 /// at login, and the service stopped. Its files stay until the Flatpak is
 /// uninstalled, but nothing starts it.
 pub fn uninstall(app: &str) -> Result<()> {
+    // The places first: a search between the two would start it again.
+    for place in [Place::Kde, Place::Gnome] {
+        if let Err(e) = set_place(place, false) {
+            eprintln!("{e:#}");
+        }
+    }
     let service = &names().service;
     match start::stop_runner() {
         Ok(true) => println!("stopped {service}"),
         Ok(false) => {}
         Err(e) => eprintln!("stopping {service}: {e:#}"),
-    }
-    for place in [Place::Kde, Place::Gnome] {
-        if let Err(e) = set_place(place, false) {
-            eprintln!("{e:#}");
-        }
     }
     match request_background(None) {
         Ok(()) => println!("no longer starts at login"),
