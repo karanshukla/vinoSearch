@@ -201,6 +201,8 @@ fn log_to(path: &Path) -> Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
+        // One that was there already, with the umask's mode.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     if fs::metadata(path).is_ok_and(|m| m.len() > LOG_MAX) {
         fs::rename(path, path.with_extension("log.old"))?;
