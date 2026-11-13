@@ -18,18 +18,29 @@ pub type Found = (String, String, f64, String, String, u32, i64);
 /// KRunner groups it.
 fn kind(h: &Hit) -> &'static str {
     match h.kind {
+        _ if picture(h) => results::IMAGE,
         Kind::Text => results::TEXT,
         Kind::Code => results::CODE,
         Kind::Session => results::SESSION,
         Kind::Media => results::MEDIA,
-        Kind::Document if crate::extract::is_document(Path::new(&h.path)) => results::DOCUMENT,
-        Kind::Document | Kind::Image => results::IMAGE,
+        Kind::Document | Kind::Image => results::DOCUMENT,
+    }
+}
+
+/// An image, by what's in it or by the text OCR read in it: held to the
+/// image floor and GAP both. OCR's text alone scored up to 0.67 for
+/// off-topic words ("valorant" found KDE doc screenshots at 0.656).
+pub fn picture(h: &Hit) -> bool {
+    match h.kind {
+        Kind::Image => true,
+        Kind::Document => !crate::extract::is_document(Path::new(&h.path)),
+        _ => false,
     }
 }
 
 /// Audio and video further than this below the best text, document or
-/// session result are left out, and images further below the best of those
-/// or audio and video. Their floors alone let them through for queries text
+/// session result are left out, and images (and text read in them) further
+/// below the best of those or audio and video. Their floors alone let them through for queries text
 /// answers well: "bills", a document at 0.704 and a photo at 0.632;
 /// "valorant", sessions at 0.79 and unrelated videos and photos at 0.66.
 /// Not yet checked against a query where text and a photo are both right.
@@ -40,7 +51,7 @@ pub const GAP: f32 = 0.06;
 pub fn drop_far_below(hits: &mut Vec<Hit>) {
     let best = |hits: &[Hit], kinds: &[Kind]| {
         hits.iter()
-            .filter(|h| kinds.contains(&h.kind))
+            .filter(|h| kinds.contains(&h.kind) && !picture(h))
             .map(|h| h.score)
             .fold(f32::NEG_INFINITY, f32::max)
     };
@@ -50,18 +61,18 @@ pub fn drop_far_below(hits: &mut Vec<Hit>) {
         hits,
         &[Kind::Text, Kind::Document, Kind::Session, Kind::Media],
     );
-    hits.retain(|h| h.kind != Kind::Image || h.score >= others - GAP);
+    hits.retain(|h| !picture(h) || h.score >= others - GAP);
 }
 
 /// Best chunk per file, files at or above their kind's `floor`, at most
 /// `limit` files of each of the window's kinds: text, then documents, then
 /// sessions, then audio and video, then images, best first within each,
 /// less those [`drop_far_below`] leaves out.
-pub fn every_file(hits: Vec<Hit>, floor: impl Fn(Kind) -> f32, limit: usize) -> Vec<Hit> {
+pub fn every_file(hits: Vec<Hit>, floor: impl Fn(&Hit) -> f32, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
     let mut groups: [Vec<Hit>; 6] = Default::default();
     for h in hits {
-        if h.score < floor(h.kind) || !seen.insert(h.path.clone()) {
+        if h.score < floor(&h) || !seen.insert(h.path.clone()) {
             continue;
         }
         let group = &mut groups[match kind(&h) {
@@ -138,11 +149,8 @@ mod tests {
         }
     }
 
-    fn floor(kind: Kind) -> f32 {
-        match kind {
-            Kind::Image => 0.6,
-            _ => 0.65,
-        }
+    fn floor(h: &Hit) -> f32 {
+        if picture(h) { 0.6 } else { 0.65 }
     }
 
     #[test]
@@ -153,7 +161,7 @@ mod tests {
             hit(Kind::Text, 0.75, "/n/a.md"),
             hit(Kind::Text, 0.60, "/n/low.md"),
             hit(Kind::Document, 0.72, "/d/scan.pdf"),
-            hit(Kind::Document, 0.71, "/p/shot.png"),
+            hit(Kind::Document, 0.76, "/p/shot.png"),
             hit(Kind::Image, 0.62, "/p/cat.jpg"),
             hit(Kind::Image, 0.66, "/p/shot.png"),
             hit(Kind::Image, 0.55, "/p/dim.jpg"),
