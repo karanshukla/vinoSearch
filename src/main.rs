@@ -576,7 +576,28 @@ fn run(cli: Cli) -> Result<bool> {
             } else if uninstall {
                 krunner::uninstall()?;
             } else if worker {
-                krunner::serve(worker_options(&cli, s)?)?;
+                let served = krunner::serve(worker_options(&cli, s)?);
+                // The worker's thread is still running, in OpenVINO as likely
+                // as not: returning would run the process's destructors under
+                // it, which segfaults, and a runner asked to quit that dies
+                // of a signal is started again. Left as a kill leaves it,
+                // which the index (WAL) is written for.
+                let code = match served {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        if e.downcast_ref::<krunner::NotStarted>().is_some() {
+                            i32::from(service::start::NOT_STARTED)
+                        } else {
+                            1
+                        }
+                    }
+                };
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let _ = std::io::stdout().flush();
+                // SAFETY: _exit takes no pointers and doesn't return.
+                unsafe { libc::_exit(code) }
             } else {
                 return krunner::supervise();
             }
