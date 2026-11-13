@@ -275,22 +275,11 @@ else
 fi
 
 step "Desktop search"
-was_running=0
-systemctl --user is-active --quiet vinosearch.service 2>/dev/null && was_running=1
-# The service, and the search place for the running desktop; it restarts
-# KRunner itself when that is running.
+# The service, and the search place for the running desktop. It starts the
+# service, restarting one already running so a re-run runs the new binary,
+# replaces the systemd unit older installs used with the autostart entry, and
+# restarts KRunner when that is running.
 vinosearch krunner --install
-# A re-run that replaced the binary: run the new one.
-if [ "$was_running" = 1 ]; then
-    systemctl --user restart vinosearch.service && echo "restarted vinosearch.service"
-fi
-# Inside a toolbox or distrobox the files land in the shared home, but the
-# host's systemd may be out of reach, so the service would only start on the
-# first search instead of at login.
-if ! systemctl --user is-enabled --quiet vinosearch.service 2>/dev/null; then
-    echo "couldn't enable vinosearch.service from here (inside a toolbox or distrobox?)."
-    echo "On the host, run: systemctl --user daemon-reload && systemctl --user enable --now vinosearch.service"
-fi
 
 printf '\nDone. Search with: vinosearch search "..." , KRunner, or GNOME Shell (GNOME: from the next login).\n'
 echo 'On sway, Hyprland and other desktops: bind a key to vinosearch menu (needs fuzzel, wofi, rofi, tofi or bemenu).'

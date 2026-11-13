@@ -63,16 +63,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve KRunner, GNOME Shell and the settings app over D-Bus, or install/remove the service.
+    /// Serve KRunner, GNOME Shell and the settings app over D-Bus, starting the service again
+    /// if it crashes, or install/remove the service.
     Krunner {
         /// Write the service files and the running desktop's search place (KRunner on Plasma,
         /// GNOME Shell on GNOME, none on other desktops, both when there's no desktop session),
-        /// then exit. `integrate` adds or removes one.
+        /// start the service (again, if it is running), then exit. `integrate` adds or removes
+        /// one.
         #[arg(long)]
         install: bool,
-        /// Remove the service and every search place, then exit.
+        /// Stop the service and remove it and every search place, then exit.
         #[arg(long, conflicts_with = "install")]
         uninstall: bool,
+        /// Serve, without the parent that starts it again: what `krunner` runs.
+        #[arg(long, hide = true, conflicts_with_all = ["install", "uninstall"])]
+        worker: bool,
     },
     /// Turn one search place on (or off with --off): kde is KRunner and the Plasma launcher,
     /// gnome is GNOME Shell's overview search, from the next login, menu is the search window
@@ -557,7 +562,11 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Command::Krunner { install, uninstall } => {
+        Command::Krunner {
+            install,
+            uninstall,
+            worker,
+        } => {
             if install {
                 krunner::install(
                     cli.openvino_dir.as_deref(),
@@ -566,8 +575,10 @@ fn run(cli: Cli) -> Result<bool> {
                 )?;
             } else if uninstall {
                 krunner::uninstall()?;
-            } else {
+            } else if worker {
                 krunner::serve(worker_options(&cli, s)?)?;
+            } else {
+                return krunner::supervise();
             }
             Ok(true)
         }
@@ -783,6 +794,9 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("error: {e:#}");
+            if e.downcast_ref::<krunner::NotStarted>().is_some() {
+                return ExitCode::from(service::start::NOT_STARTED);
+            }
             ExitCode::FAILURE
         }
     }

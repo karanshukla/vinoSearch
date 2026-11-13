@@ -12,9 +12,10 @@
 # It downloads the release's tarball and its .sha256, refuses the tarball
 # unless the checksum matches, unpacks it into a private temporary directory
 # and runs the release's own scripts/install.sh, which installs the binaries
-# into ~/.local/bin, fetches OpenVINO and the model, and restarts the service
-# if it was running. That also leaves this script as vinosearch-upgrade, which
-# the settings window's Update button runs (with VINO_UPDATE_TAG set).
+# into ~/.local/bin, fetches OpenVINO and the model, and starts the service,
+# restarting it if it was running. That also leaves this script as
+# vinosearch-upgrade, which the settings window's Update button runs (with
+# VINO_UPDATE_TAG set).
 #
 # From a checkout, scripts/install.sh builds from source instead.
 

@@ -12,6 +12,7 @@ use crate::extract::session::{self, Part};
 use crate::index::{self, Hit, Kind};
 use crate::ml::model;
 use crate::search::open::At;
+use crate::service::start::{self, config_home, data_home};
 use crate::service::watch;
 use crate::service::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
@@ -632,6 +633,8 @@ struct Control {
     status: Arc<Status>,
     db: Db,
     config: PathBuf,
+    /// Taken by Quit, which `serve` waits on beside the worker.
+    quit: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
@@ -1051,6 +1054,14 @@ impl Control {
         self.request(Request::ClearCache)
     }
 
+    /// Exit, releasing the bus name; `krunner` doesn't start it again. For
+    /// installs and uninstalls, in place of a service manager's stop.
+    fn quit(&self) {
+        if let Some(quit) = self.quit.lock().unwrap().take() {
+            let _ = quit.send(());
+        }
+    }
+
     /// Encrypt or decrypt the index as the config file's `encryption` says,
     /// now rather than at the next read of it; again after a refusal. Queued:
     /// `encrypted`, `seal` and `encryption_error` in Status say how it went.
@@ -1119,22 +1130,49 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     kept
 }
 
+/// A runner that stopped before it owned the bus name, which exits with
+/// start::NOT_STARTED so `krunner` doesn't start it again.
+#[derive(Debug)]
+pub struct NotStarted(anyhow::Error);
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+/// `vinosearch krunner`: this same command line with `--worker`, the
+/// runner, kept running by service::start. False when it stopped on an
+/// error.
+pub fn supervise() -> Result<bool> {
+    let mut worker = std::process::Command::new(std::env::current_exe()?);
+    worker.args(std::env::args_os().skip(1)).arg("--worker");
+    Ok(start::supervise(worker)?.is_none_or(|s| s.success()))
+}
+
 pub fn serve(opts: Options) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    worker::prepare(&opts.status, &opts.file)?;
+    worker::prepare(&opts.status, &opts.file).map_err(NotStarted)?;
     crate::service::power::spawn(tx.clone(), opts.status.clone());
     let _watcher = watch::spawn(
         tx.clone(),
         opts.config.clone(),
         opts.file.clone(),
         opts.status.clone(),
-    )?;
-    let db: Db = crate::index::encryption::Live::open(&index::default_db()?)?;
+    )
+    .map_err(NotStarted)?;
+    let db: Db = index::default_db()
+        .and_then(|p| crate::index::encryption::Live::open(&p))
+        .map_err(NotStarted)?;
+    let (quit, quitting) = oneshot::channel();
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
         db: db.clone(),
         config: opts.config.clone(),
+        quit: Mutex::new(Some(quit)),
     };
     let config = opts.config.clone();
     // The connection is driven by the thread that blocks on it, so that is
@@ -1144,7 +1182,7 @@ pub fn serve(opts: Options) -> Result<()> {
         let _ = done.send(worker::run(rx, opts));
     });
     zbus::block_on(async {
-        let _conn = zbus::connection::Builder::session()
+        let conn = zbus::connection::Builder::session()
             .name(SERVICE)
             .serve_at(
                 OBJECT,
@@ -1168,12 +1206,25 @@ pub fn serve(opts: Options) -> Result<()> {
             .serve_at(CONTROL, control)
             .build()
             .await
-            .context("registering on the session bus")?;
+            .context("registering on the session bus")
+            .map_err(NotStarted)?;
         eprintln!("{SERVICE} on {OBJECT}");
         // The worker only returns on a startup error or when the channel closes.
-        finished
-            .await
-            .map_err(|_| anyhow::anyhow!("worker panicked"))?
+        let worker = async {
+            finished
+                .await
+                .map_err(|_| anyhow::anyhow!("worker panicked"))?
+        };
+        let quit = async {
+            if quitting.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            // Before exiting, so Quit's reply goes out first.
+            let _ = conn.release_name(SERVICE).await;
+            eprintln!("asked to quit");
+            Ok(())
+        };
+        futures_lite::future::or(worker, quit).await
     })
 }
 
@@ -1379,17 +1430,20 @@ fn install_kde() -> Result<()> {
 }
 
 /// KRunner reads its plugins at start, so it is restarted when it is
-/// running: it comes back on the next Alt+Space, and the launcher's search
-/// stops (or starts) asking us at once.
+/// running: asked to quit, as `kquitapp6 krunner` does, then started by its
+/// bus name, and the launcher's search stops (or starts) asking us at once.
+/// Quiet when it isn't running or there is no session bus.
 fn restart_krunner() {
-    let unit = "plasma-krunner.service";
-    let active = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", unit])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if active && systemctl(&["restart", unit]) {
-        println!("restarted {unit}");
+    const KRUNNER: &str = "org.kde.krunner";
+    let quit = (
+        "/MainApplication",
+        "org.qtproject.Qt.QCoreApplication",
+        "quit",
+    );
+    match start::stop(KRUNNER, quit).map(|was| was && start::start(KRUNNER).is_ok()) {
+        Ok(true) => println!("restarted KRunner"),
+        Ok(false) => {}
+        Err(e) => eprintln!("restarting KRunner: {e:#}"),
     }
 }
 
@@ -1449,13 +1503,6 @@ pub fn integrate(place: Place, on: bool) -> Result<()> {
     Ok(())
 }
 
-fn config_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".config"),
-    })
-}
-
 /// The vinoPilot landing page's vinoSearch mark, with the viewBox cropped to
 /// a 2 px margin: the page's 4 px left the tile visibly smaller than other
 /// apps' icons in a task manager.
@@ -1463,42 +1510,6 @@ const ICON_SVG: &str = include_str!("../../data/dev.vinosearch.svg");
 
 fn icon_path() -> Result<PathBuf> {
     Ok(data_home()?.join(format!("icons/hicolor/scalable/apps/{ICON}.svg")))
-}
-
-fn data_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    })
-}
-
-/// Register the runner with KRunner and let D-Bus start it on demand. Only
-/// flags given here are baked into the service; the rest come from the config
-/// file each time the runner starts.
-const UNIT: &str = "vinosearch.service";
-
-fn unit_path() -> Result<PathBuf> {
-    Ok(config_home()?.join("systemd/user").join(UNIT))
-}
-
-/// `systemctl --user <args>`, reporting rather than failing: without systemd
-/// the runner still starts through D-Bus activation's Exec line.
-fn systemctl(args: &[&str]) -> bool {
-    match std::process::Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-    {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            eprintln!("systemctl --user {}: {s}", args.join(" "));
-            false
-        }
-        Err(e) => {
-            eprintln!("systemctl: {e}");
-            false
-        }
-    }
 }
 
 /// Delete the models: through the runner while it runs, so it unloads them
@@ -1544,11 +1555,6 @@ fn runner_owned() -> Result<Option<bool>> {
     })
 }
 
-/// Whether something already owns the runner's bus name.
-fn runner_running() -> bool {
-    matches!(runner_owned(), Ok(Some(true)))
-}
-
 /// Install the service and the search places for the running desktop;
 /// `integrate` adds or removes one.
 pub fn install(
@@ -1576,11 +1582,12 @@ pub fn install(
     Ok(())
 }
 
-/// The icon, the D-Bus activation file and the systemd user service that
-/// starts at login, so the watcher keeps the index current from then on
-/// (D-Bus activation alone would start it only at the first query). Only
-/// flags given here are baked into the service; the rest come from the
-/// config file each time the runner starts.
+/// The icon, the D-Bus activation file and the autostart entry, which
+/// starts the runner at login so the watcher keeps the index current from
+/// then on (D-Bus activation alone would start it only at the first query).
+/// Then the runner is started, or restarted to run this binary. Only flags
+/// given here are baked into the service; the rest come from the config file
+/// each time the runner starts.
 fn install_service(
     openvino_dir: Option<&Path>,
     device: Option<&str>,
@@ -1604,8 +1611,9 @@ fn install_service(
     }
     let data = data_home()?;
     let service = data.join(DBUS_SERVICE_FILE);
+    let autostart = start::autostart_path()?;
     let icon = icon_path()?;
-    for p in [&service, &icon] {
+    for p in [&service, &autostart, &icon] {
         fs::create_dir_all(p.parent().unwrap())?;
     }
     fs::write(&icon, ICON_SVG)?;
@@ -1613,44 +1621,47 @@ fn install_service(
     fs::write(
         &service,
         format!(
-            "[D-BUS Service]\nName={SERVICE}\nExec={}\nSystemdService={UNIT}\n",
+            "[D-BUS Service]\nName={SERVICE}\nExec={}\n",
             command_line(&args, dbus_quote)
         ),
     )?;
-    let unit = unit_path()?;
-    fs::create_dir_all(unit.parent().unwrap())?;
     fs::write(
-        &unit,
-        format!(
-            "[Unit]\nDescription=vinoSearch semantic file search (KRunner runner and index watcher)\n\
-             Documentation=https://github.com/karanshukla/vinoSearch\n\n\
-             [Service]\nType=dbus\nBusName={SERVICE}\nExecStart={}\n\
-             Restart=on-failure\nRestartSec=10\n\n\
-             [Install]\nWantedBy=default.target\n",
-            command_line(&args, systemd_quote)
-        ),
+        &autostart,
+        start::autostart_entry(&command_line(&args, desktop_quote)),
     )?;
     println!(
         "wrote {}\nwrote {}\nwrote {}\nwrote {}",
         service.display(),
-        unit.display(),
+        autostart.display(),
         icon.display(),
         launcher.display()
     );
-    if systemctl(&["daemon-reload"]) {
-        if runner_running() {
-            // Starting now would lose the bus name to it and fail; the unit
-            // takes over from the next login.
-            if systemctl(&["enable", UNIT]) {
-                println!(
-                    "enabled {UNIT}; a runner is already running, so it starts from the next login"
-                );
-            }
-        } else if systemctl(&["enable", "--now", UNIT]) {
-            println!("enabled and started {UNIT}");
-        }
+    if let Some(unit) = start::remove_old_unit()? {
+        println!(
+            "removed {} (the autostart entry starts it now)",
+            unit.display()
+        );
     }
+    restart_runner();
     Ok(())
+}
+
+/// Start the runner from the files just written, stopping one already
+/// running. Reports rather than fails: without a session bus here (a TTY,
+/// ssh) it starts at the next login.
+fn restart_runner() {
+    let restarted = start::stop_runner().and_then(|was| {
+        start::start(SERVICE)?;
+        Ok(was)
+    });
+    match restarted {
+        Ok(true) => println!("restarted {SERVICE}"),
+        Ok(false) => println!("started {SERVICE}"),
+        Err(e) => println!("not started now ({e:#}); it starts at the next login"),
+    }
+    if let Ok(log) = start::log_path() {
+        println!("its log: {}", log.display());
+    }
 }
 
 fn utf8(p: &Path) -> Result<&str> {
@@ -1679,25 +1690,6 @@ fn dbus_quote(arg: &str) -> String {
     q
 }
 
-/// A double-quoted word in a systemd ExecStart: C-style backslash escapes,
-/// `%%` for a literal `%` (specifiers) and `$$` for `$` (variables).
-fn systemd_quote(arg: &str) -> String {
-    let mut q = String::from('"');
-    for c in arg.chars() {
-        match c {
-            '\\' | '"' => {
-                q.push('\\');
-                q.push(c);
-            }
-            '%' => q.push_str("%%"),
-            '$' => q.push_str("$$"),
-            _ => q.push(c),
-        }
-    }
-    q.push('"');
-    q
-}
-
 /// A quoted argument in a desktop entry's Exec: the D-Bus quoting, which
 /// matches the Exec key's, then `%%` for `%` (field codes) and every
 /// backslash doubled again for the string value's own escaping.
@@ -1706,18 +1698,23 @@ fn desktop_quote(arg: &str) -> String {
 }
 
 /// Everything off: both places, the service, the icon, the app menu entry.
+/// The systemd unit an older install wrote goes too.
 pub fn uninstall() -> Result<()> {
     let data = data_home()?;
-    let unit = unit_path()?;
-    if unit.exists() {
-        systemctl(&["disable", "--now", UNIT]);
+    if let Some(unit) = start::remove_old_unit()? {
+        println!("removed {}", unit.display());
+    }
+    match start::stop_runner() {
+        Ok(true) => println!("stopped {SERVICE}"),
+        Ok(false) => {}
+        Err(e) => eprintln!("stopping {SERVICE}: {e:#}"),
     }
     for place in Place::ALL {
         uninstall_place(place)?;
     }
     for p in [
         data.join(DBUS_SERVICE_FILE),
-        unit,
+        start::autostart_path()?,
         icon_path()?,
         launcher_path()?,
     ] {
@@ -1726,7 +1723,6 @@ pub fn uninstall() -> Result<()> {
             println!("removed {}", p.display());
         }
     }
-    systemctl(&["daemon-reload"]);
     refresh_menu();
     Ok(())
 }
@@ -1979,13 +1975,8 @@ mod tests {
             command_line(&args, dbus_quote),
             r#""/opt/my apps/vinosearch" "krunner""#
         );
-        assert_eq!(
-            command_line(&args, systemd_quote),
-            r#""/opt/my apps/vinosearch" "krunner""#
-        );
         let odd = r#"/a "b" \c $d `e` 100%"#;
         assert_eq!(dbus_quote(odd), r#""/a \"b\" \\c \$d \`e\` 100%""#);
-        assert_eq!(systemd_quote(odd), r#""/a \"b\" \\c $$d `e` 100%%""#);
         assert_eq!(
             desktop_quote(odd),
             r#""/a \\"b\\" \\\\c \\$d \\`e\\` 100%%""#

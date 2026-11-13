@@ -5,7 +5,7 @@ nav_order: 8
 
 # D-Bus interface
 
-The runner owns `dev.vinosearch.Runner` on the session bus. D-Bus starts it on first use (`vinosearch krunner --install` writes the activation file), so calling any method below is enough to bring it up; it does not load the model until a query or an indexing job needs it.
+The runner owns `dev.vinosearch.Runner` on the session bus. It starts at login, and D-Bus starts it on first use otherwise (`vinosearch krunner --install` writes the autostart entry and the activation file), so calling any method below is enough to bring it up; it does not load the model until a query or an indexing job needs it.
 
 Names and `Status` keys are constants in `vinosearch_shared::dbus`; use those rather than string literals.
 
@@ -57,6 +57,7 @@ Every method returns promptly, including while the runner is indexing or downloa
 | `FetchModel` | `() → ()` | Download the model, or whatever of it is missing or corrupt, in the background (340 MB with the OCR model, plus the 671 MB vision encoder while images or media are on, and the 295 MB audio encoder while media is on; every file checked against a pinned SHA-256 and size). Fails if a download is already running. Progress in `fetching`, `fetch_done`, `fetch_total`, `fetch_error`. |
 | `DeleteModel` | `() → ()` | Unload the model and delete its files, the vision, OCR and audio models included. Fails while a download runs. Queries and indexing fail until it is fetched again. |
 | `ClearCache` | `() → ()` | Delete OpenVINO's compiled-model cache. The next model load recompiles (~4 s on the NPU). |
+| `Quit` | `() → ()` | Release the bus name and exit, without being started again until the next login or call. `krunner --install` and `--uninstall` stop the runner with it. The reply can lose the race with the exit; a caller waits for the name to go instead. |
 | `ApplyEncryption` | `() → ()` | Read `[encryption]` from the config file now and encrypt or decrypt the index to match, rather than at the next 30-second read; after a refusal, try again ([#4](https://github.com/karanshukla/vinoSearch/issues/4)). Queued behind an indexing job, which it stops. `encrypted`, `seal` and `encryption_error` say how it went. Fails if the config file doesn't parse. |
 | `Rekey` | `() → ()` | Seal a new key and encrypt the index again under it. Fails while it isn't encrypted. |
 | `LargestFolders` | `(u limit) → a(st)` | The folders inside the indexed roots holding the most chunks, as (path, chunks), biggest first: at most `limit`, none inside another, never a root itself. A folder gives way to a subfolder holding 3/4 of its chunks. It reads every chunk row, so call it when `chunks` changes, not every poll. |

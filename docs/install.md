@@ -45,7 +45,7 @@ scripts/install-runtime.sh                 # OpenVINO via ovfetch
 vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
 vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
-vinosearch krunner --install               # the systemd user service, the app menu entry and the running desktop's search
+vinosearch krunner --install               # the service (started now and at login), the app menu entry and the running desktop's search
 vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
 ```
 
@@ -73,13 +73,13 @@ libcrypto) are:
 ## Fedora Atomic and openSUSE Aeon
 
 Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under
-`~/.local`, the service in `~/.config/systemd/user`. Nothing touches `/usr`, so the release download
+`~/.local`, the service's autostart entry in `~/.config/autostart`. Nothing touches `/usr`, so the release download
 needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install`
 on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it.
 
 To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches
-the host: the home directory is shared, so the host runs the same binaries and index. If systemd
-can't be reached from the container, `install.sh` prints the one command to run on the host.
+the host: the home directory is shared, so the host runs the same binaries and index, and the host's
+session starts the service from the same autostart entry.
 `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
 
 ## Uninstalling

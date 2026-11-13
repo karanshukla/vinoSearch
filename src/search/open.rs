@@ -20,6 +20,7 @@ use crate::extract::session::{self, Part};
 use crate::index::Kind;
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -521,7 +522,10 @@ fn manager_env() -> zbus::Result<Vec<(String, String)>> {
 }
 
 /// Start `argv` for the desktop, and reap it when it exits. Blocks on the bus
-/// in a unit, so call this off the runner's.
+/// in a unit, so call this off the runner's. In a process group of its own,
+/// so a signal to the runner's (Ctrl+C on a `vinosearch krunner` in a
+/// terminal) leaves it, and its output out of the runner's log; outside a
+/// unit nothing else ties it to the runner, which can exit or crash under it.
 pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     let in_unit = in_unit();
     let env = if in_unit {
@@ -537,6 +541,9 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
         .args(&argv[1..])
         .envs(env)
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
         .spawn()?;
     std::thread::spawn(move || child.wait());
     Ok(())
