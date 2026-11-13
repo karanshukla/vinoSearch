@@ -17,6 +17,7 @@ use vinosearch_shared::config::{
 
 use vinosearch_shared::dbus::{hold, seal};
 use vinosearch_shared::models;
+use vinosearch_shared::sandbox;
 
 use crate::control::{Link, NOT_INSTALLED, Partial, Request, Status};
 use crate::{doctor, integration, portal};
@@ -267,10 +268,23 @@ struct SettingsWindow {
 }
 
 /// The release installer leaves itself as `~/.local/bin/vinosearch-upgrade`; with it,
-/// About's Update button installs a release. A build from source has none, and links to the
-/// release instead.
+/// About's Update button installs a release. A release's Flatpak bundle installs the next one
+/// with `vinosearch flatpak-update`. A build from source has neither, and links to the release
+/// instead.
 fn updater() -> vino_ui::update::Updater {
     let updater = vino_ui::update::Updater::new(vino_ui::App::Search, env!("CARGO_PKG_VERSION"));
+    if sandbox::flatpak_id().is_some() {
+        let release =
+            sandbox::info_value("Instance", "branch").as_deref() == Some(sandbox::RELEASE_BRANCH);
+        return if release {
+            updater.with_command([
+                integration::vinosearch().to_string_lossy().into_owned(),
+                "flatpak-update".into(),
+            ])
+        } else {
+            updater
+        };
+    }
     match std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".local/bin/vinosearch-upgrade"))
     {

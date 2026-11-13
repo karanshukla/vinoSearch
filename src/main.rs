@@ -170,6 +170,10 @@ enum Command {
         #[arg(long)]
         app_id: String,
     },
+    /// In the Flatpak: install release TAG's bundle [default: $VINO_UPDATE_TAG] and restart
+    /// the service on it. The settings window's Update button.
+    #[command(hide = true)]
+    FlatpakUpdate { tag: Option<String> },
 }
 
 /// OpenVINO's compiled-model cache.
@@ -307,7 +311,8 @@ fn loads_model(command: &Command) -> bool {
         | Command::Integrate { .. }
         | Command::Menu { .. }
         | Command::Extract { .. }
-        | Command::FlatpakExports { .. } => false,
+        | Command::FlatpakExports { .. }
+        | Command::FlatpakUpdate { .. } => false,
     }
 }
 
@@ -436,6 +441,10 @@ fn run(cli: Cli) -> Result<bool> {
     if let Command::FlatpakExports { share, app_id } = &cli.command {
         service::flatpak::export(share, app_id)?;
         return Ok(true);
+    }
+    // Nor an update: it is how a broken release gets fixed.
+    if let Command::FlatpakUpdate { tag } = &cli.command {
+        return service::flatpak_update::run(tag.clone());
     }
     let s = settings(&cli)?;
     match cli.command {
@@ -852,7 +861,9 @@ fn run(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Command::Extract { .. } | Command::FlatpakExports { .. } => {
+        Command::Extract { .. }
+        | Command::FlatpakExports { .. }
+        | Command::FlatpakUpdate { .. } => {
             unreachable!("handled before the settings")
         }
     }

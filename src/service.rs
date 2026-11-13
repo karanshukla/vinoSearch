@@ -2,6 +2,7 @@
 //! the model and the index, the file watcher, and when indexing may run.
 
 pub mod flatpak;
+pub mod flatpak_update;
 pub mod krunner;
 pub mod power;
 pub mod sched;

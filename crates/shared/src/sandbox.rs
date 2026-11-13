@@ -25,16 +25,36 @@ fn read_id(info: &Path, env: Option<String>) -> Option<String> {
     if let Some(id) = env.filter(|id| !id.is_empty()) {
         return Some(id);
     }
-    let mut in_app = false;
+    ini_value(&text, "Application", "name")
+}
+
+/// `key` of `[section]` in `/.flatpak-info`; None natively.
+pub fn info_value(section: &str, key: &str) -> Option<String> {
+    ini_value(
+        &std::fs::read_to_string("/.flatpak-info").ok()?,
+        section,
+        key,
+    )
+}
+
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_app = line == "[Application]";
-        } else if in_app && let Some(name) = line.strip_prefix("name=") {
-            return Some(name.trim().to_owned()).filter(|n| !n.is_empty());
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name == section;
+        } else if inside
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            return Some(v.trim().to_owned()).filter(|v| !v.is_empty());
         }
     }
     None
 }
+
+/// The branch of a release bundle. A build from a checkout is `master`, and
+/// only a release updates itself from the next release's bundle.
+pub const RELEASE_BRANCH: &str = "stable";
 
 /// The real home's `.config`: the sandbox's XDG_CONFIG_HOME is the app's
 /// own, under ~/.var/app, but the Background portal writes the autostart
@@ -171,5 +191,20 @@ mod tests {
             Some("dev.example.Env")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn info_values_come_from_their_own_section() {
+        let info = "[Application]\nname=a.b\n\n[Instance]\nbranch=stable\napp-path=/x/app/a.b/files\nname=\n";
+        assert_eq!(
+            ini_value(info, "Instance", "branch").as_deref(),
+            Some("stable")
+        );
+        assert_eq!(ini_value(info, "Application", "branch"), None);
+        assert_eq!(ini_value(info, "Instance", "name"), None);
+        assert_eq!(
+            ini_value(info, "Instance", "app-path").as_deref(),
+            Some("/x/app/a.b/files")
+        );
     }
 }
