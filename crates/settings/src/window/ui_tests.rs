@@ -739,10 +739,14 @@ fn the_index_page_lists_documents_indexed_in_part() {
     }
     let h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Indexing the rest of long documents");
-    h.get_by_label("book0.pdf, 120 of 1,640 pages");
-    h.get_by_label("book1.pdf, 30 of 41 chapters");
+    // The name and how far it got are two labels, so a long name can be cut
+    // short without losing the count.
+    h.get_by_label("book0.pdf");
+    h.get_by_label("book1.pdf");
+    h.get_by_label(", 30 of 41 chapters");
+    assert_eq!(h.query_all_by_label(", 120 of 1,640 pages").count(), 2);
     h.get_by_label("and 2 more");
-    assert!(h.query_by_label("book3.pdf, 120 of 1,640 pages").is_none());
+    assert!(h.query_by_label("book3.pdf").is_none());
 }
 
 #[test]

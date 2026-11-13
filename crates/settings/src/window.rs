@@ -557,8 +557,28 @@ impl SettingsWindow {
                     .show(ui, |ui, _| {
                         ui.with_layout(Layout::top_down(Align::Max), |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
+                            // Part of the row only: a long file name is cut
+                            // short (whole on hover), not laid over the label.
+                            let width = (ui.available_width() * 0.6).max(160.0);
                             for d in s.partial.iter().take(PARTIAL_SHOWN) {
-                                ui.label(RichText::new(partial_line(d)).size(12.5));
+                                let (name, progress) = partial_line(d);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(width, 18.0),
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.label(RichText::new(format!(", {progress}")).size(12.5));
+                                        // About 7 px a letter at this size.
+                                        let room = (ui.available_width() / 7.0) as usize;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(middle_cut(&name, room)).size(12.5),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&name);
+                                    },
+                                );
                             }
                             let more = s.partial.len().saturating_sub(PARTIAL_SHOWN);
                             if more > 0 {
@@ -1840,8 +1860,26 @@ fn count(n: i64) -> String {
 /// Documents indexed in part listed by name on the Index page; the rest are counted.
 const PARTIAL_SHOWN: usize = 3;
 
-/// "book.pdf, 120 of 640 pages".
-fn partial_line(d: &Partial) -> String {
+/// `name` in about `room` letters: the middle cut out, as the end of a file
+/// name (the track, the chapter, the extension) is what tells it from the
+/// next one.
+fn middle_cut(name: &str, room: usize) -> String {
+    let letters: Vec<char> = name.chars().collect();
+    let room = room.max(12);
+    if letters.len() <= room {
+        return name.to_owned();
+    }
+    let tail = (room - 1) * 3 / 5;
+    let head = room - 1 - tail;
+    let mut cut: String = letters[..head].iter().collect();
+    cut.push('…');
+    cut.extend(&letters[letters.len() - tail..]);
+    cut
+}
+
+/// A document indexed in part: its file name and how far it has got,
+/// "book.pdf" and "120 of 640 pages".
+fn partial_line(d: &Partial) -> (String, String) {
     let name = Path::new(&d.path)
         .file_name()
         .map_or_else(|| d.path.clone(), |n| n.to_string_lossy().into_owned());
@@ -1850,11 +1888,12 @@ fn partial_line(d: &Partial) -> String {
     } else {
         format!("{}s", d.unit)
     };
-    format!(
-        "{name}, {} of {} {unit}",
+    let progress = format!(
+        "{} of {} {unit}",
         count(d.done as i64),
         count(d.total as i64)
-    )
+    );
+    (name, progress)
 }
 
 /// How far a model download has got: wherever a Download button was
@@ -2233,6 +2272,25 @@ mod ui_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_name_keeps_both_ends() {
+        assert_eq!(middle_cut("notes.md", 20), "notes.md");
+        let cut = middle_cut(
+            "Windwaker - HYPERVIOLENCE - 06 Fractured State of Mind.mp3",
+            30,
+        );
+        assert_eq!(cut.chars().count(), 30);
+        assert!(
+            cut.starts_with("Windwaker - ") && cut.ends_with("e of Mind.mp3"),
+            "{cut}"
+        );
+        // Never so little room that nothing of either end is left.
+        assert_eq!(
+            middle_cut("a-very-long-file-name.txt", 0).chars().count(),
+            12
+        );
+    }
 
     #[test]
     fn counts_get_thousands_separators() {
