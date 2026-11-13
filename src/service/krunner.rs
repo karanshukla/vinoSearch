@@ -641,24 +641,81 @@ struct Control {
     config: PathBuf,
     /// Taken by Quit, which `serve` waits on beside the worker.
     quit: Mutex<Option<oneshot::Sender<()>>>,
+    /// What Status last counted from the index, and the index files' stamp
+    /// it was counted at.
+    counted: Mutex<Option<(Stamp, Counted)>>,
+}
+
+/// What Status counts from the index. Each is a scan of it, and with an
+/// encrypted index that is all of it read and decrypted: 53 MB and a
+/// quarter of a second for 11,600 chunks, once a second while the settings
+/// window is open, on the thread that answers searches.
+#[derive(Clone, Default)]
+struct Counted {
+    files: i64,
+    chunks: i64,
+    by_kind: [(i64, i64); 6],
+    unread_sessions: i64,
+    undecodable: i64,
+    roots: Vec<PathBuf>,
+    partial: Vec<(String, i64, i64)>,
+}
+
+/// Length and modification time of the index and its write-ahead log: any
+/// commit, by this process or `vinosearch index`, changes one of them.
+type Stamp = [Option<(u64, std::time::SystemTime)>; 2];
+
+fn stamp(db: &Path) -> Stamp {
+    ["", "-wal"].map(|ext| {
+        let meta = fs::metadata(format!("{}{ext}", db.display())).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    })
+}
+
+impl Counted {
+    fn of(conn: &rusqlite::Connection) -> anyhow::Result<Self> {
+        let (files, chunks) = index::counts(conn)?;
+        Ok(Counted {
+            files,
+            chunks,
+            by_kind: index::counts_by_kind(conn)?,
+            unread_sessions: index::unread_sessions(conn)?,
+            // Counted from the index: with a decoder installed, they are
+            // retried at the next start and the count would mislead until
+            // then.
+            undecodable: match crate::ml::vision::heif_convert() {
+                None => index::undecodable(conn)?,
+                Some(_) => 0,
+            },
+            roots: index::roots(conn)?,
+            partial: index::partial(conn, key::PARTIAL_MAX)?,
+        })
+    }
 }
 
 fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(e.to_string())
 }
 
-/// `f` of the index, or nothing while its key can't be had (`db` None).
-fn or_waiting<T: Default>(
-    db: Option<&rusqlite::Connection>,
-    f: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
-) -> zbus::fdo::Result<T> {
-    db.map(f)
-        .transpose()
-        .map_err(failed)
-        .map(Option::unwrap_or_default)
-}
-
 impl Control {
+    /// The index's counts: counted again only when the index has changed
+    /// since the last time. Nothing while its key can't be had (`db` None).
+    fn counted(&self, db: Option<&rusqlite::Connection>) -> zbus::fdo::Result<Counted> {
+        let Some(conn) = db else {
+            return Ok(Counted::default());
+        };
+        let now = stamp(&index::default_db().map_err(failed)?);
+        let mut kept = self.counted.lock().unwrap();
+        match &*kept {
+            Some((at, counted)) if *at == now => Ok(counted.clone()),
+            _ => {
+                let counted = Counted::of(conn).map_err(failed)?;
+                *kept = Some((now, counted.clone()));
+                Ok(counted)
+            }
+        }
+    }
+
     /// What the formats on in the config file as it is now need; nothing
     /// extra if it doesn't parse.
     fn model_wants(&self) -> model::Wants {
@@ -718,9 +775,11 @@ impl Control {
             Err(e) => return Err(failed(e)),
         };
         let db = db.as_deref();
-        let (files, chunks) = or_waiting(db, index::counts)?;
-        let roots: Vec<String> = or_waiting(db, index::roots)?
-            .into_iter()
+        let counted = self.counted(db)?;
+        let (files, chunks) = (counted.files, counted.chunks);
+        let roots: Vec<String> = counted
+            .roots
+            .iter()
             .map(|r| r.display().to_string())
             .collect();
         let mut out = HashMap::new();
@@ -751,8 +810,7 @@ impl Control {
         );
         out.insert(key::FILES.into(), owned(Variant::from(files)));
         out.insert(key::CHUNKS.into(), owned(Variant::from(chunks)));
-        let [text, documents, images, code, sessions, media] =
-            or_waiting(db, index::counts_by_kind)?;
+        let [text, documents, images, code, sessions, media] = counted.by_kind;
         for (k, n) in [
             (key::TEXT_FILES, text.0),
             (key::TEXT_CHUNKS, text.1),
@@ -765,10 +823,7 @@ impl Control {
             (key::SESSION_CHUNKS, sessions.1),
             (key::MEDIA_FILES, media.0),
             (key::MEDIA_CHUNKS, media.1),
-            (
-                key::SESSIONS_UNREAD,
-                or_waiting(db, index::unread_sessions)?,
-            ),
+            (key::SESSIONS_UNREAD, counted.unread_sessions),
         ] {
             out.insert(k.into(), owned(Variant::from(n)));
         }
@@ -837,25 +892,20 @@ impl Control {
             key::INDEXING_REST.into(),
             owned(Variant::from(st.indexing_rest.load(Ordering::Relaxed))),
         );
-        let partial: Vec<(String, String, u64, u64)> =
-            or_waiting(db, |c| index::partial(c, key::PARTIAL_MAX))?
-                .into_iter()
-                .map(|(path, done, total)| {
-                    let unit = crate::extract::part_unit(Path::new(&path)).to_owned();
-                    (path, unit, done as u64, total as u64)
-                })
-                .collect();
+        let partial: Vec<(String, String, u64, u64)> = counted
+            .partial
+            .into_iter()
+            .map(|(path, done, total)| {
+                let unit = crate::extract::part_unit(Path::new(&path)).to_owned();
+                (path, unit, done as u64, total as u64)
+            })
+            .collect();
         out.insert(key::PARTIAL.into(), owned(Variant::from(partial)));
         out.insert(
             key::MODEL_CHANGED.into(),
             owned(Variant::from(st.model_changed.lock().unwrap().clone())),
         );
-        // Counted from the index: with a decoder installed, they are retried
-        // at the next start and the count would mislead until then.
-        let no_decoder = match crate::ml::vision::heif_convert() {
-            None => or_waiting(db, index::undecodable)?,
-            Some(_) => 0,
-        };
+        let no_decoder = counted.undecodable;
         out.insert(key::NO_DECODER.into(), owned(Variant::from(no_decoder)));
         let cache = crate::cache_dir().map_err(failed)?;
         out.insert(
@@ -1206,6 +1256,7 @@ pub fn serve(opts: Options) -> Result<()> {
         db: db.clone(),
         config: opts.config.clone(),
         quit: Mutex::new(Some(quit)),
+        counted: Mutex::new(None),
     };
     let config = opts.config.clone();
     // The connection is driven by the thread that blocks on it, so that is
