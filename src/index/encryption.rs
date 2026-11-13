@@ -1,12 +1,16 @@
 //! The index encrypted at rest (#4): SQLCipher over the whole database, so
 //! chunk text, vectors, file names and the word index's shadow tables (#104)
-//! are all covered, with a random key sealed by `systemd-creds` (seal.rs)
-//! in `index.key` beside it.
+//! are all covered, with a random key sealed by `systemd-creds`, or kept in
+//! the desktop keyring where that can't be used (seal.rs), named by
+//! `index.key` beside it.
 //!
 //! The key file is what says the index is encrypted. Every open unseals it
 //! (once per process, then held), and a key that won't unseal or doesn't open
 //! the index is never answered with a plaintext index: `apply`, run at start
 //! and when the setting changes, rebuilds the index from the files instead.
+//! A key that can't be had yet (a locked keyring) is waited for: every open
+//! fails at once meanwhile, without asking the keyring again, until `apply`
+//! does.
 //! The folder list survives that in `index.roots`, beside the key, in
 //! plaintext: folder paths, as `exclude` in config.toml already holds.
 //!
@@ -73,6 +77,8 @@ enum Held {
     },
     /// Nothing could seal it: lost when the process ends.
     Memory(Arc<Key>),
+    /// `credential`'s key couldn't be had, for now (`seal::Unavailable`).
+    Waiting { credential: Vec<u8>, why: String },
 }
 
 static HELD: Mutex<Vec<(PathBuf, Held)>> = Mutex::new(Vec::new());
@@ -96,9 +102,11 @@ pub fn hold_in_memory(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The key `db` opens with; None while it is plaintext.
+/// The key `db` opens with; None while it is plaintext. Never prompts to
+/// unlock the keyring: that is `apply`'s, so no open (a query's) waits on
+/// the user.
 pub fn key_for(db: &Path) -> Result<Option<Arc<Key>>> {
-    key_with(db, &Sealer::default())
+    key_with(db, &Sealer::default().quiet())
 }
 
 fn key_with(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
@@ -112,19 +120,34 @@ fn key_with(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
         }
         Err(e) => return Err(e).context(key_file(db).display().to_string()),
     };
-    if let Some(k) = held().iter().find_map(|(p, h)| match h {
+    match held().iter().find_map(|(p, h)| match h {
         Held::Sealed {
             credential: c, key, ..
-        } if p == db && *c == credential => Some(key.clone()),
+        } if p == db && *c == credential => Some(Ok(key.clone())),
+        Held::Waiting { credential: c, why } if p == db && *c == credential => {
+            Some(Err(why.clone()))
+        }
         _ => None,
     }) {
-        return Ok(Some(k));
+        Some(Ok(k)) => return Ok(Some(k)),
+        Some(Err(why)) => return Err(waiting(why)),
+        None => {}
     }
-    let key = Arc::new(
-        sealer
-            .unseal(&credential)
-            .map_err(|e| Unusable(format!("{e:#}")))?,
-    );
+    let key = match sealer.unseal(&credential) {
+        Ok(k) => Arc::new(k),
+        Err(e) if seal::is_unavailable(&e) => {
+            let why = format!("{e:#}");
+            hold(
+                db,
+                Some(Held::Waiting {
+                    credential,
+                    why: why.clone(),
+                }),
+            );
+            return Err(waiting(why));
+        }
+        Err(e) => return Err(Unusable(format!("{e:#}")).into()),
+    };
     let seal = seal::sealed_with(&credential).unwrap_or(Seal::Tpm);
     hold(
         db,
@@ -135,6 +158,10 @@ fn key_with(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
         }),
     );
     Ok(Some(key))
+}
+
+fn waiting(why: String) -> anyhow::Error {
+    anyhow::Error::new(seal::Unavailable(why)).context("the index's key can't be had yet")
 }
 
 /// Key `conn` (None leaves it plaintext) and check it reads: a wrong key, or
@@ -202,13 +229,21 @@ pub struct State {
     pub error: String,
     /// Why the index was rebuilt from the files.
     pub broken: String,
+    /// Why its key can't be had yet (a locked keyring): the index is kept,
+    /// and opens once it can.
+    pub waiting: String,
 }
 
 fn state_of(db: &Path) -> State {
+    let mut waiting = String::new();
     let seal = held().iter().find_map(|(p, h)| match h {
         _ if p != db => None,
         Held::Sealed { seal, .. } => Some(seal.name()),
         Held::Memory(_) => Some(seal_name::MEMORY),
+        Held::Waiting { credential, why } => {
+            waiting.clone_from(why);
+            seal::sealed_with(credential).map(Seal::name)
+        }
     });
     let seal = match seal {
         Some(s) if key_file(db).exists() || s == seal_name::MEMORY => s,
@@ -217,6 +252,7 @@ fn state_of(db: &Path) -> State {
     State {
         encrypted: !seal.is_empty(),
         seal,
+        waiting,
         ..State::default()
     }
 }
@@ -233,8 +269,12 @@ fn state_of(db: &Path) -> State {
 /// runner) holds it shared, and the change is refused until it is done.
 pub fn apply(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> State {
     let mut broken = String::new();
+    // A key that couldn't be had is asked for again here, and only here.
+    held().retain(|(p, h)| p != db || !matches!(h, Held::Waiting { .. }));
     let mut st = match apply_inner(db, want, rekey, sealer, &mut broken) {
         Ok(()) => state_of(db),
+        // `waiting` says why.
+        Err(e) if seal::is_unavailable(&e) && !state_of(db).waiting.is_empty() => state_of(db),
         Err(e) => State {
             error: format!("{e:#}"),
             ..state_of(db)
@@ -269,11 +309,18 @@ fn apply_inner(
         }
         Ok(k)
     });
+    // Encryption turned off while the key can't be had, even after asking
+    // with a prompt: the way to start over, and the user's choice, so the
+    // index is rebuilt as a lost key's would be. Never at a quiet try (the
+    // start), which a locked keyring alone mustn't cost the index.
+    let start_over = |e: &anyhow::Error| !want.on && sealer.prompts() && seal::is_unavailable(e);
     let current = match current {
         Ok(k) => k,
-        Err(e) if is_unusable(&e) => {
+        Err(e) if is_unusable(&e) || start_over(&e) => {
             let roots = read_roots(db);
+            let old = fs::read(key_file(db)).unwrap_or_default();
             wipe(db)?;
+            sealer.forget(&old);
             hold(db, None);
             *broken = format!("{e:#}");
             eprintln!("{e:#}: the index is rebuilt from the files");
@@ -319,7 +366,12 @@ fn apply_inner(
             return Ok(());
         }
         let (key, credential, seal) = new_key(want, sealer).expect("wanted on")?;
-        convert(db, current.as_deref(), Some((&key, &credential)))?;
+        let old = fs::read(key_file(db)).unwrap_or_default();
+        if let Err(e) = convert(db, current.as_deref(), Some((&key, &credential))) {
+            sealer.forget(&credential);
+            return Err(e);
+        }
+        sealer.forget(&old);
         hold(
             db,
             Some(Held::Sealed {
@@ -331,7 +383,9 @@ fn apply_inner(
         save_roots(db, &index::open(db)?)?;
         eprintln!("index encrypted, its key sealed with {}", seal.name());
     } else if current.is_some() {
+        let old = fs::read(key_file(db)).unwrap_or_default();
         convert(db, current.as_deref(), None)?;
+        sealer.forget(&old);
         hold(db, None);
         remove(&roots_file(db))?;
         eprintln!("index decrypted");
@@ -612,10 +666,16 @@ impl Deref for LiveGuard<'_> {
 }
 
 impl Live {
+    /// Opened now, or at its first use if its key can't be had yet.
     pub fn open(path: &Path) -> Result<Arc<Live>> {
+        let conn = match index::open(path) {
+            Ok(c) => Some(c),
+            Err(e) if seal::is_unavailable(&e) => None,
+            Err(e) => return Err(e),
+        };
         let live = Arc::new(Live {
             path: path.to_owned(),
-            conn: Mutex::new(Some(index::open(path)?)),
+            conn: Mutex::new(conn),
         });
         let mut all = LIVE.lock().unwrap_or_else(|e| e.into_inner());
         all.retain(|w| w.strong_count() > 0);

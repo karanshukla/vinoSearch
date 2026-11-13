@@ -4,9 +4,11 @@
 
 use super::*;
 use crate::config::{Excludes, Formats};
+use crate::index::seal::keyring::mock::{Answer, Mock};
 use crate::index::seal::tests::{Fake, HOST_HEAD, TPM_HEAD, creds_body, retry};
 use crate::index::{FileTypes, Kind, Vectors, Words};
 use crate::ml::embed::FakeEmbed;
+use std::time::Duration;
 
 const SECRET: &str = "the ledger code is QUOKKA-7731 for the harbour invoice";
 
@@ -30,6 +32,13 @@ impl Setup {
         let fake = Fake::new(name);
         let sealer = Sealer::at(&fake.tool(&creds_body(head)));
         Setup { dir, fake, sealer }
+    }
+
+    /// The same, with no `systemd-creds`: the key in `mock`'s keyring.
+    fn keyring(name: &str, mock: &Mock) -> Self {
+        let mut s = Setup::new(name, TPM_HEAD);
+        s.sealer = Sealer::keyring_only(mock.keyring(Some(Duration::from_secs(5))));
+        s
     }
 
     fn db(&self) -> PathBuf {
@@ -304,4 +313,140 @@ fn a_memory_key_opens_a_throwaway_index() {
     assert!(!s.plain_sqlite_reads());
     assert!(s.finds_the_note());
     assert!(!key_file(&s.db()).exists());
+}
+
+#[test]
+fn without_systemd_creds_the_key_is_in_the_keyring() {
+    let Some(mock) = Mock::start("enc-keyring") else {
+        eprintln!("no dbus-daemon: skipped");
+        return;
+    };
+    let s = Setup::keyring("keyring", &mock);
+    s.index();
+    let st = s.apply(true, false, false);
+    assert_eq!(st.error, "");
+    assert_eq!(st.seal, "keyring");
+    // The key file names the item; the key is in the keyring alone.
+    let file = fs::read(key_file(&s.db())).unwrap();
+    assert!(file.starts_with(b"secret-service 1 "));
+    assert_eq!(mock.state().items.len(), 1);
+    assert!(!s.plain_sqlite_reads());
+    assert!(s.finds_the_note());
+    // A new process unseals it the same way.
+    hold(&s.db(), None);
+    assert!(s.apply(true, false, false).encrypted);
+    assert!(s.finds_the_note());
+    // A new key replaces the item, and turning it off removes it.
+    let st = s.apply(true, false, true);
+    assert_eq!(st.error, "");
+    assert_ne!(fs::read(key_file(&s.db())).unwrap(), file);
+    assert_eq!(mock.state().items.len(), 1);
+    assert!(s.finds_the_note());
+    assert_eq!(s.apply(false, false, false), State::default());
+    assert!(mock.state().items.is_empty());
+    assert!(s.plain_sqlite_reads());
+}
+
+#[test]
+fn a_locked_keyring_is_waited_for_and_the_index_kept() {
+    let Some(mock) = Mock::start("enc-locked") else {
+        return;
+    };
+    let s = Setup::keyring("locked", &mock);
+    s.index();
+    s.apply(true, false, false);
+    let before = s.on_disk();
+    // The next start: locked, and no prompt allowed.
+    hold(&s.db(), None);
+    mock.state().locked = true;
+    let want = Want {
+        on: true,
+        allow_host: false,
+    };
+    let st = apply(&s.db(), want, false, &s.sealer.quiet());
+    assert!(st.waiting.contains("locked"), "{st:?}");
+    assert_eq!((st.error.as_str(), st.broken.as_str()), ("", ""));
+    assert!(st.encrypted);
+    assert_eq!(st.seal, "keyring");
+    // Nothing dropped, nothing plaintext, and every open fails at once
+    // without asking the keyring again.
+    assert_eq!(s.on_disk(), before);
+    let e = index::open(&s.db()).unwrap_err();
+    assert!(seal::is_unavailable(&e) && !is_unusable(&e), "{e:#}");
+    assert_eq!(mock.state().prompts, 0);
+    // Dismissed at the prompt: still waiting.
+    mock.state().answer = Answer::Dismiss;
+    let st = s.apply(true, false, false);
+    assert!(st.waiting.contains("dismissed"), "{st:?}");
+    // Unlocked: opens as it was.
+    mock.state().answer = Answer::Unlock;
+    let st = s.apply(true, false, false);
+    assert_eq!((st.waiting.as_str(), st.broken.as_str()), ("", ""));
+    assert!(s.finds_the_note());
+}
+
+#[test]
+fn a_keyring_item_gone_is_waited_for_until_encryption_starts_over() {
+    let Some(mock) = Mock::start("enc-gone") else {
+        return;
+    };
+    let s = Setup::keyring("gone", &mock);
+    s.index();
+    s.apply(true, false, false);
+    let before = s.on_disk();
+    // Another keyring serves the session now, or the item was deleted.
+    hold(&s.db(), None);
+    mock.state().items.clear();
+    let st = s.apply(true, false, false);
+    assert!(st.waiting.contains("no item"), "{st:?}");
+    assert!(st.waiting.contains("another keyring"), "{st:?}");
+    assert_eq!((st.broken.as_str(), st.seal), ("", "keyring"));
+    // Kept as it was, and no new key made behind the user's back.
+    assert_eq!(s.on_disk(), before);
+    assert!(mock.state().items.is_empty());
+    assert!(seal::is_unavailable(&index::open(&s.db()).unwrap_err()));
+    // Not at a quiet try either, with encryption off.
+    let off = Want {
+        on: false,
+        allow_host: false,
+    };
+    let st = apply(&s.db(), off, false, &s.sealer.quiet());
+    assert!(!st.waiting.is_empty() && st.broken.is_empty(), "{st:?}");
+    assert_eq!(s.on_disk(), before);
+    // Turned off (the Security page's switch): started over, plaintext,
+    // without the old key, the folders kept.
+    let st = s.apply(false, false, false);
+    assert!(st.broken.contains("no item"), "{st:?}");
+    assert_eq!((st.waiting.as_str(), st.encrypted), ("", false));
+    assert!(s.plain_sqlite_reads());
+    let conn = index::open(&s.db()).unwrap();
+    assert_eq!(index::counts(&conn).unwrap(), (0, 0));
+    assert_eq!(index::roots(&conn).unwrap(), [s.dir.join("root")]);
+    drop(conn);
+    // And on again: a new key in this keyring.
+    let st = s.apply(true, false, false);
+    assert_eq!((st.error.as_str(), st.seal), ("", "keyring"));
+    assert_eq!(mock.state().items.len(), 1);
+    s.index();
+    assert!(s.finds_the_note());
+}
+
+#[test]
+fn a_tpm_sealed_index_is_never_moved_to_the_keyring() {
+    let Some(mock) = Mock::start("enc-stay") else {
+        return;
+    };
+    let mut s = Setup::new("stay", TPM_HEAD);
+    s.index();
+    s.apply(true, false, false);
+    let file = fs::read(key_file(&s.db())).unwrap();
+    // systemd-creds gone (or not found): waited for, not dropped, and not
+    // sealed again in the keyring.
+    hold(&s.db(), None);
+    s.sealer = Sealer::keyring_only(mock.keyring(Some(Duration::from_secs(5))));
+    let st = s.apply(true, false, false);
+    assert!(st.waiting.contains("systemd-creds"), "{st:?}");
+    assert_eq!((st.broken.as_str(), st.seal), ("", "tpm"));
+    assert_eq!(fs::read(key_file(&s.db())).unwrap(), file);
+    assert!(mock.state().items.is_empty());
 }

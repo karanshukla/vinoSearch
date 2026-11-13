@@ -108,6 +108,15 @@ pub mod status {
     /// Why this start found the index's key unusable and rebuilt the index
     /// from the files; empty otherwise.
     pub const SEAL_BROKEN: &str = "seal_broken";
+    /// Why the index's key can't be had yet (the keyring is locked, its
+    /// unlock prompt was dismissed or went unanswered, no Secret Service);
+    /// empty otherwise. The index is kept, searches find nothing meanwhile,
+    /// and the runner looks again every 30 s, or with a prompt on
+    /// `ApplyEncryption`.
+    pub const SEAL_WAITING: &str = "seal_waiting";
+    /// What a new key is sealed with here, a `seal` value: `tpm` or `host`
+    /// while `systemd-creds` works, else `keyring`.
+    pub const NEW_SEAL: &str = "new_seal";
 }
 
 /// Values of `status::SEAL`.
@@ -116,6 +125,9 @@ pub mod seal {
     pub const TPM: &str = "tpm";
     /// systemd's host key alone (`/var/lib/systemd/credential.secret`).
     pub const HOST: &str = "host";
+    /// The desktop keyring (Secret Service), where `systemd-creds` can't be
+    /// used: unlocked at login, readable by the user's session, no TPM.
+    pub const KEYRING: &str = "keyring";
     /// Nothing could seal it: a key held in memory only, so the index is
     /// rebuilt at the next start.
     pub const MEMORY: &str = "memory";

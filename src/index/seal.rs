@@ -1,5 +1,7 @@
 //! The index key (#4), sealed with `systemd-creds`, so there is no TPM code of
-//! our own.
+//! our own; where that isn't usable (no systemd, or one older than 256), kept
+//! in the desktop keyring instead (keyring.rs). Which one sealed a key is in
+//! `index.key` itself, so it is always unsealed the same way.
 //!
 //! As a user, `systemd-creds --user` hands the work to systemd's
 //! `io.systemd.Credentials` service, which seals a credential scoped to the
@@ -17,6 +19,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, Zeroizing};
+
+pub(crate) mod keyring;
+pub use keyring::Keyring;
+
+/// How long a keyring unlock prompt waits for the user before it is
+/// dismissed.
+pub const PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Root-owned places systemd's tools live, so PATH never picks the binary:
 /// merged /usr, split /usr, NixOS.
@@ -40,21 +49,7 @@ pub struct Key(Zeroizing<[u8; KEY_BYTES]>);
 impl Key {
     pub fn random() -> Result<Key> {
         let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
-        let mut filled = 0;
-        while filled < KEY_BYTES {
-            // SAFETY: writes at most the rest of `bytes`.
-            let n = unsafe {
-                libc::getrandom(bytes[filled..].as_mut_ptr().cast(), KEY_BYTES - filled, 0)
-            };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e).context("getrandom");
-            }
-            filled += n as usize;
-        }
+        random(&mut bytes[..])?;
         Ok(Key(bytes))
     }
 
@@ -80,6 +75,43 @@ impl Key {
     }
 }
 
+/// Fill `buf` from the kernel's CSPRNG.
+fn random(buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        // SAFETY: writes at most the rest of `buf`.
+        let n =
+            unsafe { libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("getrandom");
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
+/// The key can't be had right now (the keyring is locked, its prompt was
+/// dismissed or not answered, there is no Secret Service): wait and try
+/// again, never take it for a lost key.
+#[derive(Debug)]
+pub struct Unavailable(pub String);
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+pub fn is_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<Unavailable>().is_some())
+}
+
 /// Never the bytes.
 impl std::fmt::Debug for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -95,6 +127,9 @@ pub enum Seal {
     /// systemd's host key alone, `/var/lib/systemd/credential.secret`,
     /// readable by root.
     Host,
+    /// The desktop keyring, unlocked at login and readable by this user's
+    /// session; no TPM.
+    Keyring,
 }
 
 impl Seal {
@@ -103,6 +138,7 @@ impl Seal {
         match self {
             Seal::Tpm => vinosearch_shared::dbus::seal::TPM,
             Seal::Host => vinosearch_shared::dbus::seal::HOST,
+            Seal::Keyring => vinosearch_shared::dbus::seal::KEYRING,
         }
     }
 }
@@ -135,9 +171,13 @@ const fn nibble(c: u8) -> u8 {
     }
 }
 
-/// What a credential from `systemd-creds encrypt` (base64, as it writes
-/// them) is sealed with; None for anything but a user-scoped one.
+/// What an `index.key` is sealed with: the keyring's item reference, or a
+/// credential from `systemd-creds encrypt` (base64, as it writes them); None
+/// for anything else, a system-scoped credential included.
 pub fn sealed_with(credential: &[u8]) -> Option<Seal> {
+    if credential.starts_with(keyring::HEAD.as_bytes()) {
+        return keyring::id_of(credential).map(|_| Seal::Keyring);
+    }
     let head = base64_prefix(credential, 16)?;
     match <[u8; 16]>::try_from(&head[..16]).ok()? {
         BY_HOST_AND_TPM2_SCOPED
@@ -193,33 +233,140 @@ pub fn tpm_available() -> bool {
 pub const NO_TPM: &str = "This machine has no TPM that systemd can use, so the index key can't be \
      sealed to it. Allow the host key (weaker) or leave encryption off.";
 
-/// `systemd-creds`, or a stand-in for tests.
+/// `systemd-creds` (or a stand-in for tests), and the keyring for where it
+/// can't be used.
 #[derive(Clone)]
 pub struct Sealer {
-    program: PathBuf,
+    /// None for none at all.
+    creds: Option<Creds>,
+    keyring: Keyring,
+}
+
+#[derive(Clone)]
+enum Creds {
+    /// The system's, where it can be used.
+    System,
+    #[cfg(test)]
+    At(PathBuf),
 }
 
 impl Default for Sealer {
     fn default() -> Self {
         Sealer {
-            program: system_tool("systemd-creds"),
+            creds: Some(Creds::System),
+            keyring: Keyring {
+                address: None,
+                prompt: Some(PROMPT_WAIT),
+            },
         }
     }
+}
+
+/// systemd runs this machine and is new enough for `systemd-creds --user`
+/// (256): not so on a distribution without systemd, or in a container.
+fn creds_usable(program: &Path) -> bool {
+    if !program.is_file() || !Path::new("/run/systemd/system").is_dir() {
+        return false;
+    }
+    let Ok(out) = Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    // "systemd 259 (259.1-1.fc45)"
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|v| v >= 256)
 }
 
 impl Sealer {
     #[cfg(test)]
     pub fn at(program: &Path) -> Self {
         Sealer {
-            program: program.to_owned(),
+            creds: Some(Creds::At(program.to_owned())),
+            keyring: Keyring::default(),
         }
     }
 
-    /// Seal `key` for this user. A key sealed with the host key alone is
-    /// refused unless `allow_host` says otherwise: never weaker than asked.
+    /// No `systemd-creds`: the Secret Service `keyring` points at.
+    #[cfg(test)]
+    pub fn keyring_only(keyring: Keyring) -> Self {
+        Sealer {
+            creds: None,
+            keyring,
+        }
+    }
+
+    /// `systemd-creds`, if it can seal a new key here. Looked at once per
+    /// process, and only for a new key: not on the way to unsealing one.
+    fn sealing(&self) -> Option<PathBuf> {
+        static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        match self.creds.as_ref()? {
+            Creds::System => {
+                let program = system_tool("systemd-creds");
+                (*USABLE.get_or_init(|| creds_usable(&program))).then_some(program)
+            }
+            #[cfg(test)]
+            Creds::At(p) => Some(p.clone()),
+        }
+    }
+
+    /// `systemd-creds`, to unseal what it sealed.
+    fn unsealing(&self) -> Option<PathBuf> {
+        match self.creds.as_ref()? {
+            Creds::System => Some(system_tool("systemd-creds")).filter(|p| p.is_file()),
+            #[cfg(test)]
+            Creds::At(p) => Some(p.clone()),
+        }
+    }
+
+    /// Whether a locked keyring gets its unlock prompt.
+    pub fn prompts(&self) -> bool {
+        self.keyring.prompt.is_some()
+    }
+
+    /// The same, but a locked keyring is `Unavailable` at once rather than
+    /// prompting: for tries nobody asked for.
+    pub fn quiet(&self) -> Self {
+        Sealer {
+            keyring: Keyring {
+                prompt: None,
+                ..self.keyring.clone()
+            },
+            ..self.clone()
+        }
+    }
+
+    /// What a new key is sealed with here: the TPM or the host key (`tpm`
+    /// says which) while `systemd-creds` works, else the keyring.
+    pub fn new_seal(&self, tpm: bool) -> Seal {
+        match (self.sealing(), tpm) {
+            (None, _) => Seal::Keyring,
+            (Some(_), true) => Seal::Tpm,
+            (Some(_), false) => Seal::Host,
+        }
+    }
+
+    /// Seal `key` for this user, with `systemd-creds` wherever it works: a
+    /// key sealed with the host key alone is refused unless `allow_host` says
+    /// otherwise, never weaker than asked, and never put in the keyring
+    /// instead. Only where `systemd-creds` can't be used at all, the keyring.
     pub fn seal(&self, key: &Key, allow_host: bool) -> Result<(Vec<u8>, Seal)> {
+        let Some(program) = self.sealing() else {
+            let blob = self
+                .keyring
+                .store(&key.0[..])
+                .context("storing the key in the keyring")?;
+            return Ok((blob, Seal::Keyring));
+        };
         let out = run(
-            &self.program,
+            &program,
             &["--user", &format!("--name={NAME}"), "encrypt", "-", "-"],
             &key.0[..],
         )
@@ -228,7 +375,7 @@ impl Sealer {
             Some(Seal::Tpm) => Ok((out, Seal::Tpm)),
             Some(Seal::Host) if allow_host => Ok((out, Seal::Host)),
             Some(Seal::Host) => bail!("{NO_TPM}"),
-            None => bail!(
+            _ => bail!(
                 "systemd-creds wrote a credential of a kind vinoSearch doesn't know ({})",
                 base64_prefix(&out, 16)
                     .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
@@ -237,18 +384,41 @@ impl Sealer {
         }
     }
 
-    /// The key in `credential`. Any failure is an error and nothing else:
-    /// the caller must not fall back to anything.
+    /// The key in `credential`, from whatever sealed it. Any failure is an
+    /// error and nothing else: the caller must not fall back to anything.
+    /// An `Unavailable` one is to be waited out.
     pub fn unseal(&self, credential: &[u8]) -> Result<Key> {
+        if sealed_with(credential) == Some(Seal::Keyring) {
+            let out = self
+                .keyring
+                .fetch(credential)
+                .context("reading the key from the keyring")?;
+            return Key::from_slice(&out);
+        }
+        // Not the key's fault: waited for, never taken for a lost key.
+        let program = self.unsealing().ok_or_else(|| {
+            Unavailable("systemd-creds sealed this key, and it isn't here".into())
+        })?;
         let out = Zeroizing::new(
             run(
-                &self.program,
+                &program,
                 &["--user", &format!("--name={NAME}"), "decrypt", "-", "-"],
                 credential,
             )
             .context("systemd-creds decrypt")?,
         );
         Key::from_slice(&out)
+    }
+
+    /// Once `credential` is replaced, drop what it keeps outside its file:
+    /// the keyring's item. Nothing for `systemd-creds`, whose credential is
+    /// the file.
+    pub fn forget(&self, credential: &[u8]) {
+        if sealed_with(credential) == Some(Seal::Keyring)
+            && let Err(e) = self.keyring.delete(credential)
+        {
+            eprintln!("removing the old key from the keyring: {e:#}");
+        }
     }
 }
 
