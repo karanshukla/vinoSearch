@@ -1460,12 +1460,20 @@ impl SettingsWindow {
             );
             return;
         }
-        let no_tpm = s.is_some_and(|s| !s.tpm);
+        // Without systemd-creds the keyring is all there is: no TPM to ask about.
+        let keyring = s.is_some_and(|s| s.new_seal == seal::KEYRING);
+        let no_tpm = s.is_some_and(|s| !s.tpm) && !keyring;
         let mut changed = false;
         let rekeying = self.confirm == Some(Confirm::Rekey);
         widgets::group(ui, |ui| {
             Row::new("Encrypt the index")
-                .help("Key sealed to the TPM. Nothing is re-indexed.")
+                .help(if keyring {
+                    "Key kept in your desktop keyring, which your session can read once you \
+                     log in; this system has no systemd-creds to seal it to a TPM. Nothing is \
+                     re-indexed."
+                } else {
+                    "Key sealed to the TPM. Nothing is re-indexed."
+                })
                 .show(ui, |ui, _| {
                     let mut on = self.config.encryption.on();
                     if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
@@ -1508,6 +1516,9 @@ impl SettingsWindow {
                 .tone(Tone::Error)
                 .show(ui, |ui, _| {
                     let (kind, text) = match (s.encrypted, s.seal.as_str()) {
+                        (true, _) if !s.seal_waiting.is_empty() => {
+                            (ChipKind::Warn, "Encrypted, waiting for its key")
+                        }
                         (true, seal::TPM) => (
                             ChipKind::Ok,
                             "Encrypted, the key sealed to this machine's TPM",
@@ -1516,6 +1527,9 @@ impl SettingsWindow {
                             ChipKind::Ok,
                             "Encrypted, the key sealed with systemd's host key",
                         ),
+                        (true, seal::KEYRING) => {
+                            (ChipKind::Ok, "Encrypted, the key in your desktop keyring")
+                        }
                         (true, _) => (
                             ChipKind::Warn,
                             "Encrypted with a key held in memory only: nothing could seal it, so \
@@ -1530,6 +1544,27 @@ impl SettingsWindow {
                     };
                     a11y::live(&widgets::chip(ui, kind, text));
                 });
+            if !s.seal_waiting.is_empty() {
+                Row::new("Waiting")
+                    .help(&format!(
+                        "The index's key can't be read yet ({}). Until then searches find \
+                         nothing, and the index is kept as it is. To start over instead, turn \
+                         encryption off: the index is rebuilt from your files.",
+                        s.seal_waiting
+                    ))
+                    .tone(Tone::Warn)
+                    .show(ui, |ui, _| {
+                        // Asks the keyring again, with its unlock prompt.
+                        let label = if s.seal == seal::KEYRING {
+                            "Unlock…"
+                        } else {
+                            "Try again"
+                        };
+                        if ui.add(Button::secondary(label).small()).clicked() {
+                            self.link.send(Request::ApplyEncryption);
+                        }
+                    });
+            }
             if !s.seal_broken.is_empty() {
                 Row::new("Rebuilt")
                     .help(&format!(

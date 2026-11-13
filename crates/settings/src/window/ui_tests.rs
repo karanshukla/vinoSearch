@@ -891,6 +891,44 @@ fn without_a_tpm_turning_it_on_is_refused_until_the_host_key_is_allowed() {
 }
 
 #[test]
+fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
+    let (w, requests) = security("keyring", |s| s.new_seal = "keyring".into());
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label_contains("desktop keyring, which your session can read");
+    // No TPM, but nothing to allow: the keyring is what there is.
+    assert!(
+        h.query_by_label("Use the host key instead (weaker)")
+            .is_none()
+    );
+    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
+        .click();
+    settle(&mut h);
+    assert!(h.state().config.encryption.on());
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::ApplyEncryption))
+    );
+
+    let (w, requests) = security("keyring-waiting", |s| {
+        s.new_seal = "keyring".into();
+        s.encrypted = true;
+        s.seal = "keyring".into();
+        s.seal_waiting = "the keyring is locked".into();
+    });
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Encrypted, waiting for its key");
+    h.get_by_label_contains("can't be read yet (the keyring is locked)");
+    h.get_by_role_and_label(Role::Button, "Unlock…").click();
+    settle(&mut h);
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::ApplyEncryption))
+    );
+}
+
+#[test]
 fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
     let (w, requests) = security("rekey", |s| {
         s.tpm = true;
