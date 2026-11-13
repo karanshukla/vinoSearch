@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -192,10 +193,14 @@ fn supervised(mut worker: Command) -> Result<ExitStatus> {
 }
 
 /// Send this process's stdout and stderr, which the runner inherits, to the
-/// end of `path`, moving it to `.old` first when it is over LOG_MAX.
+/// end of `path`, moving it to `.old` first when it is over LOG_MAX. The log
+/// names files being indexed, so it is the user's alone, as the journal was.
 fn log_to(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     if fs::metadata(path).is_ok_and(|m| m.len() > LOG_MAX) {
         fs::rename(path, path.with_extension("log.old"))?;
@@ -203,8 +208,11 @@ fn log_to(path: &Path) -> Result<()> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    // One made before this, or by hand, with the umask's mode.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         // SAFETY: dup2 onto the standard descriptors, from one this owns.
         if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
