@@ -184,8 +184,9 @@ pub struct FileTypes {
     documents: bool,
     code: bool,
     sessions: bool,
-    /// vinoWhisper's own folder of sessions, where nothing else is taken.
-    sessions_dir: Option<PathBuf>,
+    /// vinoWhisper's own folders of sessions, where nothing else is taken:
+    /// a native install's, and its Flatpak's.
+    sessions_dirs: Vec<PathBuf>,
     /// Audio and video, while on and ffmpeg is installed (#187).
     media: bool,
     /// The longest media file indexed, in seconds.
@@ -211,7 +212,7 @@ impl FileTypes {
             documents: formats.documents_enabled(),
             code: formats.code_enabled(),
             sessions: formats.sessions_enabled(),
-            sessions_dir: sessions_dir(),
+            sessions_dirs: sessions_dirs(),
             media: formats.media_enabled() && crate::extract::media::ffmpeg(),
             max_media_seconds: formats.media_max_seconds()?,
             ignores: SharedIgnores::default(),
@@ -228,15 +229,15 @@ impl FileTypes {
     #[cfg(test)]
     pub fn with_sessions(mut self, on: bool, dir: Option<PathBuf>) -> Self {
         self.sessions = on;
-        self.sessions_dir = dir;
+        self.sessions_dirs = dir.into_iter().collect();
         self
     }
 
-    /// vinoWhisper's folder of sessions, and whether sessions are on. While
-    /// they are it is a root of its own: the walk of a home folder skips
+    /// vinoWhisper's folders of sessions, and whether sessions are on. While
+    /// they are each is a root of its own: the walk of a home folder skips
     /// hidden directories.
-    pub fn sessions_dir(&self) -> Option<(&Path, bool)> {
-        Some((self.sessions_dir.as_deref()?, self.sessions))
+    pub fn sessions_dirs(&self) -> (&[PathBuf], bool) {
+        (&self.sessions_dirs, self.sessions)
     }
 
     /// The kind `path` is indexed as, by its name (and for code, the ignore
@@ -244,12 +245,7 @@ impl FileTypes {
     pub fn kind(&self, path: &Path) -> Option<Kind> {
         let session = crate::extract::is_session(path);
         // A live transcript or a half-written bundle there is not wanted.
-        if self
-            .sessions_dir
-            .as_ref()
-            .is_some_and(|d| path.starts_with(d))
-            && !session
-        {
+        if !session && self.sessions_dirs.iter().any(|d| path.starts_with(d)) {
             return None;
         }
         if session {
@@ -272,11 +268,32 @@ impl FileTypes {
     }
 }
 
+/// vinoWhisper's Flatpak, which keeps its data under `~/.var/app`.
+pub const VINOWHISPER_FLATPAK: &str = "io.github.karanshukla.vinowhisper";
+
 /// Where vinoWhisper keeps its sessions (karanshukla/vinoWhisper#123),
-/// canonical as roots are.
-fn sessions_dir() -> Option<PathBuf> {
-    let dir = data_home().ok()?.join("vinowhisper/transcripts");
-    Some(fs::canonicalize(&dir).unwrap_or(dir))
+/// canonical as roots are: a native install's data, and its Flatpak's. In
+/// our own Flatpak XDG_DATA_HOME is ours, so a native vinoWhisper's is the
+/// real home's.
+fn sessions_dirs() -> Vec<PathBuf> {
+    let native = match vinosearch_shared::sandbox::flatpak_id() {
+        Some(_) => vinosearch_shared::sandbox::host_data_home(),
+        None => data_home().ok(),
+    };
+    sessions_dirs_in(native, std::env::var_os("HOME").map(PathBuf::from))
+}
+
+fn sessions_dirs_in(native_data: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let flatpak_data = home.map(|h| h.join(".var/app").join(VINOWHISPER_FLATPAK).join("data"));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for data in [native_data, flatpak_data].into_iter().flatten() {
+        let dir = data.join("vinowhisper/transcripts");
+        let dir = fs::canonicalize(&dir).unwrap_or(dir);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 fn data_home() -> Result<PathBuf> {
@@ -2950,7 +2967,33 @@ mod tests {
         );
         assert_eq!(off.kind(&dir.join(s)), None);
         assert_eq!(off.kind(&Path::new("/h/Documents").join(s)), None);
-        assert_eq!(on.sessions_dir(), Some((dir.as_path(), true)));
+        assert_eq!(on.sessions_dirs(), (&[dir][..], true));
+    }
+
+    #[test]
+    fn sessions_are_looked_for_in_a_native_install_and_in_the_flatpak() {
+        let dirs = sessions_dirs_in(Some("/h/.local/share".into()), Some("/h".into()));
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("/h/.local/share/vinowhisper/transcripts"),
+                PathBuf::from(
+                    "/h/.var/app/io.github.karanshukla.vinowhisper/data/vinowhisper/transcripts"
+                ),
+            ]
+        );
+        // The Flatpak's are no less its own folder: a live transcript there is left.
+        let types = FileTypes {
+            sessions: true,
+            sessions_dirs: dirs.clone(),
+            ..FileTypes::default()
+        };
+        assert_eq!(types.kind(&dirs[1].join("2026-11-14-090000.txt")), None);
+        assert_eq!(
+            types.kind(&dirs[1].join("2026-11-14-090000.vwsession")),
+            Some(Kind::Session)
+        );
+        assert!(sessions_dirs_in(None, None).is_empty());
     }
 
     #[test]

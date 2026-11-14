@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use configparser::ini::Ini;
+
 /// The Flatpak's app id when this runs inside its sandbox; None natively.
 pub fn flatpak_id() -> Option<&'static str> {
     static ID: OnceLock<Option<String>> = OnceLock::new();
@@ -37,19 +39,23 @@ pub fn info_value(section: &str, key: &str) -> Option<String> {
     )
 }
 
+/// A key file as GLib and KConfig write them, read with the configparser
+/// crate: `=` only, keys as written, `#` comments on their own lines, and a
+/// `;` or `#` inside a value is part of it. None when it doesn't parse.
+fn key_file(text: &str) -> Option<Ini> {
+    let mut options = Ini::new_cs().defaults();
+    options.delimiters = vec!['='];
+    options.comment_symbols = vec!['#'];
+    options.enable_inline_comments = false;
+    let mut file = Ini::new_from_defaults(options);
+    file.read(text.to_owned()).ok()?;
+    Some(file)
+}
+
 fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
-    let mut inside = false;
-    for line in text.lines().map(str::trim) {
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            inside = name == section;
-        } else if inside
-            && let Some((k, v)) = line.split_once('=')
-            && k.trim() == key
-        {
-            return Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        }
-    }
-    None
+    key_file(text)?
+        .get(section, key)
+        .filter(|value| !value.is_empty())
 }
 
 /// The branch of a release bundle. A build from a checkout is `master`, and
@@ -160,20 +166,9 @@ pub fn krunner_plugin_on(id: &str) -> bool {
 }
 
 fn plugin_on(krunnerrc: &str, id: &str) -> bool {
-    let key = format!("{id}Enabled");
-    let mut in_plugins = false;
-    let mut on = false;
-    for line in krunnerrc.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_plugins = line == "[Plugins]";
-        } else if in_plugins
-            && let Some((k, v)) = line.split_once('=')
-            && k.trim() == key
-        {
-            on = v.trim() == "true";
-        }
-    }
-    on
+    key_file(krunnerrc)
+        .and_then(|file| file.get("Plugins", &format!("{id}Enabled")))
+        .is_some_and(|value| value == "true")
 }
 
 #[cfg(test)]
@@ -239,6 +234,15 @@ mod tests {
         assert!(plugin_on(rc, "x.y"));
         assert!(!plugin_on(rc, "baloosearch"));
         assert!(!plugin_on("[General]\nx.yEnabled=true\n", "x.y"));
+        // As KConfig writes it: the last of a repeated key or group wins, a
+        // nested group is not the group, and `[$i]` and `:` belong to keys.
+        let rc = "[Plugins]\nx.yEnabled=true\nx.yEnabled=false\n\n[Plugins][Favorites]\nx.yEnabled=true\n\n[General]\nhistory[$i]=a:b;c\n";
+        assert!(!plugin_on(rc, "x.y"));
+        assert!(plugin_on(
+            "[Plugins]\nx.yEnabled=false\n[Other]\na=b\n[Plugins]\nx.yEnabled=true\n",
+            "x.y"
+        ));
+        assert!(!plugin_on("", "x.y"));
     }
 
     #[test]
@@ -272,6 +276,16 @@ mod tests {
         assert_eq!(
             ini_value(info, "Instance", "app-path").as_deref(),
             Some("/x/app/a.b/files")
+        );
+        // Flatpak's lists end in `;`, and a path may hold `:` or `#`.
+        let info = "[Context]\nfilesystems=home;host-os:ro;\n# a comment\n[Instance]\napp-path=/a:b #1/files\n";
+        assert_eq!(
+            ini_value(info, "Context", "filesystems").as_deref(),
+            Some("home;host-os:ro;")
+        );
+        assert_eq!(
+            ini_value(info, "Instance", "app-path").as_deref(),
+            Some("/a:b #1/files")
         );
     }
 }

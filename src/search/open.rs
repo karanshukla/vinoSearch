@@ -621,10 +621,47 @@ pub fn xdg_open(target: &Path) {
     }
 }
 
-/// vinoWhisper's settings window, which opens a session's part (and the
-/// transcript at a `[MM:SS]`); KRunner's PATH may lack ~/.local/bin, where
+/// The command for vinoWhisper's settings window, which opens a session's
+/// part (and the transcript at a `[MM:SS]`): its Flatpak's for a session the
+/// Flatpak saved, or where there is no native install; else the native one.
+fn vinowhisper_gui(file: &Path) -> Option<Vec<String>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let flatpak = home.as_deref().and_then(vinowhisper_flatpak);
+    let native = native_vinowhisper_gui().map(|gui| vec![gui.display().to_string()]);
+    let in_flatpak = home.is_some_and(|h| {
+        file.starts_with(h.join(".var/app").join(crate::index::VINOWHISPER_FLATPAK))
+    });
+    if in_flatpak {
+        flatpak.or(native)
+    } else {
+        native.or(flatpak)
+    }
+}
+
+/// `flatpak run` for vinoWhisper's window, when its Flatpak is installed
+/// for this user or system-wide: Flatpak exports its launcher entry there.
+fn vinowhisper_flatpak(home: &Path) -> Option<Vec<String>> {
+    let app = crate::index::VINOWHISPER_FLATPAK;
+    let entry = format!("exports/share/applications/{app}.desktop");
+    let installed = [
+        home.join(".local/share/flatpak"),
+        PathBuf::from("/var/lib/flatpak"),
+    ]
+    .iter()
+    .any(|installation| installation.join(&entry).is_file());
+    installed.then(|| {
+        vec![
+            "flatpak".into(),
+            "run".into(),
+            "--command=vinowhisper-gui".into(),
+            app.into(),
+        ]
+    })
+}
+
+/// A native install's window; KRunner's PATH may lack ~/.local/bin, where
 /// its setup puts it.
-fn vinowhisper_gui() -> Option<PathBuf> {
+fn native_vinowhisper_gui() -> Option<PathBuf> {
     const GUI: &str = "vinowhisper-gui";
     if vinosearch_shared::sandbox::flatpak_id().is_some() {
         // The host's /usr, where a package would put it, is under /run/host.
@@ -654,20 +691,21 @@ fn fragment(part: Part, stamp: Option<&str>) -> String {
     }
 }
 
-fn session_argv(gui: &Path, file: &Path, part: Part, stamp: Option<&str>) -> Vec<String> {
-    vec![
-        gui.display().to_string(),
+fn session_argv(gui: &[String], file: &Path, part: Part, stamp: Option<&str>) -> Vec<String> {
+    let mut argv = gui.to_vec();
+    argv.extend([
         "--page".into(),
         "sessions".into(),
         "--open".into(),
         format!("{}#{}", file.display(), fragment(part, stamp)),
-    ]
+    ]);
+    argv
 }
 
 fn open_session(file: &Path, part: Part, line: u32, editor: Option<&str>) -> Result<()> {
     let bytes = session::load(file)?;
     let text = session::text(&bytes, part)?;
-    if let Some(gui) = vinowhisper_gui() {
+    if let Some(gui) = vinowhisper_gui(file) {
         let stamp = match part {
             Part::Transcript if line > 0 => session::stamp_at(&text, line as usize),
             _ => None,
@@ -765,7 +803,7 @@ mod tests {
 
     #[test]
     fn a_session_opens_in_vinowhisper_at_its_stamp() {
-        let gui = Path::new("/home/u/.local/bin/vinowhisper-gui");
+        let gui = &["/home/u/.local/bin/vinowhisper-gui".to_owned()];
         let file = Path::new("/d/#1 2026-10-27-140512.vwsession");
         assert_eq!(
             session_argv(gui, file, Part::Transcript, Some("61:05")),
@@ -785,6 +823,36 @@ mod tests {
             session_argv(gui, file, Part::Transcript, None)[4],
             "/d/#1 2026-10-27-140512.vwsession#transcript"
         );
+    }
+
+    #[test]
+    fn a_session_opens_in_vinowhispers_flatpak_when_that_is_installed() {
+        let home = std::env::temp_dir().join(format!("vs-vw-flatpak-{}", std::process::id()));
+        assert_eq!(vinowhisper_flatpak(&home), None);
+        let exports = home.join(".local/share/flatpak/exports/share/applications");
+        std::fs::create_dir_all(&exports).unwrap();
+        std::fs::write(
+            exports.join("io.github.karanshukla.vinowhisper.desktop"),
+            "",
+        )
+        .unwrap();
+        let gui = vinowhisper_flatpak(&home).unwrap();
+        let file = home.join(
+            ".var/app/io.github.karanshukla.vinowhisper/data/vinowhisper/transcripts/a.vwsession",
+        );
+        let argv = session_argv(&gui, &file, Part::Summary, None);
+        assert_eq!(
+            argv[..4],
+            [
+                "flatpak",
+                "run",
+                "--command=vinowhisper-gui",
+                "io.github.karanshukla.vinowhisper"
+            ]
+        );
+        assert_eq!(argv[4..6], ["--page", "sessions"]);
+        assert_eq!(argv[7], format!("{}#summary", file.display()));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

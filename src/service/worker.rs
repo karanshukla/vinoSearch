@@ -594,22 +594,23 @@ fn forget_root(conn: &rusqlite::Connection, db: &Path, work: &Work, root: &Path)
     work.forget(root, &index::roots(conn).unwrap_or_default());
 }
 
-/// vinoWhisper's folder of sessions is a root while sessions are on
-/// (#143), registered as one added in the settings window is, and
-/// forgotten once they're off. A folder vinoWhisper makes later is
-/// followed from the next start or change of settings.
+/// vinoWhisper's folders of sessions (a native install's, and its
+/// Flatpak's) are roots while sessions are on (#143), registered as one
+/// added in the settings window is, and forgotten once they're off. A
+/// folder vinoWhisper makes later is followed from the next start or change
+/// of settings.
 fn follow_sessions(conn: &rusqlite::Connection, db: &Path, types: &FileTypes, work: &Work) {
-    let Some((dir, on)) = types.sessions_dir() else {
-        return;
-    };
-    let is_root = index::roots(conn)
-        .unwrap_or_default()
-        .iter()
-        .any(|r| r == dir);
-    if on && !is_root && index::is_real_dir(dir) {
-        work.root(dir.to_owned());
-    } else if !on && is_root {
-        forget_root(conn, db, work, dir);
+    let (dirs, on) = types.sessions_dirs();
+    for dir in dirs {
+        let is_root = index::roots(conn)
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r == dir);
+        if on && !is_root && index::is_real_dir(dir) {
+            work.root(dir.to_owned());
+        } else if !on && is_root {
+            forget_root(conn, db, work, dir);
+        }
     }
 }
 
