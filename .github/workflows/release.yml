@@ -28,6 +28,13 @@ jobs:
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
+      # Before anything is uploaded: the Flatpak's version, which software
+      # centres and vinoPilot read, comes from the metainfo's newest release.
+      - name: Check the metainfo names this release
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          grep -q "<release version=\"$version\"" packaging/flatpak/dev.vinosearch.VinoSearch.metainfo.xml ||
+            { echo "::error::the metainfo has no <release version=\"$version\">"; exit 1; }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The tag passed CI on main; this checks it again on the release image.

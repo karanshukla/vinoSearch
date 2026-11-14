@@ -17,4 +17,17 @@
     <dbus type="user">dev.vinosearch.VinoSearch.Runner</dbus>
   </provides>
   <content_rating type="oars-1.1"/>
+  <!-- Newest first, one per release: software centres and vinoPilot read
+       the installed version from here. release.yml checks the tag has its line. -->
+  <releases>
+    <release version="11.0.0" date="2026-11-14">
+      <description>
+        <ul>
+          <li>The first release as a Flatpak bundle</li>
+          <li>Encrypt the index in the Flatpak, sealed by the host's TPM</li>
+          <li>The settings and search windows draw their own title bar</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
 </component>
