@@ -68,6 +68,12 @@ pub fn host_autostart_entry(app_id: &str) -> Option<PathBuf> {
     )
 }
 
+/// The real home's `.local/share`, where the host's app menu reads the
+/// entries a user adds: the sandbox's XDG_DATA_HOME is under ~/.var/app.
+pub fn host_data_home() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share"))
+}
+
 /// Set once start at login was first asked for (or turned off), so the
 /// settings window asks only the first time it opens.
 pub fn autostart_asked_path() -> Option<PathBuf> {

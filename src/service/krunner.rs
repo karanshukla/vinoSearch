@@ -1491,14 +1491,12 @@ fn install_search_entry() -> Result<()> {
 }
 
 fn search_entry_path() -> Result<PathBuf> {
-    let entry = names()
-        .search_entry
-        .as_ref()
-        .context("no search window entry of its own here")?;
-    Ok(data_home()?.join(entry))
+    Ok(data_home()?.join(&names().search_entry))
 }
 
-fn search_entry(settings: &str) -> String {
+/// The search window's entry, `settings` being the command that opens the
+/// settings window.
+pub(crate) fn search_entry(settings: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
          Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
