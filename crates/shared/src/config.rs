@@ -158,7 +158,8 @@ pub struct Config {
 }
 
 /// The index encrypted with SQLCipher, its key sealed by `systemd-creds` to
-/// this machine's TPM and this user.
+/// this machine's TPM and this user, or kept in the desktop keyring where
+/// `systemd-creds` can't be used.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Encryption {

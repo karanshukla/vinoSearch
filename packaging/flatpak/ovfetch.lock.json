@@ -1,0 +1,17 @@
+{
+  "artifact": {
+    "id": "pypi/openvino/openvino-2026.4.1-22982-cp314-cp314-manylinux_2_28_x86_64.whl",
+    "kind": "openvino",
+    "sha256": "3631dd889dccf3d5087775948590a6609a662f90c24a9cf85bb4dfa0cdd7fd2f",
+    "url": "https://files.pythonhosted.org/packages/77/cf/830aff97404d73b8ada3ba3f02a626089a384299322cb94b52c37eaebd18/openvino-2026.4.1-22982-cp314-cp314-manylinux_2_28_x86_64.whl"
+  },
+  "openvino": "2026.4.1",
+  "bundled": {
+    "level_zero": "1.35.0",
+    "npu_driver": "1.35.0",
+    "npu_compiler": "1.35.0",
+    "compute_runtime": "26.40.40196.8",
+    "igc": "2.42.6",
+    "gmmlib": "22.10.2"
+  }
+}

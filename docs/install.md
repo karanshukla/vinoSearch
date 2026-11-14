@@ -45,7 +45,7 @@ scripts/install-runtime.sh                 # OpenVINO via ovfetch
 vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
 vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
 vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
-vinosearch krunner --install               # the systemd user service, the app menu entry and the running desktop's search
+vinosearch krunner --install               # the service (started now and at login), the app menu entry and the running desktop's search
 vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
 ```
 
@@ -73,14 +73,101 @@ libcrypto) are:
 ## Fedora Atomic and openSUSE Aeon
 
 Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under
-`~/.local`, the service in `~/.config/systemd/user`. Nothing touches `/usr`, so the release download
+`~/.local`, the service's autostart entry in `~/.config/autostart`. Nothing touches `/usr`, so the release download
 needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install`
 on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it.
 
 To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches
-the host: the home directory is shared, so the host runs the same binaries and index. If systemd
-can't be reached from the container, `install.sh` prints the one command to run on the host.
+the host: the home directory is shared, so the host runs the same binaries and index, and the host's
+session starts the service from the same autostart entry.
 `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
+
+## Flatpak
+
+A `.flatpak` bundle holds the service, the CLI and the settings window, with OpenVINO and Intel's
+NPU and GPU drivers inside it, so the host needs only the kernel's NPU driver (`intel_vpu`) and
+its firmware. Each release has it as `vinosearch-x86_64.flatpak`, with its checksum:
+
+```bash
+curl -fLO https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64.flatpak
+curl -fLO https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64.flatpak.sha256
+sha256sum -c vinosearch-x86_64.flatpak.sha256
+flatpak install --user vinosearch-x86_64.flatpak
+```
+
+The runtime (`org.freedesktop.Platform` 26.08) comes from Flathub if it isn't installed yet. Open
+vinoSearch from the app menu once: it starts the service, asks the desktop to start it at
+login (the Background portal), turns on the running desktop's search, and its Model page downloads
+the model. GNOME Shell's search finds it from the next login.
+
+To update, use **Update** on the settings window's About page. It downloads the new release's
+bundle and checksum, refuses the bundle unless the checksum matches, has the host's `flatpak`
+install it where this one is installed, and restarts the service if it was running, so the next
+search runs the new build. Reopen the settings window to run its new version too. A system-wide
+install (`flatpak install --system`) asks for an administrator's password first, as any system
+Flatpak install does. By hand, download and check the new bundle as above and run the same
+`flatpak install --user vinosearch-x86_64.flatpak`: a newer build replaces the installed one, and a
+running service keeps the old build until it stops. Restart it with:
+
+```bash
+busctl --user call dev.vinosearch.VinoSearch.Runner /control dev.vinosearch.Control1 Quit
+```
+
+The next search starts it again. Only a release bundle (branch `stable`) updates itself; a bundle
+built from a checkout (branch `master`) links to the release page instead. To move from one to a
+release, run `flatpak uninstall dev.vinosearch.VinoSearch//master` first (the index, models and
+config under `~/.var/app` stay) and install the release's bundle. To build the bundle from a
+checkout:
+
+```bash
+flatpak install --user flathub org.flatpak.Builder org.freedesktop.Sdk//26.08 \
+  org.freedesktop.Sdk.Extension.rust-stable//26.08
+flatpak run --filesystem=$HOME org.flatpak.Builder --user --install --force-clean \
+  --repo=repo build packaging/flatpak/dev.vinosearch.VinoSearch.yml
+flatpak build-bundle repo vinosearch.flatpak dev.vinosearch.VinoSearch
+```
+
+The CLI is `flatpak run dev.vinosearch.VinoSearch` (for example `... doctor` or `... index ~/Documents`).
+
+What it is allowed, and why:
+
+| Permission | For |
+|---|---|
+| `--device=all` | the NPU (`/dev/accel`), which nothing narrower exposes, and the GPU |
+| `--filesystem=home` | the files it indexes |
+| `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | the host's app entries: which app opens a file at its line, page or second, and the editor and player lists |
+| `--share=network` | downloading the models |
+| `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | the settings and search windows |
+| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, turning search places on and off in the host's settings, installing an update, and sealing the index key with the host's `systemd-creds` (`flatpak-spawn --host`) |
+| `--talk-name=org.freedesktop.secrets` | keeping the index key in the desktop keyring, on a host without `systemd-creds` |
+| `--system-talk-name=net.hadess.PowerProfiles` | holding indexing while power saver is on |
+
+What differs from the native install:
+
+- Its config, index and models are its own, under `~/.var/app/dev.vinosearch.VinoSearch`
+  (`config/vinosearch/config.toml`, `data/vinosearch`), so it can sit beside a native install. Its
+  log is the journal's where systemd starts it, and `.local/state/vinosearch/service.log` under
+  that folder elsewhere; `doctor` says where to read it. Its bus name is
+  `dev.vinosearch.VinoSearch.Runner`.
+- The KRunner plugin, GNOME Shell provider and D-Bus activation file come with it. Flatpak leaves
+  exported search providers off, so the Integration page's switches (and `integrate kde|gnome`)
+  turn them on and off in the desktop's own setting, the one its search settings page shows. The
+  search window is the **Search Files** action of the app menu entry rather than an entry of its
+  own.
+- The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
+  through the Background portal, with the running desktop's search place.
+- With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).
+- Encrypting the index works as natively. Its key is sealed by the host's `systemd-creds`, run
+  with `flatpak-spawn --host`, to the host's TPM; a key the native install sealed opens in the
+  Flatpak and the other way round, so `index.sqlite` and `index.key` can be moved between them.
+  On a host without `systemd-creds` the key goes in the desktop keyring. Starting with an
+  encrypted index takes about 10 ms more than natively, for the trip to the host. If the host
+  can't be reached (the `org.freedesktop.Flatpak` permission taken away with `flatpak override`),
+  the index is kept and waited for, as with a locked keyring, never moved to the keyring.
+- HEIC and AVIF photos aren't indexed: the runtime has no `heif-convert`.
+
+`flatpak uninstall dev.vinosearch.VinoSearch` removes it; add `--delete-data` to delete its index,
+models and config too.
 
 ## Uninstalling
 

@@ -19,13 +19,29 @@ Usage: vinosearch-settings [--page index|folders|search|model|hardware|integrati
 need no quotes).
 ";
 
+/// In the Flatpak, tell vino-ui the desktop's light or dark through its
+/// `VINO_UI_THEME`: it would ask `busctl`, find none and stay dark.
+fn follow_desktop_theme() {
+    if vinosearch_shared::sandbox::flatpak_id().is_none()
+        || std::env::var_os("VINO_UI_THEME").is_some()
+    {
+        return;
+    }
+    if let Some(dark) = portal::prefers_dark() {
+        // SAFETY: the first thing main does, before any other thread exists
+        // to read the environment.
+        unsafe { std::env::set_var("VINO_UI_THEME", if dark { "dark" } else { "light" }) };
+    }
+}
+
 fn main() -> ExitCode {
+    follow_desktop_theme();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, None),
-        ["--page", page] => window::run(vinosearch_shared::dbus::SETTINGS_APP_ID, Some(page)),
+        [] => window::run(&vinosearch_shared::dbus::names().app_id, None),
+        ["--page", page] => window::run(&vinosearch_shared::dbus::names().app_id, Some(page)),
         ["--search", ref query @ ..] => {
-            window::search::run(vinosearch_shared::dbus::SETTINGS_APP_ID, &query.join(" "))
+            window::search::run(&vinosearch_shared::dbus::names().app_id, &query.join(" "))
         }
         ["-h" | "--help"] => {
             print!("{USAGE}");

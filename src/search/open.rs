@@ -15,11 +15,17 @@
 //!
 //! An audio or video file (#188) plays from the second that matched, in the
 //! `player` setting or the default app when it is a known player.
+//!
+//! In the Flatpak all of it runs on the host, through `flatpak-spawn
+//! --host`: the apps, their desktop entries and xdg-mime's defaults are the
+//! host's, and the OpenURI portal could open a file but not at a line, page
+//! or second.
 
 use crate::extract::session::{self, Part};
 use crate::index::Kind;
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -294,7 +300,7 @@ fn find_entry(id: &str) -> Option<Entry> {
 
 /// One line of `xdg-mime`'s output, if it ran and printed one.
 fn xdg_mime(args: &[&std::ffi::OsStr]) -> Option<String> {
-    let out = Command::new("xdg-mime")
+    let out = host_command("xdg-mime")
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -490,6 +496,31 @@ fn detached(argv: Vec<String>, in_unit: bool) -> Vec<String> {
     .collect()
 }
 
+/// `program`, on the host when this runs in the Flatpak.
+fn host_command(program: &str) -> Command {
+    let argv = host_argv(vec![program.to_owned()]);
+    let mut c = Command::new(&argv[0]);
+    c.args(&argv[1..]);
+    c
+}
+
+/// `argv` run on the host when this is the Flatpak. flatpak-spawn passes
+/// none of the sandbox's environment, so the app gets the session's own.
+fn host_argv(argv: Vec<String>) -> Vec<String> {
+    in_sandbox_argv(argv, vinosearch_shared::sandbox::flatpak_id().is_some())
+}
+
+fn in_sandbox_argv(argv: Vec<String>, sandboxed: bool) -> Vec<String> {
+    if !sandboxed {
+        return argv;
+    }
+    ["flatpak-spawn", "--host"]
+        .into_iter()
+        .map(String::from)
+        .chain(argv)
+        .collect()
+}
+
 fn in_unit() -> bool {
     std::env::var_os("INVOCATION_ID").is_some() && crate::search::menu::on_path("systemd-run")
 }
@@ -509,19 +540,16 @@ fn env_pairs(entries: Vec<String>) -> Vec<(String, String)> {
 fn manager_env() -> zbus::Result<Vec<(String, String)>> {
     zbus::block_on(async {
         let bus = zbus::Connection::session().await?;
-        let manager = zbus::Proxy::new(
-            &bus,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .await?;
-        Ok(env_pairs(manager.get_property("Environment").await?))
+        let manager = zbus_systemd::systemd1::ManagerProxy::new(&bus).await?;
+        Ok(env_pairs(manager.environment().await?))
     })
 }
 
 /// Start `argv` for the desktop, and reap it when it exits. Blocks on the bus
-/// in a unit, so call this off the runner's.
+/// in a unit, so call this off the runner's. In a process group of its own,
+/// so a signal to the runner's (Ctrl+C on a `vinosearch krunner` in a
+/// terminal) leaves it, and its output out of the runner's log; outside a
+/// unit nothing else ties it to the runner, which can exit or crash under it.
 pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     let in_unit = in_unit();
     let env = if in_unit {
@@ -532,11 +560,14 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     } else {
         Vec::new()
     };
-    let argv = detached(argv, in_unit);
+    let argv = host_argv(detached(argv, in_unit));
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .envs(env)
         .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
         .spawn()?;
     std::thread::spawn(move || child.wait());
     Ok(())
@@ -584,7 +615,16 @@ pub fn xdg_open(target: &Path) {
 /// its setup puts it.
 fn vinowhisper_gui() -> Option<PathBuf> {
     const GUI: &str = "vinowhisper-gui";
-    if crate::search::menu::on_path(GUI) {
+    if vinosearch_shared::sandbox::flatpak_id().is_some() {
+        // The host's /usr, where a package would put it, is under /run/host.
+        let usr = Path::new("/usr/bin").join(GUI);
+        if Path::new("/run/host")
+            .join(usr.strip_prefix("/").unwrap())
+            .is_file()
+        {
+            return Some(usr);
+        }
+    } else if crate::search::menu::on_path(GUI) {
         return Some(PathBuf::from(GUI));
     }
     let local = PathBuf::from(std::env::var_os("HOME")?)
@@ -631,11 +671,17 @@ fn open_session(file: &Path, part: Part, line: u32, editor: Option<&str>) -> Res
 
 /// `text`, `file`'s `part`, in a file only this user can read, under
 /// $XDG_RUNTIME_DIR (memory, gone at logout), never /tmp. Copies from
-/// before are deleted first: each open leaves at most one behind.
+/// before are deleted first: each open leaves at most one behind. In the
+/// Flatpak, under its `app/<id>` directory there, which the host sees at the
+/// same path.
 fn copy_out(file: &Path, part: Part, text: &str) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("no XDG_RUNTIME_DIR")?;
-    let dir = PathBuf::from(runtime).join("vinosearch/sessions");
+    let mut runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("no XDG_RUNTIME_DIR")?);
+    if let Some(app) = vinosearch_shared::sandbox::flatpak_id() {
+        runtime = runtime.join("app").join(app);
+    }
+    let dir = runtime.join("vinosearch/sessions");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -858,6 +904,16 @@ mod tests {
                 ("OPTS".into(), "a=b".into()),
                 ("EMPTY".into(), String::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn the_flatpak_runs_apps_on_the_host() {
+        let argv = vec!["okular".to_owned(), "/home/u/a b.pdf".to_owned()];
+        assert_eq!(in_sandbox_argv(argv.clone(), false), argv);
+        assert_eq!(
+            in_sandbox_argv(argv, true),
+            ["flatpak-spawn", "--host", "okular", "/home/u/a b.pdf"]
         );
     }
 

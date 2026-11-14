@@ -1,6 +1,6 @@
 //! A folder chooser through xdg-desktop-portal's FileChooser, so the dialog is
 //! the desktop's own (Dolphin's on Plasma, Nautilus's on GNOME) and egui needs
-//! no file dialog of its own.
+//! no file dialog of its own. And the portal's Settings, for the Flatpak.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -93,6 +93,29 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+/// Whether the desktop asks for dark, from the portal's Settings; None
+/// without a portal. vino-ui asks the same through `busctl`, which the
+/// Flatpak's runtime doesn't have.
+pub fn prefers_dark() -> Option<bool> {
+    zbus::block_on(async {
+        let conn = Connection::session().await.ok()?;
+        let reply = conn
+            .call_method(
+                Some(PORTAL),
+                "/org/freedesktop/portal/desktop",
+                Some("org.freedesktop.portal.Settings"),
+                "ReadOne",
+                &("org.freedesktop.appearance", "color-scheme"),
+            )
+            .await
+            .ok()?;
+        let value: OwnedVariant = reply.body().deserialize().ok()?;
+        // 1 is dark; 2 (light) and 0 (no preference) are light, as vino-ui
+        // takes them.
+        u32::try_from(value).ok().map(|scheme| scheme == 1)
+    })
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use vinosearch_shared::config::{
 
 use vinosearch_shared::dbus::{hold, seal};
 use vinosearch_shared::models;
+use vinosearch_shared::sandbox;
 
 use crate::control::{Link, NOT_INSTALLED, Partial, Request, Status};
 use crate::{doctor, integration, portal};
@@ -267,10 +268,23 @@ struct SettingsWindow {
 }
 
 /// The release installer leaves itself as `~/.local/bin/vinosearch-upgrade`; with it,
-/// About's Update button installs a release. A build from source has none, and links to the
-/// release instead.
+/// About's Update button installs a release. A release's Flatpak bundle installs the next one
+/// with `vinosearch flatpak-update`. A build from source has neither, and links to the release
+/// instead.
 fn updater() -> vino_ui::update::Updater {
     let updater = vino_ui::update::Updater::new(vino_ui::App::Search, env!("CARGO_PKG_VERSION"));
+    if sandbox::flatpak_id().is_some() {
+        let release =
+            sandbox::info_value("Instance", "branch").as_deref() == Some(sandbox::RELEASE_BRANCH);
+        return if release {
+            updater.with_command([
+                integration::vinosearch().to_string_lossy().into_owned(),
+                "flatpak-update".into(),
+            ])
+        } else {
+            updater
+        };
+    }
     match std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".local/bin/vinosearch-upgrade"))
     {
@@ -286,6 +300,7 @@ impl SettingsWindow {
         let config_path = config::default_path().unwrap_or_default();
         let mut window = SettingsWindow::with(page, Link::start(ctx), config_path);
         window.follow_text_scale(ctx);
+        integration::first_run(&window.integration, ctx);
         window
     }
 
@@ -556,8 +571,28 @@ impl SettingsWindow {
                     .show(ui, |ui, _| {
                         ui.with_layout(Layout::top_down(Align::Max), |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
+                            // Part of the row only: a long file name is cut
+                            // short (whole on hover), not laid over the label.
+                            let width = (ui.available_width() * 0.6).max(160.0);
                             for d in s.partial.iter().take(PARTIAL_SHOWN) {
-                                ui.label(RichText::new(partial_line(d)).size(12.5));
+                                let (name, progress) = partial_line(d);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(width, 18.0),
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.label(RichText::new(format!(", {progress}")).size(12.5));
+                                        // About 7 px a letter at this size.
+                                        let room = (ui.available_width() / 7.0) as usize;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(middle_cut(&name, room)).size(12.5),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&name);
+                                    },
+                                );
                             }
                             let more = s.partial.len().saturating_sub(PARTIAL_SHOWN);
                             if more > 0 {
@@ -773,19 +808,30 @@ impl SettingsWindow {
                     ui,
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        ui.horizontal(|ui| {
-                            widgets::mono(ui, &entry);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                widgets::small(
-                                    ui,
-                                    format!(
-                                        "{} chunks · {:.0}%",
-                                        count(*chunks as i64),
-                                        share * 100.0
-                                    ),
+                        // The count first, whole and on one line; the path
+                        // has what is left and is cut short to fit. Path
+                        // first, a long one left the count a sliver to wrap in.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 18.0),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "{} chunks · {:.0}%",
+                                            count(*chunks as i64),
+                                            share * 100.0
+                                        ))
+                                        .size(12.5)
+                                        .color(p.muted),
+                                    )
+                                    .extend(),
                                 );
-                            });
-                        });
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    widgets::mono(ui, &entry);
+                                });
+                            },
+                        );
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), 4.0),
                             egui::Sense::hover(),
@@ -998,12 +1044,7 @@ impl SettingsWindow {
                         self.link.send(Request::FetchModel);
                     }
                     if s.fetching {
-                        let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
-                        widgets::small(
-                            ui,
-                            format!("{} of {}", size(s.fetch_done), size(s.fetch_total)),
-                        );
-                        widgets::progress(ui, fraction, 120.0);
+                        fetch_progress(ui, s);
                     } else if s.model_present {
                         widgets::chip(
                             ui,
@@ -1061,7 +1102,7 @@ impl SettingsWindow {
         let mut changed = false;
         widgets::group(ui, |ui| {
             Row::new("Device")
-                .help("The NPU is fastest and uses the least power.")
+                .help("The NPU is fastest and uses the least power. Without one, NPU means the GPU, else the CPU.")
                 .show(ui, |ui, _| {
                     let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
                     let mut picked = DEVICES
@@ -1197,10 +1238,9 @@ impl SettingsWindow {
                         None
                     },
                     |ui, _| {
-                        if ui
-                            .add_enabled(!s.fetching, Button::primary("Download").small())
-                            .clicked()
-                        {
+                        if s.fetching {
+                            fetch_progress(ui, s);
+                        } else if ui.add(Button::primary("Download").small()).clicked() {
                             self.link.send(Request::FetchModel);
                         }
                     },
@@ -1350,10 +1390,9 @@ impl SettingsWindow {
                         None
                     },
                     |ui, _| {
-                        if ui
-                            .add_enabled(!s.fetching, Button::primary("Download").small())
-                            .clicked()
-                        {
+                        if s.fetching {
+                            fetch_progress(ui, s);
+                        } else if ui.add(Button::primary("Download").small()).clicked() {
                             self.link.send(Request::FetchModel);
                         }
                     },
@@ -1460,12 +1499,20 @@ impl SettingsWindow {
             );
             return;
         }
-        let no_tpm = s.is_some_and(|s| !s.tpm);
+        // Without systemd-creds the keyring is all there is: no TPM to ask about.
+        let keyring = s.is_some_and(|s| s.new_seal == seal::KEYRING);
+        let no_tpm = s.is_some_and(|s| !s.tpm) && !keyring;
         let mut changed = false;
         let rekeying = self.confirm == Some(Confirm::Rekey);
         widgets::group(ui, |ui| {
             Row::new("Encrypt the index")
-                .help("Key sealed to the TPM. Nothing is re-indexed.")
+                .help(if keyring {
+                    "Key kept in your desktop keyring, which your session can read once you \
+                     log in; this system has no systemd-creds to seal it to a TPM. Nothing is \
+                     re-indexed."
+                } else {
+                    "Key sealed to the TPM. Nothing is re-indexed."
+                })
                 .show(ui, |ui, _| {
                     let mut on = self.config.encryption.on();
                     if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
@@ -1508,6 +1555,9 @@ impl SettingsWindow {
                 .tone(Tone::Error)
                 .show(ui, |ui, _| {
                     let (kind, text) = match (s.encrypted, s.seal.as_str()) {
+                        (true, _) if !s.seal_waiting.is_empty() => {
+                            (ChipKind::Warn, "Encrypted, waiting for its key")
+                        }
                         (true, seal::TPM) => (
                             ChipKind::Ok,
                             "Encrypted, the key sealed to this machine's TPM",
@@ -1516,6 +1566,9 @@ impl SettingsWindow {
                             ChipKind::Ok,
                             "Encrypted, the key sealed with systemd's host key",
                         ),
+                        (true, seal::KEYRING) => {
+                            (ChipKind::Ok, "Encrypted, the key in your desktop keyring")
+                        }
                         (true, _) => (
                             ChipKind::Warn,
                             "Encrypted with a key held in memory only: nothing could seal it, so \
@@ -1530,6 +1583,27 @@ impl SettingsWindow {
                     };
                     a11y::live(&widgets::chip(ui, kind, text));
                 });
+            if !s.seal_waiting.is_empty() {
+                Row::new("Waiting")
+                    .help(&format!(
+                        "The index's key can't be read yet ({}). Until then searches find \
+                         nothing, and the index is kept as it is. To start over instead, turn \
+                         encryption off: the index is rebuilt from your files.",
+                        s.seal_waiting
+                    ))
+                    .tone(Tone::Warn)
+                    .show(ui, |ui, _| {
+                        // Asks the keyring again, with its unlock prompt.
+                        let label = if s.seal == seal::KEYRING {
+                            "Unlock…"
+                        } else {
+                            "Try again"
+                        };
+                        if ui.add(Button::secondary(label).small()).clicked() {
+                            self.link.send(Request::ApplyEncryption);
+                        }
+                    });
+            }
             if !s.seal_broken.is_empty() {
                 Row::new("Rebuilt")
                     .help(&format!(
@@ -1646,6 +1720,7 @@ impl SettingsWindow {
     fn integration(&mut self, ui: &mut egui::Ui) {
         let state = self.integration.lock().unwrap().clone();
         let (kde, gnome) = integration::desktops();
+        let fixed = integration::menu_fixed();
         widgets::group_label(ui, "Search places");
         widgets::group_help(
             ui,
@@ -1663,6 +1738,10 @@ impl SettingsWindow {
             };
             Row::new(label).help(&help).show(ui, |ui, _| {
                 let on = state.is_on(switch);
+                if fixed && switch == integration::Switch::Menu {
+                    widgets::chip(ui, ChipKind::Ok, "On");
+                    return;
+                }
                 let button = if on { "Turn off" } else { "Turn on" };
                 let button = ui.add_enabled(!state.running, Button::secondary(button));
                 if a11y::for_what(button, label).clicked() {
@@ -1688,14 +1767,22 @@ impl SettingsWindow {
             switch_row(
                 ui,
                 "GNOME Shell",
-                "The overview's search, from the next login.",
+                if fixed {
+                    "The overview's search."
+                } else {
+                    "The overview's search, from the next login."
+                },
                 integration::Switch::Gnome,
                 (!gnome).then_some("GNOME isn't running in this session."),
             );
             switch_row(
                 ui,
                 "App menu",
-                "The search window as an app of its own.",
+                if fixed {
+                    "The search window: Search Files, in vinoSearch's menu entry's actions."
+                } else {
+                    "The search window as an app of its own."
+                },
                 integration::Switch::Menu,
                 None,
             );
@@ -1705,7 +1792,11 @@ impl SettingsWindow {
             switch_row(
                 ui,
                 "Search service",
-                "Runs at login. Turning it off removes every search place too.",
+                if fixed {
+                    "Runs at login. Turning it off turns every search place off too."
+                } else {
+                    "Runs at login. Turning it off removes every search place too."
+                },
                 integration::Switch::Service,
                 None,
             );
@@ -1794,8 +1885,26 @@ fn count(n: i64) -> String {
 /// Documents indexed in part listed by name on the Index page; the rest are counted.
 const PARTIAL_SHOWN: usize = 3;
 
-/// "book.pdf, 120 of 640 pages".
-fn partial_line(d: &Partial) -> String {
+/// `name` in about `room` letters: the middle cut out, as the end of a file
+/// name (the track, the chapter, the extension) is what tells it from the
+/// next one.
+fn middle_cut(name: &str, room: usize) -> String {
+    let letters: Vec<char> = name.chars().collect();
+    let room = room.max(12);
+    if letters.len() <= room {
+        return name.to_owned();
+    }
+    let tail = (room - 1) * 3 / 5;
+    let head = room - 1 - tail;
+    let mut cut: String = letters[..head].iter().collect();
+    cut.push('…');
+    cut.extend(&letters[letters.len() - tail..]);
+    cut
+}
+
+/// A document indexed in part: its file name and how far it has got,
+/// "book.pdf" and "120 of 640 pages".
+fn partial_line(d: &Partial) -> (String, String) {
     let name = Path::new(&d.path)
         .file_name()
         .map_or_else(|| d.path.clone(), |n| n.to_string_lossy().into_owned());
@@ -1804,11 +1913,23 @@ fn partial_line(d: &Partial) -> String {
     } else {
         format!("{}s", d.unit)
     };
-    format!(
-        "{name}, {} of {} {unit}",
+    let progress = format!(
+        "{} of {} {unit}",
         count(d.done as i64),
         count(d.total as i64)
-    )
+    );
+    (name, progress)
+}
+
+/// How far a model download has got: wherever a Download button was
+/// pressed, so the press is seen to have done something.
+fn fetch_progress(ui: &mut egui::Ui, s: &Status) {
+    let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
+    widgets::small(
+        ui,
+        format!("{} of {}", size(s.fetch_done), size(s.fetch_total)),
+    );
+    widgets::progress(ui, fraction, 120.0);
 }
 
 /// Decimal units, as the README and `fetch-model` give sizes.
@@ -2176,6 +2297,25 @@ mod ui_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_name_keeps_both_ends() {
+        assert_eq!(middle_cut("notes.md", 20), "notes.md");
+        let cut = middle_cut(
+            "Windwaker - HYPERVIOLENCE - 06 Fractured State of Mind.mp3",
+            30,
+        );
+        assert_eq!(cut.chars().count(), 30);
+        assert!(
+            cut.starts_with("Windwaker - ") && cut.ends_with("e of Mind.mp3"),
+            "{cut}"
+        );
+        // Never so little room that nothing of either end is left.
+        assert_eq!(
+            middle_cut("a-very-long-file-name.txt", 0).chars().count(),
+            12
+        );
+    }
 
     #[test]
     fn counts_get_thousands_separators() {

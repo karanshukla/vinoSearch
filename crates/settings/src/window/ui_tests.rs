@@ -739,10 +739,14 @@ fn the_index_page_lists_documents_indexed_in_part() {
     }
     let h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Indexing the rest of long documents");
-    h.get_by_label("book0.pdf, 120 of 1,640 pages");
-    h.get_by_label("book1.pdf, 30 of 41 chapters");
+    // The name and how far it got are two labels, so a long name can be cut
+    // short without losing the count.
+    h.get_by_label("book0.pdf");
+    h.get_by_label("book1.pdf");
+    h.get_by_label(", 30 of 41 chapters");
+    assert_eq!(h.query_all_by_label(", 120 of 1,640 pages").count(), 2);
     h.get_by_label("and 2 more");
-    assert!(h.query_by_label("book3.pdf, 120 of 1,640 pages").is_none());
+    assert!(h.query_by_label("book3.pdf").is_none());
 }
 
 #[test]
@@ -888,6 +892,44 @@ fn without_a_tpm_turning_it_on_is_refused_until_the_host_key_is_allowed() {
     settle(&mut h);
     let c = &h.state().config.encryption;
     assert!(c.on() && c.host_key_allowed());
+}
+
+#[test]
+fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
+    let (w, requests) = security("keyring", |s| s.new_seal = "keyring".into());
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label_contains("desktop keyring, which your session can read");
+    // No TPM, but nothing to allow: the keyring is what there is.
+    assert!(
+        h.query_by_label("Use the host key instead (weaker)")
+            .is_none()
+    );
+    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
+        .click();
+    settle(&mut h);
+    assert!(h.state().config.encryption.on());
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::ApplyEncryption))
+    );
+
+    let (w, requests) = security("keyring-waiting", |s| {
+        s.new_seal = "keyring".into();
+        s.encrypted = true;
+        s.seal = "keyring".into();
+        s.seal_waiting = "the keyring is locked".into();
+    });
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Encrypted, waiting for its key");
+    h.get_by_label_contains("can't be read yet (the keyring is locked)");
+    h.get_by_role_and_label(Role::Button, "Unlock…").click();
+    settle(&mut h);
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::ApplyEncryption))
+    );
 }
 
 #[test]

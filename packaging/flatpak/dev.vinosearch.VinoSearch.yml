@@ -1,0 +1,205 @@
+# vinoSearch as a Flatpak: the service, the CLI and the settings window,
+# with OpenVINO and Intel's NPU and GPU drivers under /app. Intel's prebuilt
+# Ubuntu packages are unpacked as they are; nothing from the host's /usr is
+# loaded. Built from this checkout; see docs/install.md.
+#
+#   flatpak run --filesystem=$HOME org.flatpak.Builder --user --install --force-clean \
+#     --state-dir ~/.cache/vinosearch/bench/flatpak/state \
+#     ~/.cache/vinosearch/bench/flatpak/build packaging/flatpak/dev.vinosearch.VinoSearch.yml
+app-id: dev.vinosearch.VinoSearch
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: vinosearch
+finish-args:
+  # /dev/accel/accel0 (NPU) is only exposed by `all`; it covers the GPU's
+  # /dev/dri too, for OpenVINO and the settings window.
+  - --device=all
+  # The files it indexes, and opens through the host.
+  - --filesystem=home
+  # The host's desktop entries under /run/host/usr/share, read-only: which
+  # app opens a file at its line, page or second, and the settings window's
+  # editor and player lists.
+  - --filesystem=host-os:ro
+  # The same for system-wide Flatpak apps.
+  - --filesystem=/var/lib/flatpak/exports/share/applications:ro
+  # Downloading the models.
+  - --share=network
+  # The settings and search windows.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # flatpak-spawn --host: results open in the host's apps, as natively, the
+  # search places are turned on in the host's settings (krunnerrc,
+  # gsettings): Flatpak exports search providers turned off, and the index
+  # key is sealed by the host's systemd-creds, to its TPM.
+  - --talk-name=org.freedesktop.Flatpak
+  # The index key in the desktop keyring, where the host has no
+  # systemd-creds to seal it with.
+  - --talk-name=org.freedesktop.secrets
+  # Holding indexing while power saver is on (src/service/power.rs).
+  - --system-talk-name=net.hadess.PowerProfiles
+  - --env=VINOSEARCH_OPENVINO_DIR=/app/lib/vinosearch/openvino
+  - --env=OCL_ICD_VENDORS=/app/etc/OpenCL/vendors
+
+modules:
+  # OpenVINO 2026.4.1: the wheel's libs/, the same files and links ovfetch
+  # installs into ~/.local/lib/vinosearch/openvino.
+  - name: openvino
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/77/cf/830aff97404d73b8ada3ba3f02a626089a384299322cb94b52c37eaebd18/openvino-2026.4.1-22982-cp314-cp314-manylinux_2_28_x86_64.whl
+        sha256: 3631dd889dccf3d5087775948590a6609a662f90c24a9cf85bb4dfa0cdd7fd2f
+        dest-filename: openvino.whl
+      - type: file
+        path: ovfetch.lock.json
+    build-commands:
+      - unzip -q openvino.whl 'openvino/libs/*' 'openvino-2026.4.1.dist-info/licenses/*'
+      - |
+        set -e
+        p=/app/lib/vinosearch/openvino
+        install -d $p
+        for f in libopenvino.so.2641 libopenvino_c.so.2641 libopenvino_onnx_frontend.so.2641 \
+                 libopenvino_auto_plugin.so libopenvino_hetero_plugin.so \
+                 libopenvino_intel_cpu_plugin.so libopenvino_intel_gpu_plugin.so \
+                 libopenvino_intel_npu_plugin.so libtbb.so.12 libtbbmalloc.so.2; do
+          install -m755 openvino/libs/$f $p/$f
+        done
+        ln -s libopenvino.so.2641 $p/libopenvino.so
+        ln -s libopenvino_c.so.2641 $p/libopenvino_c.so
+        ln -s libopenvino_onnx_frontend.so.2641 $p/libopenvino_onnx_frontend.so
+        ln -s libtbb.so.12 $p/libtbb.so
+        ln -s libtbbmalloc.so.2 $p/libtbbmalloc.so
+        install -m644 ovfetch.lock.json $p/ovfetch.lock.json
+        # The NPU compiler needs libtbb.so.12 by soname.
+        ln -s vinosearch/openvino/libtbb.so.12 /app/lib/libtbb.so.12
+        install -d /app/share/licenses/openvino
+        cp -r openvino-2026.4.1.dist-info/licenses/. /app/share/licenses/openvino/
+
+  # Level Zero loader, oneapi-src/level-zero v1.35.0 (Ubuntu 24.04 deb).
+  - name: level-zero
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    sources:
+      - type: file
+        url: https://github.com/oneapi-src/level-zero/releases/download/v1.35.0/libze1_1.35.0+u24.04_amd64.deb
+        sha256: 8420f4fd710a44bed054afad2f7e0fbc408d8b3e266a2b5464bd4ab71a0dfcf3
+        dest-filename: libze1.deb
+      - type: file
+        url: https://raw.githubusercontent.com/oneapi-src/level-zero/v1.35.0/LICENSE
+        sha256: f2e82047a47ca742088331ae2bc85b97949ed1e97dfa057cdafd03e8709fc0a2
+    build-commands:
+      - ar x libze1.deb data.tar.gz && tar xzf data.tar.gz
+      - cp -a usr/lib/x86_64-linux-gnu/libze_loader.so* /app/lib/
+      - install -Dm644 LICENSE /app/share/licenses/level-zero/LICENSE
+
+  # NPU user-mode driver and its compiler, intel/linux-npu-driver v1.35.0.
+  # The firmware package is left out: the host kernel loads firmware.
+  - name: npu-driver
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    sources:
+      - type: archive
+        url: https://github.com/intel/linux-npu-driver/releases/download/v1.35.0/linux-npu-driver-v1.35.0.20260722-29947505341-ubuntu2404.tar.gz
+        sha256: 398343e53fdac6023ad0856ef88bb6011b1e12447a112be55e85e27ef7f96c66
+        strip-components: 0
+      - type: file
+        url: https://raw.githubusercontent.com/intel/linux-npu-driver/v1.35.0/LICENSE.md
+        sha256: 451963b6682694730dbe4889fff2ef1c20def68992e2594880c15a28e6c87be5
+      - type: file
+        url: https://raw.githubusercontent.com/intel/linux-npu-driver/v1.35.0/third-party-programs.txt
+        sha256: 7ae92abe83bee3b7bac9197a4b9a151cecfce28ed8eb0a8cbd4ace5ee4ccb75a
+    build-commands:
+      - |
+        set -e
+        for d in intel-level-zero-npu_*.deb intel-driver-compiler-npu_*.deb; do
+          ar p "$d" data.tar.gz | tar xz
+        done
+      # The driver opens the compiler loader from its own directory.
+      - cp -a usr/lib/x86_64-linux-gnu/libze_intel_npu.so* usr/lib/x86_64-linux-gnu/libopenvino_intel_npu_compiler*.so /app/lib/
+      - install -Dm644 LICENSE.md /app/share/licenses/linux-npu-driver/LICENSE.md
+      - install -Dm644 third-party-programs.txt /app/share/licenses/linux-npu-driver/third-party-programs.txt
+
+  # GPU: Intel's OpenCL driver (compute-runtime 26.40.40196.8), gmmlib
+  # 22.10.2 and IGC v2.42.6, the set that release names.
+  - name: gpu-driver
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    sources:
+      - type: file
+        url: https://github.com/intel/compute-runtime/releases/download/26.40.40196.8/intel-opencl-icd_26.40.40196.8-0_amd64.deb
+        sha256: 96046069e94680b761df6e83ddc64244721178b826e3e1f8af3ca104cfd0c7c2
+        dest-filename: opencl-icd.deb
+      - type: file
+        url: https://github.com/intel/compute-runtime/releases/download/26.40.40196.8/libigdgmm12_22.10.2_amd64.deb
+        sha256: 053fceadb84a1d2f9a30a0d1bc9b16424b3f1a90cc49900fcd80aadcf25c8a4d
+        dest-filename: gmm.deb
+      - type: file
+        url: https://github.com/intel/intel-graphics-compiler/releases/download/v2.42.6/intel-igc-core-2_2.42.6+23070_amd64.deb
+        sha256: e20539632f2d99875d8f8b225d5da58b31f98baa54bb47c6328aa98ec473ab9d
+        dest-filename: igc-core.deb
+      - type: file
+        url: https://github.com/intel/intel-graphics-compiler/releases/download/v2.42.6/intel-igc-opencl-2_2.42.6+23070_amd64.deb
+        sha256: 7f5593cf828503ffb8450967768bde9209e22753bc576296e846b5a751011fa3
+        dest-filename: igc-opencl.deb
+      - type: file
+        url: https://raw.githubusercontent.com/intel/intel-graphics-compiler/v2.42.6/LICENSE.md
+        sha256: 8b2cd951f44d1fbe6adcf112e1f3a0cc989c89c8889a1c48dea5f7ece10ba9c9
+        dest-filename: igc-LICENSE.md
+      - type: file
+        url: https://raw.githubusercontent.com/intel/gmmlib/intel-gmmlib-22.10.2/LICENSE.md
+        sha256: 8b7446825df3f8b0268307e272aa6aaaf78351c83161d860d02c913c22666c48
+        dest-filename: gmmlib-LICENSE.md
+      - type: file
+        url: https://raw.githubusercontent.com/intel/compute-runtime/26.40.40196.8/LICENSE.md
+        sha256: 987a002c6c9eb75290d9937735641ef4f4b670591ee79e1ac8edebe16a81872e
+        dest-filename: compute-runtime-LICENSE.md
+    build-commands:
+      - |
+        set -e
+        for d in opencl-icd.deb gmm.deb igc-core.deb igc-opencl.deb; do
+          ar p "$d" data.tar.zst | tar x --zstd
+        done
+      - install -d /app/lib/intel-opencl /app/etc/OpenCL/vendors
+      - cp -a usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so /app/lib/intel-opencl/
+      - cp -a usr/lib/x86_64-linux-gnu/libigdgmm.so.12* usr/local/lib/lib*.so* /app/lib/
+      - echo /app/lib/intel-opencl/libigdrcl.so > /app/etc/OpenCL/vendors/intel.icd
+      - install -Dm644 compute-runtime-LICENSE.md /app/share/licenses/compute-runtime/LICENSE.md
+      - install -Dm644 usr/share/doc/intel-opencl-icd/copyright /app/share/licenses/compute-runtime/copyright
+      - install -Dm644 gmmlib-LICENSE.md /app/share/licenses/gmmlib/LICENSE.md
+      - install -Dm644 igc-LICENSE.md /app/share/licenses/intel-graphics-compiler/LICENSE.md
+      - install -Dm644 usr/local/lib/igc2/NOTICES.txt /app/share/licenses/intel-graphics-compiler/NOTICES.txt
+
+  - name: vinosearch
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/vinosearch/cargo
+      # Cargo fetches crates and the [patch.crates-io] git dependency.
+      build-args:
+        - --share=network
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .claude
+    build-commands:
+      - cargo build --release --locked -p vinosearch -p vinosearch-settings
+      - install -Dm755 target/release/vinosearch /app/bin/vinosearch
+      - install -Dm755 target/release/vinosearch-settings /app/bin/vinosearch-settings
+      # The app menu entry, icon, D-Bus activation file, KRunner plugin and
+      # GNOME Shell provider, from the templates a native install writes.
+      - /app/bin/vinosearch flatpak-exports /app/share --app-id $FLATPAK_ID
+      - install -Dm644 packaging/flatpak/$FLATPAK_ID.metainfo.xml /app/share/metainfo/$FLATPAK_ID.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/vinosearch/LICENSE

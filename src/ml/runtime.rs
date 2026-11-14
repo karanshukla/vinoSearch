@@ -1,7 +1,7 @@
 //! The OpenVINO runtime ovfetch installed, and whether it can use the NPU.
 
 use anyhow::{Context, Result, bail};
-use openvino::{Core, DeviceType, ElementType, Shape, Tensor};
+use openvino::{Core, DeviceType, ElementType, PropertyKey, Shape, Tensor};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,8 +51,47 @@ pub fn load(prefix: &Path) -> Result<()> {
         );
     }
     openvino_sys::library::load_from(lib).map_err(anyhow::Error::msg)?;
-    preload_npu(ovfetch::detect::default_npu_prefix().as_deref())?;
+    preload_npu(npu_prefix().as_deref())?;
     Ok(())
+}
+
+/// What `ovfetch npu install` made under the home, if anything. Never in
+/// the Flatpak, which ships its own driver: libraries built for the host
+/// would load against the runtime's.
+fn npu_prefix() -> Option<PathBuf> {
+    if vinosearch_shared::sandbox::flatpak_id().is_some() {
+        return None;
+    }
+    ovfetch::detect::default_npu_prefix()
+}
+
+/// The devices tried, best first, when the config file names none.
+pub const PREFERENCE: [&str; 3] = ["NPU", "GPU", "CPU"];
+
+/// The first of PREFERENCE that OpenVINO finds here. Each device is asked
+/// for in turn, so a machine with an NPU never starts the GPU's driver, and
+/// nothing is compiled. NPU when OpenVINO won't load, so the error is the
+/// one the model's loading reports.
+pub fn best_device(prefix: &Path) -> String {
+    let found = || -> Result<String> {
+        load(prefix)?;
+        let core = Core::new()?;
+        let has = |device: &str| {
+            core.get_property(&DeviceType::from(device), &PropertyKey::AvailableDevices)
+                .is_ok_and(|ids| !ids.trim().is_empty())
+        };
+        Ok(pick_device(has).to_owned())
+    };
+    found().unwrap_or_else(|e| {
+        eprintln!("finding a device: {e:#}");
+        PREFERENCE[0].to_owned()
+    })
+}
+
+/// The first device of PREFERENCE `has` says is here; the CPU always is.
+fn pick_device(mut has: impl FnMut(&str) -> bool) -> &'static str {
+    let (cpu, rest) = PREFERENCE.split_last().unwrap();
+    rest.iter().find(|d| has(d)).unwrap_or(cpu)
 }
 
 /// Load the libraries `ovfetch npu install` put in `npu_prefix`: the NPU
@@ -156,7 +195,11 @@ pub fn doctor(prefix: &Path, device: &str) -> Result<bool> {
             "missing (`ovfetch npu install` fetches Intel's)"
         }
     );
-    if let Some(p) = &machine.npu_prefix {
+    if let Some(p) = machine
+        .npu_prefix
+        .as_ref()
+        .filter(|_| npu_prefix().is_some())
+    {
         println!("npu prefix: {p} (from `ovfetch npu install`, preloaded)");
     }
     if let Some(c) = &status.openvino_ceiling {
@@ -277,6 +320,22 @@ mod tests {
         assert!(err.contains("libvinosearch-test.so"), "{err}");
         assert!(err.contains(ovfetch::detect::NPU_PRELOAD), "{err}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_best_device_is_the_first_found_and_the_cpu_otherwise() {
+        let mut asked = Vec::new();
+        assert_eq!(
+            pick_device(|d| {
+                asked.push(d.to_owned());
+                true
+            }),
+            "NPU"
+        );
+        // The GPU isn't even asked about when there is an NPU.
+        assert_eq!(asked, ["NPU"]);
+        assert_eq!(pick_device(|d| d == "GPU"), "GPU");
+        assert_eq!(pick_device(|_| false), "CPU");
     }
 
     #[test]

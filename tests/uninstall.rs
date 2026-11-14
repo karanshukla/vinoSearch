@@ -78,6 +78,43 @@ fn uninstall_deletes_the_models_and_keeps_the_index() {
 }
 
 #[test]
+fn uninstall_removes_the_autostart_entry_and_an_older_installs_unit() {
+    let home = temp_home("uninstall-start");
+    let files = [
+        "config/autostart/dev.vinosearch.Runner.desktop",
+        "config/systemd/user/vinosearch.service",
+        "data/dbus-1/services/dev.vinosearch.Runner.service",
+    ];
+    for f in files {
+        put(&home.join(f));
+    }
+    let wants = home.join("config/systemd/user/default.target.wants");
+    std::fs::create_dir_all(&wants).unwrap();
+    std::os::unix::fs::symlink("../vinosearch.service", wants.join("vinosearch.service")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vinosearch"))
+        .args(["krunner", "--uninstall"])
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        // No systemctl and no bus: never the real service of whoever runs
+        // the tests, and the files go all the same.
+        .env("PATH", "")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for f in files {
+        assert!(!home.join(f).exists(), "{f} is still there");
+    }
+    assert!(wants.join("vinosearch.service").symlink_metadata().is_err());
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
 fn delete_model_deletes_them_without_a_service() {
     let home = temp_home("delete-model");
     installed(&home);

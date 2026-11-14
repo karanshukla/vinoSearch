@@ -24,8 +24,8 @@ fn integrate(home: &Path, args: &[&str]) {
 fn temp_home(name: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
-    // The service counts as installed, so `integrate` doesn't write a unit
-    // or call systemctl for the user running the tests.
+    // The service counts as installed, so `integrate` doesn't install it and
+    // restart the runner of the user running the tests.
     let service = home.join("data/dbus-1/services/dev.vinosearch.Runner.service");
     std::fs::create_dir_all(service.parent().unwrap()).unwrap();
     std::fs::write(&service, "").unwrap();

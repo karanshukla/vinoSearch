@@ -73,6 +73,12 @@ pub struct Status {
     pub encryption_error: String,
     /// Why the index was rebuilt from the files at the runner's start.
     pub seal_broken: String,
+    /// Why the index's key can't be had yet (a locked keyring); empty
+    /// otherwise.
+    pub seal_waiting: String,
+    /// What a new key is sealed with here: a `dbus::seal` value, or empty
+    /// from a runner older than the keyring.
+    pub new_seal: String,
 }
 
 /// A long document with only some of its parts indexed so far (#108).
@@ -184,6 +190,8 @@ impl Status {
             tpm: flag(status::TPM),
             encryption_error: text(status::ENCRYPTION_ERROR),
             seal_broken: text(status::SEAL_BROKEN),
+            seal_waiting: text(status::SEAL_WAITING),
+            new_seal: text(status::NEW_SEAL),
         }
     }
 }
@@ -298,7 +306,7 @@ where
         };
         zbus::Proxy::new_owned(
             c,
-            dbus::SERVICE.to_owned(),
+            dbus::names().service.clone(),
             dbus::CONTROL_PATH.to_owned(),
             dbus::CONTROL_INTERFACE.to_owned(),
         )
@@ -415,6 +423,8 @@ mod tests {
             (status::SEAL, "tpm"),
             (status::ENCRYPTION_ERROR, ""),
             (status::SEAL_BROKEN, "the TPM was cleared"),
+            (status::SEAL_WAITING, "the keyring is locked"),
+            (status::NEW_SEAL, "keyring"),
         ] {
             map.insert(
                 k.to_owned(),
@@ -425,6 +435,8 @@ mod tests {
         assert!(s.encrypted && s.tpm);
         assert_eq!(s.seal, "tpm");
         assert_eq!(s.seal_broken, "the TPM was cleared");
+        assert_eq!(s.seal_waiting, "the keyring is locked");
+        assert_eq!(s.new_seal, "keyring");
     }
 
     #[test]

@@ -218,7 +218,7 @@ impl Runner {
             };
             zbus::Proxy::new_owned(
                 c,
-                dbus::SERVICE.to_owned(),
+                dbus::names().service.clone(),
                 dbus::CONTROL_PATH.to_owned(),
                 dbus::CONTROL_INTERFACE.to_owned(),
             )

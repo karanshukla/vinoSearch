@@ -12,8 +12,12 @@ pub struct App {
     pub name: String,
 }
 
-/// The user's data directory, then the system's, in XDG order.
+/// The user's data directory, then the system's, in XDG order. In the
+/// Flatpak, the host's: the apps that open files run there.
 pub fn data_dirs() -> Vec<PathBuf> {
+    if crate::sandbox::flatpak_id().is_some() {
+        return host_data_dirs();
+    }
     let mut dirs = Vec::new();
     match std::env::var_os("XDG_DATA_HOME") {
         Some(d) if !d.is_empty() => dirs.push(PathBuf::from(d)),
@@ -32,6 +36,27 @@ pub fn data_dirs() -> Vec<PathBuf> {
             .split(':')
             .filter(|d| !d.is_empty())
             .map(PathBuf::from),
+    );
+    dirs
+}
+
+/// The host's data directories as the sandbox sees them: the home's own
+/// (`--filesystem=home`), Flatpak's exports (the system's by their own
+/// permission), and /usr under /run/host (`--filesystem=host-os:ro`).
+fn host_data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(h) = std::env::var_os("HOME") {
+        let share = PathBuf::from(h).join(".local/share");
+        dirs.push(share.join("flatpak/exports/share"));
+        dirs.insert(0, share);
+    }
+    dirs.extend(
+        [
+            "/var/lib/flatpak/exports/share",
+            "/run/host/usr/local/share",
+            "/run/host/usr/share",
+        ]
+        .map(PathBuf::from),
     );
     dirs
 }
