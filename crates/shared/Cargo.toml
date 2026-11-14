@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+configparser = "3.3.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 toml_edit = "0.25"
