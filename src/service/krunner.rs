@@ -616,14 +616,7 @@ fn launch_settings(args: &[&str]) {
     match settings {
         Ok(s) if s.is_file() => {
             let program = s.display().to_string();
-            // In the Flatpak, a sandbox of its own (the Flatpak portal's
-            // Spawn): one started in ours would go when the runner does.
-            let spawn = sandbox::flatpak_id().map(|_| "flatpak-spawn".to_owned());
-            let argv = spawn
-                .into_iter()
-                .chain(std::iter::once(program.clone()))
-                .chain(args.iter().map(ToString::to_string))
-                .collect();
+            let argv = settings_argv(sandbox::flatpak_id(), &program, args);
             std::thread::spawn(move || {
                 if let Err(e) = crate::search::open::spawn(argv) {
                     eprintln!("{program}: {e}");
@@ -632,6 +625,22 @@ fn launch_settings(args: &[&str]) {
         }
         _ => eprintln!("vinosearch-settings is not installed beside vinosearch"),
     }
+}
+
+/// The command that opens vinosearch-settings with `args`. In the Flatpak
+/// `open::spawn` runs commands on the host, so there it is the host's
+/// `flatpak run`, as the app menu's entry is: a sandbox of its own, which
+/// one started in the runner's wouldn't outlive. Natively, `program`.
+fn settings_argv(flatpak: Option<&str>, program: &str, args: &[&str]) -> Vec<String> {
+    let command: Vec<&str> = match flatpak {
+        Some(app) => vec!["flatpak", "run", "--command=vinosearch-settings", app],
+        None => vec![program],
+    };
+    command
+        .into_iter()
+        .chain(args.iter().copied())
+        .map(String::from)
+        .collect()
 }
 
 struct Control {
@@ -2172,5 +2181,29 @@ mod tests {
             "file:///home/u/My%20Notes/%231%2050%25%3F.md"
         );
         assert_eq!(file_url("/tmp/é.txt"), "file:///tmp/%C3%A9.txt");
+    }
+    #[test]
+    fn the_search_window_opens_natively_and_from_the_flatpak() {
+        assert_eq!(
+            settings_argv(None, "/usr/bin/vinosearch-settings", &["--search", "a b"]),
+            ["/usr/bin/vinosearch-settings", "--search", "a b"]
+        );
+        // On the host, where open::spawn runs it: `flatpak-spawn` there has
+        // no sandbox to spawn from, and /app/bin isn't the host's.
+        assert_eq!(
+            settings_argv(
+                Some("dev.vinosearch.VinoSearch"),
+                "/app/bin/vinosearch-settings",
+                &["--search", "a b"]
+            ),
+            [
+                "flatpak",
+                "run",
+                "--command=vinosearch-settings",
+                "dev.vinosearch.VinoSearch",
+                "--search",
+                "a b"
+            ]
+        );
     }
 }
