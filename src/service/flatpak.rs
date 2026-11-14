@@ -189,8 +189,14 @@ fn set_place(place: Place, on: bool) -> Result<()> {
                 // opens the window.
                 let settings = format!("flatpak run --command=vinosearch-settings {}", n.app_id);
                 fs::create_dir_all(entry.parent().unwrap())?;
-                fs::write(&entry, krunner::search_entry(&settings))
-                    .with_context(|| format!("writing {}", entry.display()))?;
+                let launcher = sandbox::info_value("Instance", "app-path")
+                    .and_then(|path| sandbox::exported_launcher(&path, &n.app_id))
+                    .filter(|l| !l.chars().any(|c| c.is_control() || c == ' '));
+                fs::write(
+                    &entry,
+                    krunner::search_entry(&settings, launcher.as_deref()),
+                )
+                .with_context(|| format!("writing {}", entry.display()))?;
                 println!("wrote {}", entry.display());
             } else if entry.exists() {
                 fs::remove_file(&entry).with_context(|| format!("removing {}", entry.display()))?;

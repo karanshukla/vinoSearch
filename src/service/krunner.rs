@@ -1485,7 +1485,7 @@ fn install_search_entry() -> Result<()> {
         bail!("{s:?}: cannot go in a desktop entry");
     }
     fs::create_dir_all(entry.parent().unwrap())?;
-    fs::write(&entry, search_entry(&desktop_quote(s)))?;
+    fs::write(&entry, search_entry(&desktop_quote(s), None))?;
     println!("wrote {}", entry.display());
     Ok(())
 }
@@ -1495,14 +1495,20 @@ fn search_entry_path() -> Result<PathBuf> {
 }
 
 /// The search window's entry, `settings` being the command that opens the
-/// settings window.
-pub(crate) fn search_entry(settings: &str) -> String {
-    format!(
+/// settings window. With `only_with`, a program the menu shows the entry
+/// only in the presence of: the Flatpak's launcher, so an entry left behind
+/// by `flatpak uninstall` isn't offered.
+pub(crate) fn search_entry(settings: &str, only_with: Option<&str>) -> String {
+    let mut entry = format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
          Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
          Icon={}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n",
         names().icon
-    )
+    );
+    if let Some(program) = only_with {
+        entry.push_str(&format!("TryExec={program}\n"));
+    }
+    entry
 }
 
 /// GNOME Shell's search provider file.
@@ -1905,12 +1911,16 @@ mod tests {
 
     #[test]
     fn the_search_entry_opens_the_search_window() {
-        let entry = search_entry(&desktop_quote("/home/u/my bin/vinosearch-settings"));
+        let entry = search_entry(&desktop_quote("/home/u/my bin/vinosearch-settings"), None);
         assert!(
             entry.contains("\nExec=\"/home/u/my bin/vinosearch-settings\" --search\n"),
             "{entry}"
         );
         assert!(!entry.contains("StartupWMClass"), "{entry}");
+        assert!(!entry.contains("TryExec"), "{entry}");
+        // The Flatpak's goes from the menu with its launcher.
+        let entry = search_entry("flatpak run a.b", Some("/x/exports/bin/a.b"));
+        assert!(entry.ends_with("\nTryExec=/x/exports/bin/a.b\n"), "{entry}");
     }
 
     #[test]
