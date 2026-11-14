@@ -25,6 +25,7 @@ Filename search finds `signing-keys.md` when you remember it's called that. vino
 ```bash
 curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --index ~/Documents
 ```
+(or download the latest Flatpak from GH releases)
 
 That downloads the latest release, checks it against its `.sha256`, installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. No sudo: everything goes in your home. If something is missing (the NPU driver, say), it stops with one line saying what.
 
