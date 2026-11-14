@@ -5,7 +5,9 @@
 //! `EnabledByDefault=false`, GNOME Shell's `DefaultDisabled=true`), so a
 //! place is turned on and off in the desktop's own setting, which its search
 //! settings page shows too: KRunner's `krunnerrc` and GNOME's
-//! `org.gnome.desktop.search-providers`, written on the host. Starting at
+//! `org.gnome.desktop.search-providers`, written on the host. The search
+//! window's own app menu entry is the one file written there, in the home's
+//! `applications`: an exported entry couldn't be turned off. Starting at
 //! login goes through the Background portal, which writes and removes the
 //! autostart entry on the host.
 
@@ -85,7 +87,9 @@ pub fn install(args: &[String]) -> Result<()> {
 /// uninstalled, but nothing starts it.
 pub fn uninstall(app: &str) -> Result<()> {
     // The places first: a search between the two would start it again.
-    for place in [Place::Kde, Place::Gnome] {
+    // The menu entry is a file on the host, which uninstalling the Flatpak
+    // would leave behind.
+    for place in Place::ALL {
         if let Err(e) = set_place(place, false) {
             eprintln!("{e:#}");
         }
@@ -176,13 +180,31 @@ fn set_place(place: Place, on: bool) -> Result<()> {
             }
             println!("GNOME Shell: {}", if on { "on" } else { "off" });
         }
-        Place::Menu if on => {
-            println!("the search window is Search Files, an action of vinoSearch's app menu entry")
+        Place::Menu => {
+            let entry = sandbox::host_data_home()
+                .context("no home directory")?
+                .join(&n.search_entry);
+            if on {
+                // On the host, where the menu runs it, as `launch_settings`
+                // opens the window.
+                let settings = format!("flatpak run --command=vinosearch-settings {}", n.app_id);
+                fs::create_dir_all(entry.parent().unwrap())?;
+                let launcher = sandbox::info_value("Instance", "app-path")
+                    .and_then(|path| sandbox::exported_launcher(&path, &n.app_id))
+                    .filter(|l| !l.chars().any(|c| c.is_control() || c == ' '));
+                fs::write(
+                    &entry,
+                    krunner::search_entry(&settings, launcher.as_deref()),
+                )
+                .with_context(|| format!("writing {}", entry.display()))?;
+                println!("wrote {}", entry.display());
+            } else if entry.exists() {
+                fs::remove_file(&entry).with_context(|| format!("removing {}", entry.display()))?;
+                println!("removed {}", entry.display());
+            } else {
+                println!("the search window's app menu entry was already off");
+            }
         }
-        Place::Menu => bail!(
-            "in the Flatpak the search window is an action of vinoSearch's own app menu entry, \
-             so it can't be removed alone"
-        ),
     }
     Ok(())
 }

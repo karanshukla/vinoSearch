@@ -4360,9 +4360,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vino-user-interface"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83d0b607afa6f07779b06dd598e117775000e632578acdbb7ce71d35cf5bc837"
+checksum = "1a0fd04b6927638d938bc5e15a91cc033200cfd09677b69709310196eb6c1f0c"
 dependencies = [
  "egui",
 ]

@@ -152,8 +152,10 @@ What differs from the native install:
 - The KRunner plugin, GNOME Shell provider and D-Bus activation file come with it. Flatpak leaves
   exported search providers off, so the Integration page's switches (and `integrate kde|gnome`)
   turn them on and off in the desktop's own setting, the one its search settings page shows. The
-  search window is the **Search Files** action of the app menu entry rather than an entry of its
-  own.
+  search window is the **Search Files** action of the app menu entry; the App menu switch (and
+  `integrate menu`) adds it as an entry of its own, a file in `~/.local/share/applications` that
+  `krunner --uninstall` or turning the switch off removes. `flatpak uninstall` leaves the file,
+  which the menu stops showing.
 - The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
   through the Background portal, with the running desktop's search place.
 - With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).

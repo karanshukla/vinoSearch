@@ -3,7 +3,8 @@
 //! krunner --install` / `--uninstall` for the service with everything (#45).
 //!
 //! In the Flatpak a place's files come with it, and its switch is the
-//! desktop's own setting for the place; the service switch is that and
+//! desktop's own setting for the place (the app menu's is an entry written
+//! on the host); the service switch is that and
 //! starting at login, through the Background portal. The window turns the
 //! service on the first time it opens, as installing does natively.
 
@@ -50,7 +51,7 @@ impl State {
             return State {
                 kde: sandbox::krunner_plugin_on(&n.krunner_plugin_id),
                 gnome,
-                menu: true,
+                menu: sandbox::host_data_home().is_some_and(|d| d.join(&n.search_entry).exists()),
                 service: autostart.is_some_and(|p| p.exists()),
                 ..State::default()
             };
@@ -59,7 +60,7 @@ impl State {
         State {
             kde: on(&n.krunner_plugin),
             gnome: on(&n.gnome_provider),
-            menu: n.search_entry.as_deref().is_some_and(on),
+            menu: on(&n.search_entry),
             service: on(&n.dbus_service_file),
             ..State::default()
         }
@@ -75,9 +76,9 @@ impl State {
     }
 }
 
-/// Whether the search window comes with the app menu entry (the Flatpak's)
-/// rather than having a switch.
-pub fn menu_fixed() -> bool {
+/// Whether the places' files come with the app (the Flatpak's), their
+/// switches being the desktop's own settings.
+pub fn places_fixed() -> bool {
     sandbox::flatpak_id().is_some()
 }
 

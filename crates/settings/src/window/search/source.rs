@@ -18,6 +18,12 @@ pub enum Kind {
     Document,
     /// A photo, or text read in one.
     Image,
+    /// Source code, which only a `code:` query finds, alone (#110).
+    Code,
+    /// A vinoWhisper session's transcript or summary (#143).
+    Session,
+    /// An audio or video file, by its sound or picture (#187).
+    Media,
 }
 
 /// One file a search found.
@@ -259,10 +265,11 @@ impl Source for Runner {
             .map(|(path, kind, score, snippet, unit, at, mtime)| Found {
                 path,
                 kind: match kind.as_str() {
-                    // Code comes alone, for `code:` (#110), and reads as text.
-                    // A session's transcript or summary reads as text too (#143).
-                    results::TEXT | results::CODE | results::SESSION => Kind::Text,
+                    results::TEXT => Kind::Text,
                     results::DOCUMENT => Kind::Document,
+                    results::CODE => Kind::Code,
+                    results::SESSION => Kind::Session,
+                    results::MEDIA => Kind::Media,
                     _ => Kind::Image,
                 },
                 score,
@@ -307,11 +314,13 @@ impl Source for Runner {
 
     /// As a `text/uri-list`, which file managers paste as the file. egui's
     /// clipboard only takes text, so through wl-copy: the window is Wayland
-    /// only.
+    /// only. The Flatpak has no wl-copy of its own, so there the host's.
     fn copy(&mut self, path: &str) -> Result<(), String> {
         let uri = format!("{}\r\n", super::thumbs::file_uri(Path::new(path)));
-        let status = std::process::Command::new("wl-copy")
-            .args(["--type", "text/uri-list", &uri])
+        let sandboxed = vinosearch_shared::sandbox::flatpak_id().is_some();
+        let argv = copy_argv(sandboxed, &uri);
+        let status = std::process::Command::new(argv[0])
+            .args(&argv[1..])
             .status()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => {
@@ -324,5 +333,40 @@ impl Source for Runner {
         } else {
             Err(format!("wl-copy failed ({status})"))
         }
+    }
+}
+
+/// The command that puts `uri` on the clipboard as a file.
+fn copy_argv(sandboxed: bool, uri: &str) -> Vec<&str> {
+    let host: &[&str] = if sandboxed {
+        &["flatpak-spawn", "--host"]
+    } else {
+        &[]
+    };
+    [host, &["wl-copy", "--type", "text/uri-list", uri]].concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_copied_by_wl_copy_the_hosts_from_the_flatpak() {
+        let uri = "file:///a\r\n";
+        assert_eq!(
+            copy_argv(false, uri),
+            ["wl-copy", "--type", "text/uri-list", uri]
+        );
+        assert_eq!(
+            copy_argv(true, uri),
+            [
+                "flatpak-spawn",
+                "--host",
+                "wl-copy",
+                "--type",
+                "text/uri-list",
+                uri
+            ]
+        );
     }
 }

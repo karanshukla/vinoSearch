@@ -5,6 +5,7 @@
 //! Nothing is written to the shared cache.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -82,12 +83,22 @@ impl Thumbs {
     }
 }
 
-/// `$XDG_CACHE_HOME/thumbnails`, else `~/.cache/thumbnails`.
+/// `$XDG_CACHE_HOME/thumbnails`, else `~/.cache/thumbnails`. In the Flatpak
+/// the home's: the sandbox's XDG_CACHE_HOME is the app's own, which no file
+/// manager fills.
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+    let sandboxed = vinosearch_shared::sandbox::flatpak_id().is_some();
+    cache_dir_from(
+        std::env::var_os("XDG_CACHE_HOME").filter(|_| !sandboxed),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn cache_dir_from(xdg_cache: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let base = xdg_cache
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".cache")))?;
     Some(base.join("thumbnails"))
 }
 
@@ -239,6 +250,17 @@ mod tests {
         chunk.extend_from_slice(&typed);
         chunk.extend_from_slice(&crc32(&typed).to_be_bytes());
         [&png[..ihdr_end], &chunk, &png[ihdr_end..]].concat()
+    }
+
+    #[test]
+    fn the_cache_is_the_desktops_or_the_homes() {
+        let dir = |xdg: Option<&str>| {
+            cache_dir_from(xdg.map(OsString::from), Some("/home/u".into())).unwrap()
+        };
+        assert_eq!(dir(Some("/c")), Path::new("/c/thumbnails"));
+        // As in the Flatpak, where the sandbox's own isn't asked.
+        assert_eq!(dir(None), Path::new("/home/u/.cache/thumbnails"));
+        assert_eq!(dir(Some("")), Path::new("/home/u/.cache/thumbnails"));
     }
 
     #[test]

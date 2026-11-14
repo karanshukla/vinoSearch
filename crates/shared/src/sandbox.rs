@@ -68,6 +68,20 @@ pub fn host_autostart_entry(app_id: &str) -> Option<PathBuf> {
     )
 }
 
+/// The real home's `.local/share`, where the host's app menu reads the
+/// entries a user adds: the sandbox's XDG_DATA_HOME is under ~/.var/app.
+pub fn host_data_home() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share"))
+}
+
+/// The launcher Flatpak exports for `app`, from the sandbox's `app-path`
+/// (`<installation>/app/<app>/<arch>/<branch>/<commit>/files`): it is there
+/// while the app is installed, and gone with it.
+pub fn exported_launcher(app_path: &str, app: &str) -> Option<String> {
+    let (installation, _) = app_path.split_once(&format!("/app/{app}/"))?;
+    Some(format!("{installation}/exports/bin/{app}"))
+}
+
 /// Set once start at login was first asked for (or turned off), so the
 /// settings window asks only the first time it opens.
 pub fn autostart_asked_path() -> Option<PathBuf> {
@@ -155,6 +169,28 @@ fn plugin_on(krunnerrc: &str, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exported_launcher_is_beside_the_installation_the_app_runs_from() {
+        let app = "dev.example.App";
+        assert_eq!(
+            exported_launcher(
+                "/home/u/.local/share/flatpak/app/dev.example.App/x86_64/stable/abc/files",
+                app
+            )
+            .as_deref(),
+            Some("/home/u/.local/share/flatpak/exports/bin/dev.example.App")
+        );
+        assert_eq!(
+            exported_launcher(
+                "/var/lib/flatpak/app/dev.example.App/x86_64/master/abc/files",
+                app
+            )
+            .as_deref(),
+            Some("/var/lib/flatpak/exports/bin/dev.example.App")
+        );
+        assert_eq!(exported_launcher("/app", app), None);
+    }
 
     #[test]
     fn gsettings_lists_read_and_write() {

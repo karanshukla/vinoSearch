@@ -1724,7 +1724,7 @@ impl SettingsWindow {
     fn integration(&mut self, ui: &mut egui::Ui) {
         let state = self.integration.lock().unwrap().clone();
         let (kde, gnome) = integration::desktops();
-        let fixed = integration::menu_fixed();
+        let fixed = integration::places_fixed();
         widgets::group_label(ui, "Search places");
         widgets::group_help(
             ui,
@@ -1742,10 +1742,6 @@ impl SettingsWindow {
             };
             Row::new(label).help(&help).show(ui, |ui, _| {
                 let on = state.is_on(switch);
-                if fixed && switch == integration::Switch::Menu {
-                    widgets::chip(ui, ChipKind::Ok, "On");
-                    return;
-                }
                 let button = if on { "Turn off" } else { "Turn on" };
                 let button = ui.add_enabled(!state.running, Button::secondary(button));
                 if a11y::for_what(button, label).clicked() {
@@ -1783,7 +1779,8 @@ impl SettingsWindow {
                 ui,
                 "App menu",
                 if fixed {
-                    "The search window: Search Files, in vinoSearch's menu entry's actions."
+                    "The search window as an app of its own. Search Files, in vinoSearch's \
+                     menu entry's actions, opens it either way."
                 } else {
                     "The search window as an app of its own."
                 },

@@ -354,7 +354,7 @@ fn a_session_with_a_recording_plays_it_and_still_opens_its_transcript() {
     let fake = Fake {
         results: vec![found(
             session,
-            Kind::Text,
+            Kind::Session,
             "It happens in March.",
             "second",
             72,
@@ -378,14 +378,95 @@ fn a_session_with_a_recording_plays_it_and_still_opens_its_transcript() {
 }
 
 #[test]
+fn media_sessions_and_code_have_filters_and_media_a_section_of_its_own() {
+    let asked = Asked::default();
+    let fake = Fake {
+        results: vec![
+            found("/srv/v/trip.mkv", Kind::Media, "", "second", 754, 1),
+            found(
+                "/srv/t/talk.vwsession",
+                Kind::Session,
+                "In March.",
+                "",
+                0,
+                1,
+            ),
+            found("/srv/c/main.rs", Kind::Code, "fn main()", "line", 1, 1),
+            found("/srv/p/beach.png", Kind::Image, "", "", 0, 1),
+        ],
+        asked: Arc::clone(&asked),
+    };
+    let mut h = harness(SearchWindow::with("camping", fake), WIDE);
+    answered(&mut h);
+    h.get_by_role_and_label(Role::Heading, "Images (1)");
+    h.get_by_role_and_label(Role::Heading, "Media (1)");
+    let media = options(&h, "Media");
+    assert_eq!(media.len(), 1);
+    assert_eq!(
+        media[0].accesskit_node().label().as_deref(),
+        Some("trip.mkv, 12:34, in /srv/v")
+    );
+    assert_eq!(options(&h, "Text and documents").len(), 2);
+
+    let shown = |h: &Harness<'_, SearchWindow>| {
+        h.state()
+            .shown()
+            .iter()
+            .map(|f| f.name().to_owned())
+            .collect::<Vec<_>>()
+    };
+    for (chip, left) in [
+        ("Media (1)", vec!["talk.vwsession", "main.rs", "beach.png"]),
+        ("Sessions (1)", vec!["main.rs", "beach.png"]),
+        ("Code (1)", vec!["beach.png"]),
+    ] {
+        h.get_by_role_and_label(Role::CheckBox, chip).click();
+        settle(&mut h);
+        assert_eq!(shown(&h), left, "{chip}");
+    }
+    assert!(h.query_by_role_and_label(Role::ListBox, "Media").is_none());
+}
+
+#[test]
+fn the_window_buttons_sit_in_the_top_right_corner() {
+    for size in [WIDE, NARROW] {
+        let (mut w, _asked, dir) = window("camping", "corner");
+        w.app_title_bar = true;
+        let mut h = harness(w, size);
+        answered(&mut h);
+        // The harness lays the window out inside a margin of its own.
+        let images = h.get_by_role_and_label(Role::CheckBox, "Images (2)");
+        let margin = images.rect().left() - HEADER_INSET;
+        let gap = vino_ui::window::BAR_GAP + margin;
+        let close = h.get_by_role_and_label(Role::Button, "Close").rect();
+        assert_eq!(close.top(), gap, "{size:?}");
+        assert_eq!(close.right(), size[0] - gap, "{size:?}");
+        for name in ["Minimise", "Maximise"] {
+            let button = h.get_by_role_and_label(Role::Button, name).rect();
+            assert_eq!(button.top(), gap, "{name} {size:?}");
+        }
+        // The filters keep the header's inset on the right, wrapping
+        // before it: a menu is never squeezed past the edge.
+        let clear_of = size[0] - margin - HEADER_INSET;
+        for chip in h.query_all_by_role(Role::CheckBox) {
+            assert!(chip.rect().right() <= clear_of, "{size:?}");
+        }
+        for combo in h.query_all_by_role(Role::ComboBox) {
+            assert!(combo.rect().right() <= clear_of, "{size:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn a_media_result_names_the_time_it_plays_from() {
-    let clip = found("/srv/v/trip.mkv", Kind::Image, "", "second", 754, 1);
+    let clip = found("/srv/v/trip.mkv", Kind::Media, "", "second", 754, 1);
     assert!(clip.timed());
     assert_eq!(clip.place(), "12:34");
-    let long = found("/srv/v/film.mkv", Kind::Image, "", "second", 3723, 1);
+    let long = found("/srv/v/film.mkv", Kind::Media, "", "second", 3723, 1);
     assert_eq!(long.place(), "1:02:03");
     // The start of the file is a place too, as line 0 never is.
-    let start = found("/srv/v/trip.mkv", Kind::Image, "", "second", 0, 1);
+    let start = found("/srv/v/trip.mkv", Kind::Media, "", "second", 0, 1);
     assert_eq!(start.place(), "00:00");
     let note = found("/srv/n/a.md", Kind::Text, "x", "line", 0, 1);
     assert!(!note.timed());

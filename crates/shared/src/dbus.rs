@@ -25,10 +25,10 @@ pub struct Names {
     /// XDG_DATA_DIRS, and its presence is the GNOME search place being on.
     pub gnome_provider: String,
     /// The app menu entry for the search window, under the XDG data
-    /// directory. Its presence is the menu place being on; off by default.
-    /// None in the Flatpak, whose launcher has the search window as an
-    /// action instead.
-    pub search_entry: Option<String>,
+    /// directory: the host's in the Flatpak (`sandbox::host_data_home`),
+    /// which exports no entry it could turn off. Its presence is the menu
+    /// place being on; off by default.
+    pub search_entry: String,
     /// The D-Bus activation file, under the XDG data directory: the service
     /// is installed while it exists.
     pub dbus_service_file: String,
@@ -46,7 +46,7 @@ impl Names {
             gnome_provider:
                 "vinosearch/xdg/gnome-shell/search-providers/dev.vinosearch.search-provider.ini"
                     .into(),
-            search_entry: Some("applications/dev.vinosearch.search.desktop".into()),
+            search_entry: "applications/dev.vinosearch.search.desktop".into(),
             dbus_service_file: "dbus-1/services/dev.vinosearch.Runner.service".into(),
         }
     }
@@ -61,7 +61,7 @@ impl Names {
             krunner_plugin: format!("krunner/dbusplugins/{app}.desktop"),
             krunner_plugin_id: app.into(),
             gnome_provider: format!("gnome-shell/search-providers/{app}.search-provider.ini"),
-            search_entry: None,
+            search_entry: format!("applications/{app}.Search.desktop"),
             dbus_service_file: format!("dbus-1/services/{app}.Runner.service"),
         }
     }
@@ -232,6 +232,7 @@ mod tests {
             n.icon.clone(),
             file(&n.krunner_plugin),
             file(&n.gnome_provider),
+            file(&n.search_entry),
             file(&n.dbus_service_file),
         ] {
             assert!(name.starts_with(app), "{name}");

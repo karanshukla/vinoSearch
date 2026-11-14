@@ -1,7 +1,8 @@
 //! The search window (#111): `vinosearch-settings --search "query"`, opened
 //! from KRunner's Show all results and GNOME Shell's provider icon. Every file
-//! a query finds, photos as a grid of thumbnails and text and documents as a
-//! list with their snippet, narrowed by kind, folder, date and file type.
+//! a query finds, photos and media as grids of thumbnails and text, documents,
+//! code and sessions as a list with their snippet, narrowed by kind, folder,
+//! date and file type.
 //!
 //! A window of its own rather than a page among the settings: it opens per
 //! query, wants the room a grid needs, and the settings already have a Search
@@ -42,6 +43,13 @@ const TILE_RADIUS: f32 = 10.0;
 /// The file tile standing in for a thumbnail the grid can't make.
 const GRID_TILE: f32 = 60.0;
 const DAY: i64 = 86_400;
+/// A filter menu's width, and the least it is squeezed to before it wraps.
+const MENU_WIDTH: f32 = 180.0;
+const MENU_MIN: f32 = 140.0;
+/// A filter menu's icon, and the gap after it.
+const MENU_ICON: f32 = 16.0 + 6.0;
+/// The header's content, from the window's left and right edges.
+const HEADER_INSET: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Modified {
@@ -88,6 +96,9 @@ struct Filters {
     text: bool,
     documents: bool,
     images: bool,
+    code: bool,
+    sessions: bool,
+    media: bool,
     /// An indexed root; None for all of them.
     folder: Option<String>,
     modified: Modified,
@@ -101,6 +112,9 @@ impl Default for Filters {
             text: true,
             documents: true,
             images: true,
+            code: true,
+            sessions: true,
+            media: true,
             folder: None,
             modified: Modified::Any,
             extension: None,
@@ -114,6 +128,9 @@ impl Filters {
             Kind::Text => self.text,
             Kind::Document => self.documents,
             Kind::Image => self.images,
+            Kind::Code => self.code,
+            Kind::Session => self.sessions,
+            Kind::Media => self.media,
         };
         kind && self
             .folder
@@ -327,12 +344,23 @@ impl SearchWindow {
         egui::Panel::top("search-header")
             .show_separator_line(false)
             .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
-                left: 20,
-                right: 20,
+                left: HEADER_INSET as i8,
+                // The window's buttons go up in the corner, as in the
+                // settings window's bar.
+                right: if self.app_title_bar {
+                    vino_ui::window::BAR_GAP as i8
+                } else {
+                    HEADER_INSET as i8
+                },
                 top: 8,
                 bottom: 14,
             }))
             .show(root, |ui| {
+                let right_inset = if self.app_title_bar {
+                    HEADER_INSET - vino_ui::window::BAR_GAP
+                } else {
+                    0.0
+                };
                 if self.app_title_bar {
                     vino_ui::window::drag(ui, ui.clip_rect(), "header");
                 }
@@ -345,7 +373,8 @@ impl SearchWindow {
                     } else {
                         0.0
                     };
-                    let width = (ui.available_width() - 24.0 - buttons).clamp(120.0, 640.0);
+                    let width =
+                        (ui.available_width() - 24.0 - right_inset - buttons).clamp(120.0, 640.0);
                     let field = widgets::search_field(
                         ui,
                         &mut self.query,
@@ -374,11 +403,23 @@ impl SearchWindow {
                         widgets::spinner(ui);
                     }
                     if self.app_title_bar {
-                        vino_ui::window::controls(ui);
+                        // At the row's top, not centred on the taller field.
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(
+                                    vino_ui::window::controls_width(),
+                                    vino_ui::window::BUTTON,
+                                ),
+                                Layout::right_to_left(Align::Center),
+                                vino_ui::window::controls,
+                            );
+                        });
                     }
                 });
                 ui.add_space(4.0);
-                self.filter_bar(ui);
+                // The filters keep the inset the buttons gave up.
+                let width = ui.max_rect().right() - right_inset - ui.cursor().left();
+                ui.allocate_ui(egui::vec2(width, 0.0), |ui| self.filter_bar(ui));
             });
 
         if let Some(f) = self.selected().cloned() {
@@ -468,27 +509,41 @@ impl SearchWindow {
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
         let count = |kind| self.results.iter().filter(|f| f.kind == kind).count();
-        let (text, documents, images) =
-            (count(Kind::Text), count(Kind::Document), count(Kind::Image));
         let roots = self.link.shared.lock().unwrap().roots.clone();
         let mut extensions: BTreeMap<String, usize> = BTreeMap::new();
         for f in &self.results {
             *extensions.entry(f.extension()).or_default() += 1;
         }
         let filters = &mut self.filters;
+        let wrap_at = ui.max_rect().right();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            widgets::toggle_chip(ui, &mut filters.images, "Images", Some(images));
-            widgets::toggle_chip(ui, &mut filters.text, "Text", Some(text));
-            widgets::toggle_chip(ui, &mut filters.documents, "Documents", Some(documents));
-            let (rule, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), Sense::hover());
-            ui.painter().rect_filled(rule, 0.0, p.rule);
+            // The kinds the settings count on their Index page.
+            for (on, label, kind) in [
+                (&mut filters.images, "Images", Kind::Image),
+                (&mut filters.text, "Text", Kind::Text),
+                (&mut filters.documents, "Documents", Kind::Document),
+                (&mut filters.code, "Code", Kind::Code),
+                (&mut filters.sessions, "Sessions", Kind::Session),
+                (&mut filters.media, "Media", Kind::Media),
+            ] {
+                widgets::toggle_chip(ui, on, label, Some(count(kind)));
+            }
+            // The three menus stay together: on the chips' row behind a
+            // rule where they fit, else on a row of their own.
+            let menus = 3.0 * (MENU_ICON + MENU_WIDTH) + 2.0 * 8.0;
+            if wrap_at - ui.cursor().left() < 1.0 + 8.0 + menus {
+                ui.end_row();
+            } else {
+                let (rule, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), Sense::hover());
+                ui.painter().rect_filled(rule, 0.0, p.rule);
+            }
 
             let folder = filters
                 .folder
                 .as_deref()
                 .map_or("All folders".to_owned(), |r| tilde(Path::new(r)));
-            menu(ui, Icon::Folder, "Folder", folder, |ui| {
+            menu(ui, Icon::Folder, "Folder", folder, wrap_at, |ui| {
                 ui.selectable_value(&mut filters.folder, None, "All folders");
                 for root in &roots {
                     ui.selectable_value(
@@ -503,6 +558,7 @@ impl SearchWindow {
                 Icon::Clock,
                 "Modified",
                 filters.modified.label().to_owned(),
+                wrap_at,
                 |ui| {
                     for m in Modified::ALL {
                         ui.selectable_value(&mut filters.modified, m, m.label());
@@ -513,7 +569,7 @@ impl SearchWindow {
                 .extension
                 .as_deref()
                 .map_or("All types".to_owned(), type_name);
-            menu(ui, Icon::File, "File type", selected, |ui| {
+            menu(ui, Icon::File, "File type", selected, wrap_at, |ui| {
                 ui.selectable_value(&mut filters.extension, None, "All types");
                 for (e, n) in &extensions {
                     let name = format!("{} ({n})", type_name(e));
@@ -556,14 +612,24 @@ impl SearchWindow {
             return;
         }
         let mut first = std::mem::take(&mut self.focus_first);
-        let images: Vec<&Found> = shown.iter().filter(|f| f.kind == Kind::Image).collect();
-        if !images.is_empty() {
-            section(ui, "Images", images.len());
-            self.grid(ui, &images, &mut first);
+        let of = |kinds: &[Kind]| -> Vec<&Found> {
+            shown.iter().filter(|f| kinds.contains(&f.kind)).collect()
+        };
+        let mut any = false;
+        // A video's thumbnail is its picture, so media is a grid as photos are.
+        for (title, kinds) in [("Images", [Kind::Image]), ("Media", [Kind::Media])] {
+            let tiles = of(&kinds);
+            if !tiles.is_empty() {
+                if std::mem::replace(&mut any, true) {
+                    ui.add_space(10.0);
+                }
+                section(ui, title, tiles.len());
+                self.grid(ui, title, &tiles, &mut first);
+            }
         }
-        let texts: Vec<&Found> = shown.iter().filter(|f| f.kind != Kind::Image).collect();
+        let texts = of(&[Kind::Text, Kind::Document, Kind::Code, Kind::Session]);
         if !texts.is_empty() {
-            if !images.is_empty() {
+            if any {
                 ui.add_space(10.0);
             }
             section(ui, "Text and documents", texts.len());
@@ -571,9 +637,9 @@ impl SearchWindow {
         }
     }
 
-    fn grid(&mut self, ui: &mut egui::Ui, images: &[&Found], first: &mut bool) {
+    fn grid(&mut self, ui: &mut egui::Ui, title: &str, images: &[&Found], first: &mut bool) {
         ui.horizontal_wrapped(|ui| {
-            a11y::list_box(ui, "Images");
+            a11y::list_box(ui, title);
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             let columns = ((ui.available_width() + 12.0) / (TILE + 12.0)).max(1.0) as usize;
             let mut to = None;
@@ -785,8 +851,8 @@ impl SearchWindow {
 const SESSION: &str = "vwsession";
 
 /// A file's tile: vino-ui's for its format, by extension, so a file looks
-/// the same here as in vinoSpeak; the vinoWhisper logo for a session, which
-/// `Kind` doesn't tell from text.
+/// the same here as in vinoSpeak; the vinoWhisper logo for a session, and
+/// for a recording found in one.
 fn tile(ui: &mut egui::Ui, f: &Found, size: f32) -> egui::Response {
     match format_of(&f.path) {
         Some(format) => file_tile::file(ui, format, size),
@@ -838,19 +904,27 @@ fn result_id(f: &Found) -> egui::Id {
 }
 
 /// A filter's menu with an icon before it, named by `label` for a screen
-/// reader and kept on one line with its icon when the bar wraps.
+/// reader and kept on one line with its icon when the bar wraps, which it
+/// does at `wrap_at`: a wrapping row's own width grows with what overflows it.
 fn menu(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,
     selected: String,
+    wrap_at: f32,
     items: impl FnOnce(&mut egui::Ui),
 ) {
     let p = theme::palette(ui.ctx());
+    // A group of its own doesn't wrap as a widget does, and the combo would
+    // shrink into whatever the row has left: so on to the next row.
+    let left = ui.cursor().left();
+    if left > ui.max_rect().left() && wrap_at - left < MENU_ICON + MENU_MIN {
+        ui.end_row();
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         icons::icon(ui, icon, 16.0, p.muted);
-        let shown = widgets::combo(ui, label, selected, 180.0).show_ui(ui, items);
+        let shown = widgets::combo(ui, label, selected, MENU_WIDTH).show_ui(ui, items);
         ui.ctx()
             .accesskit_node_builder(shown.response.id, |node| node.set_label(label));
     });
