@@ -61,6 +61,19 @@ pub(crate) fn on_path(name: &str) -> bool {
     })
 }
 
+/// `cmd` run on the host through flatpak-spawn, which passes its stdin and
+/// stdout. A `--launcher` that already says flatpak-spawn is left as it is.
+fn on_host(cmd: Vec<String>) -> Vec<String> {
+    if cmd[0] == "flatpak-spawn" {
+        return cmd;
+    }
+    ["flatpak-spawn", "--host"]
+        .into_iter()
+        .map(String::from)
+        .chain(cmd)
+        .collect()
+}
+
 /// Run the launcher with `choices` on stdin. None when it was dismissed.
 fn ask(cmd: &[String], choices: &[String]) -> Result<Option<String>> {
     let mut child = Command::new(&cmd[0])
@@ -203,7 +216,22 @@ fn search(query: &str) -> Result<Vec<Match>> {
 }
 
 pub fn run(given: Option<&str>, editor: Option<&str>, player: Option<&str>) -> Result<()> {
-    let cmd = launcher(given, on_path)?;
+    let sandboxed = vinosearch_shared::sandbox::flatpak_id().is_some();
+    let cmd = if sandboxed {
+        // The launchers are the host's, and run there: the sandbox has none.
+        let cmd = launcher(given, vinosearch_shared::sandbox::host_has)?;
+        // A --launcher too: flatpak-spawn would start, and a missing one
+        // would look like a dismissed launcher.
+        if given.is_some()
+            && cmd[0] != "flatpak-spawn"
+            && !vinosearch_shared::sandbox::host_has(&cmd[0])
+        {
+            bail!("{} isn't on the host", cmd[0]);
+        }
+        on_host(cmd)
+    } else {
+        launcher(given, on_path)?
+    };
     let Some(query) = ask(&cmd, &[])? else {
         return Ok(());
     };
@@ -229,6 +257,19 @@ pub fn run(given: Option<&str>, editor: Option<&str>, player: Option<&str>) -> R
 mod tests {
     use super::*;
     use zbus::Variant;
+
+    #[test]
+    fn in_the_flatpak_the_launcher_runs_on_the_host() {
+        let words = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            on_host(words("fuzzel --dmenu")),
+            ["flatpak-spawn", "--host", "fuzzel", "--dmenu"]
+        );
+        assert_eq!(
+            on_host(words("flatpak-spawn --host wofi --dmenu")),
+            ["flatpak-spawn", "--host", "wofi", "--dmenu"]
+        );
+    }
 
     #[test]
     fn the_first_launcher_on_path_wins() {

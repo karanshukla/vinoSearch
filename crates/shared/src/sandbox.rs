@@ -110,6 +110,16 @@ pub fn host_output(argv: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Whether the host runs `program`: a name on the host's PATH, or a path.
+/// flatpak-spawn starts whatever it is given, so a program missing on the
+/// host isn't an error from spawning it. The script is fixed and `program`
+/// is its argument, never part of it.
+pub fn host_has(program: &str) -> bool {
+    host_output(&["sh", "-c", HAS_PROGRAM, "sh", program]).is_some()
+}
+
+const HAS_PROGRAM: &str = r#"command -v -- "$1" >/dev/null"#;
+
 /// GNOME's `enabled` or `disabled` search providers on the host; None
 /// without gsettings or the schema.
 pub fn gnome_providers(key: &str) -> Option<Vec<String>> {
@@ -169,6 +179,27 @@ fn plugin_on(krunnerrc: &str, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HAS_PROGRAM` as the host runs it, here with this machine's sh.
+    fn has(program: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", HAS_PROGRAM, "sh", program])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[test]
+    fn the_host_check_finds_programs_and_runs_none() {
+        assert!(has("sh"));
+        assert!(has("/bin/sh"));
+        assert!(!has("vinosearch-no-such-program"));
+        assert!(!has(""));
+        let marker = std::env::temp_dir().join(format!("vinosearch-has-{}", std::process::id()));
+        assert!(!has(&format!("sh; touch {}", marker.display())));
+        assert!(!has(&format!("$(touch {})", marker.display())));
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn the_exported_launcher_is_beside_the_installation_the_app_runs_from() {
