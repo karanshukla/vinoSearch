@@ -2144,18 +2144,17 @@ impl SettingsWindow {
                 .frame(widgets::sidebar_frame(p))
                 .show(root, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    // vino-ui's, which the window bar's row is centred on:
+                    // the logo on the nav items' icon column.
                     let brand = ui
-                        .horizontal(|ui| {
+                        .scope(|ui| {
                             ui.style_mut().interaction.selectable_labels = false;
-                            ui.add_space(8.0);
-                            vino_ui::logo::search(ui, 28.0);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.label(
-                                    RichText::new("vinoSearch").size(15.0).family(theme::bold()),
-                                );
-                                widgets::small(ui, "Settings");
-                            });
+                            widgets::sidebar_brand(
+                                ui,
+                                Some(vino_ui::logo::search),
+                                "vinoSearch",
+                                "Settings",
+                            );
                         })
                         .response
                         .rect;
@@ -2249,25 +2248,21 @@ impl SettingsWindow {
         // its end: that bar is what the window is dragged by.
         let bar = wide && self.app_title_bar;
         if bar {
-            egui::Panel::top("window-bar")
-                .show_separator_line(false)
-                .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin {
-                    left: widgets::PAGE_INSET as i8,
-                    // 15 above puts the row's centre on the sidebar logo's,
-                    // and as much beside keeps the close button square in
-                    // its corner.
-                    right: 15,
-                    top: 15,
-                    bottom: 6,
-                }))
-                .show(root, |ui| {
-                    vino_ui::window::drag(ui, ui.clip_rect(), "bar");
-                    ui.horizontal(|ui| {
-                        ui.style_mut().interaction.selectable_labels = false;
-                        widgets::title(ui, self.page.title());
-                        vino_ui::window::controls(ui);
-                    });
-                });
+            let title = self.page.title();
+            let index = self.page == Page::Index;
+            vino_ui::window::bar(
+                root,
+                widgets::PAGE_INSET,
+                |ui| {
+                    widgets::title(ui, title);
+                },
+                // Beside the buttons, as it was beside the title.
+                |ui| {
+                    if index {
+                        Self::index_status(ui, status);
+                    }
+                },
+            );
         }
 
         egui::CentralPanel::default()
@@ -2280,7 +2275,9 @@ impl SettingsWindow {
                         left: if wide { widgets::PAGE_INSET as i8 } else { 16 },
                         right: 0,
                         top: match (wide, bar) {
-                            (_, true) => 6,
+                            // The same 15 from title to content as in the
+                            // scroll area.
+                            (_, true) => 2,
                             (true, false) => 20,
                             (false, false) => 12,
                         },
@@ -2289,16 +2286,16 @@ impl SettingsWindow {
             )
             .show(root, |ui| {
                 widgets::page_scroll(ui, self.page.title(), widgets::CONTENT_MAX, |ui| {
-                    ui.horizontal(|ui| {
-                        if !bar {
+                    if !bar {
+                        ui.horizontal(|ui| {
                             widgets::title(ui, self.page.title());
-                        }
-                        if self.page == Page::Index {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                Self::index_status(ui, status);
-                            });
-                        }
-                    });
+                            if self.page == Page::Index {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    Self::index_status(ui, status);
+                                });
+                            }
+                        });
+                    }
                     if let Some(notice) = self.notice.clone() {
                         ui.add_space(12.0);
                         if widgets::notice(ui, Tone::Error, &notice) {
