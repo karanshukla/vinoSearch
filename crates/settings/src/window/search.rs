@@ -159,6 +159,8 @@ pub struct SearchWindow {
     now: fn() -> i64,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
+    /// The window's buttons and edges are drawn here, not by the desktop.
+    app_title_bar: bool,
     text_scale: f32,
 }
 
@@ -188,6 +190,7 @@ impl SearchWindow {
             now: unix_now,
             focused: true,
             kde_header: theme::kde_header(),
+            app_title_bar: false,
             text_scale: 1.0,
         };
         if !window.query.is_empty() {
@@ -330,10 +333,19 @@ impl SearchWindow {
                 bottom: 14,
             }))
             .show(root, |ui| {
+                if self.app_title_bar {
+                    vino_ui::window::drag(ui, ui.clip_rect(), "header");
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
                     vino_ui::logo::search(ui, 28.0);
-                    let width = (ui.available_width() - 24.0).clamp(120.0, 640.0);
+                    // The window's buttons take the row's right end.
+                    let buttons = if self.app_title_bar {
+                        vino_ui::window::controls_width() + 12.0
+                    } else {
+                        0.0
+                    };
+                    let width = (ui.available_width() - 24.0 - buttons).clamp(120.0, 640.0);
                     let field = widgets::search_field(
                         ui,
                         &mut self.query,
@@ -360,6 +372,9 @@ impl SearchWindow {
                     }
                     if self.searching {
                         widgets::spinner(ui);
+                    }
+                    if self.app_title_bar {
+                        vino_ui::window::controls(ui);
                     }
                 });
                 ui.add_space(4.0);
@@ -875,18 +890,29 @@ fn section(ui: &mut egui::Ui, title: &str, n: usize) {
 }
 
 impl eframe::App for SearchWindow {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        vino_ui::input::faster_touchpad(raw);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
+        if self.app_title_bar {
+            vino_ui::window::edges(ui);
+        }
     }
 }
 
 pub fn run(app_id: &str, query: &str) -> ExitCode {
+    let app_title_bar = vino_ui::window::app_title_bar();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
-            .with_app_id(app_id)
-            .with_inner_size([960.0, 680.0])
-            .with_min_inner_size([360.0, 320.0]),
+        viewport: vino_ui::window::viewport(
+            egui::ViewportBuilder::default()
+                .with_title(TITLE)
+                .with_app_id(app_id)
+                .with_inner_size([960.0, 680.0])
+                .with_min_inner_size([360.0, 320.0]),
+            app_title_bar,
+        ),
         glow_options: eframe::egui_glow::GlowConfiguration {
             vsync: false,
             ..Default::default()
@@ -900,6 +926,7 @@ pub fn run(app_id: &str, query: &str) -> ExitCode {
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
             let mut window = SearchWindow::with(&query, source::Runner::default());
+            window.app_title_bar = app_title_bar;
             window.text_scale = theme::text_scale();
             cc.egui_ctx.set_zoom_factor(window.text_scale);
             Ok(Box::new(window))
