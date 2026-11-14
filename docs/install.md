@@ -158,6 +158,10 @@ What differs from the native install:
   which the menu stops showing.
 - The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
   through the Background portal, with the running desktop's search place.
+- On sway, Hyprland and the like, bind `flatpak run dev.vinosearch.VinoSearch menu` to a key. The
+  launcher (fuzzel, wofi, rofi, tofi or bemenu, or `--launcher`) is the host's, and runs there.
+- An editor or player in `config.toml` that the host doesn't have falls back to the default app,
+  as natively.
 - With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).
 - Encrypting the index works as natively. Its key is sealed by the host's `systemd-creds`, run
   with `flatpak-spawn --host`, to the host's TPM; a key the native install sealed opens in the

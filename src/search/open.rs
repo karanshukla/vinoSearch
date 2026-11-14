@@ -560,6 +560,17 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     } else {
         Vec::new()
     };
+    // In the Flatpak, flatpak-spawn starts even when the host has no such
+    // program, so a missing one would open nothing rather than fail here
+    // and fall back to xdg-open.
+    if vinosearch_shared::sandbox::flatpak_id().is_some()
+        && !vinosearch_shared::sandbox::host_has(&argv[0])
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found on the host",
+        ));
+    }
     let argv = host_argv(detached(argv, in_unit));
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
