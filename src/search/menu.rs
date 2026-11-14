@@ -219,7 +219,16 @@ pub fn run(given: Option<&str>, editor: Option<&str>, player: Option<&str>) -> R
     let sandboxed = vinosearch_shared::sandbox::flatpak_id().is_some();
     let cmd = if sandboxed {
         // The launchers are the host's, and run there: the sandbox has none.
-        on_host(launcher(given, vinosearch_shared::sandbox::host_has)?)
+        let cmd = launcher(given, vinosearch_shared::sandbox::host_has)?;
+        // A --launcher too: flatpak-spawn would start, and a missing one
+        // would look like a dismissed launcher.
+        if given.is_some()
+            && cmd[0] != "flatpak-spawn"
+            && !vinosearch_shared::sandbox::host_has(&cmd[0])
+        {
+            bail!("{} isn't on the host", cmd[0]);
+        }
+        on_host(cmd)
     } else {
         launcher(given, on_path)?
     };
