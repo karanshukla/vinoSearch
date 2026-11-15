@@ -7,7 +7,7 @@ use eframe::egui::{self, Align, Layout, RichText};
 use vino_ui::a11y;
 use vino_ui::icons::{self, Icon};
 use vino_ui::theme;
-use vino_ui::widgets::{self, Button, ChipKind, Row, Tone};
+use vino_ui::widgets::{self, Button, ChipKind, Column, Row, Tone};
 use vinosearch_shared::apps::{self, App};
 use vinosearch_shared::config::{
     self, Config, DEFAULT_CODE_MIN_SCORE, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
@@ -62,6 +62,18 @@ impl Page {
             Page::Hardware => "Hardware",
             Page::Integration => "Integration",
             Page::About => vino_ui::about::TITLE,
+        }
+    }
+
+    fn max_width(self) -> f32 {
+        match self {
+            Page::Security | Page::About => widgets::CONTENT_MAX,
+            Page::Index
+            | Page::Folders
+            | Page::Search
+            | Page::Model
+            | Page::Hardware
+            | Page::Integration => widgets::WIDE_MAX,
         }
     }
 
@@ -452,6 +464,21 @@ impl SettingsWindow {
         status: Option<&Result<Status, String>>,
         largest: Option<&Vec<(String, u64)>>,
     ) {
+        let indexed = match status {
+            Some(Ok(s)) if s.chunks > 0 => Some(s),
+            _ => None,
+        };
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => self.status_rows(ui, status),
+            Column::Right => {
+                if let Some(s) = indexed {
+                    self.largest(ui, s, largest);
+                }
+            }
+        });
+    }
+
+    fn status_rows(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
         let p = theme::palette(ui.ctx());
         widgets::group_label(ui, "Status");
         let reachable = match status {
@@ -638,14 +665,10 @@ impl SettingsWindow {
                     }
                 });
         });
-        if let Some(s) = reachable.filter(|s| s.chunks > 0) {
-            self.largest(ui, s, largest);
-        }
     }
 
     /// What is indexed and what never is.
     fn folders(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
-        let p = theme::palette(ui.ctx());
         let reachable = match status {
             Some(Ok(s)) => Some(s),
             Some(Err(why)) => {
@@ -655,6 +678,14 @@ impl SettingsWindow {
             }
             None => None,
         };
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => self.included(ui, reachable),
+            Column::Right => self.excluded(ui),
+        });
+    }
+
+    fn included(&mut self, ui: &mut egui::Ui, reachable: Option<&Status>) {
+        let p = theme::palette(ui.ctx());
         widgets::group_label(ui, "Included");
         widgets::group_help(ui, "Indexed and watched for changes.");
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
@@ -732,7 +763,9 @@ impl SettingsWindow {
                 self.adder(ui, Target::Root);
             });
         });
+    }
 
+    fn excluded(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Excluded");
         widgets::group_help(ui, "Never indexed, even inside an included folder.");
         if let Some(why) = &self.config_broken {
@@ -979,7 +1012,6 @@ impl SettingsWindow {
     }
 
     fn model(&mut self, ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
-        let p = theme::palette(ui.ctx());
         let s = match status {
             Some(Ok(s)) => Some(s),
             Some(Err(why)) => {
@@ -991,113 +1023,127 @@ impl SettingsWindow {
         };
         // Only with no service at all: one that answers with an error may
         // have the models loaded, or be downloading them.
-        if matches!(&status, Some(Err(why)) if why == NOT_INSTALLED) {
-            self.model_files(ui);
+        let files =
+            matches!(&status, Some(Err(why)) if why == NOT_INSTALLED) && self.models_dir.is_some();
+        if s.is_none() && !files {
+            self.running(ui);
+            return;
         }
-        if let Some(s) = s {
-            widgets::group_label(ui, "EmbeddingGemma 2");
-            let deleting = self.confirm == Some(Confirm::DeleteModel);
-            widgets::group(ui, |ui| {
-                let warning = format!(
-                    "Deletes {} of models. Search and indexing stop until you download them \
-                     again.",
-                    size(s.model_bytes)
-                );
-                let row = if deleting {
-                    Row::new("Download")
-                        .help(&warning)
-                        .tint(p.error_tint)
-                        .tone(Tone::Error)
-                } else {
-                    Row::new("Download").help("Needed for search and indexing.")
-                };
-                row.show(ui, |ui, _| {
-                    if deleting {
-                        if ui
-                            .add(Button::destructive("Delete the model").small())
-                            .clicked()
-                        {
-                            self.link.send(Request::DeleteModel);
-                            self.confirm = None;
-                        }
-                        if self.cancel_button(ui).clicked() {
-                            self.confirm = None;
-                        }
-                        return;
-                    }
-                    // Whatever is on disk, a partial set included.
-                    let deletable = s.model_bytes > 0 && !s.fetching;
-                    if ui
-                        .add_enabled(deletable, Button::secondary("Delete…"))
-                        .clicked()
-                    {
-                        self.confirm = Some(Confirm::DeleteModel);
-                        self.focus_cancel = true;
-                    }
-                    let label = if s.model_present {
-                        "Verify"
-                    } else {
-                        "Download"
-                    };
-                    let button = if s.model_present {
-                        Button::secondary(label)
-                    } else {
-                        Button::primary(label).icon(Icon::Download)
-                    };
-                    if ui.add_enabled(!s.fetching, button).clicked() {
-                        self.link.send(Request::FetchModel);
-                    }
-                    if s.fetching {
-                        fetch_progress(ui, s);
-                    } else if s.model_present {
-                        widgets::chip(
-                            ui,
-                            ChipKind::Ok,
-                            &format!("Downloaded, {}", size(s.model_bytes)),
-                        );
-                    } else if s.model_bytes > 0 {
-                        widgets::chip(
-                            ui,
-                            ChipKind::Warn,
-                            &format!("Incomplete, {}", size(s.model_bytes)),
-                        );
-                    } else {
-                        widgets::chip(ui, ChipKind::Warn, "Not downloaded");
-                    }
-                });
-                if !s.fetch_error.is_empty() {
-                    Row::new("Last download")
-                        .help(&format!("Failed: {}", s.fetch_error))
-                        .tone(Tone::Error)
-                        .show(ui, |_, _| {});
-                }
-                Row::new("Memory").show(ui, |ui, _| {
-                    if ui
-                        .add_enabled(s.model_loaded, Button::secondary("Unload now"))
-                        .clicked()
-                    {
-                        self.link.send(Request::Unload);
-                    }
-                    if s.model_loaded {
-                        ui.label(format!("Loaded on {}", s.device));
-                    } else {
-                        widgets::muted(ui, "Not loaded");
-                    }
-                });
-                Row::new("Compiled cache")
-                    .help("Clearing it makes the next load slower.")
-                    .show(ui, |ui, _| {
-                        if ui
-                            .add_enabled(s.cache_bytes > 0, Button::secondary("Clear"))
-                            .clicked()
-                        {
-                            self.link.send(Request::ClearCache);
-                        }
-                        ui.label(size(s.cache_bytes));
-                    });
-            });
-        }
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => match s {
+                Some(s) => self.model_on_disk(ui, s),
+                None => self.model_files(ui),
+            },
+            Column::Right => self.running(ui),
+        });
+    }
 
+    fn model_on_disk(&mut self, ui: &mut egui::Ui, s: &Status) {
+        let p = theme::palette(ui.ctx());
+        widgets::group_label(ui, "EmbeddingGemma 2");
+        let deleting = self.confirm == Some(Confirm::DeleteModel);
+        widgets::group(ui, |ui| {
+            let warning = format!(
+                "Deletes {} of models. Search and indexing stop until you download them \
+                 again.",
+                size(s.model_bytes)
+            );
+            let row = if deleting {
+                Row::new("Download")
+                    .help(&warning)
+                    .tint(p.error_tint)
+                    .tone(Tone::Error)
+            } else {
+                Row::new("Download").help("Needed for search and indexing.")
+            };
+            row.show(ui, |ui, _| {
+                if deleting {
+                    if ui
+                        .add(Button::destructive("Delete the model").small())
+                        .clicked()
+                    {
+                        self.link.send(Request::DeleteModel);
+                        self.confirm = None;
+                    }
+                    if self.cancel_button(ui).clicked() {
+                        self.confirm = None;
+                    }
+                    return;
+                }
+                // Whatever is on disk, a partial set included.
+                let deletable = s.model_bytes > 0 && !s.fetching;
+                if ui
+                    .add_enabled(deletable, Button::secondary("Delete…"))
+                    .clicked()
+                {
+                    self.confirm = Some(Confirm::DeleteModel);
+                    self.focus_cancel = true;
+                }
+                let label = if s.model_present {
+                    "Verify"
+                } else {
+                    "Download"
+                };
+                let button = if s.model_present {
+                    Button::secondary(label)
+                } else {
+                    Button::primary(label).icon(Icon::Download)
+                };
+                if ui.add_enabled(!s.fetching, button).clicked() {
+                    self.link.send(Request::FetchModel);
+                }
+                if s.fetching {
+                    fetch_progress(ui, s);
+                } else if s.model_present {
+                    widgets::chip(
+                        ui,
+                        ChipKind::Ok,
+                        &format!("Downloaded, {}", size(s.model_bytes)),
+                    );
+                } else if s.model_bytes > 0 {
+                    widgets::chip(
+                        ui,
+                        ChipKind::Warn,
+                        &format!("Incomplete, {}", size(s.model_bytes)),
+                    );
+                } else {
+                    widgets::chip(ui, ChipKind::Warn, "Not downloaded");
+                }
+            });
+            if !s.fetch_error.is_empty() {
+                Row::new("Last download")
+                    .help(&format!("Failed: {}", s.fetch_error))
+                    .tone(Tone::Error)
+                    .show(ui, |_, _| {});
+            }
+            Row::new("Memory").show(ui, |ui, _| {
+                if ui
+                    .add_enabled(s.model_loaded, Button::secondary("Unload now"))
+                    .clicked()
+                {
+                    self.link.send(Request::Unload);
+                }
+                if s.model_loaded {
+                    ui.label(format!("Loaded on {}", s.device));
+                } else {
+                    widgets::muted(ui, "Not loaded");
+                }
+            });
+            Row::new("Compiled cache")
+                .help("Clearing it makes the next load slower.")
+                .show(ui, |ui, _| {
+                    if ui
+                        .add_enabled(s.cache_bytes > 0, Button::secondary("Clear"))
+                        .clicked()
+                    {
+                        self.link.send(Request::ClearCache);
+                    }
+                    ui.label(size(s.cache_bytes));
+                });
+        });
+    }
+
+    fn running(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Running");
         if self.config_broken.is_some() {
             widgets::group_help(ui, "The settings file doesn't parse; see the Folders page.");
@@ -1182,6 +1228,20 @@ impl SettingsWindow {
             );
             return;
         }
+        let [indexing, results] = widgets::columns(ui, |ui, column| match column {
+            Column::Left => self.what_to_index(ui, status),
+            Column::Right => self.opening_and_ranking(ui),
+        });
+        if indexing | results {
+            self.save_config();
+        }
+    }
+
+    fn what_to_index(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: Option<&Result<Status, String>>,
+    ) -> bool {
         let p = theme::palette(ui.ctx());
         let mut changed = false;
         let s = match status {
@@ -1415,7 +1475,11 @@ impl SettingsWindow {
                     .show(ui, |_, _| {});
             }
         });
+        changed
+    }
 
+    fn opening_and_ranking(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
         widgets::group_label(ui, "Opening results");
         let editors = self.editors.get_or_insert_with(apps::editors).clone();
         let players = self.players.get_or_insert_with(apps::players).clone();
@@ -1472,9 +1536,7 @@ impl SettingsWindow {
                 self.idle_dirty = true;
             }
         });
-        if changed {
-            self.save_config();
-        }
+        changed
     }
 
     /// Encrypting the index at rest (#4): the switch, what the key is sealed with, and a new
@@ -1664,6 +1726,13 @@ impl SettingsWindow {
     /// What `vinosearch doctor` reports, run the first time the page shows.
     /// The device it probes is the one picked on the Model page.
     fn hardware(&mut self, ui: &mut egui::Ui) {
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => self.this_machine(ui),
+            Column::Right => self.power(ui),
+        });
+    }
+
+    fn this_machine(&mut self, ui: &mut egui::Ui) {
         let state = self.doctor.lock().unwrap().clone();
         if state.report.is_none() && !state.running {
             doctor::run(Arc::clone(&self.doctor), ui.ctx());
@@ -1702,7 +1771,9 @@ impl SettingsWindow {
                     }
                 });
         });
+    }
 
+    fn power(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Power");
         if self.config_broken.is_some() {
             widgets::group_help(ui, "The settings file doesn't parse; see the Folders page.");
@@ -1725,11 +1796,6 @@ impl SettingsWindow {
         let state = self.integration.lock().unwrap().clone();
         let (kde, gnome) = integration::desktops();
         let fixed = integration::places_fixed();
-        widgets::group_label(ui, "Search places");
-        widgets::group_help(
-            ui,
-            "Each place has its own switch; only what's on is installed.",
-        );
         let mut flip: Option<(integration::Switch, bool)> = None;
         let mut switch_row = |ui: &mut egui::Ui,
                               label: &str,
@@ -1756,75 +1822,86 @@ impl SettingsWindow {
                 }
             });
         };
-        widgets::group(ui, |ui| {
-            switch_row(
-                ui,
-                "KRunner",
-                "Alt+Space, and the search in the Plasma app launcher.",
-                integration::Switch::Kde,
-                (!kde).then_some("Plasma isn't running in this session."),
-            );
-            switch_row(
-                ui,
-                "GNOME Shell",
-                if fixed {
-                    "The overview's search."
-                } else {
-                    "The overview's search, from the next login."
-                },
-                integration::Switch::Gnome,
-                (!gnome).then_some("GNOME isn't running in this session."),
-            );
-            switch_row(
-                ui,
-                "App menu",
-                if fixed {
-                    "The search window as an app of its own. Search Files, in vinoSearch's \
-                     menu entry's actions, opens it either way."
-                } else {
-                    "The search window as an app of its own."
-                },
-                integration::Switch::Menu,
-                None,
-            );
-        });
-        widgets::group_label(ui, "Service");
-        widgets::group(ui, |ui| {
-            switch_row(
-                ui,
-                "Search service",
-                if fixed {
-                    "Runs at login. Turning it off turns every search place off too."
-                } else {
-                    "Runs at login. Turning it off removes every search place too."
-                },
-                integration::Switch::Service,
-                None,
-            );
-            if let Some(output) = &state.output {
-                widgets::group_section(ui, |ui| {
-                    ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => {
+                widgets::group_label(ui, "Search places");
+                widgets::group_help(
+                    ui,
+                    "Each place has its own switch; only what's on is installed.",
+                );
+                widgets::group(ui, |ui| {
+                    switch_row(
+                        ui,
+                        "KRunner",
+                        "Alt+Space, and the search in the Plasma app launcher.",
+                        integration::Switch::Kde,
+                        (!kde).then_some("Plasma isn't running in this session."),
+                    );
+                    switch_row(
+                        ui,
+                        "GNOME Shell",
+                        if fixed {
+                            "The overview's search."
+                        } else {
+                            "The overview's search, from the next login."
+                        },
+                        integration::Switch::Gnome,
+                        (!gnome).then_some("GNOME isn't running in this session."),
+                    );
+                    switch_row(
+                        ui,
+                        "App menu",
+                        if fixed {
+                            "The search window as an app of its own. Search Files, in vinoSearch's \
+                             menu entry's actions, opens it either way."
+                        } else {
+                            "The search window as an app of its own."
+                        },
+                        integration::Switch::Menu,
+                        None,
+                    );
+                });
+            }
+            Column::Right => {
+                widgets::group_label(ui, "Service");
+                widgets::group(ui, |ui| {
+                    switch_row(
+                        ui,
+                        "Search service",
+                        if fixed {
+                            "Runs at login. Turning it off turns every search place off too."
+                        } else {
+                            "Runs at login. Turning it off removes every search place too."
+                        },
+                        integration::Switch::Service,
+                        None,
+                    );
+                    if let Some(output) = &state.output {
+                        widgets::group_section(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
+                        });
+                    }
+                });
+                widgets::group_label(ui, "Command line");
+                widgets::group(ui, |ui| {
+                    for (what, command) in [
+                        ("Search", "vinosearch search \"what you're looking for\""),
+                        (
+                            "Similar photos",
+                            "vinosearch similar ~/Pictures/IMG_2041.jpg",
+                        ),
+                        ("Check the NPU", "vinosearch doctor"),
+                    ] {
+                        Row::new(what).show(ui, |ui, _| {
+                            widgets::mono(ui, command);
+                        });
+                    }
                 });
             }
         });
         if let Some((switch, on)) = flip {
             integration::run(Arc::clone(&self.integration), ui.ctx(), switch, on);
         }
-        widgets::group_label(ui, "Command line");
-        widgets::group(ui, |ui| {
-            for (what, command) in [
-                ("Search", "vinosearch search \"what you're looking for\""),
-                (
-                    "Similar photos",
-                    "vinosearch similar ~/Pictures/IMG_2041.jpg",
-                ),
-                ("Check the NPU", "vinosearch doctor"),
-            ] {
-                Row::new(what).show(ui, |ui, _| {
-                    widgets::mono(ui, command);
-                });
-            }
-        });
     }
 }
 
@@ -2130,14 +2207,15 @@ impl SettingsWindow {
 
         let p = theme::palette(ctx);
         let header = theme::header(ctx, self.kde_header.as_ref(), focused);
-        let wide = ctx.content_rect().width() >= widgets::SIDEBAR_FROM;
+        let window = ctx.content_rect().width();
+        let wide = window >= widgets::SIDEBAR_FROM;
         let status = shared.status.as_ref();
 
         if wide {
             egui::Panel::left("pages")
                 .resizable(false)
                 .show_separator_line(false)
-                .exact_size(widgets::SIDEBAR_WIDTH)
+                .exact_size(widgets::sidebar_width(window))
                 .frame(widgets::sidebar_frame(p))
                 .show(root, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -2249,7 +2327,7 @@ impl SettingsWindow {
             let index = self.page == Page::Index;
             vino_ui::window::bar(
                 root,
-                widgets::PAGE_INSET,
+                widgets::page_inset(window),
                 |ui| {
                     widgets::title(ui, title);
                 },
@@ -2269,7 +2347,11 @@ impl SettingsWindow {
                     // No right margin: the scroll bar belongs on the window's edge, and the
                     // content keeps its own gap from it below.
                     .inner_margin(egui::Margin {
-                        left: if wide { widgets::PAGE_INSET as i8 } else { 16 },
+                        left: if wide {
+                            widgets::page_inset(window) as i8
+                        } else {
+                            16
+                        },
                         right: 0,
                         top: match (wide, bar) {
                             // The same 15 from title to content as in the
@@ -2282,7 +2364,7 @@ impl SettingsWindow {
                     }),
             )
             .show(root, |ui| {
-                widgets::page_scroll(ui, self.page.title(), widgets::CONTENT_MAX, |ui| {
+                widgets::page_scroll(ui, self.page.title(), self.page.max_width(), |ui| {
                     if !bar {
                         ui.horizontal(|ui| {
                             widgets::title(ui, self.page.title());
