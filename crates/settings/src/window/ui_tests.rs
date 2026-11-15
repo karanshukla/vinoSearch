@@ -827,6 +827,33 @@ fn large_text_clips_nothing_at_either_width() {
 }
 
 #[test]
+fn a_full_screen_window_puts_a_page_s_groups_in_two_columns() {
+    for (page, left, right) in [
+        (Page::Index, "Status", "Largest folders"),
+        (Page::Folders, "Included", "Excluded"),
+        (Page::Search, "What to index", "Opening results"),
+        (Page::Model, "EmbeddingGemma 2", "Running"),
+        (Page::Hardware, "This machine", "Power"),
+        (Page::Integration, "Search places", "Service"),
+    ] {
+        let (w, _requests) = window(page, "columns");
+        let h = harness(w, [1440.0, 900.0], Theme::Light);
+        let group = |label: &str| {
+            let mut found = h
+                .query_all_by_role_and_label(Role::Heading, label)
+                .filter(|n| n.accesskit_node().data().level() == Some(2));
+            found
+                .next()
+                .unwrap_or_else(|| panic!("no group {label}"))
+                .rect()
+        };
+        let (left, right) = (group(left), group(right));
+        assert_eq!(left.top(), right.top(), "{}", page.title());
+        assert!(right.left() > left.right(), "{}", page.title());
+    }
+}
+
+#[test]
 fn zoom_keeps_every_page_usable() {
     for page in Page::ALL {
         let (w, _requests) = window(page, "zoom");
