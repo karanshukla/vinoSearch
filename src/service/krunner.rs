@@ -1226,7 +1226,7 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 /// A runner that stopped before it owned the bus name, which exits with
 /// start::NOT_STARTED so `krunner` doesn't start it again.
 #[derive(Debug)]
-pub struct NotStarted(anyhow::Error);
+pub struct NotStarted(pub(crate) anyhow::Error);
 
 impl std::fmt::Display for NotStarted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
