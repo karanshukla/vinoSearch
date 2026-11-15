@@ -63,6 +63,8 @@ pub struct Status {
     pub indexing_rest: bool,
     /// Documents indexed in part so far, the next in line first.
     pub partial: Vec<Partial>,
+    /// Audio and video files waiting for a charger.
+    pub media_waiting_for_ac: u64,
     /// The index on disk is encrypted (#4).
     pub encrypted: bool,
     /// What its key is sealed with: a `dbus::seal` value, or empty.
@@ -185,6 +187,7 @@ impl Status {
             no_decoder: signed(status::NO_DECODER),
             indexing_rest: flag(status::INDEXING_REST),
             partial,
+            media_waiting_for_ac: unsigned(status::MEDIA_WAITING_FOR_AC),
             encrypted: flag(status::ENCRYPTED),
             seal: text(status::SEAL),
             tpm: flag(status::TPM),

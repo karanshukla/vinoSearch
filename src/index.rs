@@ -1051,6 +1051,15 @@ pub fn has_partial(conn: &Connection, media: bool) -> Result<bool> {
         .is_some())
 }
 
+/// Audio and video files registered but not fully embedded yet.
+pub fn media_partial(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT count(*) FROM partial WHERE media = 1", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 /// Documents indexed in part so far (#108), the next in line first: (path,
 /// parts in, parts in all). At most `limit`.
 pub fn partial(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, i64)>> {
@@ -2542,6 +2551,24 @@ mod tests {
         )
         .unwrap();
         id
+    }
+
+    #[test]
+    fn media_partial_counts_audio_and_video_only() {
+        let dir =
+            std::env::temp_dir().join(format!("vinosearch-media-wait-{}", std::process::id()));
+        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let book = dir.join("book.txt");
+        let clip = dir.join("clip.mp4");
+        fs::write(&book, "a long book").unwrap();
+        fs::write(&clip, "frames").unwrap();
+        add_partial(&conn, &book, 30, 70);
+        assert_eq!(media_partial(&conn).unwrap(), 0);
+        let id = add_partial(&conn, &clip, 0, 22);
+        conn.execute("UPDATE partial SET media = 1 WHERE file_id = ?1", [id])
+            .unwrap();
+        assert_eq!(media_partial(&conn).unwrap(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
