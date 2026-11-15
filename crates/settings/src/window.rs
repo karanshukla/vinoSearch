@@ -1461,6 +1461,18 @@ impl SettingsWindow {
                         }
                     },
                 );
+            } else if media
+                && let Some(s) = s
+                && s.media_waiting_for_ac > 0
+            {
+                let n = s.media_waiting_for_ac;
+                Row::new("")
+                    .help(&format!(
+                        "{} {} for a charger.",
+                        count(n as i64),
+                        if n == 1 { "file waits" } else { "files wait" }
+                    ))
+                    .show(ui, |_, _| {});
             }
             if let Some(s) = s
                 && s.sessions_unread > 0
