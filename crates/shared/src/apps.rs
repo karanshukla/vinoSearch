@@ -18,15 +18,7 @@ pub fn data_dirs() -> Vec<PathBuf> {
     if crate::sandbox::flatpak_id().is_some() {
         return host_data_dirs();
     }
-    let mut dirs = Vec::new();
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => dirs.push(PathBuf::from(d)),
-        _ => {
-            if let Some(h) = std::env::var_os("HOME") {
-                dirs.push(PathBuf::from(h).join(".local/share"));
-            }
-        }
-    }
+    let mut dirs: Vec<PathBuf> = crate::xdg::data_home().into_iter().collect();
     let system = std::env::var("XDG_DATA_DIRS")
         .ok()
         .filter(|d| !d.is_empty())

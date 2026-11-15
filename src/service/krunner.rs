@@ -13,7 +13,7 @@ use crate::index::{self, Hit, Kind};
 use crate::ml::model;
 use crate::search::open::At;
 use crate::service::flatpak;
-use crate::service::start::{self, config_home, data_home};
+use crate::service::start;
 use crate::service::watch;
 use crate::service::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use vinosearch_shared::sandbox;
+use vinosearch_shared::xdg::{config_home, data_home};
 use zbus::interface;
 use zbus::{OwnedVariant, Variant};
 

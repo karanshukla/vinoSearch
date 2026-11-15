@@ -59,7 +59,7 @@ fn update(tag: Option<String>) -> Result<()> {
     }
     let app_path = sandbox::info_value("Instance", "app-path")
         .context("/.flatpak-info doesn't say where the app is installed")?;
-    let home = PathBuf::from(std::env::var_os("HOME").context("no HOME")?);
+    let home = vinosearch_shared::xdg::home()?;
     let scope = installation(&app_path, app, &home)?;
 
     // A mirror, or a test's fake release. The checksum is checked the same.

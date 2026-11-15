@@ -75,6 +75,7 @@ const SKIP_DIRS: &[&str] = &[
 const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
 
 use vinosearch_shared::limits::MAX_IMAGE_BYTES;
+use vinosearch_shared::xdg;
 /// Documents are parsed whole in memory too, once for each run of parts.
 /// Their extracted text is held to MAX_TEXT_BYTES.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
@@ -278,9 +279,9 @@ pub const VINOWHISPER_FLATPAK: &str = "io.github.karanshukla.vinowhisper";
 fn sessions_dirs() -> Vec<PathBuf> {
     let native = match vinosearch_shared::sandbox::flatpak_id() {
         Some(_) => vinosearch_shared::sandbox::host_data_home(),
-        None => data_home().ok(),
+        None => xdg::data_home().ok(),
     };
-    sessions_dirs_in(native, std::env::var_os("HOME").map(PathBuf::from))
+    sessions_dirs_in(native, xdg::home().ok())
 }
 
 fn sessions_dirs_in(native_data: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -296,19 +297,12 @@ fn sessions_dirs_in(native_data: Option<PathBuf>, home: Option<PathBuf>) -> Vec<
     dirs
 }
 
-fn data_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    })
-}
-
 /// Log entries kept. A Vectors further behind than this reloads in full,
 /// which at that many changes is no slower than applying them.
 const CHUNK_LOG_KEEP: i64 = 100_000;
 
 pub fn default_db() -> Result<PathBuf> {
-    Ok(data_home()?.join("vinosearch/index.sqlite"))
+    Ok(xdg::data_home()?.join("vinosearch/index.sqlite"))
 }
 
 /// The index holds copies of file contents, so only the user may read it:

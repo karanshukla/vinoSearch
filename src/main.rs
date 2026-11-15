@@ -178,12 +178,7 @@ enum Command {
 
 /// OpenVINO's compiled-model cache.
 pub(crate) fn cache_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("no HOME"))?)
-            .join(".cache"),
-    };
-    Ok(base.join("vinosearch/ov-cache"))
+    Ok(vinosearch_shared::xdg::cache_home()?.join("vinosearch/ov-cache"))
 }
 
 pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<embed::Embedder> {

@@ -363,16 +363,8 @@ impl Formats {
     }
 }
 
-fn home() -> Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var_os("HOME").context("no HOME")?))
-}
-
 pub fn default_path() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => home()?.join(".config"),
-    };
-    Ok(base.join("vinosearch/config.toml"))
+    Ok(crate::xdg::config_home()?.join("vinosearch/config.toml"))
 }
 
 impl Config {
@@ -525,7 +517,7 @@ impl Config {
     }
 
     pub fn excludes(&self) -> Result<Excludes> {
-        let home = home()?;
+        let home = crate::xdg::home()?;
         self.exclude
             .iter()
             .map(|e| resolve(e, &home))
