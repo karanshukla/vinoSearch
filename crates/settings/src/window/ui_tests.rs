@@ -1002,3 +1002,26 @@ fn the_index_bar_shows_every_kind_indexed() {
         assert!(rect.height() < 24.0, "{legend} is {rect:?}");
     }
 }
+
+#[test]
+fn the_media_row_says_how_many_files_wait_for_a_charger() {
+    for (waiting, says) in [
+        (12, Some("12 files wait for a charger.")),
+        (1, Some("1 file waits for a charger.")),
+        (0, None),
+    ] {
+        let (mut w, _requests) = window(Page::Search, &format!("media-ac-{waiting}"));
+        w.config.formats.media.enabled = Some(true);
+        if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+            s.ffmpeg = true;
+            s.media_waiting_for_ac = waiting;
+        }
+        let h = harness(w, WIDE, Theme::Light);
+        match says {
+            Some(text) => {
+                h.get_by_label(text);
+            }
+            None => assert!(h.query_by_label_contains("for a charger").is_none()),
+        }
+    }
+}
