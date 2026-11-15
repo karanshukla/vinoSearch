@@ -665,6 +665,51 @@ fn answer<E: Embed>(
     }));
 }
 
+/// Folders `old` excluded that `new` doesn't. Their files are new to the
+/// index, and a check of each folder finds them.
+fn no_longer_excluded(old: &Excludes, new: &Excludes) -> Vec<PathBuf> {
+    old.paths()
+        .iter()
+        .filter(|p| !new.contains(p) && index::is_real_dir(p))
+        .cloned()
+        .collect()
+}
+
+/// A cache that was never written is cleared already.
+fn clear_compiled_cache() -> Result<()> {
+    match std::fs::remove_dir_all(crate::cache_dir()?) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Runs of the rest of long documents that failed in a row. One file the
+/// model can't take goes behind the others (`index::media::rest`), so the
+/// next run is tried; a second failure straight after is taken for the
+/// device, and the rest waits for a Retry or a load.
+/// `one_failed_run_of_the_rest_is_tried_again` and
+/// `a_second_failed_run_in_a_row_waits` pin both sides.
+#[derive(Default)]
+struct RestFailures(u32);
+
+impl RestFailures {
+    const TAKEN_FOR_THE_DEVICE: u32 = 2;
+
+    fn succeeded(&mut self) {
+        self.0 = 0;
+    }
+
+    /// Whether the rest should stop being tried.
+    fn failed(&mut self) -> bool {
+        self.0 += 1;
+        let give_up = self.0 >= Self::TAKEN_FOR_THE_DEVICE;
+        if give_up {
+            self.0 = 0;
+        }
+        give_up
+    }
+}
+
 pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     let openvino_dir = opts.openvino_dir.clone();
     run_with(jobs, opts, |device| {
@@ -741,10 +786,7 @@ fn run_with<E: Embed>(
     // Whether the rest of long documents may run when nothing else waits:
     // not after it failed to, until a Retry or a load succeeds.
     let mut rest_ready = true;
-    // Runs of the rest that failed in a row. One file the model can't take
-    // goes behind the others (`index::media::rest`), so the next run is
-    // tried; a second failure straight after is taken for the device.
-    let mut rest_failures = 0;
+    let mut rest_failures = RestFailures::default();
     // Whether the models audio and video need were there when last looked:
     // without them media waits for a Retry (a fetch sends one) instead of
     // loading the model to find out again.
@@ -768,15 +810,7 @@ fn run_with<E: Embed>(
         if let Some(file) = file {
             match file.excludes() {
                 Ok(ex) if ex != rules.excludes => {
-                    // What is no longer excluded: index it (its files are
-                    // new to the index, and a check of each finds them).
-                    let allowed: Vec<PathBuf> = rules
-                        .excludes
-                        .paths()
-                        .iter()
-                        .filter(|p| !ex.contains(p) && index::is_real_dir(p))
-                        .cloned()
-                        .collect();
+                    let allowed = no_longer_excluded(&rules.excludes, &ex);
                     rules.excludes = ex;
                     match index::purge(&conn, &rules.excludes) {
                         Ok(n) => eprintln!("exclusions changed, {n} files removed"),
@@ -856,16 +890,11 @@ fn run_with<E: Embed>(
                         Err(e) => eprintln!("deleting the model: {e:#}"),
                     }
                 }
-                Request::ClearCache => {
-                    // Loaded stages are compiled already; only the next load reads the cache.
-                    match crate::cache_dir().and_then(|d| match std::fs::remove_dir_all(&d) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-                        _ => Ok(()),
-                    }) {
-                        Ok(()) => eprintln!("compiled-model cache cleared"),
-                        Err(e) => eprintln!("clearing the cache: {e:#}"),
-                    }
-                }
+                // Loaded stages are compiled already; only the next load reads the cache.
+                Request::ClearCache => match clear_compiled_cache() {
+                    Ok(()) => eprintln!("compiled-model cache cleared"),
+                    Err(e) => eprintln!("clearing the cache: {e:#}"),
+                },
             }
         }
         // Then the most urgent item, unless the work is held. A model that
@@ -1070,7 +1099,7 @@ fn run_with<E: Embed>(
                             }
                             _ => {}
                         }
-                        rest_failures = 0;
+                        rest_failures.succeeded();
                         status.last_indexed.store(unix_now(), Ordering::Relaxed);
                     }
                     Ok(None) => {}
@@ -1079,9 +1108,7 @@ fn run_with<E: Embed>(
                     Err(_) if interrupted(&r) => {}
                     Err(e) => {
                         eprintln!("indexing the rest of a long document: {e:#}");
-                        rest_failures += 1;
-                        if rest_failures >= 2 {
-                            rest_failures = 0;
+                        if rest_failures.failed() {
                             rest_ready = false;
                         }
                     }
@@ -1118,6 +1145,27 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn one_failed_run_of_the_rest_is_tried_again() {
+        let mut failures = RestFailures::default();
+        assert!(!failures.failed());
+    }
+
+    #[test]
+    fn a_second_failed_run_in_a_row_waits() {
+        let mut failures = RestFailures::default();
+        failures.failed();
+        assert!(failures.failed());
+    }
+
+    #[test]
+    fn a_run_that_worked_starts_the_count_of_failures_again() {
+        let mut failures = RestFailures::default();
+        failures.failed();
+        failures.succeeded();
+        assert!(!failures.failed());
     }
 
     #[test]
