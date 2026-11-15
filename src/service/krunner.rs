@@ -668,6 +668,7 @@ struct Counted {
     undecodable: i64,
     roots: Vec<PathBuf>,
     partial: Vec<(String, i64, i64)>,
+    media_partial: i64,
 }
 
 /// Length and modification time of the index and its write-ahead log: any
@@ -698,6 +699,7 @@ impl Counted {
             },
             roots: index::roots(conn)?,
             partial: index::partial(conn, key::PARTIAL_MAX)?,
+            media_partial: index::media_partial(conn)?,
         })
     }
 }
@@ -900,6 +902,16 @@ impl Control {
         out.insert(
             key::INDEXING_REST.into(),
             owned(Variant::from(st.indexing_rest.load(Ordering::Relaxed))),
+        );
+        // Media runs on AC only (#192), whatever `index_on_battery` says.
+        let media_waiting = if st.power.on_battery() {
+            counted.media_partial.max(0) as u64
+        } else {
+            0
+        };
+        out.insert(
+            key::MEDIA_WAITING_FOR_AC.into(),
+            owned(Variant::from(media_waiting)),
         );
         let partial: Vec<(String, String, u64, u64)> = counted
             .partial

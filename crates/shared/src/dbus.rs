@@ -125,6 +125,9 @@ pub mod status {
     /// unit "page", "slide", "chapter" or "part".
     pub const PARTIAL: &str = "partial";
     pub const PARTIAL_MAX: usize = 100;
+    /// Audio and video files waiting for a charger to be embedded (#192):
+    /// the media rows in `partial` while on battery, else 0.
+    pub const MEDIA_WAITING_FOR_AC: &str = "media_waiting_for_ac";
     /// PauseIndexing was called and ResumeIndexing not since.
     pub const PAUSED: &str = "paused";
     /// Why indexing is held for power (#109): a `hold` value, or empty.
