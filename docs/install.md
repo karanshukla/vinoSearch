@@ -25,6 +25,19 @@ as a service started at login. It skips whatever is already done, so re-running 
 download upgrades in place. If something is missing (the NPU driver, say), it stops with one line
 saying what.
 
+The release's `install.sh` does the same without unpacking anything first, and checks the download
+against its `.sha256`:
+
+```bash
+curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --index ~/Documents
+```
+
+## Upgrading
+
+Use **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (a
+release tag like `vinosearch-upgrade v6` installs that one). It skips whatever is already done and
+restarts the service.
+
 ## From source
 
 Needs Rust and a C compiler. The same script builds the binaries with cargo into `~/.cargo/bin`
@@ -177,7 +190,8 @@ models and config too.
 
 ## Uninstalling
 
-`vinosearch/scripts/install.sh --uninstall` removes the service, the KRunner and GNOME files and the
+`vinosearch/scripts/install.sh --uninstall` (or the `curl ... install.sh | bash -s -- --uninstall`
+form) removes the service, the KRunner and GNOME files and the
 binaries, and deletes the models (`~/.local/share/vinosearch/models`) and their compiled cache
 (`~/.cache/vinosearch/ov-cache`). The index, `config.toml` and the OpenVINO runtime are kept. Add
 `--purge` to also delete the index and the runtime; `config.toml` is still kept.

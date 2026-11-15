@@ -16,105 +16,45 @@ Filename search finds `signing-keys.md` when you remember it's called that. vino
 
 ## Requirements
 
-- Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU (AMD, older Intel)? `install.sh` runs it on the CPU, just slower; `--device CPU` does the same explicitly.
-- KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher (fuzzel, wofi, rofi, tofi or bemenu). The settings window is Wayland only.
-- Rust, a C compiler and OpenSSL's headers, only to build from source.
+- Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU? It runs on the CPU, just slower.
+- KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher.
+- x86_64 with glibc 2.39 or newer for the release download (Fedora 40+, Ubuntu 24.04+, Debian 13, Arch, Tumbleweed, Fedora Atomic, Aeon). Anything older builds [from source](docs/install.md#from-source).
 
 ## Install
 
 ```bash
 curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --index ~/Documents
 ```
-(or download the latest Flatpak from GH releases)
 
-That downloads the latest release, checks it against its `.sha256`, installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a service started at login. No sudo: everything goes in your home. If something is missing (the NPU driver, say), it stops with one line saying what.
+That installs the prebuilt binaries into `~/.local/bin`, fetches OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks), and registers vinoSearch with the running desktop's search. No sudo: everything goes in your home. If something is missing (the NPU driver, say), it stops with one line saying what.
 
-To upgrade, use **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (a release tag like `vinosearch-upgrade v6` installs that one). It skips whatever is already done and restarts the service.
+| To | Do |
+|---|---|
+| Upgrade | **Check for updates** on the settings window's About page, or `vinosearch-upgrade` |
+| Uninstall | the same `curl` line with `--uninstall` in place of `--index ~/Documents` (keeps your index and settings; `--purge` deletes the index too) |
+| Use the Flatpak | [download the bundle](docs/install.md#flatpak) from the latest release |
+| Check the install | `vinosearch doctor` |
 
-`curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --uninstall` removes the service, the KRunner and GNOME files and the binaries, and deletes the models and their compiled cache. Your index and settings stay; add `--purge` to also delete the index and the OpenVINO runtime. To delete only the models, use **Delete…** on the settings window's Model page, or `vinosearch delete-model`.
-
-<details>
-<summary>From source instead</summary>
-
-Needs Rust and a C compiler. The same script builds the binaries with cargo into `~/.cargo/bin` when run from a checkout, and `git pull` then a re-run upgrades:
-
-```bash
-git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
-scripts/install.sh --index ~/Documents
-```
-
-Or step by step:
-
-```bash
-cargo install --path .                     # vinosearch into ~/.cargo/bin
-cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
-cargo install ovfetch                      # 0.6.0 or newer
-scripts/install-runtime.sh                 # OpenVINO via ovfetch
-vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
-vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
-vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
-vinosearch krunner --install               # the service (started now and at login), the app menu entry and the running desktop's search
-vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
-```
-
-`vinosearch doctor` checks the NPU, driver and runtime, then compiles and runs a probe model.
-
-</details>
-
-<details>
-<summary>Other distros, and Fedora Atomic or openSUSE Aeon</summary>
-
-The release download runs on x86_64 with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13, Arch, openSUSE Tumbleweed, and the image-based Fedora Atomic (Silverblue, Kinoite, Bazzite) and openSUSE Aeon. On anything older (Debian 12, Ubuntu 22.04, openSUSE Leap 15) `install.sh` says so; build from source there.
-
-Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from [rustup](https://rustup.rs). The C compiler and OpenSSL's headers (SQLCipher links the system's libcrypto) are `sudo dnf install gcc openssl-devel` on Fedora, `sudo apt install build-essential libssl-dev` on Debian and Ubuntu, `sudo pacman -S --needed base-devel openssl` on Arch and `sudo zypper install gcc libopenssl-devel` on openSUSE.
-
-**Image-based systems.** Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under `~/.local`, the service's autostart entry in `~/.config/autostart`. Nothing touches `/usr`, so the release download needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install` on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it. To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches the host: the home directory is shared, so the host runs the same binaries and index. `/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
-
-</details>
+[Installing](docs/install.md) has the rest: building from source, other distros, Fedora Atomic and openSUSE Aeon, the Flatpak's permissions, and what uninstalling keeps.
 
 ## Use it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, vinoWhisper sessions in **vinoWhisper sessions**, and `code:` queries in **vinoSearch Code**.
+- **Plasma:** Alt+Space opens KRunner.
 - **GNOME:** the overview's search, from the next login.
-- **Sway, Hyprland, COSMIC and the rest:** `vinosearch menu` asks for a query in fuzzel, wofi, rofi, tofi or bemenu (the first it finds), shows the results in it, and opens the one you pick. Bind it to a key, e.g. `bindsym $mod+s exec vinosearch menu` in sway or `bind = SUPER, S, exec, vinosearch menu` in Hyprland. `--launcher "rofi -dmenu -i"` (or `VINOSEARCH_LAUNCHER`) picks another dmenu-style command. It asks the running service, so a warm query is as quick as KRunner's.
-- **Terminal:** `vinosearch search "how do I rotate the signing key"`, `vinosearch search "code: retry a failed download"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg` for indexed photos that look like one.
+- **Sway, Hyprland, COSMIC and the rest:** bind `vinosearch menu` to a key. It asks in fuzzel, wofi, rofi, tofi or bemenu.
+- **Terminal:** `vinosearch search "how do I rotate the signing key"`, `vinosearch search "code: retry a failed download"`, or `vinosearch similar ~/Pictures/IMG_2041.jpg`.
 
-Results need 3 or more characters. Enter opens the file: a text file at the matching line in your editor, a PDF at the matching page in Okular, Evince, Papers or Zathura, an audio or video file from the matching time in mpv, VLC or Celluloid. Other files, and apps that can't be told where, open at the top.
+Results need 3 or more characters. Enter opens the file at the match: a text file at its line, a PDF at its page, audio and video at the time. **Show all results** opens a search window with up to 100 files of each kind, thumbnails and filters.
 
-**All results.** KRunner's **Show all results** on any match, or the vinoSearch icon beside GNOME's results, opens the query in a search window (needs `vinosearch-settings`): up to 100 files of each kind, photos as a grid of thumbnails, text and documents with their snippet and line or page, filtered by kind, folder, date and file type. Enter or a double click opens a result at its match; **Open folder** and **Copy file** (pastes as the file in a file manager; needs `wl-copy`) are below. `vinosearch-settings --search "query"` opens it from a key binding.
+[Using it](docs/using.md) covers which editors, viewers and players open at the match, the search window, key bindings and the CLI.
 
 ## Settings
 
 <p align="center"><img src="docs/media/settings.svg" width="720" alt="The vinoSearch settings window on its Index page, indexing photos: the file count rises, the Pictures folder's share of the index grows, then it reads Up to date."></p>
 
-Open **vinoSearch** from the app menu, or run `vinosearch-settings`. On sway or Hyprland, **Add folder…** needs a file chooser portal (`xdg-desktop-portal-gtk` provides one; `xdg-desktop-portal-wlr` doesn't); without it, type the path instead. It shows what's indexed and lets you add folders and exclusions, turn images, documents and code on, set how close a result has to be and pick the editor that opens text results and the player that plays audio and video from your installed apps, pick the NPU, GPU or CPU, and turn KRunner and GNOME search on or off, each on its own. Changes apply within 30 seconds, no restart.
+Open **vinoSearch** from the app menu, or run `vinosearch-settings`. It shows what's indexed and sets the folders and exclusions, which kinds are on (images, documents, code, vinoWhisper sessions, audio and video), how close a result has to be, the editor and player, the device, and KRunner and GNOME search. Changes apply within 30 seconds, no restart.
 
-Everything it sets lives in `~/.config/vinosearch/config.toml`, if you'd rather edit that:
-
-```toml
-exclude = ["~/Downloads"]   # never indexed or watched, even under an indexed root
-device = "NPU"
-idle_unload_minutes = 5     # free the model after this long idle; 0 keeps it loaded
-editor = "code"             # opens text results at their line [default: the default app]; or "org.kde.kate.desktop", or "foot -e nvim +{line} {file}"
-player = "mpv"              # plays media results at their time (mpv, vlc or celluloid) [default: the default app]; or "mpv --start={seconds} {file}"
-
-[formats.text]
-min_score = 0.65            # lower it for more, looser results
-
-[formats.images]
-enabled = true              # off by default: the vision encoder is a 671 MB download
-extensions = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif"]
-min_score = 0.68
-
-[formats.code]
-enabled = true              # off by default; found only by queries starting "code:"
-min_score = 0.72
-
-[formats.sessions]
-enabled = true              # off by default; vinoWhisper's saved transcripts and summaries
-```
-
-Flags and environment variables override the file. Package trees like `~/snap`, `~/go/pkg` and conda installs are excluded by default; [how it works](docs/how-it-works.md#what-gets-indexed) has the list.
+Everything it sets lives in `~/.config/vinosearch/config.toml`. [Settings](docs/configuration.md) has the whole file.
 
 ## Performance
 
@@ -134,31 +74,20 @@ Images take 1.3 s and about 4.4 J each on the NPU, with no CPU time beyond decod
 
 n=1 machine. Your NPU and your files will differ.
 
-## Models
-
-Text uses [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) as [arankays/embeddinggemma-2-text-int8-cw-onnx](https://huggingface.co/arankays/embeddinggemma-2-text-int8-cw-onnx): INT8, 274 MB, with a fix for an OpenVINO conversion bug ([#1](https://github.com/karanshukla/vinoSearch/issues/1)). On BEIR SciFact it scores **0.846 nDCG@10**, against 0.582 for the published ONNX export and 0.684 for bge-small. The [full table](docs/how-it-works.md#text-model-benchmark) has 12 models.
-
-Images use its vision encoder, rewritten with static shapes so the NPU can compile it, as [arankays/embeddinggemma-2-vision-static-onnx](https://huggingface.co/arankays/embeddinggemma-2-vision-static-onnx): fp32, 671 MB, downloaded only once images are on. On Flickr30k's 1k test split (1,000 images, 5,000 captions), both stages on the NPU (`bench/image_retrieval.py`, `bench/image_energy.py`):
-
-| Soft tokens | Text→image R@1 / R@5 / R@10 | ms/image | Package J/image |
-|---|---|---|---|
-| 280 | 86.3 / 97.5 / 98.7 | 2767 | 9.4 |
-| **140 (used)** | **84.5 / 96.9 / 98.6** | **1311** | **4.4** |
-| 70 | 81.1 / 95.4 / 97.9 | 653 | 2.2 |
-
-Text in images and scanned PDFs is read by PaddleOCR's PP-OCRv6 small detector and recogniser, as RapidOCR publishes them, at [arankays/pp-ocrv6-small-onnx](https://huggingface.co/arankays/pp-ocrv6-small-onnx) (31 MB), compiled at static shapes so the NPU runs both ([#106](https://github.com/karanshukla/vinoSearch/issues/106)). On 1920x1080 browser screenshots it finds 96-98% of the words shown in about 0.5 s, where RapidOCR's own pipeline on the CPU finds 86-94% in 1.4-2.1 s (`bench/ocr_static.py`). It reads Chinese, Japanese, English and Latin-script languages; not Cyrillic, Arabic or Korean.
+[Performance and models](docs/performance.md) has the models and their benchmarks: EmbeddingGemma 2 for text (0.846 nDCG@10 on BEIR SciFact) and images (84.5 R@1 on Flickr30k), PP-OCRv6 for text in images.
 
 ## Privacy
 
 The index is SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600, directory 0700). Embeddings can be partly inverted back to their text, so treat the index like the files it covers.
 
-It can be encrypted at rest ([#4](https://github.com/karanshukla/vinoSearch/issues/4)): the settings window's Security page, or `enabled = true` under `[encryption]` in the config file. Off by default. The whole database is SQLCipher (AES-256), so text, vectors, file names and the word index are all covered, and its random key is sealed by `systemd-creds` to this machine's TPM and your user. Turning it on or off converts the index in place; nothing is indexed again, and search is unchanged. Without a TPM it's refused unless you allow systemd's host key, which root can read. If the key stops unsealing (TPM cleared, board replaced), the index is rebuilt from your files, never left readable. Without systemd 256 or newer, the key goes in your desktop keyring instead, which is weaker: anything running as you can read it once you log in. Details in [How it works](docs/how-it-works.md#encryption-at-rest).
+It can be encrypted at rest with SQLCipher, its key sealed to this machine's TPM. Off by default. [Privacy](docs/privacy.md) has what that covers and what it doesn't.
 
 ## More
 
 - [vinosearch.vinopilot.ca](https://vinosearch.vinopilot.ca): these docs as a site.
-- [How it works](docs/how-it-works.md): indexing, watching, the runner, the settings window, the runtime and NPU gotchas.
+- [How it works](docs/how-it-works.md): indexing, watching, the runner, encryption, the runtime and NPU gotchas.
 - [D-Bus interface](docs/dbus.md): KRunner, GNOME Shell and the control interface the settings app uses.
+- [Releasing](docs/releasing.md): how a release is cut.
 
 ## License
 
