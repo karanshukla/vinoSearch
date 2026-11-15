@@ -186,22 +186,11 @@ struct Entry {
 
 /// `Exec` and `Terminal` from the `[Desktop Entry]` group of `text`.
 fn parse_entry(text: &str) -> Option<Entry> {
-    let mut in_entry = false;
     let (mut exec, mut terminal) = (None, false);
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_entry = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_entry {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "Exec" => exec = Some(value.trim()),
-            "Terminal" => terminal = value.trim() == "true",
+    for (key, value) in vinosearch_shared::apps::entry_keys(text) {
+        match key {
+            "Exec" => exec = Some(value),
+            "Terminal" => terminal = value == "true",
             _ => {}
         }
     }
