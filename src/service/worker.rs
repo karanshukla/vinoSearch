@@ -72,6 +72,8 @@ pub enum Request {
 }
 
 impl Request {
+    /// Whether a file being indexed stops for this, or waits for it (pinned
+    /// by `tests::unload_waits_for_the_file_being_indexed_and_forget_stops_it`).
     fn stops_indexing(&self) -> bool {
         matches!(
             self,
@@ -89,7 +91,20 @@ impl Request {
 #[derive(Default)]
 pub struct Pending {
     generation: AtomicU64,
-    inner: Mutex<(Option<Config>, Vec<Request>)>,
+    inner: Mutex<Waiting>,
+}
+
+#[derive(Default)]
+struct Waiting {
+    config: Option<Config>,
+    requests: Vec<Request>,
+}
+
+/// What a take of `Pending` hands over, and the generation it is current to.
+struct Arrived {
+    generation: u64,
+    config: Option<Config>,
+    requests: Vec<Request>,
 }
 
 impl Pending {
@@ -98,16 +113,15 @@ impl Pending {
     /// idle timeout and the rest apply, except where a flag overrides them.
     pub fn config(&self, file: Config) {
         let mut p = self.inner.lock().unwrap();
-        p.0 = Some(file);
-        // Under the lock, so what `take` returns is current to the count it
-        // reads: a count moved after a take means another take to come.
+        p.config = Some(file);
+        // Under the lock, so a take's generation is current to what it took.
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn request(&self, r: Request) {
         let mut p = self.inner.lock().unwrap();
         let stops = r.stops_indexing();
-        p.1.push(r);
+        p.requests.push(r);
         if stops {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -117,24 +131,27 @@ impl Pending {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// What arrived since the last take, with the count it is current to.
-    fn take(&self) -> (u64, Option<Config>, Vec<Request>) {
+    /// What arrived since the last take.
+    fn take(&self) -> Arrived {
         let mut p = self.inner.lock().unwrap();
-        let generation = self.generation.load(Ordering::Relaxed);
-        (generation, p.0.take(), std::mem::take(&mut p.1))
+        Arrived {
+            generation: self.generation.load(Ordering::Relaxed),
+            config: p.config.take(),
+            requests: std::mem::take(&mut p.requests),
+        }
     }
 
     /// Take the encryption requests alone, leaving the rest for the worker
-    /// once the index's key is had: the last Want asked for, if any.
+    /// once the index's key is had: the last Want asked for, if any. A
+    /// Rekey goes too: there is nothing to re-key until the key is had.
     fn take_encryption(&self) -> Option<Want> {
         let mut p = self.inner.lock().unwrap();
         let mut want = None;
-        p.1.retain(|r| match r {
+        p.requests.retain(|r| match r {
             Request::Encryption(w) => {
                 want = Some(*w);
                 false
             }
-            // Nothing to re-key until the key is had.
             Request::Rekey => false,
             _ => true,
         });
@@ -422,19 +439,14 @@ fn wait_for_key(
     want: &mut Want,
 ) -> Result<rusqlite::Connection> {
     let sealer = Sealer::default();
-    // The first try prompts, as the start of a session does; one the user
-    // asks for prompts too and may start over.
     let mut ask = Some(sealer.clone());
     loop {
-        // Asked while the last try was still prompting.
         if let Some(w) = status.pending.take_encryption() {
             *want = w;
             ask = Some(sealer.asked());
         }
         let s = ask.take().unwrap_or_else(|| sealer.quiet());
         let w = *want;
-        // A prompt may wait a minute on the user: queries are answered (with
-        // nothing) meanwhile, not held behind it.
         let stopping = std::thread::scope(|scope| {
             let asking = scope.spawn(|| apply_encryption(status, db, w, false, &s));
             while !asking.is_finished() {
@@ -683,6 +695,61 @@ fn clear_compiled_cache() -> Result<()> {
     }
 }
 
+/// The most urgent item, unless the work is held: roots, changes and what
+/// walks found, then the rest of long documents a run of parts at a time,
+/// then audio and video on AC only (`power` sends a Retry when a charger
+/// comes). A model that won't load leaves only roots, whose walk needs none.
+fn next_item(
+    status: &Status,
+    conn: &rusqlite::Connection,
+    rest_ready: bool,
+    media_models: bool,
+) -> Option<Item> {
+    if status.held() {
+        return None;
+    }
+    let waiting_model = status.waiting_model.load(Ordering::Relaxed);
+    status.work.take(waiting_model).or_else(|| {
+        let media = media_models && !status.power.on_battery();
+        (rest_ready && !waiting_model && index::has_partial(conn, media).unwrap_or(false))
+            .then_some(Item::Rest)
+    })
+}
+
+/// The worker has nothing left to do: log what this run did, and once
+/// nothing is left to check, the re-indexing a model change asked for is
+/// done.
+fn finish_run(status: &Status, run: index::Stats) {
+    if run.files_embedded + run.removed + run.duplicates > 0 {
+        eprintln!(
+            "indexed: {} files embedded ({} chunks), {} duplicates, {} removed",
+            run.files_embedded, run.chunks, run.duplicates, run.removed
+        );
+    }
+    if !status.work.pending() {
+        status.model_changed.lock().unwrap().clear();
+    }
+}
+
+/// Encrypt, decrypt or re-key: the worker's connection closed while the file
+/// is replaced, and the vector cache read again from the new one.
+fn reencrypt<E: Embed>(
+    status: &Status,
+    db: &Path,
+    conn: &mut rusqlite::Connection,
+    loaded: &mut Option<Loaded<E>>,
+    want: Want,
+    rekey: bool,
+) -> Result<()> {
+    *conn = rusqlite::Connection::open_in_memory()?;
+    apply_encryption(status, db, want, rekey, &Sealer::default().asked());
+    *conn = index::open(db)?;
+    if let Some(l) = loaded.as_mut() {
+        l.vectors = Vectors::load(conn)?;
+    }
+    Ok(())
+}
+
 /// Runs of the rest of long documents that failed in a row; `TAKEN_FOR_THE_DEVICE` of them stop it.
 #[derive(Default)]
 struct RestFailures(u32);
@@ -756,21 +823,6 @@ fn run_with<E: Embed>(
         Ok(Loaded { emb, vectors })
     };
     let status = &opts.status;
-    // Encrypt, decrypt or re-key (#4): the worker's connection closed while
-    // the file is replaced, and the vector cache read again from the new one.
-    let reencrypt = |conn: &mut rusqlite::Connection,
-                     loaded: &mut Option<Loaded<E>>,
-                     want: Want,
-                     rekey: bool|
-     -> Result<()> {
-        *conn = rusqlite::Connection::open_in_memory()?;
-        apply_encryption(status, &db, want, rekey, &Sealer::default().asked());
-        *conn = index::open(&db)?;
-        if let Some(l) = loaded.as_mut() {
-            l.vectors = Vectors::load(conn)?;
-        }
-        Ok(())
-    };
     let mut loaded: Option<Loaded<E>> = None;
     let unload = |loaded: &mut Option<Loaded<E>>, why: &str| {
         if loaded.take().is_some() {
@@ -778,20 +830,16 @@ fn run_with<E: Embed>(
             eprintln!("model unloaded ({why})");
         }
     };
-    // Whether the rest of long documents may run when nothing else waits:
-    // not after it failed to, until a Retry or a load succeeds.
+    // False once the rest of long documents failed, until a Retry or a load
+    // succeeds.
     let mut rest_ready = true;
     let mut rest_failures = RestFailures::default();
-    // Whether the models audio and video need were there when last looked:
-    // without them media waits for a Retry (a fetch sends one) instead of
-    // loading the model to find out again.
+    // False once media's models were missing, until a Retry (a fetch sends
+    // one): not found out again by loading the model.
     let mut media_models = true;
-    // What this run of indexing (since the worker last had nothing to do)
-    // has done, for Status and one line in the log; and whether it did
-    // anything at all.
+    // Since the worker last had nothing to do.
     let mut run = index::Stats::default();
     let mut did_work = false;
-    // When the last job finished, and when to free the document stage.
     let mut last_job = Instant::now();
     let mut free_docs: Option<Instant> = None;
     let mut timed_out = false;
@@ -800,8 +848,12 @@ fn run_with<E: Embed>(
             last_job = Instant::now();
         }
         // The settings and requests first: anything taken below is checked
-        // under them. `applied` is the count they are current to.
-        let (applied, file, requests) = status.pending.take();
+        // under them.
+        let Arrived {
+            generation: applied,
+            config: file,
+            requests,
+        } = status.pending.take();
         if let Some(file) = file {
             match file.excludes() {
                 Ok(ex) if ex != rules.excludes => {
@@ -816,7 +868,7 @@ fn run_with<E: Embed>(
                 Ok(_) => {}
                 Err(e) => eprintln!("exclusions not applied: {e:#}"),
             }
-            // Turned on, the watcher checks every root for what is wanted now.
+            // What is newly wanted is the watcher's to find, root by root.
             match FileTypes::new(&file.formats) {
                 Ok(new) if new != rules.types => {
                     rules.types = new;
@@ -835,7 +887,6 @@ fn run_with<E: Embed>(
                     eprintln!("device changed to {new}");
                     device = new.to_owned();
                     *status.device.lock().unwrap() = device.clone();
-                    // Loaded again, on the new device, by the next item that needs it.
                     unload(&mut loaded, "device changed");
                 }
             }
@@ -843,11 +894,10 @@ fn run_with<E: Embed>(
                 Ok(new) => pace.set(new),
                 Err(e) => eprintln!("index_busy_percent not applied: {e:#}"),
             }
-            // Released, the work waiting for a charger is simply taken below.
             status.power.set_index_on_battery(file.index_on_battery());
             if Want::of(&file) != want {
                 want = Want::of(&file);
-                reencrypt(&mut conn, &mut loaded, want, false)?;
+                reencrypt(status, &db, &mut conn, &mut loaded, want, false)?;
             }
             if !opts.pinned.idle_unload {
                 let m = file
@@ -868,13 +918,12 @@ fn run_with<E: Embed>(
                 Request::Forget(root) => forget_root(&conn, &db, &status.work, &root),
                 Request::Encryption(w) => {
                     want = w;
-                    reencrypt(&mut conn, &mut loaded, want, false)?;
+                    reencrypt(status, &db, &mut conn, &mut loaded, want, false)?;
                 }
-                Request::Rekey => reencrypt(&mut conn, &mut loaded, want, true)?,
+                Request::Rekey => reencrypt(status, &db, &mut conn, &mut loaded, want, true)?,
                 Request::Unload => unload(&mut loaded, "asked to"),
                 Request::DeleteModel => {
-                    // Checked again here: this may have waited for a file
-                    // while a FetchModel started.
+                    // Again: a FetchModel may have started while this waited.
                     if status.fetching.load(Ordering::SeqCst) {
                         eprintln!("not deleting the model: a download started since it was asked");
                         continue;
@@ -885,43 +934,17 @@ fn run_with<E: Embed>(
                         Err(e) => eprintln!("deleting the model: {e:#}"),
                     }
                 }
-                // Loaded stages are compiled already; only the next load reads the cache.
+                // Only the next load reads the cache.
                 Request::ClearCache => match clear_compiled_cache() {
                     Ok(()) => eprintln!("compiled-model cache cleared"),
                     Err(e) => eprintln!("clearing the cache: {e:#}"),
                 },
             }
         }
-        // Then the most urgent item, unless the work is held. A model that
-        // won't load leaves roots to register, whose walk needs none.
-        let waiting_model = status.waiting_model.load(Ordering::Relaxed);
-        let item = if status.held() {
-            None
-        } else {
-            status.work.take(waiting_model).or_else(|| {
-                // The first pass over everything is done; the rest of long
-                // documents is what's left, a run of parts at a time, then
-                // audio and video, on AC only (#192): `power` sends a
-                // Retry when a charger comes.
-                let media = media_models && !status.power.on_battery();
-                (rest_ready && !waiting_model && index::has_partial(&conn, media).unwrap_or(false))
-                    .then_some(Item::Rest)
-            })
-        };
+        let item = next_item(status, &conn, rest_ready, media_models);
         let Some(item) = item else {
             if std::mem::take(&mut did_work) {
-                if run.files_embedded + run.removed + run.duplicates > 0 {
-                    eprintln!(
-                        "indexed: {} files embedded ({} chunks), {} duplicates, {} removed",
-                        run.files_embedded, run.chunks, run.duplicates, run.removed
-                    );
-                }
-                run = index::Stats::default();
-                // The re-indexing a model change asked for is done once
-                // nothing is left to check.
-                if !status.work.pending() {
-                    status.model_changed.lock().unwrap().clear();
-                }
+                finish_run(status, std::mem::take(&mut run));
             }
             let unload_at = idle.filter(|_| loaded.is_some()).map(|d| last_job + d);
             let free_at = free_docs.filter(|_| loaded.is_some());
@@ -972,8 +995,7 @@ fn run_with<E: Embed>(
                     }
                     answer(&conn, emb, vectors, &query, k, reply);
                     // A query too long for the query stage compiled the
-                    // document stage: free it as after indexing. Short
-                    // queries leave the timer alone.
+                    // document stage: free it as after indexing.
                     if emb.has_documents() && !had_docs {
                         free_docs = Some(Instant::now() + DOCS_HOLD);
                     }
@@ -1016,7 +1038,6 @@ fn run_with<E: Embed>(
                     status.waiting_model.store(true, Ordering::Relaxed);
                     match item {
                         Item::Check(path) => status.work.changed([path]),
-                        // Tried again once a load succeeds.
                         Item::Rest => rest_ready = false,
                         Item::Root(_) => unreachable!("needs no model"),
                     }
@@ -1028,29 +1049,23 @@ fn run_with<E: Embed>(
         }
         status.waiting_model.store(false, Ordering::Relaxed);
         let Loaded { emb, vectors } = loaded.as_mut().unwrap();
-        // Indexing runs at idle priority and stops between chunks for
-        // queries, which are answered at normal priority from the vectors
-        // as they were (a reload per file would cost more than the query).
-        // Compile the document stage first: OpenVINO's threads created by
-        // the compile inherit the caller's priority, and at idle they would
-        // stay there.
+        // Compiled before dropping to idle priority: OpenVINO's threads
+        // inherit the compiling thread's priority and would stay at idle.
         if let Err(e) = emb.prepare_documents() {
             eprintln!("compiling the document model: {e:#}");
         }
         emb.set_document_share(pace.share());
-        // `index_rest` leaves media waiting without them, and so must the
-        // choice of the next item, or it would be Rest again for nothing.
+        // As `index_rest` does, or the next item would be Rest for nothing.
         media_models = emb.can_embed_media();
         let idle = sched::Idle::enter();
         let mut retried = false;
-        // Between chunks: stop for a pause or a hold, or for settings and
-        // requests that arrived (the item goes back first in line, and is
-        // checked again under them); answer queries.
+        // Stops for a hold or for what arrived (the item goes back first in
+        // line); answers queries at normal priority from the vectors as they
+        // were (a reload per file would cost more than the query).
         let mut between = |conn: &rusqlite::Connection, emb: &mut E| -> Result<()> {
             if status.held() || status.pending.generation() != applied {
                 return Err(Interrupted.into());
             }
-            // Plugged in or unplugged mid-file, or the setting changed.
             emb.set_document_share(pace.share());
             while let Ok(job) = jobs.try_recv() {
                 match job {
@@ -1098,8 +1113,7 @@ fn run_with<E: Embed>(
                         status.last_indexed.store(unix_now(), Ordering::Relaxed);
                     }
                     Ok(None) => {}
-                    // Held or stopped: the run goes again from where the
-                    // index has it.
+                    // The next run goes on from where the index has it.
                     Err(_) if interrupted(&r) => {}
                     Err(e) => {
                         eprintln!("indexing the rest of a long document: {e:#}");
@@ -1170,7 +1184,6 @@ mod tests {
         work.changed([p("/h/b"), p("/h/a")]);
         work.root(p("/h"));
         work.root(p("/h"));
-        // A change outranks a walk's finding of the same path.
         work.found([p("/h/a")]);
         assert!(work.pending());
         let mut order = Vec::new();
@@ -1187,6 +1200,17 @@ mod tests {
             ]
         );
         assert!(!work.pending());
+    }
+
+    #[test]
+    fn a_change_outranks_a_walks_finding_of_the_same_path() {
+        let work = Work::default();
+        work.found([p("/h/b")]);
+        work.changed([p("/h/a")]);
+        work.found([p("/h/a")]);
+        assert_eq!(work.take(false), Some(Item::Check(p("/h/a"))));
+        assert_eq!(work.take(false), Some(Item::Check(p("/h/b"))));
+        assert_eq!(work.take(false), None);
     }
 
     #[test]
@@ -1218,8 +1242,8 @@ mod tests {
         work.root(p("/h/docs"));
         work.changed([p("/h/dev/proj/x.rs"), p("/h/dev/y.md"), p("/h/docs/z.md")]);
         work.found([p("/h/dev/w.md")]);
-        // ~/dev/proj is a root of its own, and stays.
-        work.forget(&p("/h/dev"), &[p("/h/dev/proj"), p("/h/docs")]);
+        let other_roots = [p("/h/dev/proj"), p("/h/docs")];
+        work.forget(&p("/h/dev"), &other_roots);
         let mut left = Vec::new();
         while let Some(item) = work.take(false) {
             left.push(item);
@@ -1237,8 +1261,8 @@ mod tests {
     #[test]
     fn pending_keeps_the_latest_config_and_every_request() {
         let pending = Pending::default();
-        let (g0, file, requests) = pending.take();
-        assert!(file.is_none() && requests.is_empty());
+        let first = pending.take();
+        assert!(first.config.is_none() && first.requests.is_empty());
         pending.config(Config {
             exclude: vec!["~/a".into()],
             ..Config::default()
@@ -1247,18 +1271,28 @@ mod tests {
             exclude: vec!["~/b".into()],
             ..Config::default()
         });
-        // Unload waits for the file being indexed; Forget stops it.
         pending.request(Request::Unload);
-        assert_eq!(pending.generation(), g0 + 2);
         pending.request(Request::Forget(p("/h/dev")));
-        assert_eq!(pending.generation(), g0 + 3);
-        let (g, file, requests) = pending.take();
-        assert_eq!(g, g0 + 3);
-        assert_eq!(file.unwrap().exclude, ["~/b"]);
-        assert_eq!(requests, [Request::Unload, Request::Forget(p("/h/dev"))]);
-        let (g, file, requests) = pending.take();
-        assert_eq!(g, g0 + 3);
-        assert!(file.is_none() && requests.is_empty());
+        let arrived = pending.take();
+        assert_eq!(arrived.generation, first.generation + 3);
+        assert_eq!(arrived.config.unwrap().exclude, ["~/b"]);
+        assert_eq!(
+            arrived.requests,
+            [Request::Unload, Request::Forget(p("/h/dev"))]
+        );
+        let again = pending.take();
+        assert_eq!(again.generation, first.generation + 3);
+        assert!(again.config.is_none() && again.requests.is_empty());
+    }
+
+    #[test]
+    fn unload_waits_for_the_file_being_indexed_and_forget_stops_it() {
+        let pending = Pending::default();
+        let g0 = pending.generation();
+        pending.request(Request::Unload);
+        assert_eq!(pending.generation(), g0);
+        pending.request(Request::Forget(p("/h/dev")));
+        assert_eq!(pending.generation(), g0 + 1);
     }
 
     /// A temporary tree and index of their own, removed when dropped.
@@ -1384,9 +1418,8 @@ mod tests {
         follow_sessions(&conn, &h.db(), &on, &h.status.work);
         assert!(matches!(h.status.work.take(true), Some(Item::Root(r)) if r == dir));
         index::add_root(&conn, &dir).unwrap();
-        // Already a root: nothing more to do.
         follow_sessions(&conn, &h.db(), &on, &h.status.work);
-        assert!(!h.status.work.pending());
+        assert!(!h.status.work.pending(), "already a root");
         let off = FileTypes::default().with_sessions(false, Some(dir.clone()));
         follow_sessions(&conn, &h.db(), &off, &h.status.work);
         assert!(h.roots().is_empty());
@@ -1423,18 +1456,20 @@ mod tests {
         fs::remove_file(&gone).unwrap();
         fs::write(&keep, "apples, pears and plums\n").unwrap();
         h.write("new/another.md", "cherry pie\n");
-        // A directory is checked for what under it is new; a path under no
-        // root is left alone.
         h.status.work.changed([keep, gone, dir, outside]);
         h.embedded.store(0, Ordering::Relaxed);
         h.run(|_| {});
-        assert_eq!(h.indexed(), ["keep.md", "new/another.md", "new/inside.md"]);
+        assert_eq!(
+            h.indexed(),
+            ["keep.md", "new/another.md", "new/inside.md"],
+            "a directory is checked for what is new under it, a path under no root left alone"
+        );
         assert_eq!(h.embedded.load(Ordering::Relaxed), 2);
     }
 
-    /// The check #136 added: a file being indexed when the exclusions
-    /// change stops after its chunk, and the exclusions apply before any
-    /// more of it, or anything else, is indexed.
+    /// A file being indexed when the exclusions change stops after its
+    /// chunk, and the exclusions apply before any more of it, or anything
+    /// else, is indexed.
     #[test]
     fn an_exclusion_arriving_mid_file_stops_it_within_a_chunk() {
         let h = Harness::new("exclude");
@@ -1454,8 +1489,11 @@ mod tests {
             }
         });
         assert_eq!(h.indexed(), ["keep.md"]);
-        // keep.md, and the one chunk of private/a.md before the stop.
-        assert_eq!(h.embedded.load(Ordering::Relaxed), 2);
+        let keep_and_the_chunk_before_the_stop = 2;
+        assert_eq!(
+            h.embedded.load(Ordering::Relaxed),
+            keep_and_the_chunk_before_the_stop
+        );
         assert!(!h.status.work.pending());
     }
 
@@ -1497,7 +1535,6 @@ mod tests {
         let h = Harness::new("media-no-models");
         let clip = h.write("clip.wav", "not decoded in this test");
         let (mtime, size) = index::stamp_of(&fs::metadata(&clip).unwrap()).unwrap();
-        // Recorded and waiting, as a check on AC leaves it.
         let conn = index::open(&h.db()).unwrap();
         conn.execute(
             "INSERT INTO files (id, path, mtime, size, sha256) VALUES (1, ?1, ?2, ?3, x'aa')",
@@ -1537,13 +1574,14 @@ mod tests {
                 })
             })
         });
-        // A Retry (a charger, a fetch that brought something else) has it
-        // look once more, and no more than that.
         tx.send(Job::Retry).unwrap();
         drop(tx);
-        // Returns: the worker went idle with the file still waiting.
         worker.join().unwrap().unwrap();
-        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            1,
+            "a Retry has it look once more, and no more than that"
+        );
         assert_eq!(index::partial(&conn, 10).unwrap().len(), 1);
     }
 }

@@ -162,8 +162,7 @@ fn describe(h: &Hit) -> (String, String) {
             format!("{dir}:{}{copies}  {}", h.line, crate::snippet(&h.text))
         }
         Kind::Image => format!("{dir}{copies}"),
-        // Text OCR read in an image (#106) has no page or slide to name.
-        Kind::Document if !crate::extract::is_document(path) => {
+        Kind::Document if read_in_an_image(h) => {
             format!("{dir}{copies}  {}", crate::snippet(&h.text))
         }
         Kind::Document => format!(
@@ -268,15 +267,20 @@ fn owned(v: Variant<'_>) -> OwnedVariant {
     v.try_into().expect("string values have no fds")
 }
 
+/// Text OCR read in an image: scored as a document, but with no page or
+/// slide to name, and listed with the images.
+fn read_in_an_image(h: &Hit) -> bool {
+    h.kind == Kind::Document && !crate::extract::is_document(Path::new(&h.path))
+}
+
 fn to_match(h: Hit, floors: Floors, play: Option<&Play>) -> Match {
     let (name, subtext) = describe(&h);
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Variant::from(subtext)));
     props.insert("urls".into(), owned(Variant::from(vec![file_url(&h.path)])));
-    // A group per kind, named so each reads as ours (#73). Text read in an
-    // image (#106) is scored as a document but listed with the images.
+    // Named so each group reads as ours among KRunner's.
     let category = match h.kind {
-        Kind::Document if !crate::extract::is_document(Path::new(&h.path)) => "vinoSearch Images",
+        Kind::Document if read_in_an_image(&h) => "vinoSearch Images",
         Kind::Text => "vinoSearch Text",
         Kind::Document => "vinoSearch Documents",
         Kind::Image => "vinoSearch Images",
@@ -291,18 +295,16 @@ fn to_match(h: Hit, floors: Floors, play: Option<&Play>) -> Match {
         owned(Variant::from(match_actions(&h, play.is_some()))),
     );
     // For vinosearch menu, which opens the pick itself; KRunner ignores keys
-    // it doesn't know.
+    // it doesn't know. A summary opens at its top.
     match at(&h) {
         Some(At::Line(l)) => drop(props.insert("line".into(), owned(Variant::from(l)))),
         Some(At::Page(p)) => drop(props.insert("page".into(), owned(Variant::from(p)))),
-        // A transcript's line opens at its stamp; a summary at its top.
         Some(At::Session(Part::Transcript, l)) => {
             drop(props.insert("line".into(), owned(Variant::from(l))))
         }
         Some(At::Second(s)) => drop(props.insert("second".into(), owned(Variant::from(s)))),
         Some(At::Session(Part::Summary, _)) | None => {}
     }
-    // A transcript hit's recording: what the menu plays instead.
     if let Some((file, second)) = play {
         let file = file.display().to_string();
         props.insert("play".into(), owned(Variant::from(file)));
@@ -499,7 +501,6 @@ impl Runner {
                 let at = Some(At::Session(Part::Summary, 0));
                 open(&self.db, &self.config, &match_id, at, false);
             }
-            // At the line that matched, when it was the transcript's.
             OPEN_TRANSCRIPT => {
                 let at = match place {
                     Some(at @ At::Session(Part::Transcript, _)) => at,
@@ -566,7 +567,6 @@ impl Gnome {
                         let (name, description) = describe(h);
                         (name, description, h.kind)
                     }
-                    // From an earlier search: the path alone.
                     None => (
                         Path::new(&id)
                             .file_name()
@@ -578,7 +578,6 @@ impl Gnome {
                 let mut meta = HashMap::new();
                 meta.insert("name".into(), owned(Variant::from(name)));
                 meta.insert("description".into(), owned(Variant::from(description)));
-                // A serialized GThemedIcon, which falls back to the generic name.
                 let (specific, generic) = crate::search::icons::for_path(Path::new(&id), kind);
                 let gicon = format!(". GThemedIcon {specific} {generic}");
                 meta.insert("gicon".into(), owned(Variant::from(gicon)));
@@ -690,9 +689,7 @@ impl Counted {
             chunks,
             by_kind: index::counts_by_kind(conn)?,
             unread_sessions: index::unread_sessions(conn)?,
-            // Counted from the index: with a decoder installed, they are
-            // retried at the next start and the count would mislead until
-            // then.
+            // With a decoder installed they are retried at the next start.
             undecodable: match crate::ml::vision::heif_convert() {
                 None => index::undecodable(conn)?,
                 Some(_) => 0,
@@ -778,8 +775,7 @@ impl Control {
     /// State, storage and progress; keys in vinosearch_shared::dbus::status,
     /// described in docs/dbus.md.
     fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedVariant>> {
-        // Still answered while the index's key can't be had yet, its counts
-        // empty: `seal_waiting` says why (#4).
+        // Answered while the key can't be had yet, counts empty.
         let db = match self.db.lock() {
             Ok(db) => Some(db),
             Err(e) if crate::index::seal::is_unavailable(&e) => None,
@@ -864,8 +860,6 @@ impl Control {
         let model_dir = model::default_dir().map_err(failed)?;
         let vision_dir = model::vision_dir().map_err(failed)?;
         let ocr_dir = model::ocr_dir().map_err(failed)?;
-        // The vision encoder and OCR count while images are on, and the
-        // vision and audio encoders while media is.
         let wants = self.model_wants();
         let images = model::images_present(&model_dir, &vision_dir, &ocr_dir);
         let media = model::vision_present(&model_dir, &vision_dir)
@@ -873,7 +867,6 @@ impl Control {
         let present =
             model::present(&model_dir) && (!wants.images || images) && (!wants.media || media);
         out.insert(key::MODEL_PRESENT.into(), owned(Variant::from(present)));
-        // Per format, so the settings window says which download is missing.
         out.insert(
             key::IMAGES_MODEL_PRESENT.into(),
             owned(Variant::from(images)),
@@ -903,7 +896,7 @@ impl Control {
             key::INDEXING_REST.into(),
             owned(Variant::from(st.indexing_rest.load(Ordering::Relaxed))),
         );
-        // Media runs on AC only (#192), whatever `index_on_battery` says.
+        // Media runs on AC only, whatever `index_on_battery` says.
         let media_waiting = if st.power.on_battery() {
             counted.media_partial.max(0) as u64
         } else {
@@ -948,7 +941,7 @@ impl Control {
         out.insert(key::SEAL_WAITING.into(), owned(Variant::from(enc.waiting)));
         out.insert(
             key::NEW_SEAL.into(),
-            // Looked at here rather than at start, which it would slow.
+            // Here rather than at start, which it would slow.
             owned(Variant::from(
                 crate::index::seal::Sealer::default()
                     .new_seal(st.tpm.load(Ordering::Relaxed))
@@ -1053,7 +1046,6 @@ impl Control {
                 .filter_map(|h| {
                     let play = recording(&self.db, &h);
                     let mut found = crate::search::results::found(h)?;
-                    // A transcript hit plays its recording from this second.
                     if let Some((_, second)) = play {
                         found.4 = "second".to_owned();
                         found.5 = second;
@@ -1131,7 +1123,6 @@ impl Control {
                 status.fetch_done.store(done, Ordering::Relaxed);
             });
             match result {
-                // Indexing that found no model can run now.
                 Ok(()) => {
                     let _ = jobs.send(Job::Retry);
                 }
@@ -1171,8 +1162,7 @@ impl Control {
     /// `encrypted`, `seal` and `encryption_error` in Status say how it went.
     fn apply_encryption(&self) -> zbus::fdo::Result<()> {
         let file = Config::load(&self.config).map_err(|e| failed(format!("{e:#}")))?;
-        // The watcher too, or it would take the file it next reads for
-        // unchanged and pass nothing on.
+        // The watcher too, or it would take its next read for unchanged.
         self.status.reload_config.store(true, Ordering::Relaxed);
         self.request(Request::Encryption(crate::index::encryption::Want::of(
             &file,
@@ -1314,7 +1304,6 @@ pub fn serve(opts: Options) -> Result<()> {
             .context("registering on the session bus")
             .map_err(NotStarted)?;
         eprintln!("{} on {OBJECT}", names().service);
-        // The worker only returns on a startup error or when the channel closes.
         let worker = async {
             finished
                 .await
@@ -1329,10 +1318,9 @@ pub fn serve(opts: Options) -> Result<()> {
             eprintln!("asked to quit");
             Ok(())
         };
-        // The bus gone (a session that ended under a runner that outlived
-        // it): nothing can reach this one again, and it would hold the
-        // instance lock against the next session's. NameLost is only what
-        // the stream is on; it ends when the connection does.
+        // A runner that outlived its session would hold the instance lock
+        // against the next one. NameLost is only what the stream is on; it
+        // ends when the connection does.
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .sender("org.freedesktop.DBus")
@@ -1467,8 +1455,8 @@ mod tests {
                 m.5.get("line").map(|v| u32::try_from(v.clone()).unwrap()),
             )
         };
-        // "It happens in March.", in the [01:12] paragraph.
-        let (category, subtext, actions, line) = session(6);
+        let in_the_0112_paragraph = 6;
+        let (category, subtext, actions, line) = session(in_the_0112_paragraph);
         assert_eq!(category, "vinoWhisper sessions");
         assert!(
             subtext.starts_with("Transcript at 01:12 · 2026-10-27 14:05, 43 min"),
@@ -1481,7 +1469,6 @@ mod tests {
         assert!(subtext.starts_with("Summary, AI-generated · "), "{subtext}");
         assert_eq!(actions, [OPEN_TRANSCRIPT, OPEN_FOLDER, SHOW_ALL]);
         assert_eq!(line, None);
-        // Anything else offers neither.
         let m = to_match(hit(Kind::Text, 0.8, "/n.md"), FLOORS, None);
         let actions = Vec::<String>::try_from(m.5.get("actions").cloned().unwrap()).unwrap();
         assert_eq!(actions, [OPEN_FOLDER, SHOW_ALL]);

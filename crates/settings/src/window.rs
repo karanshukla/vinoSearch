@@ -229,7 +229,7 @@ struct SettingsWindow {
     link: Link,
     config_path: PathBuf,
     config: Config,
-    // Set when the file doesn't parse: saving would replace what the user wrote.
+    /// Set when the file doesn't parse: saving would replace what the user wrote.
     config_broken: Option<String>,
     idle_dirty: bool,
     new_root: String,
@@ -505,7 +505,7 @@ fn score_row(
             )
         };
         // Right to left: Default, the number, Closer, the bar, Looser.
-        // Default keeps its space when hidden, so every row's bar lines up (#203).
+        // Default keeps its space when hidden, so every row's bar lines up.
         let reset = ui.add_visible(current.is_some(), Button::ghost("Default").small());
         if current.is_some() && a11y::for_what(reset, label).clicked() {
             out = Some(None);
@@ -516,7 +516,6 @@ fn score_row(
             .fixed_decimals(2);
         let number = named(ui.add(number));
         ui.label(text(ui, "Closer"));
-        // The bar takes what "Looser" leaves of the row.
         let looser = text(ui, "Looser");
         let room = ui.available_width() - looser.size().x - 2.0 * ui.spacing().item_spacing.x;
         ui.spacing_mut().slider_width = room.clamp(48.0, 240.0);
@@ -586,34 +585,10 @@ impl SettingsWindow {
         let ctx = &root.ctx().clone();
         let focused = ctx.input(|input| input.focused);
         if focused && !self.focused {
-            // The desktop's light/dark switch or text size may have changed while we were in the
-            // background, and the config file or the KRunner registration may have changed under us.
-            theme::follow_desktop(ctx);
-            self.kde_header = theme::kde_header();
-            self.follow_text_scale(ctx);
-            if !self.idle_dirty {
-                self.reload_config();
-            }
-            let mut integration = self.integration.lock().unwrap();
-            if !integration.running {
-                let output = integration.output.take();
-                *integration = integration::State {
-                    output,
-                    ..integration::State::read()
-                };
-            }
+            self.catch_up_on_focus(ctx);
         }
         self.focused = focused;
-
-        let picked = self.picked.lock().unwrap().take();
-        if let Some((target, answer)) = picked {
-            self.picking = false;
-            match answer {
-                Ok(Some(path)) => self.add(target, &path),
-                Ok(None) => {}
-                Err(e) => self.notice = Some(format!("No folder chooser: {e}")),
-            }
-        }
+        self.take_picked_folder();
         let shared = self.link.shared.lock().unwrap().clone();
         if let Some(refused) = shared.refused {
             self.link.shared.lock().unwrap().refused = None;
@@ -625,7 +600,6 @@ impl SettingsWindow {
         // The title bar is the compositor's: give the tree's window the same name.
         ctx.accesskit_node_builder(egui::accesskit_root_id(), |node| node.set_label(TITLE));
 
-        // Escape backs out of a pending Remove or Delete.
         if self.confirm.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.confirm = None;
         }
@@ -825,6 +799,39 @@ impl SettingsWindow {
             self.save_config();
         }
     }
+
+    /// Back from the background: the desktop's light/dark switch or text
+    /// size may have changed, and the config file or the KRunner
+    /// registration under us.
+    fn catch_up_on_focus(&mut self, ctx: &egui::Context) {
+        theme::follow_desktop(ctx);
+        self.kde_header = theme::kde_header();
+        self.follow_text_scale(ctx);
+        if !self.idle_dirty {
+            self.reload_config();
+        }
+        let mut integration = self.integration.lock().unwrap();
+        if !integration.running {
+            let output = integration.output.take();
+            *integration = integration::State {
+                output,
+                ..integration::State::read()
+            };
+        }
+    }
+
+    /// The folder chooser's answer, once it has one.
+    fn take_picked_folder(&mut self) {
+        let picked = self.picked.lock().unwrap().take();
+        if let Some((target, answer)) = picked {
+            self.picking = false;
+            match answer {
+                Ok(Some(path)) => self.add(target, &path),
+                Ok(None) => {}
+                Err(e) => self.notice = Some(format!("No folder chooser: {e}")),
+            }
+        }
+    }
 }
 
 pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
@@ -839,8 +846,8 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
                 .with_min_inner_size([340.0, 320.0]),
             app_title_bar,
         ),
-        // As in vinoWhisper: with vsync, a swap waits on a frame callback KWin holds back from
-        // a window it considers hidden, and the window stops answering pings.
+        // With vsync, a swap waits on a frame callback KWin holds back from a
+        // window it considers hidden, and the window stops answering pings.
         glow_options: eframe::egui_glow::GlowConfiguration {
             vsync: false,
             ..Default::default()
