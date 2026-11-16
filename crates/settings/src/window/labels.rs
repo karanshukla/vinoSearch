@@ -36,15 +36,8 @@ pub(super) fn ago_from(at: u64, now: u64) -> String {
 
 /// 41924 as "41,924".
 pub(super) fn count(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    if n < 0 { format!("-{out}") } else { out }
+    let digits = vinosearch_shared::numbers::thousands(n.unsigned_abs());
+    if n < 0 { format!("-{digits}") } else { digits }
 }
 
 /// `name` in about `room` letters: the middle cut out, as the end of a file
