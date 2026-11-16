@@ -9,6 +9,7 @@
 //! login) waits for the bus name and exits. Owning the name stays the last
 //! word: a runner that can't take it doesn't start.
 
+use crate::service::flatpak_installed::{self, Change};
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::IsTerminal;
@@ -17,6 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use vinosearch_shared::dbus::{CONTROL_INTERFACE, CONTROL_PATH, names};
 use vinosearch_shared::sandbox;
@@ -77,10 +79,19 @@ pub fn autostart_entry(exec: &str) -> String {
 /// last exit, or None when another runs it.
 pub fn supervise(worker: Command) -> Result<Option<ExitStatus>> {
     let lock = instance_lock_path()?;
-    let Some(_held) = single_instance(&lock, Duration::from_secs(30))? else {
+    let Some(held) = single_instance(&lock, Duration::from_secs(30))? else {
         return Ok(None);
     };
-    supervised(worker).map(Some)
+    let changed = flatpak_installed::spawn();
+    let status = supervised(worker, &changed)?;
+    if changed.get() == Some(&Change::Updated) {
+        // The new build's `krunner` takes the lock, and the name, from here.
+        drop(held);
+        if let Err(e) = start(&names().service) {
+            eprintln!("starting the new build: {e:#}");
+        }
+    }
+    Ok(Some(status))
 }
 
 /// `$XDG_RUNTIME_DIR`, which logind empties at logout, else the cache. In
@@ -159,7 +170,7 @@ fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
     }
 }
 
-fn supervised(mut worker: Command) -> Result<ExitStatus> {
+fn supervised(mut worker: Command, changed: &OnceLock<Change>) -> Result<ExitStatus> {
     // Started by systemd (D-Bus activation, the autostart entry), stderr is
     // the journal's already: timestamps, rotation and a rate limit for
     // nothing. A file only where there is neither that nor a terminal, and
@@ -191,7 +202,8 @@ fn supervised(mut worker: Command) -> Result<ExitStatus> {
         }
         let started = Instant::now();
         let status = worker.status().context("starting the runner")?;
-        if after(status) == After::Stop {
+        // A build that went is not started again, crashed or not.
+        if after(status) == After::Stop || changed.get().is_some() {
             return Ok(status);
         }
         let d = backoff(wait, started.elapsed());

@@ -151,13 +151,13 @@ fn same_version(tag: &str, version: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
+pub(crate) enum Scope {
     User,
     System,
 }
 
 impl Scope {
-    fn flag(self) -> &'static str {
+    pub(crate) fn flag(self) -> &'static str {
         match self {
             Scope::User => "--user",
             Scope::System => "--system",
@@ -167,7 +167,7 @@ impl Scope {
 
 /// `flatpak SUBCOMMAND --user|--system` on the host, for its arguments to
 /// follow.
-fn host_flatpak(subcommand: &str, scope: Scope) -> Command {
+pub(crate) fn host_flatpak(subcommand: &str, scope: Scope) -> Command {
     let mut command = Command::new("flatpak-spawn");
     // The host has no sandbox paths to start in.
     command
@@ -191,7 +191,7 @@ fn installed_version(scope: Scope, app: &str) -> Option<String> {
 
 /// Which installation `app_path` (`/.flatpak-info`'s, `<dir>/app/<id>/...`)
 /// is in, so the update goes where this build is rather than beside it.
-fn installation(app_path: &str, app: &str, home: &Path) -> Result<Scope> {
+pub(crate) fn installation(app_path: &str, app: &str, home: &Path) -> Result<Scope> {
     let dir = app_path
         .find(&format!("/app/{app}/"))
         .map(|at| Path::new(&app_path[..at]))
