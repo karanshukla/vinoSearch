@@ -1022,8 +1022,7 @@ pub fn index_rest<E: Embed>(
     }))
 }
 
-/// Keep what of `chunks` fits in MAX_TEXT_BYTES with `have` bytes of the
-/// document in already. True when some had to go.
+/// Trim `chunks` to MAX_TEXT_BYTES with `have` already in; true if some went.
 fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
     let mut total = have;
     let fits = chunks
@@ -1103,8 +1102,7 @@ pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// What a file `walk` found is indexed as, with its metadata: None if it
-/// isn't a wanted type or is over its kind's size cap. Reads no contents.
+/// What a file `walk` found is indexed as, with its metadata, or None. Reads no contents.
 pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
     let kind = types.kind(entry.path())?;
     let meta = entry.metadata().ok()?;
@@ -2077,6 +2075,48 @@ mod tests {
         assert_eq!(run.len(), 1);
         assert!(text_budget(&mut run, MAX_TEXT_BYTES));
         assert!(run.is_empty());
+    }
+
+    #[test]
+    fn text_exactly_at_the_budget_is_kept() {
+        let mut run = vec![(1, "x".repeat(600))];
+        assert!(!text_budget(&mut run, MAX_TEXT_BYTES - 600));
+        assert_eq!(run.len(), 1);
+    }
+
+    #[test]
+    fn text_one_byte_past_the_budget_is_left_out() {
+        let mut run = vec![(1, "x".repeat(600))];
+        assert!(text_budget(&mut run, MAX_TEXT_BYTES - 599));
+        assert!(run.is_empty());
+    }
+
+    fn indexable_html_of(name: &str, len: u64) -> Option<Kind> {
+        let dir = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = fs::File::create(dir.join("page.html")).unwrap();
+        file.set_len(len).unwrap();
+        let entry = WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().is_file())
+            .unwrap();
+        let kind = indexable(&entry, &FileTypes::default()).map(|(k, _)| k);
+        fs::remove_dir_all(&dir).unwrap();
+        kind
+    }
+
+    #[test]
+    fn a_file_exactly_at_its_kinds_size_cap_is_indexable() {
+        assert_eq!(
+            indexable_html_of("cap-at", MAX_FILE_BYTES),
+            Some(Kind::Text)
+        );
+    }
+
+    #[test]
+    fn a_file_one_byte_over_its_kinds_size_cap_is_not_indexable() {
+        assert_eq!(indexable_html_of("cap-over", MAX_FILE_BYTES + 1), None);
     }
 
     #[test]

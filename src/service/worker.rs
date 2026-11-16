@@ -683,12 +683,7 @@ fn clear_compiled_cache() -> Result<()> {
     }
 }
 
-/// Runs of the rest of long documents that failed in a row. One file the
-/// model can't take goes behind the others (`index::media::rest`), so the
-/// next run is tried; a second failure straight after is taken for the
-/// device, and the rest waits for a Retry or a load.
-/// `one_failed_run_of_the_rest_is_tried_again` and
-/// `a_second_failed_run_in_a_row_waits` pin both sides.
+/// Runs of the rest of long documents that failed in a row; `TAKEN_FOR_THE_DEVICE` of them stop it.
 #[derive(Default)]
 struct RestFailures(u32);
 
