@@ -44,46 +44,40 @@ pub(crate) const MAX_TEXT_BYTES: u64 = 16 << 20;
 /// Text files that may be books, held to MAX_TEXT_BYTES instead of
 /// MAX_FILE_BYTES.
 const PROSE: &[&str] = &["txt", "md", "rst", "org", "tex"];
-/// Prose and markup. Code is a kind of its own, in `code::EXTENSIONS` (#110).
+/// Prose and markup; code is `code::EXTENSIONS`. No config formats: they
+/// are where credentials live (pinned by `tests::config_files_are_not_indexed`).
 pub(crate) const TEXT_EXTENSIONS: &[&str] = &["md", "txt", "rst", "org", "tex", "html", "htm"];
-// No config formats (toml, yaml, json, ini, conf, ...): they are where
-// credentials live, and the index is plaintext unless encryption is on (#4).
 /// Directories that are always build output, caches, generated reports or
-/// vendored dependencies. Generic names a person might use for their own
-/// files (`bin`, `out`, `lib`) are left out.
+/// vendored dependencies (`obj` is .NET's). Generic names a person might use
+/// for their own files (`bin`, `out`, `lib`) are left out (pinned by
+/// `tests::generated_trees_and_files_are_skipped`).
 const SKIP_DIRS: &[&str] = &[
-    // JavaScript
     "node_modules",
     "bower_components",
     "dist",
-    // Rust, Java, Gradle, CMake, Elixir, Sphinx
     "target",
     "build",
     "_build",
-    // .NET intermediate output (generated .cs files)
     "obj",
-    // Python
     "__pycache__",
     "venv",
     "site-packages",
-    // Conda installs, wherever they are
     "miniconda3",
     "anaconda3",
     "miniforge3",
     "mambaforge",
-    // Go, PHP, Ruby
     "vendor",
-    // Apple
     "Pods",
     "DerivedData",
-    // Elm
     "elm-stuff",
-    // Test coverage reports
     "coverage",
     "htmlcov",
 ];
 /// Directory name prefixes with the same meaning (`cmake-build-debug`, ...).
 const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
+/// `Kind::max_bytes` for media, which `formats.media.max_hours` holds by
+/// duration instead, and which is never read whole.
+const HELD_BY_DURATION: u64 = u64::MAX;
 
 use vinosearch_shared::limits::MAX_IMAGE_BYTES;
 use vinosearch_shared::xdg;
@@ -141,21 +135,18 @@ impl Kind {
             Kind::Text | Kind::Code => MAX_FILE_BYTES,
             Kind::Image => MAX_IMAGE_BYTES,
             Kind::Document | Kind::Session => MAX_DOCUMENT_BYTES,
-            // Held to `formats.media.max_hours` by duration instead, and
-            // never read whole.
-            Kind::Media => u64::MAX,
+            Kind::Media => HELD_BY_DURATION,
         }
     }
 
-    /// What made this kind's vectors, as `meta` records it (#80): the text
-    /// model's revision, and for images the vision encoder's, the soft-token
-    /// count and the OCR model's, which reads their text (#106). Vectors with another tag score against this
-    /// build's queries without erroring, just wrongly, so they are dropped.
+    /// What made this kind's vectors, as `meta` records it: the models'
+    /// revisions, and whatever else changes the vectors or what a hit points
+    /// at. Vectors with another tag score against this build's queries
+    /// without erroring, just wrongly, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
             Kind::Text | Kind::Document | Kind::Code => crate::ml::model::REVISION.to_owned(),
-            // Chunked by paragraph since #186: the vectors are the same model's,
-            // but a hit's stamp is only right in chunks made that way.
+            // The text model's vectors, but a hit's stamp needs paragraph chunks.
             Kind::Session => format!("{}+paragraphs", crate::ml::model::REVISION),
             Kind::Image => format!(
                 "{}+{}/{}+ocr:{}/{}",
@@ -256,8 +247,7 @@ impl FileTypes {
     /// files above it); None if it is not.
     pub fn kind(&self, path: &Path) -> Option<Kind> {
         let session = crate::extract::is_session(path);
-        // A live transcript or a half-written bundle there is not wanted.
-        if !session && self.sessions_dirs.iter().any(|d| path.starts_with(d)) {
+        if !session && self.in_sessions_dir(path) {
             return None;
         }
         if session {
@@ -277,6 +267,14 @@ impl FileTypes {
             return Some(Kind::Media);
         }
         self.images.contains(&ext).then_some(Kind::Image)
+    }
+
+    /// Inside vinoWhisper's folders only sessions are taken: anything else
+    /// there is a live transcript or a half-written bundle (pinned by
+    /// `tests::a_live_transcript_or_half_written_bundle_in_vinowhispers_folder_is_not_taken`,
+    /// `tests::a_live_transcript_in_the_flatpaks_folder_is_not_taken_either`).
+    fn in_sessions_dir(&self, path: &Path) -> bool {
+        self.sessions_dirs.iter().any(|d| path.starts_with(d))
     }
 }
 
@@ -351,15 +349,7 @@ pub fn chunk(text: &str) -> Vec<(usize, String)> {
         }
         let mut rest = line;
         while rest.len() > CHUNK_CHARS {
-            let mut cut = CHUNK_CHARS;
-            while !rest.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            // Between words if there is a space in the back half: a PDF
-            // page's text layer is often a few very long lines.
-            if let Some(space) = rest[..cut].rfind(' ').filter(|&i| i >= CHUNK_CHARS / 2) {
-                cut = space + 1;
-            }
+            let cut = long_line_cut(rest);
             out.push((i + 1, rest[..cut].to_string()));
             rest = &rest[cut..];
         }
@@ -371,6 +361,22 @@ pub fn chunk(text: &str) -> Vec<(usize, String)> {
     }
     out.retain(|(_, c)| !c.trim().is_empty());
     out
+}
+
+/// Where to end a chunk of a line over CHUNK_CHARS: after a space in the back
+/// half if there is one (a PDF page's text layer is often a few very long
+/// lines), else at the last char boundary that fits (pinned by
+/// `tests::long_lines_split_between_words`,
+/// `tests::long_lines_split_on_char_boundaries`).
+fn long_line_cut(line: &str) -> usize {
+    let mut cut = CHUNK_CHARS;
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    match line[..cut].rfind(' ').filter(|&i| i >= CHUNK_CHARS / 2) {
+        Some(space) => space + 1,
+        None => cut,
+    }
 }
 
 fn to_blob(v: &[f32]) -> Vec<u8> {
@@ -399,15 +405,17 @@ pub struct Stats {
     pub no_decoder: usize,
 }
 
-/// Hidden directories and build output under `root` (not `root` itself).
+/// Whether a directory between `root` and `path` is hidden or build output.
+/// `path`'s own name is for `wanted` or its own walk to judge (pinned by
+/// `tests::skipped_under_judges_parent_directories_only`).
 pub fn skipped_under(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root).is_ok_and(|rel| {
-        let mut parts: Vec<_> = rel.components().collect();
-        parts.pop(); // the file or directory itself is judged by `wanted` / its own walk
-        parts
-            .iter()
-            .any(|c| skipped_dir(&c.as_os_str().to_string_lossy()))
-    })
+    path.strip_prefix(root)
+        .ok()
+        .and_then(Path::parent)
+        .is_some_and(|dirs| {
+            dirs.components()
+                .any(|c| skipped_dir(&c.as_os_str().to_string_lossy()))
+        })
 }
 
 /// A directory, and not a symlink to one. Following a link would index its
@@ -417,9 +425,10 @@ pub fn is_real_dir(path: &Path) -> bool {
 }
 
 /// Everything under `root` that indexing looks at, skipping hidden and build
-/// directories and anything excluded.
+/// directories and anything excluded. Follows no links, `root` included
+/// (pinned by `tests::walk_does_not_follow_symlinks`,
+/// `tests::a_link_given_as_the_root_is_not_followed`).
 pub fn walk<'a>(root: &Path, ex: &'a Excludes) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
-    // follow_links(false) alone still follows `root` itself when it is a link.
     WalkDir::new(root)
         .follow_links(false)
         .follow_root_links(false)
@@ -563,16 +572,21 @@ fn write_file(
     )?;
     let file_id = tx.last_insert_rowid();
     insert_chunks(&tx, file_id, &first.chunks, vectors, kinds)?;
-    // The rest of a long one waits for `index_rest`.
-    let total = first.parts.min(MAX_PARTS);
+    leave_rest_for_later(&tx, file_id, first.parts)?;
+    tx.commit()?;
+    Ok(Outcome::Embedded(first.chunks.len()))
+}
+
+/// A `partial` row for `index_rest` when `parts` is more than the first run.
+fn leave_rest_for_later(tx: &Connection, file_id: i64, parts: usize) -> Result<()> {
+    let total = parts.min(MAX_PARTS);
     if total > PARTS_AT_ONCE {
         tx.execute(
             "INSERT INTO partial (file_id, done, total) VALUES (?1, ?2, ?3)",
             params![file_id, PARTS_AT_ONCE as i64, total as i64],
         )?;
     }
-    tx.commit()?;
-    Ok(Outcome::Embedded(first.chunks.len()))
+    Ok(())
 }
 
 /// A file as the walk found it: its path and what the filesystem says of it.
@@ -638,7 +652,6 @@ fn settle_known(
     has_holder: bool,
 ) -> Result<Option<Outcome>> {
     if known.sha256.as_deref() == Some(hash) {
-        // Touched, not changed.
         conn.execute(
             "UPDATE files SET mtime = ?1, size = ?2 WHERE id = ?3",
             params![seen.mtime, seen.size, known.id],
@@ -648,16 +661,27 @@ fn settle_known(
     if !known.is_stamped(seen) {
         return Ok(None);
     }
-    // Indexed before content hashes: record this one, and if another file
-    // already holds the same chunks, drop this file's copy.
+    backfill_hash(conn, known, hash, has_holder).map(Some)
+}
+
+/// A row indexed before content hashes gets its hash, and gives its chunks
+/// up if another file already holds the same ones (pinned by
+/// `index::pipeline_tests::a_file_indexed_before_hashes_gets_its_hash_and_is_not_embedded_again`,
+/// `index::pipeline_tests::a_file_indexed_before_hashes_gives_up_its_chunks_to_an_older_copy`).
+fn backfill_hash(
+    conn: &Connection,
+    known: &Known,
+    hash: &[u8],
+    has_holder: bool,
+) -> Result<Outcome> {
     conn.execute(
         "UPDATE files SET sha256 = ?1 WHERE id = ?2",
         params![hash, known.id],
     )?;
     if has_holder && conn.execute("DELETE FROM chunks WHERE file_id = ?1", [known.id])? > 0 {
-        return Ok(Some(Outcome::Duplicate));
+        return Ok(Outcome::Duplicate);
     }
-    Ok(Some(Outcome::Unchanged))
+    Ok(Outcome::Unchanged)
 }
 
 /// Media is probed before it is hashed, so a film over the longest indexed is
@@ -693,7 +717,8 @@ struct Content {
 }
 
 /// None if the file can't be read now. Media is hashed as it streams, and
-/// its bytes are left empty.
+/// its bytes are left empty; an Err is `between` stopping that, which
+/// leaves the file as it was.
 fn read_and_hash<E: Embed>(
     conn: &Connection,
     emb: &mut E,
@@ -710,7 +735,6 @@ fn read_and_hash<E: Embed>(
         return Ok(None);
     };
     let hash = match kind {
-        // An error is `between`'s: a stop, which leaves the file as it was.
         Kind::Media => match media::hash(path, &mut || between(conn, emb))? {
             Some(h) => h,
             None => return Ok(None),
@@ -741,6 +765,9 @@ impl Chunked {
 
 type Built = ControlFlow<Outcome, Chunked>;
 
+/// Generated or minified code keeps a row with no chunks, so it isn't read
+/// again until it changes (pinned by
+/// `index::pipeline_tests::generated_code_is_kept_as_a_row_with_no_chunks_and_not_read_again`).
 fn text_chunks<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -749,7 +776,6 @@ fn text_chunks<E: Embed>(
     between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Built> {
     let text = std::str::from_utf8(&content.bytes).expect("read as a string");
-    // Kept as a row with no chunks, so it isn't read again until it changes.
     if let Some(why) = (seen.kind == Kind::Code)
         .then(|| crate::index::code::unwanted(text))
         .flatten()
@@ -767,9 +793,12 @@ fn text_chunks<E: Embed>(
     )))
 }
 
-// A file that can't be read, or has no text (a scan), keeps a row with no
-// chunks, so it isn't parsed again until it changes. So does a session in a
-// format this build doesn't read.
+/// A document that can't be read, or has no text OCR can read, keeps a row
+/// with no chunks, so it isn't parsed again until it changes. So does a
+/// session in a format this build doesn't read (pinned by
+/// `tests::a_document_that_does_not_parse_has_no_chunks`,
+/// `index::pipeline_tests::a_session_that_does_not_parse_keeps_a_row_and_is_not_parsed_again`,
+/// `index::pipeline_tests::a_session_of_an_unknown_format_is_kept_unread_and_counted`).
 fn document_chunks<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -777,23 +806,20 @@ fn document_chunks<E: Embed>(
     content: &Content,
     between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Built> {
-    // Recorded first: the parser runs in a child with limits, but a file the
-    // child cannot parse must not be parsed again on every restart, and a
-    // stop while embedding must leave it to be indexed next time, so the
-    // record goes once it parses.
+    // Recorded before parsing, so a file that crashes the parser isn't
+    // parsed again at every restart; dropped once it parses, so a stop while
+    // embedding leaves it to be indexed next time.
     seen.record(conn, &content.hash)?;
     let mut first =
         document_parts(seen.path, &content.bytes, 0, parser(seen.kind)).unwrap_or_else(|e| {
             eprintln!("skip {}: {e:#}", seen.path.display());
             Extract::default()
         });
-    // No text layer: a scan, read by OCR when it can be (#106).
     let scan = first.chunks.is_empty() && is_scannable(seen.path) && emb.can_read_text();
     if !first.chunks.is_empty() || scan {
         conn.execute("DELETE FROM files WHERE path = ?1", [seen.key])?;
     }
     if scan {
-        // Read whole, up to ocr::MAX_SCAN_PAGES: never left in part.
         first = Extract {
             parts: 1,
             chunks: scan_chunks(conn, emb, seen.path, &content.bytes, between)?,
@@ -805,10 +831,11 @@ fn document_chunks<E: Embed>(
     )))
 }
 
-// A chunk with no text and line 0 from the pixels, then the text OCR reads in
-// them as document chunks (#106). One that doesn't decode keeps a row with no
-// chunks, like a document with no text, so it isn't decoded again at every
-// check.
+/// A chunk with no text and line 0 from the pixels, then the text OCR reads
+/// in them as document chunks. One that doesn't decode keeps a row with no
+/// chunks, so it isn't decoded again at every check (pinned by
+/// `index::pipeline_tests::an_image_is_one_chunk_of_its_own_with_no_text`,
+/// `index::pipeline_tests::an_image_that_does_not_decode_is_kept_as_a_row_with_no_chunks`).
 fn image_chunks<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -902,9 +929,10 @@ fn is_scannable(path: &Path) -> bool {
 }
 
 /// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
-/// up to `ocr::MAX_SCAN_PAGES` and within `ocr::SCAN_WALL` of rendering.
-/// The first page that won't render ends the scan with the pages read so
-/// far: a file that stalls one page likely stalls them all.
+/// up to `ocr::MAX_SCAN_PAGES` and never left in part. `ocr::SCAN_WALL`
+/// bounds poppler's rendering only: OCR and embedding are paced by
+/// `between`. The first page that won't render ends the scan with the pages
+/// read so far: a file that stalls one page likely stalls them all.
 fn scan_chunks<E: Embed>(
     conn: &Connection,
     emb: &mut E,
@@ -912,10 +940,8 @@ fn scan_chunks<E: Embed>(
     bytes: &[u8],
     between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
 ) -> Result<Vec<(usize, String)>> {
-    // Rendering only: OCR and embedding are the runner's own work, paced by
-    // `between`.
-    let mut deadline = std::time::Instant::now() + crate::ml::ocr::SCAN_WALL;
-    let pages = match crate::ml::ocr::pdf_pages(bytes, deadline) {
+    let mut render_deadline = std::time::Instant::now() + crate::ml::ocr::SCAN_WALL;
+    let pages = match crate::ml::ocr::pdf_pages(bytes, render_deadline) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
@@ -932,7 +958,7 @@ fn scan_chunks<E: Embed>(
     let mut out = Vec::new();
     for page in 1..=pages.min(crate::ml::ocr::MAX_SCAN_PAGES) {
         let started = std::time::Instant::now();
-        let img = match crate::ml::ocr::render_page(bytes, page, deadline) {
+        let img = match crate::ml::ocr::render_page(bytes, page, render_deadline) {
             Ok(img) => img,
             Err(e) => {
                 eprintln!("{} page {page}: {e:#}; stopping there", path.display());
@@ -942,8 +968,7 @@ fn scan_chunks<E: Embed>(
         let rendered = started.elapsed();
         let text = emb.read_text(&img)?.join("\n");
         between(conn, emb)?;
-        // The deadline counts poppler's time, not the OCR's or a query's.
-        deadline += started.elapsed() - rendered;
+        render_deadline += started.elapsed() - rendered;
         if !text.trim().is_empty() {
             out.push((page, text));
         }
@@ -970,12 +995,9 @@ fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
     crate::extract::select(chunks, false, from, count)
 }
 
-/// Parts `from..from + PARTS_AT_ONCE` of `path` through `parse` (the child
-/// process, #84). Err if it doesn't parse, the child was stopped, or the
-/// run's text is over MAX_FILE_BYTES.
-/// Documents are parsed in a child with limits (#84). A session is plain
-/// text in a zip, nothing in it needs a parser that could crash or hang,
-/// and each part it unzips is held to 1 MiB, so it's read here.
+/// Documents are parsed in a child with limits. A session is plain text in
+/// a zip, nothing in it needs a parser that could crash or hang, and each
+/// part it unzips is held to 1 MiB, so it's read here.
 fn parser(kind: Kind) -> Parser {
     match kind {
         Kind::Session => crate::extract::parts,
@@ -983,6 +1005,10 @@ fn parser(kind: Kind) -> Parser {
     }
 }
 
+/// Parts `from..from + PARTS_AT_ONCE` of `path` through `parse`. Err if it
+/// doesn't parse, the child was stopped, or the run's text is over
+/// MAX_FILE_BYTES (pinned by
+/// `tests::a_run_of_parts_over_max_file_bytes_of_text_is_refused`).
 fn document_parts(path: &Path, bytes: &[u8], from: usize, parse: Parser) -> Result<Extract> {
     let run = parse(path, bytes, from, PARTS_AT_ONCE)?;
     let size: usize = run.chunks.iter().map(|(_, c)| c.len()).sum();
@@ -1010,7 +1036,7 @@ enum Next {
 /// documents before media, which is taken only if `media`, and a file the
 /// model failed on after those it hasn't.
 fn next_rest(conn: &Connection, media: bool) -> Result<Option<Next>> {
-    let row: Option<(i64, String, i64, i64, i64, i64)> = conn
+    let row = conn
         .query_row(
             "SELECT f.id, f.path, f.mtime, f.size, p.done, p.total
              FROM partial p JOIN files f ON f.id = p.file_id
@@ -1018,34 +1044,42 @@ fn next_rest(conn: &Connection, media: bool) -> Result<Option<Next>> {
              ORDER BY p.media, p.tries, p.file_id LIMIT 1",
             [media],
             |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
+                Ok(Waiting {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    stamp: (r.get(2)?, r.get(3)?),
+                    done: r.get(4)?,
+                    total: r.get(5)?,
+                })
             },
         )
         .optional()?;
-    let Some((id, path, mtime, size, done, total)) = row else {
+    let Some(row) = row else {
         return Ok(None);
     };
-    let now = fs::symlink_metadata(&path)
+    let now = fs::symlink_metadata(&row.path)
         .ok()
         .filter(|m| m.is_file())
         .as_ref()
         .and_then(stamp_of);
-    if now != Some((mtime, size)) {
-        return Ok(Some(Next::Again(path)));
+    if now != Some(row.stamp) {
+        return Ok(Some(Next::Again(row.path)));
     }
     Ok(Some(Next::Parts {
-        id,
-        path,
-        from: done as usize,
-        total: total as usize,
+        id: row.id,
+        path: row.path,
+        from: row.done as usize,
+        total: row.total as usize,
     }))
+}
+
+/// A `partial` row and the stamp its file had when it was recorded.
+struct Waiting {
+    id: i64,
+    path: String,
+    stamp: (i64, i64),
+    done: i64,
+    total: i64,
 }
 
 /// Store the chunks of parts `from..done` of file `id`, and move its partial
@@ -1102,18 +1136,8 @@ pub fn index_rest<E: Embed>(
     let Some(next) = next_rest(conn, emb.can_embed_media())? else {
         return Ok(None);
     };
-    let again = |conn: &mut Connection,
-                 emb: &mut E,
-                 path: String,
-                 between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>|
-     -> Result<Option<Rest>> {
-        // Whatever the stamp says, index_file must take it as changed.
-        conn.execute("UPDATE files SET mtime = -1 WHERE path = ?1", [&path])?;
-        index_file(conn, emb, Path::new(&path), types, between)?;
-        Ok(Some(Rest::Again(path)))
-    };
     let (id, key, from, total) = match next {
-        Next::Again(path) => return again(conn, emb, path, between),
+        Next::Again(path) => return index_again(conn, emb, path, types, between).map(Some),
         Next::Parts {
             id,
             path,
@@ -1123,12 +1147,12 @@ pub fn index_rest<E: Embed>(
     };
     let path = Path::new(&key);
     // Media isn't hashed again for each slice: next_rest's stamp check
-    // stands for it.
+    // stands for that.
     match types.kind(path) {
         Some(Kind::Media) => {
             return media::rest(conn, emb, id, key, from, total, between).map(Some);
         }
-        None => return again(conn, emb, key, between),
+        None => return index_again(conn, emb, key, types, between).map(Some),
         _ => {}
     }
     let hash: Option<Vec<u8>> =
@@ -1139,19 +1163,18 @@ pub fn index_rest<E: Embed>(
         {
             (kind, bytes)
         }
-        _ => return again(conn, emb, key, between),
+        _ => return index_again(conn, emb, key, types, between).map(Some),
     };
     let run = match kind {
         Kind::Document | Kind::Session => document_parts(path, &bytes, from, parser(kind)),
         _ => match String::from_utf8(bytes) {
             Ok(text) => Ok(text_parts(path, &text, from, PARTS_AT_ONCE)),
-            Err(_) => return again(conn, emb, key, between),
+            Err(_) => return index_again(conn, emb, key, types, between).map(Some),
         },
     };
     let mut done = (from + PARTS_AT_ONCE).min(total);
     let mut chunks = match run {
         Ok(run) => run.chunks,
-        // What is in stays; the rest isn't tried again until it changes.
         Err(e) => {
             eprintln!(
                 "{}: stopped at part {from} of {total}: {e:#}",
@@ -1186,6 +1209,19 @@ pub fn index_rest<E: Embed>(
         total,
         chunks: chunks.len(),
     }))
+}
+
+/// `path` indexed afresh, as changed whatever its stamp says.
+fn index_again<E: Embed>(
+    conn: &mut Connection,
+    emb: &mut E,
+    path: String,
+    types: &FileTypes,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Rest> {
+    conn.execute("UPDATE files SET mtime = -1 WHERE path = ?1", [&path])?;
+    index_file(conn, emb, Path::new(&path), types, between)?;
+    Ok(Rest::Again(path))
 }
 
 /// Trim `chunks` to MAX_TEXT_BYTES with `have` already in; true if some went.
@@ -1276,8 +1312,10 @@ pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, 
 }
 
 /// Paths under `root` the index is behind on: wanted files that are new or
-/// changed (by mtime and size), and indexed files that are gone. Needs no
-/// model, so a runner can check at start whether it has anything to do.
+/// changed (by mtime and size), and indexed files that are gone, excluded,
+/// skipped or no longer wanted. Needs no model, so a runner can check at
+/// start whether it has anything to do (pinned by
+/// `tests::stale_finds_new_changed_and_gone_files`).
 pub fn stale(
     conn: &Connection,
     root: &Path,
@@ -1291,7 +1329,6 @@ pub fn stale(
         let Some(key) = path.to_str() else { continue };
         let was = known.remove(key);
         let Some((_, meta)) = indexable(&entry, types) else {
-            // An indexed file that is no longer wanted (grew too big, say).
             if was.is_some() {
                 out.push(path.to_path_buf());
             }
@@ -1301,7 +1338,6 @@ pub fn stale(
             out.push(path.to_path_buf());
         }
     }
-    // Indexed, but not found by the walk: deleted, or now excluded or skipped.
     out.extend(known.into_keys().map(PathBuf::from));
     Ok(out)
 }
@@ -1368,55 +1404,60 @@ pub fn index<E: Embed>(
         if let Some(p) = entry.path().to_str() {
             seen.insert(p.to_owned());
         }
-        match index_file(conn, emb, entry.path(), types, &mut |c, e| {
+        let outcome = index_file(conn, emb, entry.path(), types, &mut |c, e| {
             after(&stats, c, e)
-        })? {
-            Outcome::Embedded(n) => {
-                stats.files_embedded += 1;
-                stats.chunks += n;
-                stats.files_seen += 1;
-            }
-            Outcome::Unchanged => stats.files_seen += 1,
-            Outcome::Duplicate => {
-                stats.duplicates += 1;
-                stats.files_seen += 1;
-            }
-            Outcome::Unreadable { no_decoder } => {
-                stats.files_seen += 1;
-                stats.no_decoder += usize::from(no_decoder);
-            }
-            Outcome::Skipped => {
-                if let Some(p) = entry.path().to_str() {
-                    seen.remove(p);
-                }
-            }
+        })?;
+        if matches!(outcome, Outcome::Skipped)
+            && let Some(p) = entry.path().to_str()
+        {
+            seen.remove(p);
         }
+        stats.add(outcome);
         after(&stats, conn, emb)?;
     }
-
-    let gone: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
-        let rows = stmt.query_map([like_under(&root.to_string_lossy())], |r| {
-            r.get::<_, String>(0)
-        })?;
-        rows.filter_map(Result::ok)
-            .filter(|p| !seen.contains(p))
-            .collect()
-    };
-    for p in &gone {
-        conn.execute("DELETE FROM files WHERE path = ?1", [p])?;
-    }
-    stats.removed = gone.len() + purged;
-    if !gone.is_empty() {
-        compact(conn)?;
-    }
+    stats.removed = remove_unseen_under(conn, &root, &seen)? + purged;
     Ok(stats)
 }
 
+impl Stats {
+    fn add(&mut self, outcome: Outcome) {
+        if !matches!(outcome, Outcome::Skipped) {
+            self.files_seen += 1;
+        }
+        match outcome {
+            Outcome::Embedded(n) => {
+                self.files_embedded += 1;
+                self.chunks += n;
+            }
+            Outcome::Duplicate => self.duplicates += 1,
+            Outcome::Unreadable { no_decoder } => self.no_decoder += usize::from(no_decoder),
+            Outcome::Unchanged | Outcome::Skipped => {}
+        }
+    }
+}
+
+/// Drop the indexed files under `root` that the walk didn't see; how many.
+fn remove_unseen_under(conn: &Connection, root: &Path, seen: &HashSet<String>) -> Result<usize> {
+    let gone: Vec<String> = conn
+        .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?
+        .query_map([like_under(&root.to_string_lossy())], |r| r.get(0))?
+        .filter_map(Result::ok)
+        .filter(|p: &String| !seen.contains(p))
+        .collect();
+    for p in &gone {
+        conn.execute("DELETE FROM files WHERE path = ?1", [p])?;
+    }
+    if !gone.is_empty() {
+        compact(conn)?;
+    }
+    Ok(gone.len())
+}
+
 /// Stop treating `root` as a root and drop what was indexed under it, except
-/// files another root still covers (with roots `~/Dev` and `~/Dev/proj`,
-/// forgetting either keeps the files `~/Dev` still walks). Returns files
-/// removed.
+/// files another root still walks. Returns files removed (pinned by
+/// `tests::forgetting_an_inner_root_keeps_what_the_outer_one_walks`,
+/// `tests::forgetting_the_outer_root_keeps_the_roots_inside_it`,
+/// `tests::forgetting_a_root_under_a_hidden_directory_drops_all_of_it`).
 pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
     conn.execute(
         "DELETE FROM roots WHERE path = ?1",
@@ -1454,9 +1495,12 @@ pub fn forget(conn: &Connection, root: &Path) -> Result<usize> {
 
 #[cfg(test)]
 mod pipeline_tests;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::Scratch;
     use super::vectors::{dot, quantize};
     use super::words::{WORDS_MAX_CHUNKS, expression, ranked};
     use super::*;
@@ -1507,17 +1551,25 @@ mod tests {
 
     #[test]
     fn index_is_private_to_the_user() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-test-{}", std::process::id()));
+        let dir = Scratch::new("private");
         let db = dir.join("sub/index.sqlite");
         open(&db).unwrap();
-        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(db.parent().unwrap()), 0o700);
         assert_eq!(mode(&db), 0o600);
-        // An existing, looser database is tightened on open.
+    }
+
+    #[test]
+    fn a_looser_index_is_tightened_on_open() {
+        let dir = Scratch::new("loose");
+        let db = dir.join("index.sqlite");
+        open(&db).unwrap();
         fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
         open(&db).unwrap();
         assert_eq!(mode(&db), 0o600);
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
@@ -1552,8 +1604,8 @@ mod tests {
 
     #[test]
     fn an_images_text_counts_under_images() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-ocrcount-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("ocrcount");
+        let conn = dir.db();
         file_with(
             &conn,
             "/shot.png",
@@ -1565,16 +1617,27 @@ mod tests {
             &[(Kind::Document, 1), (Kind::Document, 2)],
         );
         file_with(&conn, "/notes.md", &[(Kind::Text, 1)]);
-        let counts = counts_by_kind(&conn).unwrap();
-        // Kind::ALL's order: text, documents, images.
-        assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0), (0, 0), (0, 0)]);
-        let _ = fs::remove_dir_all(&dir);
+        let counts: Vec<_> = Kind::ALL
+            .into_iter()
+            .zip(counts_by_kind(&conn).unwrap())
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                (Kind::Text, (1, 1)),
+                (Kind::Document, (1, 2)),
+                (Kind::Image, (1, 3)),
+                (Kind::Code, (0, 0)),
+                (Kind::Session, (0, 0)),
+                (Kind::Media, (0, 0)),
+            ]
+        );
     }
 
     #[test]
     fn recent_files_are_text_and_documents_newest_first() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-recent-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("recent");
+        let conn = dir.db();
         for (p, mtime) in [
             ("/old.md", 1),
             ("/report.pdf", 5),
@@ -1601,13 +1664,12 @@ mod tests {
         );
         assert_eq!(recent_files(&conn, 10, exists).unwrap().len(), 4);
         assert!(recent_files(&conn, 0, exists).unwrap().is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn remove_drops_a_file_or_a_whole_directory() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-rm-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("rm");
+        let conn = dir.db();
         for p in ["/a/x.md", "/a/b/y.md", "/a_b/z.md", "/c.md"] {
             conn.execute(
                 "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
@@ -1628,13 +1690,11 @@ mod tests {
         assert!(is_indexed(&conn, "/a_b/z.md").unwrap());
         assert!(!is_indexed(&conn, "/a_b").unwrap());
         assert!(!is_indexed(&conn, "/c.md").unwrap());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn copies_share_chunks_and_inherit_them() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-dup-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+    /// `/a/x.md` holding one chunk, `/b/x.md` its copy and `/c/y.md` other
+    /// content: (holder id, copy id, the chunk's vector).
+    fn a_file_and_its_copy(conn: &Connection) -> (i64, i64, Vec<f32>) {
         let file = |path: &str, hash: &[u8]| {
             conn.execute(
                 "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?2)",
@@ -1653,53 +1713,62 @@ mod tests {
         .unwrap();
         let b = file("/b/x.md", b"same");
         file("/c/y.md", b"other");
+        (a, b, v)
+    }
+
+    fn top_text_hits(conn: &Connection, v: &[f32]) -> Vec<Hit> {
+        search(conn, &Vectors::load(conn).unwrap(), v, None, Kind::Text, 5).unwrap()
+    }
+
+    #[test]
+    fn the_holder_of_a_copys_content_is_the_other_file() {
+        let dir = Scratch::new("dup-holder");
+        let conn = dir.db();
+        let (a, _, _) = a_file_and_its_copy(&conn);
         assert_eq!(holder_of(&conn, b"same", "/b/x.md").unwrap(), Some(a));
         assert_eq!(holder_of(&conn, b"same", "/a/x.md").unwrap(), None);
+    }
 
-        // One hit for the content, naming the copy.
-        let hits = search(
-            &conn,
-            &Vectors::load(&conn).unwrap(),
-            &v,
-            None,
-            Kind::Text,
-            5,
-        )
-        .unwrap();
+    #[test]
+    fn copies_are_one_hit_naming_the_copy() {
+        let dir = Scratch::new("dup-hit");
+        let conn = dir.db();
+        let (_, _, v) = a_file_and_its_copy(&conn);
+        let hits = top_text_hits(&conn, &v);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/a/x.md");
         assert_eq!(hits[0].copies, ["/b/x.md"]);
+    }
 
-        // The holder goes: the copy takes its chunks, same ids.
+    #[test]
+    fn when_the_holder_goes_its_copy_takes_the_same_chunks() {
+        let dir = Scratch::new("dup-inherit");
+        let conn = dir.db();
+        let (_, b, v) = a_file_and_its_copy(&conn);
         remove(&conn, Path::new("/a")).unwrap();
         let owner: i64 = conn
             .query_row("SELECT file_id FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(owner, b);
-        let hits = search(
-            &conn,
-            &Vectors::load(&conn).unwrap(),
-            &v,
-            None,
-            Kind::Text,
-            5,
-        )
-        .unwrap();
+        let hits = top_text_hits(&conn, &v);
         assert_eq!(
             (hits[0].path.as_str(), hits[0].copies.len()),
             ("/b/x.md", 0)
         );
-
-        // The last copy goes: so do the chunks.
-        remove(&conn, Path::new("/b/x.md")).unwrap();
-        assert_eq!(counts(&conn).unwrap(), (1, 0));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn an_old_index_gains_the_hash_and_kind_columns() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-mig-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+    fn when_the_last_copy_goes_so_do_the_chunks() {
+        let dir = Scratch::new("dup-last");
+        let conn = dir.db();
+        a_file_and_its_copy(&conn);
+        remove(&conn, Path::new("/a")).unwrap();
+        remove(&conn, Path::new("/b/x.md")).unwrap();
+        assert_eq!(counts(&conn).unwrap(), (1, 0));
+    }
+
+    /// An index from before content hashes and kinds: `/old.md`, one chunk.
+    fn old_index(dir: &Path) -> PathBuf {
         let db = dir.join("i.sqlite");
         Connection::open(&db)
             .unwrap()
@@ -1712,7 +1781,13 @@ mod tests {
                  INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, 'x', x'');",
             )
             .unwrap();
-        let conn = open(&db).unwrap();
+        db
+    }
+
+    #[test]
+    fn an_old_index_gains_the_hash_and_kind_columns() {
+        let dir = Scratch::new("mig");
+        let conn = open(&old_index(&dir)).unwrap();
         let hash: Option<Vec<u8>> = conn
             .query_row("SELECT sha256 FROM files WHERE path = '/old.md'", [], |r| {
                 r.get(0)
@@ -1723,78 +1798,99 @@ mod tests {
             .query_row("SELECT kind FROM chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(kind, Kind::Text as i64);
-        // Its chunks are in the word index, under their file's name too.
-        assert_eq!(matching(&conn, "x"), [1]);
-        assert_eq!(matching(&conn, "old"), [1]);
-        drop(conn);
-        open(&db).unwrap(); // and opening it again is a no-op
-        assert_eq!(matching(&open(&db).unwrap(), "x"), [1]);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn forget_keeps_files_another_root_covers() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-forget-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        let files = |conn: &Connection| -> Vec<String> {
-            conn.prepare("SELECT path FROM files ORDER BY path")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        let setup = |conn: &Connection| {
-            conn.execute_batch("DELETE FROM files; DELETE FROM roots;")
-                .unwrap();
-            for r in ["/dev", "/dev/proj", "/dev/.hidden/p2"] {
-                conn.execute("INSERT INTO roots (path) VALUES (?1)", [r])
-                    .unwrap();
-            }
-            for p in ["/dev/a.md", "/dev/proj/b.md", "/dev/.hidden/p2/c.md"] {
-                conn.execute(
-                    "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
-                    [p],
-                )
-                .unwrap();
-            }
-        };
+    fn an_old_index_gains_its_chunks_in_the_word_index_by_text_and_file_name() {
+        let dir = Scratch::new("mig-words");
+        let conn = open(&old_index(&dir)).unwrap();
+        assert_eq!(matching(&conn, "x"), [1]);
+        assert_eq!(matching(&conn, "old"), [1]);
+    }
 
-        // The inner root: /dev still walks proj/b.md.
-        setup(&conn);
+    #[test]
+    fn opening_a_migrated_index_again_changes_nothing() {
+        let dir = Scratch::new("mig-again");
+        let db = old_index(&dir);
+        open(&db).unwrap();
+        open(&db).unwrap();
+        assert_eq!(matching(&open(&db).unwrap(), "x"), [1]);
+    }
+
+    /// Roots `/dev`, `/dev/proj` and `/dev/.hidden/p2`, a file in each.
+    fn nested_roots(dir: &Scratch) -> Connection {
+        let conn = dir.db();
+        for r in ["/dev", "/dev/proj", "/dev/.hidden/p2"] {
+            conn.execute("INSERT INTO roots (path) VALUES (?1)", [r])
+                .unwrap();
+        }
+        for p in ["/dev/a.md", "/dev/proj/b.md", "/dev/.hidden/p2/c.md"] {
+            conn.execute(
+                "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
+                [p],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn file_paths(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn forgetting_an_inner_root_keeps_what_the_outer_one_walks() {
+        let dir = Scratch::new("forget-inner");
+        let conn = nested_roots(&dir);
         assert_eq!(forget(&conn, Path::new("/dev/proj")).unwrap(), 0);
         assert_eq!(
-            files(&conn),
+            file_paths(&conn),
             ["/dev/.hidden/p2/c.md", "/dev/a.md", "/dev/proj/b.md"]
         );
+    }
 
-        // The outer root: proj and the hidden root stay, as their own roots.
-        setup(&conn);
+    #[test]
+    fn forgetting_the_outer_root_keeps_the_roots_inside_it() {
+        let dir = Scratch::new("forget-outer");
+        let conn = nested_roots(&dir);
         assert_eq!(forget(&conn, Path::new("/dev")).unwrap(), 1);
-        assert_eq!(files(&conn), ["/dev/.hidden/p2/c.md", "/dev/proj/b.md"]);
+        assert_eq!(
+            file_paths(&conn),
+            ["/dev/.hidden/p2/c.md", "/dev/proj/b.md"]
+        );
+    }
 
-        // A root under a hidden directory, which /dev's walk skips: all of it goes.
-        setup(&conn);
+    #[test]
+    fn forgetting_a_root_under_a_hidden_directory_drops_all_of_it() {
+        let dir = Scratch::new("forget-hidden");
+        let conn = nested_roots(&dir);
         assert_eq!(forget(&conn, Path::new("/dev/.hidden/p2")).unwrap(), 1);
-        assert_eq!(files(&conn), ["/dev/a.md", "/dev/proj/b.md"]);
+        assert_eq!(file_paths(&conn), ["/dev/a.md", "/dev/proj/b.md"]);
+    }
 
-        // No other root overlaps: everything under it goes.
+    #[test]
+    fn forgetting_a_root_nothing_overlaps_drops_everything_under_it() {
+        let dir = Scratch::new("forget-alone");
+        let conn = nested_roots(&dir);
         conn.execute_batch("DELETE FROM roots WHERE path != '/dev/proj'")
             .unwrap();
         assert_eq!(forget(&conn, Path::new("/dev/proj")).unwrap(), 1);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn largest_folders_name_where_the_bulk_is() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-largest-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("largest");
+        let conn = dir.db();
         conn.execute_batch("INSERT INTO roots VALUES ('/h'), ('/h/dev/app');")
             .unwrap();
         let mut v = vec![0f32; DIM];
         v[0] = 1.0;
         for (path, n) in [
-            // Almost all of linux/ is drivers/gpu: that is what to show.
             ("/h/dev/linux/drivers/gpu/a.c", 40),
             ("/h/dev/linux/drivers/gpu/b.c", 50),
             ("/h/dev/linux/README", 5),
@@ -1829,7 +1925,6 @@ mod tests {
             ]
         );
         assert_eq!(largest_folders(&conn, 1).unwrap().len(), 1);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1840,27 +1935,40 @@ mod tests {
         assert!(text_file(Path::new("notes.md")));
     }
 
-    #[test]
-    fn walk_does_not_follow_symlinks() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-links-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+    /// `root/real/a.md`, and `root/link` to a directory outside `root`.
+    fn a_tree_with_a_link_out(name: &str) -> Scratch {
+        let dir = Scratch::new(name);
         fs::create_dir_all(dir.join("root/real")).unwrap();
         fs::create_dir_all(dir.join("secret")).unwrap();
         fs::write(dir.join("root/real/a.md"), "a").unwrap();
         fs::write(dir.join("secret/tax.md"), "s").unwrap();
         std::os::unix::fs::symlink(dir.join("secret"), dir.join("root/link")).unwrap();
-        let files = |p: &Path| -> Vec<PathBuf> {
-            walk(p, &Excludes::default())
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.into_path())
-                .collect()
-        };
-        assert_eq!(files(&dir.join("root")), [dir.join("root/real/a.md")]);
-        // The watcher walks a created path directly, so the link is the root.
-        assert!(files(&dir.join("root/link")).is_empty());
+        dir
+    }
+
+    fn walked_files(root: &Path) -> Vec<PathBuf> {
+        walk(root, &Excludes::default())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .collect()
+    }
+
+    #[test]
+    fn walk_does_not_follow_symlinks() {
+        let dir = a_tree_with_a_link_out("links");
+        assert_eq!(
+            walked_files(&dir.join("root")),
+            [dir.join("root/real/a.md")]
+        );
         assert!(!is_real_dir(&dir.join("root/link")));
         assert!(is_real_dir(&dir.join("root/real")));
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// As the watcher walks a created path.
+    #[test]
+    fn a_link_given_as_the_root_is_not_followed() {
+        let dir = a_tree_with_a_link_out("link-root");
+        assert!(walked_files(&dir.join("root/link")).is_empty());
     }
 
     #[test]
@@ -1894,30 +2002,38 @@ mod tests {
         assert_eq!(code.kind(Path::new("/p/vendor.bundle.js")), None);
         assert_eq!(code.kind(Path::new("/p/app.js")), Some(Kind::Code));
         assert_eq!(code.kind(Path::new("/p/README.md")), Some(Kind::Text));
-        // Code is off unless turned on (#110).
-        assert_eq!(FileTypes::default().kind(Path::new("/p/app.js")), None);
     }
 
     #[test]
-    fn sessions_are_taken_anywhere_and_only_sessions_from_vinowhispers_folder() {
-        let dir = PathBuf::from("/h/.local/share/vinowhisper/transcripts");
+    fn code_is_off_unless_turned_on() {
+        assert_eq!(FileTypes::default().kind(Path::new("/p/app.js")), None);
+    }
+
+    const TRANSCRIPTS: &str = "/h/.local/share/vinowhisper/transcripts";
+    const SESSION: &str = "2026-10-27-140512.vwsession";
+
+    #[test]
+    fn sessions_are_taken_anywhere_while_on() {
+        let dir = PathBuf::from(TRANSCRIPTS);
         let on = FileTypes::default().with_sessions(true, Some(dir.clone()));
         let off = FileTypes::default().with_sessions(false, Some(dir.clone()));
-        let s = "2026-10-27-140512.vwsession";
+        let s = SESSION;
         assert_eq!(on.kind(&dir.join(s)), Some(Kind::Session));
         assert_eq!(
             on.kind(&Path::new("/h/Documents").join(s)),
             Some(Kind::Session)
         );
-        // A live transcript, and a bundle being written.
-        assert_eq!(on.kind(&dir.join("2026-10-28-090000.txt")), None);
-        assert_eq!(
-            on.kind(&dir.join(".2026-10-27-140512.vwsession.k3j.tmp")),
-            None
-        );
         assert_eq!(off.kind(&dir.join(s)), None);
         assert_eq!(off.kind(&Path::new("/h/Documents").join(s)), None);
         assert_eq!(on.sessions_dirs(), (&[dir][..], true));
+    }
+
+    #[test]
+    fn a_live_transcript_or_half_written_bundle_in_vinowhispers_folder_is_not_taken() {
+        let dir = PathBuf::from(TRANSCRIPTS);
+        let on = FileTypes::default().with_sessions(true, Some(dir.clone()));
+        assert_eq!(on.kind(&dir.join("2026-10-28-090000.txt")), None);
+        assert_eq!(on.kind(&dir.join(format!(".{SESSION}.k3j.tmp"))), None);
     }
 
     #[test]
@@ -1932,7 +2048,12 @@ mod tests {
                 ),
             ]
         );
-        // The Flatpak's are no less its own folder: a live transcript there is left.
+        assert!(sessions_dirs_in(None, None).is_empty());
+    }
+
+    #[test]
+    fn a_live_transcript_in_the_flatpaks_folder_is_not_taken_either() {
+        let dirs = sessions_dirs_in(Some("/h/.local/share".into()), Some("/h".into()));
         let types = FileTypes {
             sessions: true,
             sessions_dirs: dirs.clone(),
@@ -1943,7 +2064,6 @@ mod tests {
             types.kind(&dirs[1].join("2026-11-14-090000.vwsession")),
             Some(Kind::Session)
         );
-        assert!(sessions_dirs_in(None, None).is_empty());
     }
 
     #[test]
@@ -1967,9 +2087,7 @@ mod tests {
 
     #[test]
     fn stale_finds_new_changed_and_gone_files() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-stale-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("stale");
         let conn = open(&dir.join("db/index.sqlite")).unwrap();
         let root = dir.join("root");
         fs::create_dir_all(&root).unwrap();
@@ -1995,7 +2113,6 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["deleted.md", "edited.md", "new.md", "skip.toml"]);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2014,8 +2131,8 @@ mod tests {
 
     #[test]
     fn search_returns_the_best_k_in_order() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-search-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("search");
+        let conn = dir.db();
         conn.execute(
             "INSERT INTO files (id, path, mtime, size) VALUES (1, '/f', 0, 0)",
             [],
@@ -2040,7 +2157,6 @@ mod tests {
             .map(|h| h.line)
             .collect();
         assert_eq!(lines, [10, 9, 8]);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn images_on() -> FileTypes {
@@ -2076,8 +2192,8 @@ mod tests {
 
     #[test]
     fn documents_are_searched_apart_from_text() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-docs-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("docs");
+        let conn = dir.db();
         add_file(&conn, "/notes.md", &[0]);
         add_file(&conn, "/a.pdf", &[0]);
         conn.execute("UPDATE chunks SET kind = 2 WHERE file_id = (SELECT id FROM files WHERE path = '/a.pdf')", []).unwrap();
@@ -2094,19 +2210,24 @@ mod tests {
         assert_eq!(paths(Kind::Text), ["/notes.md"]);
         assert_eq!(paths(Kind::Document), ["/a.pdf"]);
         assert!(paths(Kind::Image).is_empty());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_document_that_does_not_parse_has_no_chunks() {
         let parse = crate::extract::parts;
         assert!(document_parts(Path::new("/p/a.pdf"), b"not a pdf", 0, parse).is_err());
-        // A run of parts with over MAX_FILE_BYTES of text: one slide will do.
-        let slide = format!(
+    }
+
+    #[test]
+    fn a_run_of_parts_over_max_file_bytes_of_text_is_refused() {
+        let one_slide_over = format!(
             "<draw:page><text:p>{}</text:p></draw:page>",
             "word ".repeat(250_000)
         );
-        assert!(document_parts(Path::new("/p/a.fodp"), slide.as_bytes(), 0, parse).is_err());
+        let parse = crate::extract::parts;
+        assert!(
+            document_parts(Path::new("/p/a.fodp"), one_slide_over.as_bytes(), 0, parse).is_err()
+        );
     }
 
     /// `path` indexed as it is on disk now, with `chunks` chunks and the
@@ -2134,9 +2255,8 @@ mod tests {
 
     #[test]
     fn media_partial_counts_audio_and_video_only() {
-        let dir =
-            std::env::temp_dir().join(format!("vinosearch-media-wait-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("media-wait");
+        let conn = dir.db();
         let book = dir.join("book.txt");
         let clip = dir.join("clip.mp4");
         fs::write(&book, "a long book").unwrap();
@@ -2147,12 +2267,11 @@ mod tests {
         conn.execute("UPDATE partial SET media = 1 WHERE file_id = ?1", [id])
             .unwrap();
         assert_eq!(media_partial(&conn).unwrap(), 1);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_rest_of_a_long_document_resumes_where_it_stopped() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-rest-{}", std::process::id()));
+        let dir = Scratch::new("rest");
         let db = dir.join("i.sqlite");
         let mut conn = open(&db).unwrap();
         let book = dir.join("book.txt");
@@ -2170,7 +2289,6 @@ mod tests {
         assert_eq!(next_rest(&conn, true).unwrap(), Some(parts(30)));
         let run = [(31, "second".to_owned())];
         store_rest(&mut conn, id, Kind::Text, 60, 70, &run, &[vec![0.0; DIM]]).unwrap();
-        // A restart picks it up from there.
         drop(conn);
         let mut conn = open(&db).unwrap();
         assert_eq!(next_rest(&conn, true).unwrap(), Some(parts(60)));
@@ -2178,16 +2296,14 @@ mod tests {
         store_rest(&mut conn, id, Kind::Text, 70, 70, &run, &[vec![0.0; DIM]]).unwrap();
         assert_eq!(next_rest(&conn, true).unwrap(), None);
         assert!(!has_partial(&conn, true).unwrap());
-        // Still one file, with every run's chunks.
         assert_eq!(counts(&conn).unwrap(), (1, 3));
         assert_eq!(counts_by_kind(&conn).unwrap()[0], (1, 3));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_long_document_that_changed_or_went_is_indexed_again() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-again-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("again");
+        let conn = dir.db();
         let book = dir.join("book.txt");
         fs::write(&book, "a long book").unwrap();
         let key = book.to_str().unwrap().to_owned();
@@ -2199,17 +2315,15 @@ mod tests {
         );
         fs::remove_file(&book).unwrap();
         assert_eq!(next_rest(&conn, true).unwrap(), Some(Next::Again(key)));
-        // Indexed again, the old row and its partial row go.
         conn.execute("DELETE FROM files WHERE id = ?1", [id])
             .unwrap();
         assert!(!has_partial(&conn, true).unwrap());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_copy_takes_over_a_long_document_indexed_in_part() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-hand-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("hand");
+        let conn = dir.db();
         let book = dir.join("book.pdf");
         fs::write(&book, "%PDF").unwrap();
         let id = add_partial(&conn, &book, 30, 640);
@@ -2229,7 +2343,6 @@ mod tests {
         conn.execute("DELETE FROM files WHERE id = ?1", [copy])
             .unwrap();
         assert!(!has_partial(&conn, true).unwrap());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2258,8 +2371,7 @@ mod tests {
     }
 
     fn indexable_html_of(name: &str, len: u64) -> Option<Kind> {
-        let dir = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new(name);
         let file = fs::File::create(dir.join("page.html")).unwrap();
         file.set_len(len).unwrap();
         let entry = WalkDir::new(&dir)
@@ -2267,9 +2379,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .find(|e| e.file_type().is_file())
             .unwrap();
-        let kind = indexable(&entry, &FileTypes::default()).map(|(k, _)| k);
-        fs::remove_dir_all(&dir).unwrap();
-        kind
+        indexable(&entry, &FileTypes::default()).map(|(k, _)| k)
     }
 
     #[test]
@@ -2304,8 +2414,8 @@ mod tests {
 
     #[test]
     fn kinds_are_searched_apart_and_purged_when_turned_off() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-kinds-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("kinds");
+        let conn = dir.db();
         add_file(&conn, "/notes.md", &[0, 1]);
         add_file(&conn, "/cat.png", &[0]);
         conn.execute("UPDATE chunks SET kind = 1, start_line = 0 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
@@ -2321,7 +2431,6 @@ mod tests {
         };
         assert_eq!(paths(&v, Kind::Image), ["/cat.png"]);
         assert_eq!(paths(&v, Kind::Text), ["/notes.md", "/notes.md"]);
-        // Kinds stay with their vectors as rows are swapped out on removal.
         remove(&conn, Path::new("/notes.md")).unwrap();
         add_file(&conn, "/b.md", &[0]);
         v.refresh(&conn).unwrap();
@@ -2332,35 +2441,40 @@ mod tests {
         assert_eq!(purge_types(&conn, &FileTypes::default()).unwrap(), 1);
         v.refresh(&conn).unwrap();
         assert!(paths(&v, Kind::Image).is_empty());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn counts_are_split_by_kind() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-bykind-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("bykind");
+        let conn = dir.db();
         add_file(&conn, "/notes.md", &[0, 1]);
         add_file(&conn, "/more.md", &[2]);
         add_file(&conn, "/cat.png", &[3]);
         conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
-        // A document recorded without text counts under nothing.
+        assert_eq!(
+            counts_by_kind(&conn).unwrap(),
+            [(2, 3), (0, 0), (1, 1), (0, 0), (0, 0), (0, 0)]
+        );
+        assert_eq!(counts(&conn).unwrap(), (3, 4));
+    }
+
+    #[test]
+    fn a_document_recorded_without_text_counts_under_no_kind() {
+        let dir = Scratch::new("bykind-empty");
+        let conn = dir.db();
         conn.execute(
             "INSERT INTO files (path, mtime, size) VALUES ('/scan.pdf', 0, 0)",
             [],
         )
         .unwrap();
-        assert_eq!(
-            counts_by_kind(&conn).unwrap(),
-            [(2, 3), (0, 0), (1, 1), (0, 0), (0, 0), (0, 0)]
-        );
-        assert_eq!(counts(&conn).unwrap(), (4, 4));
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(counts_by_kind(&conn).unwrap(), [(0, 0); 6]);
+        assert_eq!(counts(&conn).unwrap(), (1, 0));
     }
 
     #[test]
     fn an_indexed_image_gives_its_vector_and_so_does_a_copy() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-simv-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("simv");
+        let conn = dir.db();
         conn.execute(
             "INSERT INTO files (path, mtime, size, sha256) VALUES ('/p/a.jpg', 0, 0, x'aa')",
             [],
@@ -2384,7 +2498,6 @@ mod tests {
         assert_eq!(image_vector(&conn, "/p/copy.jpg").unwrap(), Some(want));
         assert_eq!(image_vector(&conn, "/p/notes.md").unwrap(), None);
         assert_eq!(image_vector(&conn, "/p/missing.jpg").unwrap(), None);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A unit vector along `axis`, as an embedding blob.
@@ -2441,8 +2554,8 @@ mod tests {
 
     #[test]
     fn no_query_can_break_the_word_lookup() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-fts-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("fts");
+        let conn = dir.db();
         add_file(&conn, "/notes/a.md", &[0]);
         conn.execute("UPDATE chunks SET text = 'near the end, or not'", [])
             .unwrap();
@@ -2470,14 +2583,21 @@ mod tests {
                 assert!(ranked(&conn, &terms).is_ok(), "{q} -> {terms:?}");
             }
         }
-        // Operators are words like any other.
-        assert_eq!(matching(&conn, "near or not"), [1]);
-        assert_eq!(matching(&conn, "end NOT near"), [1]);
         assert!(matching(&conn, "text:end").is_empty());
         for q in ["", "  ", "***", "\"\"", "- : ()"] {
             assert!(expression(q).is_none(), "{q}");
         }
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn operators_are_words_like_any_other() {
+        let dir = Scratch::new("fts-ops");
+        let conn = dir.db();
+        add_file(&conn, "/a.md", &[0]);
+        conn.execute("UPDATE chunks SET text = 'near the end, or not'", [])
+            .unwrap();
+        assert_eq!(matching(&conn, "near or not"), [1]);
+        assert_eq!(matching(&conn, "end NOT near"), [1]);
     }
 
     #[test]
@@ -2504,14 +2624,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exact_words_find_what_vectors_miss() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-hybrid-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        // Axis 0 is "invoices in general"; the one with the number is off it.
-        let general = add_file(&conn, "/inv/general.md", &[0])[0];
-        let near = add_file(&conn, "/inv/near.md", &[0])[0];
-        let numbered = add_file(&conn, "/inv/march.md", &[1])[0];
+    /// Three invoice notes: along the query's axis 0, "invoices in general"
+    /// leads, then the march one; the one with the number is far off it.
+    /// The numbered chunk's id comes back.
+    fn invoices(conn: &Connection) -> i64 {
+        let general = add_file(conn, "/inv/general.md", &[0])[0];
+        let near = add_file(conn, "/inv/near.md", &[0])[0];
+        let numbered = add_file(conn, "/inv/march.md", &[1])[0];
         let set = |id: i64, text: &str, v: &[f32]| {
             let mut e = vec![0f32; DIM];
             e[..v.len()].copy_from_slice(v);
@@ -2524,39 +2643,70 @@ mod tests {
         set(general, "Invoices are due in 30 days.", &[0.8, 0.6]);
         set(near, "The march invoice total.", &[0.78, 0.6257]);
         set(numbered, "Invoice INV-20431, total 120 EUR", &[0.2, 0.98]);
-        let vectors = Vectors::load(&conn).unwrap();
+        numbered
+    }
+
+    /// The top `k` text hits along axis 0, boosted by `words`.
+    fn along_axis_0(conn: &Connection, words: &str, k: usize) -> Vec<String> {
+        let vectors = Vectors::load(conn).unwrap();
+        let words = (!words.is_empty()).then(|| Words::find(conn, words).unwrap());
         let mut q = vec![0f32; DIM];
         q[0] = 1.0;
-        let paths = |words: Option<&Words>, k: usize| -> Vec<String> {
-            search(&conn, &vectors, &q, words, Kind::Text, k)
-                .unwrap()
-                .into_iter()
-                .map(|h| h.path)
-                .collect()
-        };
-        assert_eq!(paths(None, 1), ["/inv/general.md"]);
-        // An identifier leads, whatever its cosine.
-        let id = Words::find(&conn, "INV-20431").unwrap();
-        assert_eq!(paths(Some(&id), 1), ["/inv/march.md"]);
+        search(conn, &vectors, &q, words.as_ref(), Kind::Text, k)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect()
+    }
+
+    #[test]
+    fn without_words_the_closest_vector_leads() {
+        let dir = Scratch::new("hybrid-none");
+        let conn = dir.db();
+        invoices(&conn);
+        assert_eq!(along_axis_0(&conn, "", 1), ["/inv/general.md"]);
+    }
+
+    #[test]
+    fn an_identifier_leads_whatever_its_cosine() {
+        let dir = Scratch::new("hybrid-id");
+        let conn = dir.db();
+        invoices(&conn);
+        assert_eq!(along_axis_0(&conn, "INV-20431", 1), ["/inv/march.md"]);
         assert_eq!(
-            paths(Some(&id), 3),
+            along_axis_0(&conn, "INV-20431", 3),
             ["/inv/march.md", "/inv/general.md", "/inv/near.md"]
         );
-        // Plain words nudge a near tie, but don't lift a far chunk.
-        let plain = Words::find(&conn, "march invoice").unwrap();
-        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
-        let plain = Words::find(&conn, "invoice total").unwrap();
-        assert_eq!(paths(Some(&plain), 2), ["/inv/near.md", "/inv/general.md"]);
-        // File names count as words: an image has no text but its name.
+    }
+
+    #[test]
+    fn plain_words_nudge_a_near_tie_but_do_not_lift_a_far_chunk() {
+        let dir = Scratch::new("hybrid-plain");
+        let conn = dir.db();
+        invoices(&conn);
+        for words in ["march invoice", "invoice total"] {
+            assert_eq!(
+                along_axis_0(&conn, words, 2),
+                ["/inv/near.md", "/inv/general.md"],
+                "{words}"
+            );
+        }
+    }
+
+    /// An image has no text but its name.
+    #[test]
+    fn file_names_count_as_words() {
+        let dir = Scratch::new("hybrid-name");
+        let conn = dir.db();
+        let numbered = invoices(&conn);
         let name = Words::find(&conn, "march.md").unwrap();
         assert!(name.ids.contains(&numbered));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn words_in_too_many_chunks_are_not_looked_up() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-common-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("common");
+        let conn = dir.db();
         add_file(&conn, "/f.md", &[]);
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..=WORDS_MAX_CHUNKS {
@@ -2569,17 +2719,15 @@ mod tests {
         }
         tx.commit().unwrap();
         assert!(Words::find(&conn, "common").is_none());
-        // The common word is left out; the rare one still has to be there.
         assert_eq!(Words::find(&conn, "common rare").unwrap().ids.len(), 1);
         assert_eq!(Words::find(&conn, "rare common").unwrap().ids.len(), 1);
         assert!(Words::find(&conn, "absent").unwrap().ids.is_empty());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_word_index_follows_chunks() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-words-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
+        let dir = Scratch::new("words");
+        let conn = dir.db();
         conn.execute_batch(
             "INSERT INTO files (path, mtime, size, sha256) VALUES ('/a/first.md', 0, 0, x'01');
              INSERT INTO chunks (file_id, start_line, text, embedding) VALUES (1, 1, 'zebra', x'');
@@ -2588,58 +2736,73 @@ mod tests {
         .unwrap();
         assert_eq!(matching(&conn, "zebra"), [1]);
         assert_eq!(matching(&conn, "first"), [1]);
-        // The holder goes: its chunk is found under the copy's name instead.
         remove(&conn, Path::new("/a")).unwrap();
         assert_eq!(matching(&conn, "zebra second"), [1]);
         assert!(matching(&conn, "first").is_empty());
-        // The last copy goes, and the chunk with it.
         remove(&conn, Path::new("/b")).unwrap();
         assert!(matching(&conn, "zebra").is_empty());
-        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reader's vectors, loaded, and a second connection that writes as
+    /// `vinosearch index` or the watcher would: `/base.md` with 20 chunks,
+    /// `/a.md` with 3.
+    fn reader_and_writer(dir: &Scratch) -> (Connection, Connection, Vectors) {
+        let conn = dir.db();
+        let writer = dir.db();
+        add_file(&writer, "/base.md", &(0..20).collect::<Vec<_>>());
+        add_file(&writer, "/a.md", &[20, 21, 22]);
+        let v = Vectors::load(&conn).unwrap();
+        assert_eq!(v.len(), 23);
+        (conn, writer, v)
+    }
+
+    /// Caught up incrementally, to what loading from scratch gives.
+    fn assert_caught_up(conn: &Connection, v: &mut Vectors) {
+        assert!(v.catch_up(conn).unwrap(), "fell back to a full reload");
+        assert_eq!(contents(v), contents(&Vectors::load(conn).unwrap()));
     }
 
     #[test]
-    fn refresh_applies_only_what_changed() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-refresh-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        // A second connection writes, as `vinosearch index` or the watcher would.
-        let writer = open(&dir.join("i.sqlite")).unwrap();
-        add_file(&writer, "/base.md", &(0..20).collect::<Vec<_>>());
-        add_file(&writer, "/a.md", &[20, 21, 22]);
-        let mut v = Vectors::load(&conn).unwrap();
-        assert_eq!(v.len(), 23);
-
-        // Incremental, and the same as loading from scratch.
-        let caught_up = |v: &mut Vectors| {
-            assert!(v.catch_up(&conn).unwrap(), "fell back to a full reload");
-            assert_eq!(contents(v), contents(&Vectors::load(&conn).unwrap()));
-        };
-        // New chunks, and a file replaced (delete cascades to its chunks).
+    fn refresh_applies_new_chunks_and_a_replaced_file() {
+        let dir = Scratch::new("refresh-new");
+        let (conn, writer, mut v) = reader_and_writer(&dir);
         add_file(&writer, "/c.md", &[23]);
         remove(&writer, Path::new("/a.md")).unwrap();
         add_file(&writer, "/a.md", &[24, 25]);
-        caught_up(&mut v);
+        assert_caught_up(&conn, &mut v);
         assert_eq!(v.len(), 23);
-        // The highest id deleted, then reused for a different vector: SQLite
-        // hands out max(id) + 1, so the new chunk gets the old one's id.
+        assert_caught_up(&conn, &mut v);
+    }
+
+    /// SQLite hands out max(id) + 1, so a new chunk can get a deleted one's id.
+    #[test]
+    fn refresh_applies_a_reused_id_with_its_new_vector() {
+        let dir = Scratch::new("refresh-reuse");
+        let (conn, writer, mut v) = reader_and_writer(&dir);
         let max: i64 = writer
             .query_row("SELECT max(id) FROM chunks", [], |r| r.get(0))
             .unwrap();
         remove(&writer, Path::new("/a.md")).unwrap();
-        assert_eq!(add_file(&writer, "/d.md", &[26, 27]).last(), Some(&max));
-        caught_up(&mut v);
-        // Nothing changed.
-        caught_up(&mut v);
+        assert_eq!(add_file(&writer, "/d.md", &[26, 27, 28]).last(), Some(&max));
+        assert_caught_up(&conn, &mut v);
+    }
 
-        // The log pruned past this copy: refresh reloads in full.
+    #[test]
+    fn refresh_reloads_in_full_once_the_log_is_pruned_past_it() {
+        let dir = Scratch::new("refresh-pruned");
+        let (conn, writer, mut v) = reader_and_writer(&dir);
         add_file(&writer, "/e.md", &[28]);
         writer.execute("DELETE FROM chunk_log", []).unwrap();
         assert!(!v.catch_up(&conn).unwrap());
         v.refresh(&conn).unwrap();
         assert_eq!(contents(&v), contents(&Vectors::load(&conn).unwrap()));
-        // Most of the index changed: also a full reload.
+    }
+
+    #[test]
+    fn refresh_reloads_in_full_when_most_of_the_index_changed() {
+        let dir = Scratch::new("refresh-most");
+        let (conn, writer, mut v) = reader_and_writer(&dir);
         remove(&writer, Path::new("/base.md")).unwrap();
         assert!(!v.catch_up(&conn).unwrap());
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

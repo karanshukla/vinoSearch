@@ -47,6 +47,20 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
 
+  # Every `tests::name` a comment cites is a real #[test] fn
+  # (docs/comment-style.md). Also part of `cargo test`; its own job so a
+  # broken citation is named on the PR.
+  doc-links:
+    name: Doc Links
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - run: cargo test --locked --test doc_links
+
   deny:
     runs-on: ubuntu-latest
     steps:

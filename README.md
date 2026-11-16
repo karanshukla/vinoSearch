@@ -88,6 +88,7 @@ It can be encrypted at rest with SQLCipher, its key sealed to this machine's TPM
 - [How it works](docs/how-it-works.md): indexing, watching, the runner, encryption, the runtime and NPU gotchas.
 - [D-Bus interface](docs/dbus.md): KRunner, GNOME Shell and the control interface the settings app uses.
 - [Releasing](docs/releasing.md): how a release is cut.
+- [Comment style](docs/comment-style.md): for contributors. A rule gets a named test, cited from the code as ``(pinned by `tests::name`)``; `tests/doc_links.rs` checks the citations.
 
 ## License
 

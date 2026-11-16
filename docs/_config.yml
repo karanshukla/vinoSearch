@@ -14,6 +14,7 @@ aux_links:
   GitHub: https://github.com/karanshukla/vinoSearch
 footer_content: 'Released under the <a href="https://github.com/karanshukla/vinoSearch/blob/main/LICENSE">MIT licence</a>.'
 exclude:
+  - comment-style.md
   - Gemfile
   - Gemfile.lock
   - vendor
