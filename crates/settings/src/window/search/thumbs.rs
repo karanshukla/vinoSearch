@@ -284,6 +284,21 @@ mod tests {
     }
 
     #[test]
+    fn every_byte_glib_escapes_is_escaped_and_no_other() {
+        use std::os::unix::ffi::OsStrExt;
+        for b in 1u8..=255 {
+            let kept = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=:@/".contains(&b);
+            let want = if kept {
+                format!("file://{}", b as char)
+            } else {
+                format!("file://%{b:02X}")
+            };
+            let path = Path::new(std::ffi::OsStr::from_bytes(std::slice::from_ref(&b)));
+            assert_eq!(file_uri(path), want, "byte {b}");
+        }
+    }
+
+    #[test]
     fn a_current_cached_thumbnail_is_used_and_a_stale_one_is_not() {
         let dir = temp("cache");
         let photo = dir.join("photo.png");

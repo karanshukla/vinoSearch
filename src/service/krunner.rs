@@ -2203,6 +2203,21 @@ mod tests {
         );
         assert_eq!(file_url("/tmp/é.txt"), "file:///tmp/%C3%A9.txt");
     }
+
+    #[test]
+    fn only_letters_digits_slash_and_four_marks_stay_unescaped_in_a_file_url() {
+        for b in 0u8..=127 {
+            let c = b as char;
+            let kept = c.is_ascii_alphanumeric() || "/-._~".contains(c);
+            let want = if kept {
+                format!("file://{c}")
+            } else {
+                format!("file://%{b:02X}")
+            };
+            assert_eq!(file_url(&c.to_string()), want, "byte {b}");
+        }
+    }
+
     #[test]
     fn the_search_window_opens_natively_and_from_the_flatpak() {
         assert_eq!(
