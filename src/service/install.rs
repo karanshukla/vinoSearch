@@ -1,5 +1,5 @@
 //! The files that make vinoSearch part of a desktop: the service's unit and
-//! bus name, the launcher, and each search place's own entry (#45).
+//! bus name, the launcher, and each search place's own entry.
 
 use crate::service::{flatpak, start};
 use anyhow::{Context, Result, bail};
@@ -9,7 +9,7 @@ use vinosearch_shared::dbus::{GNOME_PATH as GNOME, Names, RUNNER_PATH as OBJECT,
 use vinosearch_shared::sandbox;
 use vinosearch_shared::xdg::{config_home, data_home};
 
-/// A place vinoSearch's results show (#45). Each has files of its own, written
+/// A place vinoSearch's results show. Each has files of its own, written
 /// and removed apart from the service's, so a Plasma session gets no GNOME
 /// provider and a GNOME session no KRunner plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -40,7 +40,7 @@ impl Place {
 /// `ubuntu:GNOME`, ...). None for any other desktop (sway, Hyprland, COSMIC,
 /// XFCE...): neither KRunner nor GNOME Shell runs there, so `vinosearch menu`
 /// is the way in. Both when the variable is unset or empty (a TTY, ssh),
-/// where the desktop can't be told, as every install did before #45.
+/// where the desktop can't be told.
 fn places_for(desktop: Option<&str>) -> Vec<Place> {
     let desktop = desktop.unwrap_or_default();
     if desktop.trim().is_empty() {
@@ -210,6 +210,14 @@ pub(crate) fn dbus_service(n: &Names, exec: &str) -> String {
     format!("[D-BUS Service]\nName={}\nExec={exec}\n", n.service)
 }
 
+/// The environment.d line adding `xdg` to XDG_DATA_DIRS: appended, so it
+/// never shadows anything the system provides, after the XDG spec's default
+/// for sessions that leave the variable unset (pinned by
+/// `tests::our_data_dir_goes_after_the_systems`).
+fn data_dirs_line(xdg: &str) -> String {
+    format!("XDG_DATA_DIRS=${{XDG_DATA_DIRS:-/usr/local/share/:/usr/share/}}:{xdg}\n")
+}
+
 fn install_gnome() -> Result<()> {
     let g = gnome_files()?;
     let xdg = g.xdg.to_str().context("data directory is not UTF-8")?;
@@ -221,12 +229,7 @@ fn install_gnome() -> Result<()> {
     }
     fs::write(&g.provider, gnome_provider(names()))?;
     let launcher = install_launcher()?;
-    // Appended, so it never shadows anything the system provides. The
-    // default is the XDG spec's, for sessions that leave the variable unset.
-    fs::write(
-        &g.environment,
-        format!("XDG_DATA_DIRS=${{XDG_DATA_DIRS:-/usr/local/share/:/usr/share/}}:{xdg}\n"),
-    )?;
+    fs::write(&g.environment, data_dirs_line(xdg))?;
     println!(
         "wrote {}\nwrote {}\nwrote {} (GNOME Shell search: from the next login)",
         g.provider.display(),
@@ -532,9 +535,21 @@ mod tests {
         );
         assert!(!entry.contains("StartupWMClass"), "{entry}");
         assert!(!entry.contains("TryExec"), "{entry}");
-        // The Flatpak's goes from the menu with its launcher.
+    }
+
+    #[test]
+    fn the_flatpaks_search_entry_goes_from_the_menu_with_its_launcher() {
         let entry = search_entry("flatpak run a.b", Some("/x/exports/bin/a.b"));
         assert!(entry.ends_with("\nTryExec=/x/exports/bin/a.b\n"), "{entry}");
+    }
+
+    #[test]
+    fn our_data_dir_goes_after_the_systems() {
+        assert_eq!(
+            data_dirs_line("/h/.local/share/vinosearch/xdg"),
+            "XDG_DATA_DIRS=${XDG_DATA_DIRS:-/usr/local/share/:/usr/share/}\
+             :/h/.local/share/vinosearch/xdg\n"
+        );
     }
 
     #[test]

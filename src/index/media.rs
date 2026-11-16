@@ -1,7 +1,7 @@
-//! Audio and video files (#187): recorded when a check finds them, then
-//! embedded from `index_rest` once everything else is in, SLICE seconds at a
-//! time from the second the last slice ended, so a film interrupted halfway
-//! carries on from there (#192). Their sound in 10 s windows (quiet ones
+//! Audio and video files: recorded when a check finds them, then embedded
+//! from `index_rest` once everything else is in, SLICE seconds at a time from
+//! the second the last slice ended, so a film interrupted halfway carries on
+//! from there. Their sound in 10 s windows (quiet ones
 //! skipped), their picture a frame per shot. Nothing is read whole: the hash
 //! streams, and ffmpeg decodes through pipes.
 
@@ -158,11 +158,22 @@ pub fn start(
     Ok(Outcome::Embedded(0))
 }
 
+/// How many files `fit` moved.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Fitted {
+    pub left_out: usize,
+    pub taken_up: usize,
+}
+
+/// An mtime no file has: a file left out before it was hashed gets it when
+/// taken up, so `index_rest` indexes it afresh, hash and all.
+const NO_STAMP: i64 = -1;
+
 /// Hold the index to `max_seconds` of media per file after the setting
 /// changed: files now over it lose their chunks and wait, and files that
 /// waited and now fit are queued for `index_rest`. Nothing is probed or
-/// hashed for it. Returns (files left out, files taken up).
-pub fn fit(conn: &Connection, max_seconds: f64) -> Result<(usize, usize)> {
+/// hashed for it.
+pub fn fit(conn: &Connection, max_seconds: f64) -> Result<Fitted> {
     let tx = conn.unchecked_transaction()?;
     let over = "SELECT file_id FROM media WHERE too_long = 0 AND seconds > ?1";
     tx.execute(
@@ -188,20 +199,19 @@ pub fn fit(conn: &Connection, max_seconds: f64) -> Result<(usize, usize)> {
         .collect::<rusqlite::Result<_>>()?;
     for (id, path, seconds, hash) in &fits {
         tx.execute("UPDATE media SET too_long = 0 WHERE file_id = ?1", [id])?;
-        // A copy of one taken up before it shares that one's chunks.
-        if let Some(hash) = hash
-            && super::holder_of(&tx, hash, path)?.is_some()
-        {
+        let copy_of_one_taken_up = match hash {
+            Some(hash) => super::holder_of(&tx, hash, path)?.is_some(),
+            None => false,
+        };
+        if copy_of_one_taken_up {
             continue;
         }
         tx.execute(
             "INSERT OR IGNORE INTO partial (file_id, done, total, media) VALUES (?1, 0, ?2, 1)",
             params![id, seconds.ceil() as i64],
         )?;
-        // Left out before it was hashed: a stamp that can't match has
-        // `index_rest` index it afresh, hash and all, when its turn comes.
         if hash.is_none() {
-            tx.execute("UPDATE files SET mtime = -1 WHERE id = ?1", [id])?;
+            tx.execute("UPDATE files SET mtime = ?2 WHERE id = ?1", [*id, NO_STAMP])?;
         }
     }
     tx.commit()?;
@@ -212,14 +222,34 @@ pub fn fit(conn: &Connection, max_seconds: f64) -> Result<(usize, usize)> {
             fits.len()
         );
     }
-    Ok((out, fits.len()))
+    Ok(Fitted {
+        left_out: out,
+        taken_up: fits.len(),
+    })
+}
+
+/// The seconds of file `id` a call to `rest` embeds.
+struct SliceAt<'a> {
+    id: i64,
+    path: &'a Path,
+    from: u32,
+    end: u32,
+    probe: &'a Probe,
+}
+
+/// What a slice embedded: `(line, text)` chunks and their vectors.
+#[derive(Default)]
+struct Embedded {
+    chunks: Vec<(usize, String)>,
+    vectors: Vec<Vec<f32>>,
 }
 
 /// Embed seconds `from..from + SLICE` of file `id`, and move its partial
 /// row on. A track that won't decode is left out of the slice; when neither
-/// will, the file stops where it is. An error from the model ends the call
-/// with the file put behind the others waiting, so one file the model
-/// can't take doesn't hold up the rest.
+/// will, or the file has neither now (replaced since it was recorded, with
+/// the same stamp, by subtitles or data only), the file stops where it is.
+/// An error from the model ends the call (`put_back`), as one from `between`
+/// (a stop, a query's turn) does.
 pub fn rest<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -246,90 +276,27 @@ pub fn rest<E: Embed>(
             chunks: 0,
         })
     };
-    // The model's error on this file, which goes to the back of the queue.
-    let put_back = |conn: &Connection, why: anyhow::Error| -> anyhow::Error {
-        match conn.execute(
-            "UPDATE partial SET tries = tries + 1 WHERE file_id = ?1",
-            [id],
-        ) {
-            Ok(_) => why.context(format!("embedding {}", path.display())),
-            Err(e) => e.into(),
-        }
-    };
     let probe = match media::probe(path) {
         Ok(p) => p,
         Err(e) => return stopped(conn, e),
     };
-    let mut chunks = Vec::new();
-    let mut vectors = Vec::new();
-    // Each track's decoding error, if it had one. Errors from `between` (a
-    // stop, a query's turn) end the call instead, as the model's do.
+    let slice = SliceAt {
+        id,
+        path,
+        from,
+        end,
+        probe: &probe,
+    };
+    let mut out = Embedded::default();
     let mut failed = Vec::new();
     if probe.audio {
-        match media::audio(path, from, &probe) {
-            Err(e) => failed.push(e.context("sound")),
-            Ok(windows) => {
-                for w in windows {
-                    // Samples `log_mel` refuses (NaN in a float file) are a
-                    // track that won't decode, not the model failing.
-                    let w = match w.and_then(|w| Ok((crate::ml::audio::log_mel(&w.samples)?, w))) {
-                        Ok(w) => w,
-                        Err(e) => {
-                            failed.push(e.context("sound"));
-                            break;
-                        }
-                    };
-                    let (features, w) = w;
-                    if w.start >= end {
-                        break;
-                    }
-                    if w.quiet() {
-                        continue;
-                    }
-                    match emb.audio(&features) {
-                        Ok(v) => vectors.push(v),
-                        Err(e) => return Err(put_back(conn, e)),
-                    }
-                    chunks.push((w.start as usize, String::new()));
-                    between(conn, emb)?;
-                }
-            }
-        }
+        failed.extend(embed_sound(conn, emb, &slice, &mut out, between)?);
     }
     if probe.video {
-        match media::frames(path, from, &probe) {
-            Err(e) => failed.push(e.context("picture")),
-            Ok(frames) => {
-                for f in frames {
-                    let f = match f
-                        .and_then(|f| Ok((crate::ml::vision::prepare(&f.image)?, f.second)))
-                    {
-                        Ok(f) => f,
-                        Err(e) => {
-                            failed.push(e.context("picture"));
-                            break;
-                        }
-                    };
-                    let (pixels, second) = f;
-                    if second >= f64::from(end) {
-                        break;
-                    }
-                    match emb.image(&pixels) {
-                        Ok(v) => vectors.push(v),
-                        Err(e) => return Err(put_back(conn, e)),
-                    }
-                    // Up, so a seek to it lands in the shot, not the one
-                    // before a cut a fraction of a second earlier.
-                    chunks.push((FRAME_LINES + second.ceil() as usize, String::new()));
-                    between(conn, emb)?;
-                }
-            }
-        }
+        failed.extend(embed_picture(conn, emb, &slice, &mut out, between)?);
     }
     let tracks = usize::from(probe.audio) + usize::from(probe.video);
     if tracks == 0 {
-        // It had one when it was recorded: replaced since, with the same
-        // stamp, by something with subtitles or data only.
         return stopped(conn, anyhow!("no sound or picture"));
     }
     if failed.len() == tracks {
@@ -348,15 +315,98 @@ pub fn rest<E: Embed>(
         Kind::Media,
         end as usize,
         total,
-        &chunks,
-        &vectors,
+        &out.chunks,
+        &out.vectors,
     )?;
     Ok(Rest::Parts {
         path: key,
         done: end as usize,
         total,
-        chunks: chunks.len(),
+        chunks: out.chunks.len(),
     })
+}
+
+/// Embeds the slice's sound into `out`, quiet windows skipped: the track's
+/// decoding error if it has one. Samples `log_mel` refuses (NaN in a float
+/// file) are a track that won't decode, not the model failing.
+fn embed_sound<E: Embed>(
+    conn: &Connection,
+    emb: &mut E,
+    s: &SliceAt,
+    out: &mut Embedded,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Option<anyhow::Error>> {
+    let windows = match media::audio(s.path, s.from, s.probe) {
+        Ok(w) => w,
+        Err(e) => return Ok(Some(e.context("sound"))),
+    };
+    for w in windows {
+        let (features, w) = match w.and_then(|w| Ok((crate::ml::audio::log_mel(&w.samples)?, w))) {
+            Ok(w) => w,
+            Err(e) => return Ok(Some(e.context("sound"))),
+        };
+        if w.start >= s.end {
+            break;
+        }
+        if w.quiet() {
+            continue;
+        }
+        let v = emb.audio(&features).map_err(|e| put_back(conn, s, e))?;
+        out.vectors.push(v);
+        out.chunks.push((w.start as usize, String::new()));
+        between(conn, emb)?;
+    }
+    Ok(None)
+}
+
+/// Embeds the slice's frames into `out`: the track's decoding error if it
+/// has one.
+fn embed_picture<E: Embed>(
+    conn: &Connection,
+    emb: &mut E,
+    s: &SliceAt,
+    out: &mut Embedded,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Option<anyhow::Error>> {
+    let frames = match media::frames(s.path, s.from, s.probe) {
+        Ok(f) => f,
+        Err(e) => return Ok(Some(e.context("picture"))),
+    };
+    for f in frames {
+        let (pixels, second) =
+            match f.and_then(|f| Ok((crate::ml::vision::prepare(&f.image)?, f.second))) {
+                Ok(f) => f,
+                Err(e) => return Ok(Some(e.context("picture"))),
+            };
+        if second >= f64::from(s.end) {
+            break;
+        }
+        let v = emb.image(&pixels).map_err(|e| put_back(conn, s, e))?;
+        out.vectors.push(v);
+        out.chunks.push((frame_line(second), String::new()));
+        between(conn, emb)?;
+    }
+    Ok(None)
+}
+
+/// The line a frame at `second` is stored under: rounded up, so a seek to it
+/// lands in the shot, not the one before a cut a fraction of a second earlier
+/// (pinned by `tests::a_frame_between_seconds_is_stored_at_the_next_one`,
+/// `tests::a_frame_on_a_whole_second_is_stored_at_that_second`).
+fn frame_line(second: f64) -> usize {
+    FRAME_LINES + second.ceil() as usize
+}
+
+/// The model's error on the slice: the file goes behind the others waiting,
+/// so one file the model can't take doesn't hold up the rest.
+fn put_back(conn: &Connection, s: &SliceAt, why: anyhow::Error) -> anyhow::Error {
+    match conn.execute(
+        "UPDATE partial SET tries = tries + 1 WHERE file_id = ?1",
+        [s.id],
+    ) {
+        Ok(_) => why.context(format!("embedding {}", s.path.display())),
+        Err(e) => e.into(),
+    }
 }
 
 #[cfg(test)]
@@ -364,14 +414,17 @@ mod tests {
     use super::*;
     use anyhow::bail;
 
+    /// A sparse file of `len` zeros, taking no disk, named for `tag`.
+    fn sparse_zeros(tag: &str, len: u64) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("vinosearch-hash-{tag}-{}", std::process::id()));
+        std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+        path
+    }
+
     #[test]
-    fn hashing_a_big_file_lets_queries_in_and_stops_when_told() {
-        let path = std::env::temp_dir().join(format!("vinosearch-hash-{}", std::process::id()));
-        // Sparse: 40 MiB of zeros that take no disk.
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(40 << 20)
-            .unwrap();
+    fn hashing_a_big_file_lets_queries_in() {
+        let path = sparse_zeros("turns", 40 << 20);
         let mut turns = 0;
         let whole = hash(&path, &mut || {
             turns += 1;
@@ -379,14 +432,34 @@ mod tests {
         })
         .unwrap()
         .unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(turns, 2);
         let zeros = Sha256::digest(vec![0u8; 40 << 20]).to_vec();
         assert_eq!(whole, zeros);
+    }
 
+    #[test]
+    fn hashing_stops_when_told() {
+        let path = sparse_zeros("stop", 40 << 20);
         let stopped = hash(&path, &mut || bail!("stop"));
-        assert_eq!(stopped.unwrap_err().to_string(), "stop");
         std::fs::remove_file(&path).unwrap();
-        // Gone: unreadable, which is no error.
+        assert_eq!(stopped.unwrap_err().to_string(), "stop");
+    }
+
+    #[test]
+    fn hashing_a_gone_file_is_none_not_an_error() {
+        let path = sparse_zeros("gone", 0);
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(hash(&path, &mut || Ok(())).unwrap(), None);
+    }
+
+    #[test]
+    fn a_frame_between_seconds_is_stored_at_the_next_one() {
+        assert_eq!(frame_line(12.25), FRAME_LINES + 13);
+    }
+
+    #[test]
+    fn a_frame_on_a_whole_second_is_stored_at_that_second() {
+        assert_eq!(frame_line(12.0), FRAME_LINES + 12);
     }
 }

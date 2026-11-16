@@ -4,7 +4,7 @@
 //! The image is resized, keeping its aspect ratio, to the largest size with
 //! at most `PATCHES` 16x16 patches and sides that are multiples of 48 (a
 //! soft token pools 3x3 patches), then cut into patches and padded to
-//! `PATCHES`, which is the static vision encoder's input shape (#2).
+//! `PATCHES`, which is the static vision encoder's input shape.
 
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, imageops::FilterType};
@@ -57,12 +57,19 @@ fn target_size(height: u32, width: u32) -> Result<(u32, u32)> {
 
 /// HEIF containers: HEIC from iPhones (and some Android phones), AVIF. The
 /// `image` crate decodes neither, so they go through libheif's heif-convert
-/// when it is installed (#79). By extension, as `formats.images.extensions`
+/// when it is installed. By extension, as `formats.images.extensions`
 /// names them.
 pub const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
 /// heif-convert on a 12-megapixel photo takes about a second; a hang
 /// shouldn't hold indexing for long.
 const CONVERT_WALL: Duration = Duration::from_secs(60);
+/// What heif-convert names the first image of a file holding several (a
+/// burst), instead of `out.jpg`.
+const FIRST_OF_A_BURST: &str = "out-1.jpg";
+/// Catmull-Rom is bicubic with a = -0.5, which is what torchvision's
+/// antialiased bicubic resize uses; image's filter widens when shrinking, as
+/// antialiasing does.
+const ANTIALIASED_BICUBIC: FilterType = FilterType::CatmullRom;
 
 /// An image this build has no decoder for, told apart from a broken file so
 /// the indexer can count it and say what to install.
@@ -168,8 +175,7 @@ fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
         let mut cmd = std::process::Command::new(tool);
         cmd.arg("-q").arg("90").arg(&input).arg(&output);
         crate::proc::run(cmd, &[], CONVERT_WALL).context("heif-convert")?;
-        // A file holding several images (a burst) is written as out-1.jpg, ...
-        let first = dir.join("out-1.jpg");
+        let first = dir.join(FIRST_OF_A_BURST);
         let path = if output.is_file() { output } else { first };
         std::fs::read(&path).context("heif-convert wrote nothing")
     })();
@@ -186,6 +192,7 @@ pub fn load(bytes: &[u8]) -> Result<RgbImage> {
     decode(bytes)
 }
 
+/// Alpha is dropped, not composited, as the processor's convert("RGB") does.
 fn decode(bytes: &[u8]) -> Result<RgbImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
@@ -194,9 +201,8 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
     let mut decoder = reader
         .into_decoder()
         .context("not an image this build reads")?;
-    // Everything the steps below hold, judged from the header before decoding.
     let (w, h) = decoder.dimensions();
-    let needed = 2 * decoder.total_bytes() + u64::from(w) * u64::from(h) * 3;
+    let needed = bytes_to_decode(w, h, decoder.total_bytes());
     if needed > MAX_DECODED_BYTES {
         bail!(
             "{w}x{h} needs {} MB to decode, more than {}",
@@ -207,31 +213,36 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
     let orientation = decoder.orientation()?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
-    // Alpha is dropped, not composited, as the processor's convert("RGB") does.
     Ok(img.to_rgb8())
+}
+
+/// What decoding, orienting and converting to RGB hold, judged from the
+/// header (pinned by
+/// `tests::an_image_too_big_to_decode_is_refused_from_its_header`).
+fn bytes_to_decode(w: u32, h: u32, decoded: u64) -> u64 {
+    2 * decoded + u64::from(w) * u64::from(h) * 3
 }
 
 pub fn prepare(img: &RgbImage) -> Result<Pixels> {
     let (h, w) = target_size(img.height(), img.width())?;
-    // Catmull-Rom is bicubic with a = -0.5, which is what torchvision's
-    // antialiased bicubic resize uses; image's filter widens when shrinking,
-    // as antialiasing does.
     let resized;
     let img = if (h, w) == (img.height(), img.width()) {
         img
     } else {
-        resized = image::imageops::resize(img, w, h, FilterType::CatmullRom);
+        resized = image::imageops::resize(img, w, h, ANTIALIASED_BICUBIC);
         &resized
     };
     patchify(img)
 }
 
 /// Cut an image whose sides are multiples of 48 into patches, padded to `PATCHES`.
+/// It needs one whole soft token at least, so it has a row of features
+/// (pinned by `tests::a_grid_of_one_whole_soft_token_is_taken`,
+/// `tests::a_grid_without_a_whole_soft_token_is_refused`).
 fn patchify(img: &RgbImage) -> Result<Pixels> {
     let (h, w) = (img.height(), img.width());
     let (rows, cols) = (h as usize / PATCH, w as usize / PATCH);
     let n = rows * cols;
-    // At least one whole soft token, so the image has a row of features.
     if n > PATCHES || rows < POOL || cols < POOL {
         bail!("{w}x{h} is {rows}x{cols} patches, not 3x3 to {PATCHES}");
     }
@@ -273,9 +284,9 @@ mod tests {
         let parent = std::env::temp_dir().join(format!("vinosearch-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         std::fs::create_dir_all(&parent).unwrap();
-        // Every name the next few calls could pick, made beforehand.
         let pid = std::process::id();
-        for n in 0..200 {
+        let every_name_the_next_calls_could_pick = 0..200;
+        for n in every_name_the_next_calls_could_pick {
             let _ = std::fs::create_dir(parent.join(format!("{pid}-{n}")));
         }
         let before: Vec<_> = std::fs::read_dir(&parent)
@@ -294,9 +305,10 @@ mod tests {
         std::fs::remove_dir_all(&parent).unwrap();
     }
 
+    /// As `get_aspect_ratio_preserving_size(h, w, 16, 1260, 3)` in transformers
+    /// 5.20.1 gives them.
     #[test]
     fn sizes_match_the_processor() {
-        // get_aspect_ratio_preserving_size(h, w, 16, 1260, 3), transformers 5.20.1.
         for ((h, w), want) in [
             ((1956, 4096), (384, 816)),
             ((500, 580), (480, 576)),
@@ -319,20 +331,27 @@ mod tests {
 
     #[test]
     fn an_image_too_big_to_decode_is_refused_from_its_header() {
-        // A 40,000 x 40,000 24-bit BMP, 4.8 GB decoded: its header alone.
-        let (w, h) = (40_000i32, 40_000i32);
+        let bmp = bmp_header(40_000, 40_000);
+        let err = load(&bmp).unwrap_err().to_string();
+        assert!(err.contains("needs"), "{err}");
+    }
+
+    /// A 24-bit BMP's header alone; 40,000 x 40,000 is 4.8 GB decoded.
+    fn bmp_header(w: i32, h: i32) -> Vec<u8> {
+        const FILE_SIZE_UNCHECKED: u32 = 54;
+        const PIXEL_DATA_OFFSET: u32 = 54;
+        const BITMAPINFOHEADER: u32 = 40;
         let mut bmp = b"BM".to_vec();
-        bmp.extend(54u32.to_le_bytes()); // file size, not checked
+        bmp.extend(FILE_SIZE_UNCHECKED.to_le_bytes());
         bmp.extend([0; 4]);
-        bmp.extend(54u32.to_le_bytes()); // pixel data offset
-        bmp.extend(40u32.to_le_bytes()); // BITMAPINFOHEADER
+        bmp.extend(PIXEL_DATA_OFFSET.to_le_bytes());
+        bmp.extend(BITMAPINFOHEADER.to_le_bytes());
         bmp.extend(w.to_le_bytes());
         bmp.extend(h.to_le_bytes());
         bmp.extend(1u16.to_le_bytes());
         bmp.extend(24u16.to_le_bytes());
         bmp.extend([0; 24]);
-        let err = load(&bmp).unwrap_err().to_string();
-        assert!(err.contains("needs"), "{err}");
+        bmp
     }
 
     #[test]
@@ -368,23 +387,15 @@ mod tests {
         else {
             return;
         };
-        // Upright: 64x32, red on the left, blue on the right.
-        let upright = RgbImage::from_fn(64, 32, |x, _| {
+        let upright_red_left_blue_right = RgbImage::from_fn(64, 32, |x, _| {
             image::Rgb(if x < 32 { [255, 0, 0] } else { [0, 0, 255] })
         });
-        let stored = image::imageops::rotate270(&upright);
+        let stored = image::imageops::rotate270(&upright_red_left_blue_right);
         let mut jpeg = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
             .encode_image(&stored)
             .unwrap();
-        // APP1 after SOI: Exif, a little-endian TIFF header, one IFD entry,
-        // Orientation (0x0112) SHORT 6.
-        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0".to_vec();
-        exif.extend([0; 4]);
-        let mut app1 = vec![0xff, 0xe1];
-        app1.extend((exif.len() as u16 + 2).to_be_bytes());
-        app1.extend(exif);
-        jpeg.splice(2..2, app1);
+        jpeg.splice(2..2, exif_orientation_6_app1());
 
         let dir = std::env::temp_dir().join(format!("vinosearch-irot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -411,6 +422,22 @@ mod tests {
         assert!(right[2] > 200 && right[0] < 60, "right {right:?}");
     }
 
+    /// An APP1 segment to follow SOI: Exif, a little-endian TIFF header, one
+    /// IFD entry, Orientation (0x0112) SHORT 6.
+    fn exif_orientation_6_app1() -> Vec<u8> {
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0".to_vec();
+        exif.extend([0; 4]);
+        let mut app1 = vec![0xff, 0xe1];
+        app1.extend((exif.len() as u16 + 2).to_be_bytes());
+        app1.extend(exif);
+        app1
+    }
+
+    #[test]
+    fn a_grid_of_one_whole_soft_token_is_taken() {
+        assert_eq!(patchify(&RgbImage::new(48, 48)).unwrap().tokens, 1);
+    }
+
     #[test]
     fn a_grid_without_a_whole_soft_token_is_refused() {
         assert!(patchify(&RgbImage::new(480, 32)).is_err());
@@ -420,16 +447,17 @@ mod tests {
     fn patches_are_rows_then_columns_then_channels() {
         let img = RgbImage::from_fn(48 * 2, 48, |x, y| image::Rgb([x as u8, y as u8, 7]));
         let px = patchify(&img).unwrap();
-        // 6 columns by 3 rows of patches.
-        assert_eq!(px.tokens, 2);
-        let patch = 6 + 2; // row 1, column 2
+        assert_eq!(px.tokens, 2, "6 columns by 3 rows of patches");
+        let (columns, row, column) = (6, 1, 2);
+        let patch = row * columns + column;
         assert_eq!(&px.positions[patch * 2..patch * 2 + 2], &[2, 1]);
         let v = &px.values[patch * PATCH_DIM..];
-        // Pixel (x 32, y 16) first, then (x 33, y 16).
-        assert_eq!(v[0], 32.0 / 255.0);
-        assert_eq!(v[1], 16.0 / 255.0);
-        assert_eq!(v[2], 7.0 / 255.0);
-        assert_eq!(v[3], 33.0 / 255.0);
+        assert_eq!(
+            v[..3],
+            [32.0 / 255.0, 16.0 / 255.0, 7.0 / 255.0],
+            "pixel (32, 16)"
+        );
+        assert_eq!(v[3], 33.0 / 255.0, "then (33, 16)");
         assert_eq!(v[PATCH * 3 + 1], 17.0 / 255.0);
         assert_eq!(px.positions[18 * 2], -1);
         assert!(px.values[18 * PATCH_DIM..].iter().all(|&x| x == 0.0));

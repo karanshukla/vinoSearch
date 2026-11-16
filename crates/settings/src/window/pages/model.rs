@@ -62,6 +62,14 @@ impl SettingsWindow {
         });
     }
 
+    /// Only with no service at all: one that answers with an error may have
+    /// the models loaded, or be downloading them (pinned by
+    /// `window::ui_tests::without_the_service_the_models_are_deleted_from_disk` and
+    /// `window::ui_tests::a_service_that_answers_with_an_error_keeps_its_models`).
+    fn only_files_to_show(&self, status: Option<&Result<Status, String>>) -> bool {
+        matches!(status, Some(Err(why)) if why == NOT_INSTALLED) && self.models_dir.is_some()
+    }
+
     pub(in crate::window) fn model(
         &mut self,
         ui: &mut egui::Ui,
@@ -76,11 +84,7 @@ impl SettingsWindow {
             }
             None => None,
         };
-        // Only with no service at all: one that answers with an error may
-        // have the models loaded, or be downloading them.
-        let files =
-            matches!(&status, Some(Err(why)) if why == NOT_INSTALLED) && self.models_dir.is_some();
-        if s.is_none() && !files {
+        if s.is_none() && !self.only_files_to_show(status) {
             self.running(ui);
             return;
         }
@@ -125,7 +129,6 @@ impl SettingsWindow {
                     }
                     return;
                 }
-                // Whatever is on disk, a partial set included.
                 let deletable = s.model_bytes > 0 && !s.fetching;
                 if ui
                     .add_enabled(deletable, Button::secondary("Delete…"))
@@ -241,7 +244,7 @@ impl SettingsWindow {
                                     }
                                 }),
                         )
-                        // DragValue's own hover cursor is a horizontal resize arrow, which reads as a splitter here.
+                        // DragValue's resize-arrow cursor reads as a splitter here.
                         .on_hover_cursor(egui::CursorIcon::Text);
                     let response = named(response);
                     if response.changed() {

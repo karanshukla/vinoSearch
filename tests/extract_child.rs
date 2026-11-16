@@ -1,4 +1,4 @@
-//! `vinosearch extract`, the child the indexer runs for every document (#84),
+//! `vinosearch extract`, the child the indexer runs for every document,
 //! through the built binary.
 
 use std::io::Write;
@@ -38,7 +38,6 @@ fn chunks_come_back_as_json() {
 
 #[test]
 fn a_run_of_parts_comes_back_with_the_count() {
-    // 1,000 rows of ~600 bytes: a chunk each, so 1,000 chunks and 334 parts.
     let mut csv = String::from("n,text\n");
     for i in 0..1000 {
         csv.push_str(&format!("{i},{}\n", "w".repeat(600 + i % 7)));
@@ -54,7 +53,11 @@ fn a_run_of_parts_comes_back_with_the_count() {
     );
     let out: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let chunks = out["chunks"].as_array().unwrap();
-    assert!(out["parts"].as_u64().unwrap() > 300, "{}", out["parts"]);
+    assert!(
+        out["parts"].as_u64().unwrap() > 300,
+        "1,000 rows of ~600 bytes are a chunk each, 1,000 chunks in 334 parts: {}",
+        out["parts"]
+    );
     assert!(!chunks.is_empty() && chunks.len() <= 90, "{}", chunks.len());
 }
 
@@ -72,9 +75,8 @@ fn a_broken_document_is_an_error_on_stderr() {
 
 #[test]
 fn a_document_over_the_size_cap_is_refused() {
-    // Larger than the indexer would ever send (MAX_DOCUMENT_BYTES).
-    let big = vec![b'a'; (32 << 20) + 1];
-    let out = extract("/x/a.csv", &big);
+    let over_max_document_bytes = vec![b'a'; (32 << 20) + 1];
+    let out = extract("/x/a.csv", &over_max_document_bytes);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("bytes"));
 }

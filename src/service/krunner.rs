@@ -278,7 +278,6 @@ fn to_match(h: Hit, floors: Floors, play: Option<&Play>) -> Match {
     let mut props = HashMap::new();
     props.insert("subtext".into(), owned(Variant::from(subtext)));
     props.insert("urls".into(), owned(Variant::from(vec![file_url(&h.path)])));
-    // Named so each group reads as ours among KRunner's.
     let category = match h.kind {
         Kind::Document if read_in_an_image(&h) => "vinoSearch Images",
         Kind::Text => "vinoSearch Text",
@@ -430,7 +429,6 @@ fn file_text(db: &Db, id: &str) -> Result<String> {
         Some(Kind::Document) => {
             crate::extract::text(path).with_context(|| format!("extracting {id}"))
         }
-        // The record; the summary is a model's account of it.
         Some(Kind::Session) => session::load(path)
             .and_then(|b| session::text(&b, Part::Transcript))
             .with_context(|| format!("reading {id}")),
@@ -941,7 +939,6 @@ impl Control {
         out.insert(key::SEAL_WAITING.into(), owned(Variant::from(enc.waiting)));
         out.insert(
             key::NEW_SEAL.into(),
-            // Here rather than at start, which it would slow.
             owned(Variant::from(
                 crate::index::seal::Sealer::default()
                     .new_seal(st.tpm.load(Ordering::Relaxed))
@@ -1047,8 +1044,8 @@ impl Control {
                     let play = recording(&self.db, &h);
                     let mut found = crate::search::results::found(h)?;
                     if let Some((_, second)) = play {
-                        found.4 = "second".to_owned();
-                        found.5 = second;
+                        found.unit = "second".to_owned();
+                        found.at = second;
                     }
                     Some(found)
                 })
@@ -1270,8 +1267,8 @@ pub fn serve(opts: Options) -> Result<()> {
         counted: Mutex::new(None),
     };
     let config = opts.config.clone();
-    // The connection is driven by the thread that blocks on it, so that is
-    // this one; the worker reports back through a channel the future awaits.
+    // The thread that blocks on the connection drives it, so the worker
+    // runs on another.
     let (done, finished) = oneshot::channel();
     std::thread::spawn(move || {
         let _ = done.send(worker::run(rx, opts));

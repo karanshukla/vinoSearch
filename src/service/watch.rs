@@ -35,6 +35,8 @@ const ROOTS_EVERY: Duration = Duration::from_secs(30);
 const CATCH_UP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// Wall time running this far ahead of monotonic time means the machine slept.
 const SLEPT: Duration = Duration::from_secs(60);
+/// How long to wait for an event before looking at the timers.
+const POLL: Duration = Duration::from_millis(500);
 
 struct State {
     watcher: RecommendedWatcher,
@@ -43,6 +45,8 @@ struct State {
     /// Directories with a watch. Dropped when the directory is removed or
     /// renamed away, so one recreated at the same path is watched again.
     watched: HashSet<PathBuf>,
+    /// A watch was refused, most likely for want of inotify watches
+    /// (fs.inotify.max_user_watches): warned once, retried at the next catch-up.
     warned_limit: bool,
     excludes: Excludes,
     types: FileTypes,
@@ -62,19 +66,18 @@ impl State {
                 Ok(()) => {
                     self.watched.insert(entry.into_path());
                 }
-                Err(e) => {
-                    // ENOSPC: out of inotify watches (fs.inotify.max_user_watches).
-                    if !self.warned_limit {
-                        eprintln!("watch {}: {e}", entry.path().display());
-                        self.warned_limit = true;
-                    }
+                Err(e) if !self.warned_limit => {
+                    eprintln!("watch {}: {e}", entry.path().display());
+                    self.warned_limit = true;
                 }
+                Err(_) => {}
             }
         }
     }
 
     /// Drop the watches on `dir` and everything under it that `keep` rejects.
-    /// Returns how many were dropped.
+    /// Returns how many were dropped. The kernel already dropped those on
+    /// deleted directories, so unwatching them fails harmlessly.
     fn unwatch_tree(&mut self, dir: &Path, keep: impl Fn(&Self, &Path) -> bool) -> usize {
         let drop: Vec<PathBuf> = self
             .watched
@@ -83,11 +86,22 @@ impl State {
             .cloned()
             .collect();
         for d in &drop {
-            // Fails for directories already deleted; the kernel dropped those.
             let _ = self.watcher.unwatch(d);
             self.watched.remove(d);
         }
         drop.len()
+    }
+
+    /// Watch directories `old` excluded that are excluded no longer.
+    fn watch_unexcluded(&mut self, old: &Excludes) {
+        for dir in old.paths() {
+            if !self.excludes.contains(dir)
+                && index::is_real_dir(dir)
+                && self.root_of(dir).is_some()
+            {
+                self.watch_tree(dir);
+            }
+        }
     }
 
     /// Follow roots added since the last look, and drop forgotten ones with
@@ -106,20 +120,24 @@ impl State {
         }
         for root in roots {
             if !self.roots.contains(&root) && root.is_dir() && !self.excludes.contains(&root) {
-                let before = self.watched.len();
-                self.watch_tree(&root);
-                eprintln!(
-                    "watching {} ({} directories)",
-                    root.display(),
-                    self.watched.len() - before
-                );
-                // Catch up on what changed while nothing was watching (before
-                // login, or with the runner stopped). Watches are already in
-                // place, so nothing falls between this scan and them.
-                self.check(conn, jobs, &root);
-                self.roots.push(root);
+                self.follow(conn, jobs, root);
             }
         }
+    }
+
+    /// Watch a new root, then catch up on what changed while nothing watched
+    /// it (before login, or with the runner stopped). The watches go in
+    /// first, so no change falls between the check and them.
+    fn follow(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: PathBuf) {
+        let before = self.watched.len();
+        self.watch_tree(&root);
+        eprintln!(
+            "watching {} ({} directories)",
+            root.display(),
+            self.watched.len() - before
+        );
+        self.check(conn, jobs, &root);
+        self.roots.push(root);
     }
 
     /// Put whatever under `root` differs from the index to the worker.
@@ -155,8 +173,8 @@ impl State {
     }
 
     /// The innermost root holding `path`: a root can sit in a hidden folder
-    /// under another (vinoWhisper's sessions, #143), which the outer one's
-    /// rules would skip.
+    /// under another (vinoWhisper's sessions), which the outer one's rules
+    /// would skip (pinned by `tests::a_path_belongs_to_its_innermost_root`).
     fn root_of(&self, path: &Path) -> Option<&Path> {
         self.roots
             .iter()
@@ -166,7 +184,10 @@ impl State {
     }
 }
 
-/// Whether a change to `path` could alter the index.
+/// Whether a change to `path` could alter the index. A path that is gone
+/// counts whatever its name: it may have been an indexed file or directory
+/// (pinned by `tests::a_path_that_is_gone_is_relevant_whatever_its_type`
+/// and `tests::an_existing_file_of_an_unindexed_type_is_not_relevant`).
 fn relevant(root: &Path, path: &Path, ex: &Excludes, types: &FileTypes) -> bool {
     if ex.contains(path) || index::skipped_under(root, path) {
         return false;
@@ -178,17 +199,16 @@ fn relevant(root: &Path, path: &Path, ex: &Excludes, types: &FileTypes) -> bool 
             .unwrap_or_default();
         return !index::skipped_dir(&name);
     }
-    // Gone paths may have been indexed files or directories; removal sorts it out.
     !path.exists() || index::wanted(path, types)
 }
 
-/// Paths an event says are no longer there: removed, or renamed away.
+/// Paths an event says are no longer there: removed, or renamed away. A
+/// rename with both names lists them as [from, to].
 fn gone(event: &Event) -> &[PathBuf] {
     match event.kind {
         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
             &event.paths
         }
-        // [from, to]
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
             &event.paths[..event.paths.len().min(1)]
         }
@@ -196,6 +216,8 @@ fn gone(event: &Event) -> &[PathBuf] {
     }
 }
 
+/// Whether an event can change what is indexed (pinned by
+/// `tests::chmod_and_access_are_not_interesting`).
 fn interesting(kind: &EventKind) -> bool {
     match kind {
         EventKind::Create(_) | EventKind::Remove(_) => true,
@@ -229,10 +251,205 @@ impl Clock {
         slept
     }
 
-    /// How much further wall time moved than monotonic time since `before`.
+    /// How much further wall time moved than monotonic time since `before`
+    /// (pinned by `tests::a_wall_clock_stepped_back_is_not_sleep`).
     fn ahead_of(&self, before: &Clock) -> Duration {
         let wall = self.wall.duration_since(before.wall).unwrap_or_default();
         wall.saturating_sub(self.mono - before.mono)
+    }
+}
+
+/// The worker hung up: the service is stopping.
+struct WorkerGone;
+
+/// The watch thread: `State` plus the config, the timers and what is waiting.
+struct Watch {
+    st: State,
+    jobs: mpsc::Sender<Job>,
+    config: PathBuf,
+    /// What `config` held when last applied.
+    file: Config,
+    status: Arc<Status>,
+    /// Closed and opened again under it when encryption changes.
+    db: Arc<crate::index::encryption::Live>,
+    pending: HashSet<PathBuf>,
+    last_event: Instant,
+    last_roots: Instant,
+    last_check: Instant,
+    clock: Clock,
+    /// Why the next catch-up is due, once indexing allows it.
+    due: Option<&'static str>,
+}
+
+impl Watch {
+    /// Follow the roots already indexed, then start the timers.
+    fn start(
+        mut st: State,
+        jobs: mpsc::Sender<Job>,
+        config: PathBuf,
+        file: Config,
+        status: Arc<Status>,
+        db: Arc<crate::index::encryption::Live>,
+    ) -> Watch {
+        if let Ok(conn) = db.lock() {
+            st.sync_roots(&conn, &jobs);
+        }
+        status.last_checked.store(unix_now(), Ordering::Relaxed);
+        Watch {
+            st,
+            jobs,
+            config,
+            file,
+            status,
+            db,
+            pending: HashSet::new(),
+            last_event: Instant::now(),
+            last_roots: Instant::now(),
+            last_check: Instant::now(),
+            clock: Clock::now(),
+            due: None,
+        }
+    }
+
+    fn run(mut self, events: mpsc::Receiver<notify::Result<Event>>) {
+        loop {
+            match events.recv_timeout(POLL) {
+                Ok(Ok(event)) => self.on_event(event),
+                Ok(Err(e)) => eprintln!("watch: {e}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            if self.tick().is_err() {
+                return;
+            }
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), WorkerGone> {
+        self.flush_settled()?;
+        if self.last_roots.elapsed() >= ROOTS_EVERY
+            || self.status.reload_config.swap(false, Ordering::Relaxed)
+        {
+            self.reload_config()?;
+            self.resync_roots();
+            self.last_roots = Instant::now();
+        }
+        self.note_due_checks();
+        self.catch_up_once_settled();
+        Ok(())
+    }
+
+    fn wake(&self) -> Result<(), WorkerGone> {
+        self.jobs.send(Job::Wake).map_err(|_| WorkerGone)
+    }
+
+    fn on_event(&mut self, event: Event) {
+        if event.need_rescan() {
+            self.due.get_or_insert("events were dropped");
+            self.last_event = Instant::now();
+        } else if interesting(&event.kind) {
+            self.on_change(event);
+        }
+    }
+
+    /// Watches under paths that went are dropped before any are added, so a
+    /// rename's destination is watched again.
+    fn on_change(&mut self, event: Event) {
+        for path in gone(&event) {
+            self.st.unwatch_tree(path, |_, _| false);
+        }
+        let may_add_dirs = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+        for path in event.paths {
+            let Some(root) = self.st.root_of(&path).map(Path::to_path_buf) else {
+                continue;
+            };
+            if !relevant(&root, &path, &self.st.excludes, &self.st.types) {
+                continue;
+            }
+            if index::is_real_dir(&path) && may_add_dirs {
+                self.st.watch_tree(&path);
+            }
+            self.pending.insert(path);
+            self.last_event = Instant::now();
+        }
+    }
+
+    fn flush_settled(&mut self) -> Result<(), WorkerGone> {
+        if self.pending.is_empty() || self.last_event.elapsed() < DEBOUNCE {
+            return Ok(());
+        }
+        self.status.work.changed(self.pending.drain());
+        self.wake()
+    }
+
+    /// A config that fails to parse, or has a bad exclusion or file type,
+    /// changes nothing: better the last good exclusions than index what a
+    /// typo un-excluded. The file types also follow what is installed (media
+    /// once ffmpeg is there), so they can change with the file as it was.
+    fn reload_config(&mut self) -> Result<(), WorkerGone> {
+        let loaded = Config::load(&self.config)
+            .and_then(|c| Ok((c.excludes()?, FileTypes::new(&c.formats)?, c)));
+        let (ex, types, c) = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("reading config: {e:#}");
+                return Ok(());
+            }
+        };
+        if c == self.file && types == self.st.types {
+            return Ok(());
+        }
+        if c != self.file {
+            eprintln!("{}: changed", self.config.display());
+        }
+        let old = std::mem::replace(&mut self.st.excludes, ex);
+        self.st.watch_unexcluded(&old);
+        if types != self.st.types {
+            self.st.types = types;
+            self.due.get_or_insert("file types changed");
+        }
+        self.file = c.clone();
+        self.status.pending.config(c);
+        self.wake()
+    }
+
+    fn resync_roots(&mut self) {
+        match self.db.lock() {
+            Ok(conn) => self.st.sync_roots(&conn, &self.jobs),
+            Err(e) => eprintln!("watch: {e:#}"),
+        }
+    }
+
+    fn note_due_checks(&mut self) {
+        if self.clock.slept() {
+            self.due.get_or_insert("woke from sleep");
+        }
+        if self.last_check.elapsed() >= CATCH_UP_EVERY {
+            self.due.get_or_insert("hourly");
+        }
+        if self.status.check_now.swap(false, Ordering::Relaxed) {
+            self.due.get_or_insert("asked to");
+        }
+    }
+
+    /// Only after a burst settles, and not while indexing: the walk would
+    /// find what the worker hasn't reached yet, for nothing.
+    fn catch_up_once_settled(&mut self) {
+        let Some(why) = self.due else {
+            return;
+        };
+        if self.last_event.elapsed() < DEBOUNCE || self.status.indexing() {
+            return;
+        }
+        match self.db.lock() {
+            Ok(conn) => self.st.catch_up(&conn, &self.jobs, why),
+            Err(e) => eprintln!("watch: {e:#}"),
+        }
+        self.status
+            .last_checked
+            .store(unix_now(), Ordering::Relaxed);
+        self.last_check = Instant::now();
+        self.due = None;
     }
 }
 
@@ -242,199 +459,121 @@ impl Clock {
 pub fn spawn(
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
-    mut file: Config,
+    file: Config,
     status: Arc<Status>,
 ) -> Result<std::thread::JoinHandle<()>> {
     let excludes = file.excludes()?;
     let types = FileTypes::new(&file.formats)?;
-    // Closed and opened again under it when encryption changes (#4).
     let db = crate::index::encryption::Live::open(&index::default_db()?)?;
     let (tx, events) = mpsc::channel();
     let watcher = notify::recommended_watcher(tx)?;
+    let st = State {
+        watcher,
+        status: status.clone(),
+        roots: Vec::new(),
+        watched: HashSet::new(),
+        warned_limit: false,
+        excludes,
+        types,
+    };
     Ok(std::thread::spawn(move || {
-        let mut st = State {
-            watcher,
-            status: status.clone(),
-            roots: Vec::new(),
-            watched: HashSet::new(),
-            warned_limit: false,
-            excludes,
-            types,
-        };
-        if let Ok(conn) = db.lock() {
-            st.sync_roots(&conn, &jobs);
-        }
-        status.last_checked.store(unix_now(), Ordering::Relaxed);
-        let mut pending: HashSet<PathBuf> = HashSet::new();
-        let mut last_event = Instant::now();
-        let mut last_roots = Instant::now();
-        let mut last_check = Instant::now();
-        let mut clock = Clock::now();
-        // Why the next check is due, once indexing allows it.
-        let mut due: Option<&str> = None;
-        loop {
-            match events.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ok(event)) if event.need_rescan() => {
-                    // The kernel's queue overflowed: some changes were dropped.
-                    due.get_or_insert("events were dropped");
-                    last_event = Instant::now();
-                }
-                Ok(Ok(event)) if interesting(&event.kind) => {
-                    // Before anything below re-adds the destination of a rename.
-                    for path in gone(&event) {
-                        st.unwatch_tree(path, |_, _| false);
-                    }
-                    for path in event.paths {
-                        let Some(root) = st.root_of(&path).map(Path::to_path_buf) else {
-                            continue;
-                        };
-                        if !relevant(&root, &path, &st.excludes, &st.types) {
-                            continue;
-                        }
-                        if index::is_real_dir(&path)
-                            && matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
-                        {
-                            st.watch_tree(&path);
-                        }
-                        pending.insert(path);
-                        last_event = Instant::now();
-                    }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!("watch: {e}"),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if !pending.is_empty() && last_event.elapsed() >= DEBOUNCE {
-                status.work.changed(pending.drain());
-                if jobs.send(Job::Wake).is_err() {
-                    break;
-                }
-            }
-            if last_roots.elapsed() >= ROOTS_EVERY
-                || status.reload_config.swap(false, Ordering::Relaxed)
-            {
-                // A file that fails to parse, or has a bad exclusion or file
-                // type, changes nothing: better the last good exclusions than
-                // index what a typo un-excluded.
-                match Config::load(&config)
-                    .and_then(|c| Ok((c.excludes()?, FileTypes::new(&c.formats)?, c)))
-                {
-                    // The types also follow what is installed: media starts
-                    // once ffmpeg is there, with the file as it was.
-                    Ok((ex, types, c)) if c != file || types != st.types => {
-                        if c != file {
-                            eprintln!("{}: changed", config.display());
-                        }
-                        let old = std::mem::replace(&mut st.excludes, ex);
-                        // Directories no longer excluded need watches now.
-                        for dir in old.paths() {
-                            if !st.excludes.contains(dir)
-                                && index::is_real_dir(dir)
-                                && st.root_of(dir).is_some()
-                            {
-                                st.watch_tree(dir);
-                            }
-                        }
-                        // A type turned on: what of it is already there.
-                        if types != st.types {
-                            st.types = types;
-                            due.get_or_insert("file types changed");
-                        }
-                        file = c.clone();
-                        status.pending.config(c);
-                        if jobs.send(Job::Wake).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("reading config: {e:#}"),
-                }
-                match db.lock() {
-                    Ok(conn) => st.sync_roots(&conn, &jobs),
-                    Err(e) => eprintln!("watch: {e:#}"),
-                }
-                last_roots = Instant::now();
-            }
-            if clock.slept() {
-                due.get_or_insert("woke from sleep");
-            }
-            if last_check.elapsed() >= CATCH_UP_EVERY {
-                due.get_or_insert("hourly");
-            }
-            if status.check_now.swap(false, Ordering::Relaxed) {
-                due.get_or_insert("asked to");
-            }
-            // After a burst settles, and not while indexing: the walk would
-            // find what the worker hasn't reached yet, for nothing.
-            if let Some(why) = due
-                && last_event.elapsed() >= DEBOUNCE
-                && !status.indexing()
-            {
-                match db.lock() {
-                    Ok(conn) => st.catch_up(&conn, &jobs, why),
-                    Err(e) => eprintln!("watch: {e:#}"),
-                }
-                status.last_checked.store(unix_now(), Ordering::Relaxed);
-                last_check = Instant::now();
-                due = None;
-            }
-        }
+        Watch::start(st, jobs, config, file, status, db).run(events)
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, CreateKind, MetadataKind, RemoveKind};
+
+    fn clock_after(before: &Clock, mono: Duration, wall: SystemTime) -> Clock {
+        Clock {
+            mono: before.mono + mono,
+            wall,
+        }
+    }
 
     #[test]
     fn a_wall_clock_jump_reads_as_sleep() {
         let before = Clock::now();
-        let awake = Clock {
-            mono: before.mono + Duration::from_secs(5),
-            wall: before.wall + Duration::from_secs(5),
-        };
+        let five = Duration::from_secs(5);
+        let awake = clock_after(&before, five, before.wall + five);
         assert!(awake.ahead_of(&before) <= SLEPT);
-        let resumed = Clock {
-            mono: before.mono + Duration::from_secs(5),
-            wall: before.wall + Duration::from_secs(8 * 3600),
-        };
+        let resumed = clock_after(&before, five, before.wall + Duration::from_secs(8 * 3600));
         assert!(resumed.ahead_of(&before) > SLEPT);
-        // A clock stepped back is not sleep.
-        let stepped_back = Clock {
-            mono: before.mono + Duration::from_secs(5),
-            wall: before.wall - Duration::from_secs(3600),
-        };
+    }
+
+    #[test]
+    fn a_wall_clock_stepped_back_is_not_sleep() {
+        let before = Clock::now();
+        let wall = before.wall - Duration::from_secs(3600);
+        let stepped_back = clock_after(&before, Duration::from_secs(5), wall);
         assert_eq!(stepped_back.ahead_of(&before), Duration::ZERO);
+    }
+
+    /// A root with `src`, `target`, `.git` and an excluded `private`, in a
+    /// temp dir of its own, removed on drop.
+    struct Tree {
+        dir: PathBuf,
+        root: PathBuf,
+        ex: Excludes,
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Tree {
+            let dir = std::env::temp_dir()
+                .join(format!("vinosearch-watch-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for d in ["root/src", "root/target", "root/.git", "root/private"] {
+                std::fs::create_dir_all(dir.join(d)).unwrap();
+            }
+            let root = std::fs::canonicalize(dir.join("root")).unwrap();
+            let config: Config =
+                toml::from_str(&format!("exclude = [{:?}]", root.join("private"))).unwrap();
+            let ex = config.excludes().unwrap();
+            Tree { dir, root, ex }
+        }
+
+        fn relevant(&self, p: &str) -> bool {
+            relevant(
+                &self.root,
+                &self.root.join(p),
+                &self.ex,
+                &FileTypes::default(),
+            )
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
     fn relevant_follows_the_indexing_rules() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-watch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for d in ["root/src", "root/target", "root/.git", "root/private"] {
-            std::fs::create_dir_all(dir.join(d)).unwrap();
-        }
-        let root = std::fs::canonicalize(dir.join("root")).unwrap();
-        let config: Config =
-            toml::from_str(&format!("exclude = [{:?}]", root.join("private"))).unwrap();
-        let ex = config.excludes().unwrap();
-        let types = FileTypes::default();
-        let yes = |p: &str| relevant(&root, &root.join(p), &ex, &types);
+        let tree = Tree::new("rules");
+        assert!(tree.relevant("notes.md"));
+        assert!(tree.relevant("src"));
+        assert!(!tree.relevant("target"));
+        assert!(!tree.relevant(".git"));
+        assert!(!tree.relevant("target/debug/out.rs"));
+        assert!(!tree.relevant(".git/HEAD"));
+        assert!(!tree.relevant("private"));
+        assert!(!tree.relevant("private/diary.md"));
+    }
 
-        assert!(yes("notes.md"));
-        assert!(yes("src"));
-        // Gone: it may have been indexed, so removal sorts it out.
-        assert!(yes("gone.xcf"));
-        std::fs::write(root.join("photo.xcf"), b"").unwrap();
-        assert!(!yes("photo.xcf"));
-        assert!(!yes("target"));
-        assert!(!yes(".git"));
-        assert!(!yes("target/debug/out.rs"));
-        assert!(!yes(".git/HEAD"));
-        assert!(!yes("private"));
-        assert!(!yes("private/diary.md"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    #[test]
+    fn a_path_that_is_gone_is_relevant_whatever_its_type() {
+        let tree = Tree::new("gone");
+        assert!(tree.relevant("gone.xcf"));
+    }
+
+    #[test]
+    fn an_existing_file_of_an_unindexed_type_is_not_relevant() {
+        let tree = Tree::new("unindexed");
+        std::fs::write(tree.root.join("photo.xcf"), b"").unwrap();
+        assert!(!tree.relevant("photo.xcf"));
     }
 
     #[test]
@@ -466,40 +605,50 @@ mod tests {
         assert_eq!(st.root_of(Path::new("/elsewhere")), None);
     }
 
-    #[test]
-    fn gone_and_interesting_read_the_event_kind() {
-        use notify::event::{CreateKind, MetadataKind, RemoveKind};
-        let event = |kind, paths: &[&str]| Event {
+    fn event(kind: EventKind, paths: &[&str]) -> Event {
+        Event {
             kind,
             paths: paths.iter().map(PathBuf::from).collect(),
             attrs: Default::default(),
-        };
-        let rename = |mode| EventKind::Modify(ModifyKind::Name(mode));
+        }
+    }
 
+    fn rename(mode: RenameMode) -> EventKind {
+        EventKind::Modify(ModifyKind::Name(mode))
+    }
+
+    #[test]
+    fn gone_reads_the_event_kind() {
         let removed = event(EventKind::Remove(RemoveKind::File), &["/a"]);
         assert_eq!(gone(&removed), [PathBuf::from("/a")]);
         assert_eq!(
             gone(&event(rename(RenameMode::From), &["/a"])),
             [PathBuf::from("/a")]
         );
-        // [from, to]: only the old name went.
         let both = event(rename(RenameMode::Both), &["/a", "/b"]);
-        assert_eq!(gone(&both), [PathBuf::from("/a")]);
+        assert_eq!(
+            gone(&both),
+            [PathBuf::from("/a")],
+            "a rename lists [from, to]: only the old name went"
+        );
         assert!(gone(&event(rename(RenameMode::Both), &[])).is_empty());
         assert!(gone(&event(rename(RenameMode::To), &["/b"])).is_empty());
         assert!(gone(&event(EventKind::Create(CreateKind::File), &["/c"])).is_empty());
+    }
 
+    #[test]
+    fn creates_removes_and_modifications_are_interesting() {
         assert!(interesting(&EventKind::Create(CreateKind::File)));
         assert!(interesting(&EventKind::Remove(RemoveKind::Any)));
         assert!(interesting(&rename(RenameMode::Both)));
         assert!(interesting(&EventKind::Modify(ModifyKind::Any)));
-        // chmod and atime don't change what is indexed.
-        assert!(!interesting(&EventKind::Modify(ModifyKind::Metadata(
-            MetadataKind::Permissions
-        ))));
-        assert!(!interesting(&EventKind::Access(
-            notify::event::AccessKind::Any
-        )));
+    }
+
+    #[test]
+    fn chmod_and_access_are_not_interesting() {
+        let chmod = ModifyKind::Metadata(MetadataKind::Permissions);
+        assert!(!interesting(&EventKind::Modify(chmod)));
+        assert!(!interesting(&EventKind::Access(AccessKind::Any)));
         assert!(!interesting(&EventKind::Other));
     }
 }

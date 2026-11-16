@@ -25,6 +25,8 @@ pub fn bytes(base: &Path) -> u64 {
     ALL.iter().map(|name| tree_bytes(&base.join(name))).sum()
 }
 
+/// Links aren't followed: one out of the tree isn't ours to count (pinned by
+/// `tests::a_link_out_of_the_tree_is_not_counted`).
 fn tree_bytes(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
@@ -32,7 +34,6 @@ fn tree_bytes(path: &Path) -> u64 {
     entries
         .flatten()
         .map(|e| match e.file_type() {
-            // Not followed: a link out of the tree isn't ours to count.
             Ok(t) if t.is_dir() => tree_bytes(&e.path()),
             Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
             _ => 0,
@@ -41,7 +42,8 @@ fn tree_bytes(path: &Path) -> u64 {
 }
 
 /// Remove the models' directories under `base`, and `base` itself if that
-/// leaves it empty. The caller makes sure nothing has them loaded.
+/// leaves it empty. The caller makes sure nothing has them loaded (pinned by
+/// `tests::delete_removes_the_models_and_keeps_anything_else`).
 pub fn delete(base: &Path) -> Result<()> {
     for name in ALL {
         let dir = base.join(name);
@@ -51,7 +53,6 @@ pub fn delete(base: &Path) -> Result<()> {
             Err(e) => return Err(e).with_context(|| dir.display().to_string()),
         }
     }
-    // Fails while anything else is in it, which is then kept.
     let _ = fs::remove_dir(base);
     Ok(())
 }
@@ -75,10 +76,21 @@ mod tests {
         assert!(ALL.iter().all(|n| !base.join(n).exists()));
         assert!(base.join("notes.txt").is_file());
         fs::remove_file(base.join("notes.txt")).unwrap();
-        // Nothing left: the directory goes too, and a second delete is fine.
         delete(&base).unwrap();
-        assert!(!base.exists());
-        delete(&base).unwrap();
+        assert!(!base.exists(), "nothing left, so the directory goes too");
+        delete(&base).expect("a second delete is fine");
+    }
+
+    #[test]
+    fn a_link_out_of_the_tree_is_not_counted() {
+        let base = std::env::temp_dir().join(format!("vs-models-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(TEXT)).unwrap();
+        fs::write(base.join(TEXT).join("m.onnx"), vec![0u8; 5]).unwrap();
+        fs::write(base.join("outside.bin"), vec![0u8; 50]).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.bin"), base.join(TEXT).join("link")).unwrap();
+        assert_eq!(bytes(&base), 5);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

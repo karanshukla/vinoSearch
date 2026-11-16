@@ -1,4 +1,4 @@
-//! The index key (#4), sealed with `systemd-creds`, so there is no TPM code of
+//! The index key, sealed with `systemd-creds`, so there is no TPM code of
 //! our own; where that isn't usable (no systemd, or one older than 256), kept
 //! in the desktop keyring instead (keyring.rs). Which one sealed a key is in
 //! `index.key` itself, so it is always unsealed the same way.
@@ -83,7 +83,10 @@ fn system_tool(name: &str) -> Option<Tool> {
 }
 
 /// The host's `name`, looked for under `root`, where the sandbox sees the
-/// host's /usr and /bin. NixOS's /run isn't shared, so there it is assumed.
+/// host's /usr and /bin (pinned by
+/// `tests::host_tools_are_found_under_the_hosts_root_owned_dirs`). NixOS's /run
+/// isn't shared, so there it is assumed (pinned by
+/// `tests::on_a_nixos_host_its_run_tools_are_taken_on_trust`).
 fn host_tool(root: &Path, name: &str) -> Option<PathBuf> {
     SYSTEM_BIN_DIRS
         .iter()
@@ -94,6 +97,7 @@ fn host_tool(root: &Path, name: &str) -> Option<PathBuf> {
             Err(_) => false,
         })
 }
+
 /// Sealed into the credential: one sealed under another name doesn't unseal
 /// as this one.
 const NAME: &str = "vinosearch-index";
@@ -204,7 +208,7 @@ impl Seal {
 const BY_HOST_SCOPED: [u8; 16] = id("55b9ed1d38594d43a8319d2ebb332ac6");
 const BY_HOST_AND_TPM2_SCOPED: [u8; 16] = id("ef4ac13679a9480ea7db68897f9f165d");
 const BY_HOST_AND_TPM2_PK_SCOPED: [u8; 16] = id("adbc4ca3efb64201ba881b6f2e4095ea");
-// systemd 262 pins TPM credentials to the TPM's SRK, under new ids.
+/// systemd 262's ids for TPM credentials pinned to the TPM's SRK.
 const BY_HOST_AND_TPM2_SCOPED_SRK: [u8; 16] = id("2a1f877a4275431ab3f9ed1f5d8f6601");
 const BY_HOST_AND_TPM2_PK_SCOPED_SRK: [u8; 16] = id("16e492949f94400286758f94b7c52bc7");
 
@@ -229,7 +233,8 @@ const fn nibble(c: u8) -> u8 {
 
 /// What an `index.key` is sealed with: the keyring's item reference, or a
 /// credential from `systemd-creds encrypt` (base64, as it writes them); None
-/// for anything else, a system-scoped credential included.
+/// for anything else, a system-scoped credential included (pinned by
+/// `tests::a_system_scoped_credential_is_not_ours`).
 pub fn sealed_with(credential: &[u8]) -> Option<Seal> {
     if credential.starts_with(keyring::HEAD.as_bytes()) {
         return keyring::id_of(credential).map(|_| Seal::Keyring);
@@ -315,30 +320,43 @@ impl Default for Sealer {
     }
 }
 
-/// systemd runs this machine and is new enough for `systemd-creds --user`
-/// (256): not so on a distribution without systemd, or in a container. From
-/// the Flatpak, the host's; `Unavailable` while it can't be reached.
+/// The first systemd with `systemd-creds --user`.
+const FIRST_USER_CREDS_SYSTEMD: u32 = 256;
+
+/// systemd runs this machine and is new enough for `systemd-creds --user`:
+/// not so on a distribution without systemd, or in a container. From the
+/// Flatpak, the host's; `Unavailable` while it can't be reached.
 fn creds_usable(creds: &Tool) -> Result<bool> {
-    let booted = match &creds.host {
-        None => Path::new("/run/systemd/system").is_dir(),
-        // The same test, made on the host.
-        Some(_) => match system_tool("systemd-notify") {
-            Some(t) => succeeded(run(&t, &["--booted"], &[]))?.is_some(),
-            None => false,
-        },
-    };
-    if !booted {
+    if !systemd_booted(creds)? {
         return Ok(false);
     }
     let Some(out) = succeeded(run(creds, &["--version"], &[]))? else {
         return Ok(false);
     };
-    // "systemd 259 (259.1-1.fc45)"
-    Ok(String::from_utf8_lossy(&out)
+    Ok(has_user_creds(&out))
+}
+
+/// Whether systemd runs the system `creds` runs on: this one, or the host.
+fn systemd_booted(creds: &Tool) -> Result<bool> {
+    if creds.host.is_none() {
+        return Ok(Path::new("/run/systemd/system").is_dir());
+    }
+    match system_tool("systemd-notify") {
+        Some(t) => Ok(succeeded(run(&t, &["--booted"], &[]))?.is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Whether `systemd-creds --version`, as in `systemd 259 (259.1-1.fc45)`,
+/// names a systemd with `--user` (pinned by
+/// `tests::systemd_256_has_user_credentials`,
+/// `tests::systemd_255_has_no_user_credentials`).
+fn has_user_creds(version: &[u8]) -> bool {
+    String::from_utf8_lossy(version)
         .split_whitespace()
         .nth(1)
         .and_then(|v| v.parse::<u32>().ok())
-        .is_some_and(|v| v >= 256))
+        .is_some_and(|v| v >= FIRST_USER_CREDS_SYSTEMD)
 }
 
 /// A tool's output, None when it failed; Err only when it couldn't be run
@@ -451,11 +469,12 @@ impl Sealer {
     }
 
     /// What a new key is sealed with here: the TPM or the host key (`tpm`
-    /// says which) while `systemd-creds` works, else the keyring.
+    /// says which) while `systemd-creds` works, else the keyring. A host out
+    /// of reach for now still counts as `systemd-creds` (pinned by
+    /// `tests::in_the_flatpak_without_the_host_the_key_is_waited_for`).
     pub fn new_seal(&self, tpm: bool) -> Seal {
         match (self.sealing(), tpm) {
             (Ok(None), _) => Seal::Keyring,
-            // A host out of reach for now: still `systemd-creds` that seals.
             (_, true) => Seal::Tpm,
             (_, false) => Seal::Host,
         }
@@ -494,18 +513,12 @@ impl Sealer {
 
     /// The key in `credential`, from whatever sealed it. Any failure is an
     /// error and nothing else: the caller must not fall back to anything.
-    /// An `Unavailable` one is to be waited out.
+    /// An `Unavailable` one is to be waited out, never taken for a lost key
+    /// (which rebuilds the index): a missing `systemd-creds` is one.
     pub fn unseal(&self, credential: &[u8]) -> Result<Key> {
         if sealed_with(credential) == Some(Seal::Keyring) {
-            let out = self
-                .keyring
-                .fetch(credential)
-                .context("reading the key from the keyring")?;
-            // An item that isn't a key is the keyring's oddity, waited out
-            // like the rest: never a lost key, which rebuilds the index.
-            return Key::from_slice(&out).map_err(|e| Unavailable(format!("{e:#}")).into());
+            return self.keyring_key(credential);
         }
-        // Not the key's fault: waited for, never taken for a lost key.
         let tool = self.unsealing().ok_or_else(|| {
             Unavailable("systemd-creds sealed this key, and it isn't here".into())
         })?;
@@ -520,6 +533,16 @@ impl Sealer {
         Key::from_slice(&out)
     }
 
+    /// The key the keyring keeps for `credential`. An item that isn't a key
+    /// is the keyring's oddity, `Unavailable` like the rest.
+    fn keyring_key(&self, credential: &[u8]) -> Result<Key> {
+        let out = self
+            .keyring
+            .fetch(credential)
+            .context("reading the key from the keyring")?;
+        Key::from_slice(&out).map_err(|e| Unavailable(format!("{e:#}")).into())
+    }
+
     /// Once `credential` is replaced, drop what it keeps outside its file:
     /// the keyring's item. Nothing for `systemd-creds`, whose credential is
     /// the file.
@@ -532,50 +555,16 @@ impl Sealer {
     }
 }
 
+/// flatpak-spawn's arguments before the tool's path. `-v` is for its word on
+/// how the tool exited (`host_exit`).
+const FLATPAK_SPAWN_ARGS: [&str; 4] = ["-v", "--clear-env", "--directory=/", "--host"];
+
+/// `tool`'s stdout for `args` and `input`. A failed exit is reported before a
+/// failed write: a child that exits early breaks the pipe, and its stderr says
+/// why.
 fn run(tool: &Tool, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
-    // Nothing of ours reaches it; it talks to systemd over its socket.
-    let mut cmd = match &tool.host {
-        None => Command::new(&tool.path),
-        Some(spawn) => {
-            let mut c = Command::new(&spawn.program);
-            // -v, for its word on how the tool exited (`host_exit`). The
-            // tool gets no environment and its stdin and stdout are these
-            // pipes, passed to it: the key never passes through flatpak-spawn
-            // or the session helper.
-            c.args(["-v", "--clear-env", "--directory=/", "--host"])
-                .arg(&tool.path);
-            c
-        }
-    };
-    cmd.args(args).env_clear();
-    if tool.host.is_some()
-        && let Some(bus) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
-    {
-        // flatpak-spawn's way to the host.
-        cmd.env("DBUS_SESSION_BUS_ADDRESS", bus);
-    }
-    let spawned = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match spawned {
-        Ok(c) => c,
-        Err(e) if tool.host.is_some() => bail!(Unavailable(format!(
-            "{} can't run {} on the host: {e}",
-            FLATPAK_SPAWN,
-            tool.path.display()
-        ))),
-        Err(e) => return Err(e).with_context(|| tool.path.display().to_string()),
-    };
-    // Written from a thread so a full stdout pipe can't deadlock us.
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    let mut input = Zeroizing::new(input.to_vec());
-    let writer = std::thread::spawn(move || {
-        let r = stdin.write_all(&input);
-        input.zeroize();
-        r
-    });
+    let mut child = start(tool, args)?;
+    let writer = write_in_background(child.stdin.take().expect("stdin is piped"), input);
     let out = match &tool.host {
         None => child.wait_with_output()?,
         Some(spawn) => output_within(child, spawn.timeout).map_err(|why| {
@@ -586,40 +575,86 @@ fn run(tool: &Tool, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
         })?,
     };
     let written = writer.join().expect("stdin writer panicked");
-    let mut stdout = out.stdout;
+    let mut stdout = Zeroizing::new(out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let (ok, why) = match &tool.host {
         None => (out.status.success(), stderr.trim().to_owned()),
-        Some(_) => match host_exit(&stderr) {
-            (Some(code), why) => (code == 0 && out.status.success(), why),
-            // It never ran, or never finished: the host's fault, not the
-            // key's.
-            (None, why) => {
-                stdout.zeroize();
+        Some(_) => {
+            let (code, why) = host_exit(&stderr);
+            let Some(code) = code else {
                 bail!(Unavailable(format!(
                     "{} couldn't be run on the host: {why}",
                     tool.path.display()
                 )));
-            }
-        },
+            };
+            (code == 0 && out.status.success(), why)
+        }
     };
-    // Status first: a child that exits early breaks the pipe, and its stderr
-    // says why.
     if !ok {
-        stdout.zeroize();
         bail!("{why}");
     }
-    if let Err(e) = written {
-        stdout.zeroize();
-        return Err(e.into());
+    written?;
+    Ok(std::mem::take(&mut *stdout))
+}
+
+/// `tool` started on piped stdio, with no environment of ours (pinned by
+/// `tests::creds_gets_no_environment_of_ours`): it talks to systemd over its
+/// socket. Through flatpak-spawn, which gets only the session bus, its way to
+/// the host (pinned by
+/// `tests::on_the_host_flatpak_spawn_gets_the_bus_and_nothing_else`), the
+/// tool's stdin and stdout are these pipes, passed on: the key never passes
+/// through flatpak-spawn or the session helper.
+fn start(tool: &Tool, args: &[&str]) -> Result<Child> {
+    let mut cmd = match &tool.host {
+        None => Command::new(&tool.path),
+        Some(spawn) => {
+            let mut c = Command::new(&spawn.program);
+            c.args(FLATPAK_SPAWN_ARGS).arg(&tool.path);
+            c
+        }
+    };
+    cmd.args(args).env_clear();
+    if tool.host.is_some()
+        && let Some(bus) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+    {
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", bus);
     }
-    Ok(stdout)
+    let spawned = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    match spawned {
+        Ok(c) => Ok(c),
+        Err(e) if tool.host.is_some() => bail!(Unavailable(format!(
+            "{} can't run {} on the host: {e}",
+            FLATPAK_SPAWN,
+            tool.path.display()
+        ))),
+        Err(e) => Err(e).with_context(|| tool.path.display().to_string()),
+    }
+}
+
+/// Writes `input` to `stdin` from a thread, so a full stdout pipe can't
+/// deadlock the reader, and zeroes its copy.
+fn write_in_background(
+    mut stdin: std::process::ChildStdin,
+    input: &[u8],
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    let mut input = Zeroizing::new(input.to_vec());
+    std::thread::spawn(move || {
+        let r = stdin.write_all(&input);
+        input.zeroize();
+        r
+    })
 }
 
 /// flatpak-spawn -v's stderr: the exit code of what it ran on the host, if
 /// it says it ran and exited (`F: child exit code PID: CODE`), and the rest,
 /// which is that tool's stderr or why flatpak-spawn failed. Its own exit
-/// code can't tell those apart: 1 for both.
+/// code can't tell those apart: 1 for both. No code means the tool never ran
+/// or never finished: the host's fault, not the key's (pinned by
+/// `tests::on_the_host_a_tool_that_never_ran_is_unavailable`).
 fn host_exit(stderr: &str) -> (Option<i32>, String) {
     let mut pid = None;
     let mut code = None;
@@ -728,19 +763,23 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
         }
 
         pub fn tool(&self, body: &str) -> PathBuf {
-            let path = self.dir.join("systemd-creds");
-            let tmp = self.dir.join("systemd-creds.tmp");
-            fs::write(
-                &tmp,
-                format!(
+            self.script(
+                "systemd-creds",
+                &format!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n/usr/bin/env > '{}'\n{body}\n",
                     self.dir.join("argv").display(),
                     self.dir.join("env").display()
                 ),
             )
-            .unwrap();
+        }
+
+        /// An executable `name` holding `text`, renamed into place so no fork
+        /// elsewhere holds it open for writing.
+        fn script(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.dir.join(name);
+            let tmp = self.dir.join(format!("{name}.tmp"));
+            fs::write(&tmp, text).unwrap();
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
-            // Renamed into place, so no fork elsewhere holds it open for writing.
             fs::rename(&tmp, &path).unwrap();
             path
         }
@@ -775,18 +814,55 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
     }
 
     #[test]
-    fn key_ids_match_what_systemd_writes() {
-        // Real credentials from systemd 259: `systemd-creds --user encrypt`
-        // without a TPM, and the head of one sealed with a TPM.
+    fn a_systemd_259_user_credential_without_a_tpm_is_sealed_with_the_host_key() {
         let host = b"VbntHThZTUOoMZ0uuzMqxiAAAAABAAAADAAAABAAAAAHCZcL";
         assert_eq!(sealed_with(host), Some(Seal::Host));
+    }
+
+    #[test]
+    fn a_systemd_259_user_credential_with_a_tpm_is_sealed_with_the_tpm() {
         assert_eq!(sealed_with(TPM_HEAD.as_bytes()), Some(Seal::Tpm));
-        // systemd 262, TPM-sealed and pinned to its SRK.
+    }
+
+    #[test]
+    fn a_systemd_262_credential_pinned_to_the_srk_is_sealed_with_the_tpm() {
         assert_eq!(sealed_with(b"Kh+HekJ1Qxqz+e0fXY9mASAA"), Some(Seal::Tpm));
-        // A system-scoped host credential, and junk.
+    }
+
+    #[test]
+    fn a_system_scoped_credential_is_not_ours() {
         assert_eq!(sealed_with(b"Whxqht+dQJax1aZeCGLxmgAA"), None);
+    }
+
+    #[test]
+    fn junk_is_no_credential() {
         assert_eq!(sealed_with(b"not base64!"), None);
         assert_eq!(sealed_with(b"AAAA"), None);
+    }
+
+    #[test]
+    fn systemd_256_has_user_credentials() {
+        assert!(has_user_creds(b"systemd 256 (256.1-1.fc41)\n+PAM +AUDIT"));
+    }
+
+    #[test]
+    fn systemd_255_has_no_user_credentials() {
+        assert!(!has_user_creds(
+            b"systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT"
+        ));
+    }
+
+    /// Fails unless every variable in the environment `file` recorded is
+    /// one of `allowed`, or one sh sets itself.
+    fn assert_env_only(file: &Path, allowed: &[&str]) {
+        let env = fs::read_to_string(file).unwrap();
+        for line in env.lines() {
+            let k = line.split('=').next().unwrap();
+            assert!(
+                matches!(k, "PWD" | "SHLVL" | "_" | "OLDPWD") || allowed.contains(&k),
+                "leaked {line}"
+            );
+        }
     }
 
     #[test]
@@ -817,15 +893,14 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
             fake.argv(),
             ["--user", "--name=vinosearch-index", "decrypt", "-", "-"]
         );
-        // Nothing of ours in its environment: sh sets these itself.
-        let env = fs::read_to_string(fake.dir.join("env")).unwrap();
-        for line in env.lines() {
-            let k = line.split('=').next().unwrap();
-            assert!(
-                matches!(k, "PWD" | "SHLVL" | "_" | "OLDPWD"),
-                "leaked {line}"
-            );
-        }
+    }
+
+    #[test]
+    fn creds_gets_no_environment_of_ours() {
+        let fake = Fake::new("env");
+        let s = Sealer::at(&fake.tool(&creds_body(TPM_HEAD)));
+        retry(|| s.seal(&Key::random().unwrap(), false)).unwrap();
+        assert_env_only(&fake.dir.join("env"), &[]);
     }
 
     #[test]
@@ -840,17 +915,25 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
     }
 
     #[test]
-    fn failures_are_errors_with_stderr_and_no_output() {
+    fn a_failure_after_output_is_an_error_with_its_stderr_and_no_key() {
         let fake = Fake::new("fail");
-        // stdout before failing: none of it may be taken as a key.
         let s = Sealer::at(
             &fake.tool("printf '%032d' 0; echo 'Failed to unseal secret using TPM2' >&2; exit 1"),
         );
         let e = retry(|| s.unseal(b"blob")).unwrap_err();
         assert!(format!("{e:#}").contains("unseal secret"), "{e:#}");
-        // An unknown kind of credential, and a missing tool.
+    }
+
+    #[test]
+    fn a_credential_of_an_unknown_kind_is_refused() {
+        let fake = Fake::new("unknown");
         let s = Sealer::at(&fake.tool("cat >/dev/null; echo AAAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(retry(|| s.seal(&Key::random().unwrap(), true)).is_err());
+    }
+
+    #[test]
+    fn a_missing_creds_tool_is_an_error() {
+        let fake = Fake::new("absent");
         let s = Sealer::at(&fake.dir.join("absent"));
         assert!(s.unseal(b"blob").is_err());
     }
@@ -859,19 +942,13 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
     /// does what `body` says. `HOST` runs the "host" tool (the rest of argv
     /// after `--host`) and reports as `flatpak-spawn -v` does.
     pub fn spawner(fake: &Fake, body: &str) -> PathBuf {
-        let path = fake.dir.join("flatpak-spawn");
-        let tmp = fake.dir.join("flatpak-spawn.tmp");
-        fs::write(
-            &tmp,
-            format!(
+        fake.script(
+            "flatpak-spawn",
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/spawn-argv'\n/usr/bin/env > '{dir}/spawn-env'\n{body}\n",
                 dir = fake.dir.display()
             ),
         )
-        .unwrap();
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::rename(&tmp, &path).unwrap();
-        path
     }
 
     pub const HOST: &str = r#"while [ "$1" != --host ]; do shift; done; shift
@@ -907,50 +984,71 @@ exit $c"#;
                 "-"
             ]
         );
-        // flatpak-spawn gets the bus, and nothing else of ours.
-        let env = fs::read_to_string(fake.dir.join("spawn-env")).unwrap();
-        for line in env.lines() {
-            let k = line.split('=').next().unwrap();
-            assert!(
-                matches!(
-                    k,
-                    "PWD" | "SHLVL" | "_" | "OLDPWD" | "DBUS_SESSION_BUS_ADDRESS"
-                ),
-                "leaked {line}"
-            );
-        }
     }
 
     #[test]
-    fn on_the_host_only_the_tools_own_failure_is_a_failure() {
-        let fake = Fake::new("hostfail");
-        let wait = Duration::from_secs(10);
-        // systemd-creds ran on the host and refused: the key's fault.
-        let creds = fake.tool("echo 'Failed to unseal secret using TPM2' >&2; exit 1");
-        let s = Sealer::on_host(&spawner(&fake, HOST), &creds, wait);
+    fn on_the_host_flatpak_spawn_gets_the_bus_and_nothing_else() {
+        let fake = Fake::new("hostenv");
+        let creds = fake.tool(&creds_body(TPM_HEAD));
+        let s = Sealer::on_host(&spawner(&fake, HOST), &creds, Duration::from_secs(10));
+        retry(|| s.seal(&Key::random().unwrap(), false)).unwrap();
+        assert_env_only(&fake.dir.join("spawn-env"), &["DBUS_SESSION_BUS_ADDRESS"]);
+    }
+
+    const HOST_WAIT: Duration = Duration::from_secs(10);
+
+    /// A `systemd-creds` that refuses to unseal.
+    fn refusing_creds(fake: &Fake) -> PathBuf {
+        fake.tool("echo 'Failed to unseal secret using TPM2' >&2; exit 1")
+    }
+
+    #[test]
+    fn on_the_host_the_tools_own_refusal_is_a_failure() {
+        let fake = Fake::new("hostrefuse");
+        let creds = refusing_creds(&fake);
+        let s = Sealer::on_host(&spawner(&fake, HOST), &creds, HOST_WAIT);
         let e = retry(|| s.unseal(b"blob")).unwrap_err();
         assert!(!is_unavailable(&e), "{e:#}");
         assert_eq!(
             format!("{e:#}"),
             "systemd-creds decrypt: Failed to unseal secret using TPM2"
         );
-        // The host never ran it: no session helper, no permission. The same
-        // exit code, and a key that is only out of reach.
-        for body in [
-            "echo 'Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1",
-            "echo \"Can't find bus: no address\" >&2; exit 1",
-            // Ran, but never said how it ended (the bus went away).
-            "echo 'F: child_pid: 4242' >&2; exit 1",
-            // Claims a success it doesn't report.
-            "printf '%032d' 0; exit 0",
+    }
+
+    #[test]
+    fn on_the_host_a_tool_that_never_ran_is_unavailable() {
+        let fake = Fake::new("hostnever");
+        let creds = refusing_creds(&fake);
+        for (why, body) in [
+            (
+                "no session helper",
+                "echo 'Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1",
+            ),
+            ("no bus", "echo \"Can't find bus: no address\" >&2; exit 1"),
+            (
+                "ran, but never said how it ended",
+                "echo 'F: child_pid: 4242' >&2; exit 1",
+            ),
+            (
+                "claims a success it doesn't report",
+                "printf '%032d' 0; exit 0",
+            ),
         ] {
-            let s = Sealer::on_host(&spawner(&fake, body), &creds, wait);
+            let s = Sealer::on_host(&spawner(&fake, body), &creds, HOST_WAIT);
             let e = retry(|| s.unseal(b"blob")).unwrap_err();
-            assert!(is_unavailable(&e), "{body}: {e:#}");
-            assert!(retry(|| s.seal(&Key::random().unwrap(), true)).is_err());
+            assert!(is_unavailable(&e), "{why}: {e:#}");
+            assert!(
+                retry(|| s.seal(&Key::random().unwrap(), true)).is_err(),
+                "{why}"
+            );
         }
-        // No flatpak-spawn at all.
-        let s = Sealer::on_host(&fake.dir.join("absent"), &creds, wait);
+    }
+
+    #[test]
+    fn without_flatpak_spawn_the_key_is_unavailable() {
+        let fake = Fake::new("hostabsent");
+        let creds = refusing_creds(&fake);
+        let s = Sealer::on_host(&fake.dir.join("absent"), &creds, HOST_WAIT);
         assert!(is_unavailable(&s.unseal(b"blob").unwrap_err()));
     }
 
@@ -983,7 +1081,12 @@ exit $c"#;
             host_tool(root, "systemd-creds").as_deref(),
             Some(Path::new("/usr/bin/systemd-creds"))
         );
-        // NixOS: its /run isn't shared, so taken on trust.
+    }
+
+    #[test]
+    fn on_a_nixos_host_its_run_tools_are_taken_on_trust() {
+        let fake = Fake::new("hostnixos");
+        let root = &fake.dir;
         assert_eq!(host_tool(root, "systemd-notify"), None);
         fs::create_dir_all(root.join("etc")).unwrap();
         fs::write(root.join("etc/NIXOS"), "").unwrap();
@@ -1007,7 +1110,14 @@ exit $c"#;
         let (blob, seal) = s.seal(&key, true).unwrap();
         assert_eq!(seal, s.new_seal(tpm));
         assert_eq!(*s.unseal(&blob).unwrap().raw(), *key.raw());
-        // Sealed under another name: the host's refusal, a failure.
+    }
+
+    #[test]
+    #[ignore = "needs the Flatpak sandbox"]
+    fn in_the_flatpak_a_key_sealed_under_another_name_is_refused_by_the_host() {
+        assert!(vinosearch_shared::sandbox::flatpak_id().is_some());
+        let s = Sealer::default();
+        let key = Key::random().unwrap();
         let other = run(
             &system_tool("systemd-creds").unwrap(),
             &["--user", "--name=other", "encrypt", "-", "-"],
@@ -1016,7 +1126,12 @@ exit $c"#;
         .unwrap();
         let e = s.unseal(&other).unwrap_err();
         assert!(!is_unavailable(&e), "{e:#}");
-        // A host tool that hangs: given up on, and stopped on the host.
+    }
+
+    #[test]
+    #[ignore = "needs the Flatpak sandbox"]
+    fn in_the_flatpak_a_host_tool_that_hangs_is_stopped_on_the_host() {
+        assert!(vinosearch_shared::sandbox::flatpak_id().is_some());
         let sleep = Tool {
             path: "/usr/bin/sleep".into(),
             host: Some(Spawn {
@@ -1038,7 +1153,7 @@ exit $c"#;
         );
     }
 
-    /// The same, with the Flatpak's permission to reach the host taken away
+    /// In the Flatpak with its permission to reach the host taken away
     /// (`flatpak run --no-talk-name=org.freedesktop.Flatpak`): waited for,
     /// and never the keyring instead.
     #[test]

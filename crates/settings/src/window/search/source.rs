@@ -18,11 +18,11 @@ pub enum Kind {
     Document,
     /// A photo, or text read in one.
     Image,
-    /// Source code, which only a `code:` query finds, alone (#110).
+    /// Source code, which only a `code:` query finds, alone.
     Code,
-    /// A vinoWhisper session's transcript or summary (#143).
+    /// A vinoWhisper session's transcript or summary.
     Session,
-    /// An audio or video file, by its sound or picture (#187).
+    /// An audio or video file, by its sound or picture.
     Media,
 }
 
@@ -56,7 +56,7 @@ impl Found {
     }
 
     /// Whether the match is a time in an audio or video file, or in the
-    /// recording a session was made from (#188).
+    /// recording a session was made from.
     pub fn timed(&self) -> bool {
         self.unit == "second"
     }
@@ -145,18 +145,8 @@ impl Link {
                 out.lock().unwrap().roots = roots;
                 repaint();
             }
-            while let Ok(mut ask) = rx.recv() {
-                // Only the newest of the searches waiting is worth running.
-                while let Ask::Search(..) = ask {
-                    match rx.try_recv() {
-                        Ok(next @ Ask::Search(..)) => ask = next,
-                        Ok(other) => {
-                            run(&mut source, &out, ask);
-                            ask = other;
-                        }
-                        Err(_) => break,
-                    }
-                }
+            while let Ok(ask) = rx.recv() {
+                let ask = newest_search(&rx, &mut source, &out, ask);
                 run(&mut source, &out, ask);
                 repaint();
             }
@@ -168,10 +158,31 @@ impl Link {
         let _ = self.ctx.set(ctx.clone());
     }
 
+    /// Fails only once the thread has stopped, which it does with the window.
     pub fn send(&self, ask: Ask) {
-        // The thread only stops with the window.
         let _ = self.asks.send(ask);
     }
+}
+
+/// Only the newest of the searches waiting is worth running; anything else
+/// queued among them is run as it comes.
+fn newest_search(
+    rx: &Receiver<Ask>,
+    source: &mut impl Source,
+    out: &Mutex<Answers>,
+    mut ask: Ask,
+) -> Ask {
+    while let Ask::Search(..) = ask {
+        match rx.try_recv() {
+            Ok(next @ Ask::Search(..)) => ask = next,
+            Ok(other) => {
+                run(source, out, ask);
+                ask = other;
+            }
+            Err(_) => break,
+        }
+    }
+    ask
 }
 
 fn run(source: &mut impl Source, out: &Mutex<Answers>, ask: Ask) {

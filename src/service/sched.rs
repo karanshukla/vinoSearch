@@ -12,6 +12,9 @@ const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 const IOPRIO_CLASS_IDLE: libc::c_int = 3;
 /// Class "none": priority follows the CPU nice value, the default.
 const IOPRIO_DEFAULT: libc::c_int = 0;
+const IOPRIO_IDLE: libc::c_int = IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT;
+/// How often `Pace` rereads the power supply.
+const BATTERY_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether leaving SCHED_IDLE is allowed here. An unprivileged thread may
 /// switch back to SCHED_OTHER only while its nice value is inside
@@ -46,7 +49,8 @@ fn set_io(prio: libc::c_int) -> bool {
 }
 
 /// On battery: a battery is present and no charger (mains or USB-C) is
-/// online. A machine with no battery is never on it.
+/// online. A machine with no battery is never on it (pinned by
+/// `tests::battery_only_without_a_charger_online`).
 pub fn on_battery() -> bool {
     on_battery_in(std::path::Path::new("/sys/class/power_supply"))
 }
@@ -65,7 +69,7 @@ fn on_battery_in(dir: &std::path::Path) -> bool {
 }
 
 /// Share of the device's time background indexing may take: `share`, or
-/// half of it on battery. Rechecks the power supply every 10 s.
+/// half of it on battery. Rechecks the power supply every BATTERY_EVERY.
 pub struct Pace {
     share: f64,
     battery: bool,
@@ -86,10 +90,7 @@ impl Pace {
     }
 
     pub fn share(&mut self) -> f64 {
-        if self
-            .checked
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
-        {
+        if self.checked.is_none_or(|t| t.elapsed() >= BATTERY_EVERY) {
             self.battery = on_battery();
             self.checked = Some(std::time::Instant::now());
         }
@@ -112,7 +113,7 @@ pub struct Idle {
 impl Idle {
     pub fn enter() -> Self {
         let cpu = can_return() && set_cpu(libc::SCHED_IDLE);
-        let io = set_io(IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT);
+        let io = set_io(IOPRIO_IDLE);
         if !cpu && !WARNED.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "indexing at normal CPU priority: RLIMIT_NICE would not allow returning from SCHED_IDLE"
@@ -129,7 +130,7 @@ impl Idle {
             set_cpu(libc::SCHED_IDLE);
         }
         if self.io {
-            set_io(IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT);
+            set_io(IOPRIO_IDLE);
         }
         out
     }
@@ -182,10 +183,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Run `f` on a thread of its own, so the test harness's is never demoted.
+    fn on_its_own_thread(f: impl FnOnce() + Send + 'static) {
+        std::thread::spawn(f).join().unwrap();
+    }
+
     #[test]
     fn idle_is_entered_and_left() {
-        // Its own thread, so the test harness's thread is never demoted.
-        std::thread::spawn(|| {
+        on_its_own_thread(|| {
             assert_eq!(policy(), libc::SCHED_OTHER);
             {
                 let idle = Idle::enter();
@@ -196,8 +201,6 @@ mod tests {
                 }
             }
             assert_eq!(policy(), libc::SCHED_OTHER);
-        })
-        .join()
-        .unwrap();
+        });
     }
 }

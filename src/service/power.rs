@@ -1,4 +1,4 @@
-//! Holding indexing for power (#109): on battery while `index_on_battery` is
+//! Holding indexing for power: on battery while `index_on_battery` is
 //! false, and while power-profiles-daemon (or tuned-ppd, which serves the
 //! same interface) has the power-saver profile on.
 //!
@@ -10,7 +10,7 @@
 //!
 //! Held work waits in the worker with what a PauseIndexing holds, and a
 //! `Job::Retry` runs it once nothing holds it any more. Audio and video wait
-//! for a charger whatever `index_on_battery` says (#192), so plugging one in
+//! for a charger whatever `index_on_battery` says, so plugging one in
 //! sends a Retry too.
 
 use crate::service::sched;
@@ -57,7 +57,8 @@ impl Hold {
 }
 
 /// Whether indexing waits, and why. Waiting for a charger comes first: it
-/// outlasts power saver, which a charger usually turns off.
+/// outlasts power saver, which a charger usually turns off (pinned by
+/// `tests::what_holds_indexing`).
 pub fn hold(index_on_battery: bool, on_battery: bool, power_saver: bool) -> Option<Hold> {
     if on_battery && !index_on_battery {
         Some(Hold::Charger)
@@ -90,7 +91,8 @@ impl State {
 
     /// Apply `change`; true when that released held indexing, or with
     /// nothing held brought a charger, which media waits for: either needs
-    /// a Retry.
+    /// a Retry (pinned by `tests::only_the_last_release_asks_for_a_retry`
+    /// and `tests::a_charger_asks_for_a_retry_even_when_nothing_was_held`).
     fn update(&self, change: impl FnOnce(&Self)) -> bool {
         let _guard = self.lock.lock().unwrap();
         let before = self.hold();
@@ -108,7 +110,7 @@ impl State {
     }
 
     /// On battery now, whatever `index_on_battery` says: media waits for AC
-    /// either way (#192).
+    /// either way.
     pub fn on_battery(&self) -> bool {
         self.on_battery.load(Ordering::Relaxed)
     }
@@ -127,25 +129,28 @@ impl State {
 }
 
 /// Watch the battery and the power profile for as long as the process runs,
-/// sending `Job::Retry` to `jobs` when indexing may go on again.
+/// sending `Job::Retry` to `jobs` when indexing may go on again. The battery
+/// is read once before returning, so a job started before the first poll is
+/// held already.
 pub fn spawn(jobs: mpsc::Sender<Job>, status: Arc<Status>) {
-    // Read now, so a job started before the first poll is held already.
     status.power.set_on_battery(sched::on_battery());
-    let battery = (jobs.clone(), status.clone());
-    std::thread::spawn(move || {
-        let (jobs, status) = battery;
-        loop {
-            std::thread::sleep(BATTERY_EVERY);
-            if status.power.set_on_battery(sched::on_battery()) && jobs.send(Job::Retry).is_err() {
-                return;
-            }
-        }
-    });
+    let (battery_jobs, battery_status) = (jobs.clone(), status.clone());
+    std::thread::spawn(move || poll_battery(&battery_jobs, &battery_status));
     std::thread::spawn(move || {
         if let Err(e) = watch_profile(&jobs, &status) {
             eprintln!("power profile not watched: {e}");
         }
     });
+}
+
+/// Until the worker hangs up.
+fn poll_battery(jobs: &mpsc::Sender<Job>, status: &Status) {
+    loop {
+        std::thread::sleep(BATTERY_EVERY);
+        if status.power.set_on_battery(sched::on_battery()) && jobs.send(Job::Retry).is_err() {
+            return;
+        }
+    }
 }
 
 fn set_power_saver(jobs: &mpsc::Sender<Job>, status: &Status, on: bool) {
@@ -207,59 +212,46 @@ fn changed_profile(
     }
 }
 
+/// Signals on `conn` matching `rule`.
+async fn signals(
+    conn: &zbus::Connection,
+    rule: zbus::Result<zbus::MatchRule<'static>>,
+) -> zbus::Result<zbus::MessageStream> {
+    zbus::MessageStream::for_match_rule(rule?, conn, NonZeroUsize::new(8)).await
+}
+
+/// The daemon starting, stopping or restarting.
+fn owner_changed() -> zbus::Result<zbus::MatchRule<'static>> {
+    zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")
+        .interface("org.freedesktop.DBus")
+        .member("NameOwnerChanged")
+        .add_arg(PPD)
+        .build()
+}
+
+fn profile_changed() -> zbus::Result<zbus::MatchRule<'static>> {
+    zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(PPD)
+        .path(PPD_PATH)
+        .interface("org.freedesktop.DBus.Properties")
+        .member("PropertiesChanged")
+        .add_arg(PPD)
+        .build()
+}
+
+/// Both streams are subscribed before the first read, so a change between
+/// the two isn't missed.
 fn watch_profile(jobs: &mpsc::Sender<Job>, status: &Arc<Status>) -> zbus::Result<()> {
-    // A connection is only driven by the thread that blocks on it, so the
-    // daemon-owner thread opens its own.
     zbus::block_on(async {
         let conn = zbus::Connection::system().await?;
-        // The daemon starting, stopping or restarting. Subscribed before the
-        // first read, so a change between the two isn't missed.
-        let mut owner = zbus::MessageStream::for_match_rule(
-            zbus::MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .sender("org.freedesktop.DBus")
-                .interface("org.freedesktop.DBus")
-                .member("NameOwnerChanged")
-                .add_arg(PPD)
-                .build()?,
-            &conn,
-            NonZeroUsize::new(8),
-        )
-        .await?;
-        let mut changes = zbus::MessageStream::for_match_rule(
-            zbus::MatchRule::builder()
-                .msg_type(zbus::message::Type::Signal)
-                .sender(PPD)
-                .path(PPD_PATH)
-                .interface("org.freedesktop.DBus.Properties")
-                .member("PropertiesChanged")
-                .add_arg(PPD)
-                .build()?,
-            &conn,
-            NonZeroUsize::new(8),
-        )
-        .await?;
+        let owner = signals(&conn, owner_changed()).await?;
+        let mut changes = signals(&conn, profile_changed()).await?;
         set_power_saver(jobs, status, read_profile(&conn).await);
-        {
-            let (jobs, status) = (jobs.clone(), status.clone());
-            std::thread::spawn(move || {
-                zbus::block_on(async move {
-                    let Ok(conn) = zbus::Connection::system().await else {
-                        return;
-                    };
-                    while let Some(msg) = owner.next().await {
-                        let Ok(msg) = msg else { continue };
-                        let Ok((_, _, new)) = msg.body().deserialize::<(String, String, String)>()
-                        else {
-                            continue;
-                        };
-                        // Gone: no daemon, no power saver. A new owner: read what it says.
-                        let on = !new.is_empty() && read_profile(&conn).await;
-                        set_power_saver(&jobs, &status, on);
-                    }
-                })
-            });
-        }
+        let (owner_jobs, owner_status) = (jobs.clone(), status.clone());
+        std::thread::spawn(move || follow_owner(owner, &owner_jobs, &owner_status));
         while let Some(msg) = changes.next().await {
             type Body = (String, HashMap<String, OwnedVariant>, Vec<String>);
             let Ok(msg) = msg else { continue };
@@ -277,6 +269,25 @@ fn watch_profile(jobs: &mpsc::Sender<Job>, status: &Arc<Status>) -> zbus::Result
     })
 }
 
+/// Follow the daemon's owner on a thread and connection of its own: a
+/// connection is only driven by the thread that blocks on it. With the
+/// daemon gone there is no power saver; a new owner is asked what it says.
+fn follow_owner(mut owner: zbus::MessageStream, jobs: &mpsc::Sender<Job>, status: &Status) {
+    zbus::block_on(async move {
+        let Ok(conn) = zbus::Connection::system().await else {
+            return;
+        };
+        while let Some(msg) = owner.next().await {
+            let Ok(msg) = msg else { continue };
+            let Ok((_, _, new)) = msg.body().deserialize::<(String, String, String)>() else {
+                continue;
+            };
+            let on = !new.is_empty() && read_profile(&conn).await;
+            set_power_saver(jobs, status, on);
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,7 +295,6 @@ mod tests {
 
     #[test]
     fn what_holds_indexing() {
-        // (index_on_battery, on_battery, power_saver)
         assert_eq!(hold(true, false, false), None);
         assert_eq!(hold(true, true, false), None);
         assert_eq!(hold(false, false, false), None);
@@ -304,43 +314,55 @@ mod tests {
         assert!(!s.set_index_on_battery(false));
         assert_eq!(s.hold(), Some(Hold::Charger));
         assert!(!s.set_power_saver(true));
-        // Plugged in: power saver still holds it.
-        assert!(!s.set_on_battery(false));
+        assert!(
+            !s.set_on_battery(false),
+            "plugged in: power saver still holds it"
+        );
         assert_eq!(s.hold(), Some(Hold::PowerSaver));
         assert!(s.set_power_saver(false));
         assert_eq!(s.hold(), None);
-        // Setting what is already so releases nothing.
-        assert!(!s.set_power_saver(false));
-        // Unplugged again, then the setting turned back on.
+        assert!(
+            !s.set_power_saver(false),
+            "setting what is already so releases nothing"
+        );
         assert!(!s.set_on_battery(true));
-        assert!(s.set_index_on_battery(true));
+        assert!(
+            s.set_index_on_battery(true),
+            "unplugged again, then the setting turned back on"
+        );
     }
 
     #[test]
     fn a_charger_asks_for_a_retry_even_when_nothing_was_held() {
-        // index_on_battery on, the default: nothing is held on battery, but
-        // media waits for the charger.
         let s = State::default();
         assert!(!s.set_on_battery(true));
-        assert_eq!(s.hold(), None);
-        assert!(s.set_on_battery(false));
-        // Still plugged in, and unplugging: nothing new to run.
-        assert!(!s.set_on_battery(false));
-        assert!(!s.set_on_battery(true));
-        // A charger under power saver: the Retry comes when that ends.
+        assert_eq!(s.hold(), None, "index_on_battery is on by default");
+        assert!(s.set_on_battery(false), "media waits for the charger");
+        assert!(
+            !s.set_on_battery(false),
+            "still plugged in: nothing new to run"
+        );
+        assert!(!s.set_on_battery(true), "unplugging: nothing new to run");
         assert!(!s.set_power_saver(true));
-        assert!(!s.set_on_battery(false));
-        assert!(s.set_power_saver(false));
+        assert!(
+            !s.set_on_battery(false),
+            "a charger under power saver runs nothing yet"
+        );
+        assert!(
+            s.set_power_saver(false),
+            "the Retry comes when power saver ends"
+        );
+    }
+
+    fn profile(p: &str) -> HashMap<String, OwnedVariant> {
+        HashMap::from([(
+            PROFILE.to_owned(),
+            OwnedVariant::try_from(Variant::from(p)).unwrap(),
+        )])
     }
 
     #[test]
     fn reads_the_profile_from_properties_changed() {
-        let profile = |p: &str| {
-            HashMap::from([(
-                PROFILE.to_owned(),
-                OwnedVariant::try_from(Variant::from(p)).unwrap(),
-            )])
-        };
         assert_eq!(
             changed_profile(PPD, &profile("power-saver"), &[]),
             Change::Now(true)
@@ -353,7 +375,10 @@ mod tests {
             changed_profile(PPD, &profile("performance"), &[]),
             Change::Now(false)
         );
-        // Another property, or another interface.
+    }
+
+    #[test]
+    fn another_property_or_interface_is_unrelated() {
         let other = HashMap::from([(
             "PerformanceDegraded".to_owned(),
             OwnedVariant::try_from(Variant::from("")).unwrap(),
@@ -363,7 +388,10 @@ mod tests {
             changed_profile("org.example", &profile("power-saver"), &[]),
             Change::Unrelated
         );
-        // Invalidated: read again.
+    }
+
+    #[test]
+    fn an_invalidated_profile_is_read_again() {
         assert_eq!(
             changed_profile(PPD, &HashMap::new(), &[PROFILE.to_owned()]),
             Change::Reread

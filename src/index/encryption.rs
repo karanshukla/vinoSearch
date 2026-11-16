@@ -1,6 +1,6 @@
-//! The index encrypted at rest (#4): SQLCipher over the whole database, so
-//! chunk text, vectors, file names and the word index's shadow tables (#104)
-//! are all covered, with a random key sealed by `systemd-creds`, or kept in
+//! The index encrypted at rest: SQLCipher over the whole database, so chunk
+//! text, vectors, file names and the word index's shadow tables are all
+//! covered, with a random key sealed by `systemd-creds`, or kept in
 //! the desktop keyring where that can't be used (seal.rs), named by
 //! `index.key` beside it.
 //!
@@ -27,7 +27,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use vinosearch_shared::config::Config;
@@ -266,14 +266,16 @@ fn state_of(db: &Path) -> State {
 /// Connections opened through `Live` are closed meanwhile and reopen on
 /// their next use; any other this process holds on `db` must be closed
 /// first. Another process with the index open (`vinosearch index` beside the
-/// runner) holds it shared, and the change is refused until it is done.
+/// runner) holds it shared, and the change is refused until it is done
+/// (pinned by `tests::another_process_holding_the_index_blocks_a_conversion`).
+///
+/// A key that can't be had yet is asked for again here, and only here. It
+/// isn't an `error`: `waiting` says why.
 pub fn apply(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> State {
     let mut broken = String::new();
-    // A key that couldn't be had is asked for again here, and only here.
     held().retain(|(p, h)| p != db || !matches!(h, Held::Waiting { .. }));
     let mut st = match apply_inner(db, want, rekey, sealer, &mut broken) {
         Ok(()) => state_of(db),
-        // `waiting` says why.
         Err(e) if seal::is_unavailable(&e) && !state_of(db).waiting.is_empty() => state_of(db),
         Err(e) => State {
             error: format!("{e:#}"),
@@ -284,6 +286,8 @@ pub fn apply(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> State {
     st
 }
 
+/// `apply`'s work. A settled index takes no lock, so `vinosearch index`
+/// beside the runner just opens it.
 fn apply_inner(
     db: &Path,
     want: Want,
@@ -294,74 +298,19 @@ fn apply_inner(
     if rekey && !want.on {
         bail!("encryption is off: there's no key to replace");
     }
-    // Nothing to change: no lock, so `vinosearch index` beside the runner
-    // just opens it.
     if !rekey && settled(db, want, sealer) {
         return Ok(());
     }
     let _lock = Lock::exclusive(db)?;
     let _closed = close_all(db);
-    // What opens it now.
-    let current = key_with(db, sealer).and_then(|k| {
-        if db.exists() {
-            let conn = Connection::open(db)?;
-            unlock(&conn, k.as_deref())?;
-        }
-        Ok(k)
-    });
-    // Encryption turned off by the user now while the key can't be had: the
-    // way to start over, and their choice, so the index is rebuilt as a lost
-    // key's would be. Never at the start or from `vinosearch index`, where a
-    // keyring that is locked or not up yet mustn't cost the index.
-    let start_over =
-        |e: &anyhow::Error| !want.on && sealer.starts_over() && seal::is_unavailable(e);
-    let current = match current {
+    let current = match current_key(db, sealer) {
         Ok(k) => k,
-        Err(e) if is_unusable(&e) || start_over(&e) => {
-            let roots = read_roots(db);
-            let old = fs::read(key_file(db)).unwrap_or_default();
-            wipe(db)?;
-            sealer.forget(&old);
-            hold(db, None);
-            *broken = format!("{e:#}");
-            eprintln!("{e:#}: the index is rebuilt from the files");
-            // A fresh index as asked for, holding the folders it had.
-            let key = match new_key(want, sealer) {
-                Some(Ok((key, credential, seal))) => {
-                    write_key(db, &credential)?;
-                    hold(
-                        db,
-                        Some(Held::Sealed {
-                            credential,
-                            key,
-                            seal,
-                        }),
-                    );
-                    true
-                }
-                // Encrypted before, and wanted encrypted: never plaintext.
-                Some(Err(e)) => {
-                    hold(db, Some(Held::Memory(Arc::new(Key::random()?))));
-                    eprintln!("{e:#}: the new index's key is kept in memory only");
-                    true
-                }
-                None => false,
-            };
-            let conn = index::open(db)?;
-            for r in &roots {
-                conn.execute("INSERT OR IGNORE INTO roots (path) VALUES (?1)", [r])?;
-            }
-            if key {
-                save_roots(db, &conn)?;
-            }
-            return Ok(());
+        Err(e) if is_unusable(&e) || starts_over(&e, want, sealer) => {
+            return rebuild(db, want, sealer, &e, broken);
         }
         Err(e) => return Err(e),
     };
-    let memory = held()
-        .iter()
-        .any(|(p, h)| p == db && matches!(h, Held::Memory(_)));
-    let sealed = current.is_some() && !memory;
+    let sealed = current.is_some() && !held_in_memory(db);
     if want.on {
         if sealed && !rekey {
             return Ok(());
@@ -394,21 +343,98 @@ fn apply_inner(
     Ok(())
 }
 
-/// `db` is as `want` asks, and opens.
+/// The key that opens `db` now, checked against it.
+fn current_key(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
+    let k = key_with(db, sealer)?;
+    if db.exists() {
+        let conn = Connection::open(db)?;
+        unlock(&conn, k.as_deref())?;
+    }
+    Ok(k)
+}
+
+/// Encryption turned off by the user now while the key can't be had: the way
+/// to start over, and their choice, so the index is rebuilt as a lost key's
+/// would be. Never at the start or from `vinosearch index`, where a keyring
+/// that is locked or not up yet mustn't cost the index (pinned by
+/// `tests::a_keyring_item_gone_is_waited_for_until_encryption_starts_over`).
+fn starts_over(e: &anyhow::Error, want: Want, sealer: &Sealer) -> bool {
+    !want.on && sealer.starts_over() && seal::is_unavailable(e)
+}
+
+/// Replace `db`, whose key is lost (`why`), with an empty index as `want`
+/// asks, holding the folders it had for the watcher to index again (pinned by
+/// `tests::a_key_that_wont_unseal_rebuilds_the_index_encrypted`).
+fn rebuild(
+    db: &Path,
+    want: Want,
+    sealer: &Sealer,
+    why: &anyhow::Error,
+    broken: &mut String,
+) -> Result<()> {
+    let roots = read_roots(db);
+    let old = fs::read(key_file(db)).unwrap_or_default();
+    wipe(db)?;
+    sealer.forget(&old);
+    hold(db, None);
+    *broken = format!("{why:#}");
+    eprintln!("{why:#}: the index is rebuilt from the files");
+    let encrypted = hold_new_key(db, want, sealer)?;
+    let conn = index::open(db)?;
+    for r in &roots {
+        conn.execute("INSERT OR IGNORE INTO roots (path) VALUES (?1)", [r])?;
+    }
+    if encrypted {
+        save_roots(db, &conn)?;
+    }
+    Ok(())
+}
+
+/// A new key for `db`, sealed and held, while `want` is on; whether there is
+/// one. A key that won't seal is held in memory: an index wanted encrypted is
+/// never plaintext (pinned by
+/// `tests::a_key_that_wont_unseal_rebuilds_the_index_encrypted`).
+fn hold_new_key(db: &Path, want: Want, sealer: &Sealer) -> Result<bool> {
+    match new_key(want, sealer) {
+        Some(Ok((key, credential, seal))) => {
+            write_key(db, &credential)?;
+            hold(
+                db,
+                Some(Held::Sealed {
+                    credential,
+                    key,
+                    seal,
+                }),
+            );
+            Ok(true)
+        }
+        Some(Err(e)) => {
+            hold(db, Some(Held::Memory(Arc::new(Key::random()?))));
+            eprintln!("{e:#}: the new index's key is kept in memory only");
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+fn held_in_memory(db: &Path) -> bool {
+    held()
+        .iter()
+        .any(|(p, h)| p == db && matches!(h, Held::Memory(_)))
+}
+
+/// `db` is as `want` asks, and opens. A key in memory is never settled:
+/// sealed when it can be, or dropped.
 fn settled(db: &Path, want: Want, sealer: &Sealer) -> bool {
     let Ok(key) = key_with(db, sealer) else {
         return false;
     };
-    let memory = held()
-        .iter()
-        .any(|(p, h)| p == db && matches!(h, Held::Memory(_)));
     let opens = !db.exists()
         || Connection::open(db)
             .map_err(anyhow::Error::from)
             .and_then(|c| unlock(&c, key.as_deref()))
             .is_ok();
-    // A key in memory is never settled: sealed when it can be, or dropped.
-    opens && !memory && want.on == key.is_some()
+    opens && !held_in_memory(db) && want.on == key.is_some()
 }
 
 type Sealed = (Arc<Key>, Vec<u8>, Seal);
@@ -434,8 +460,7 @@ fn convert(db: &Path, from: Option<&Key>, to: Option<(&Key, &Vec<u8>)>) -> Resul
         let export = || -> Result<()> {
             let conn = Connection::open(db)?;
             unlock(&conn, from)?;
-            // The WAL's pages into the file, so none of them is left behind.
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            checkpoint(&conn)?;
             let raw = to.map(|(k, _)| k.raw());
             conn.execute(
                 "ATTACH DATABASE ?1 AS target KEY ?2",
@@ -458,14 +483,25 @@ fn convert(db: &Path, from: Option<&Key>, to: Option<(&Key, &Vec<u8>)>) -> Resul
         Some((_, credential)) => write_key(db, credential)?,
         None => remove(&key_file(db))?,
     }
-    // The old file's journal must not be read as the new one's.
-    for ext in ["-wal", "-shm"] {
-        remove(&sibling(db, ext))?;
-    }
+    remove_journal(db)?;
     if db.exists() {
         fs::rename(&new, db)?;
     }
     sync_dir(db)
+}
+
+/// Moves the WAL's pages into the database file, so none is left behind.
+fn checkpoint(conn: &Connection) -> Result<()> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(())
+}
+
+/// Removes `db`'s journal, so the old file's isn't read as a new one's.
+fn remove_journal(db: &Path) -> Result<()> {
+    for ext in ["-wal", "-shm"] {
+        remove(&sibling(db, ext))?;
+    }
+    Ok(())
 }
 
 /// Remove the database, its journal and its key.
@@ -492,14 +528,20 @@ fn remove(p: &Path) -> Result<()> {
     }
 }
 
-/// Create `p` empty and readable by this user only.
-fn private(p: &Path) -> Result<File> {
+/// Create `p`'s folder, if missing, for this user only.
+fn private_parent(p: &Path) -> Result<()> {
     if let Some(dir) = p.parent() {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
     }
+    Ok(())
+}
+
+/// Create `p` empty and readable by this user only.
+fn private(p: &Path) -> Result<File> {
+    private_parent(p)?;
     OpenOptions::new()
         .write(true)
         .create(true)
@@ -508,8 +550,6 @@ fn private(p: &Path) -> Result<File> {
         .open(p)
         .with_context(|| p.display().to_string())
 }
-
-use std::os::unix::fs::DirBuilderExt;
 
 /// Write `contents` to `p` whole: to a new file, synced, renamed over.
 fn write_private(p: &Path, contents: &[u8]) -> Result<()> {
@@ -580,12 +620,7 @@ pub fn hold_shared(db: &Path) -> Result<()> {
 
 fn private_lock(db: &Path) -> Result<File> {
     let p = sibling(db, ".lock");
-    if let Some(dir) = p.parent() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
+    private_parent(&p)?;
     OpenOptions::new()
         .read(true)
         .write(true)

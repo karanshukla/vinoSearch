@@ -30,7 +30,7 @@ const WAIT_MS: i64 = 120_000;
 
 const QUERY_PREFIX: &str = "task: search result | query: ";
 /// EmbeddingGemma's prompt for finding code from a description, for
-/// `code:` queries (#110).
+/// `code:` queries.
 const CODE_QUERY_PREFIX: &str = "task: code retrieval | query: ";
 /// An image's prompt, `<bos> <|image> <|image|> x tokens <image|> <eos>`,
 /// padded to this: SOFT_TOKENS + 4 rounded up to 16, model_image_140's shape.
@@ -63,7 +63,7 @@ struct ImageStage {
     cache: PathBuf,
 }
 
-/// The audio encoder and the text model taking its output (#190).
+/// The audio encoder and the text model taking its output.
 struct AudioStage {
     _audio: CompiledModel,
     audio: InferRequest,
@@ -224,15 +224,20 @@ pub(crate) fn compile_cached(
     .context("setting CACHE_DIR")?;
     let before = blobs(cache);
     let compiled = compile(core)?;
-    // A new blob means a cache miss (a new OpenVINO, say), so the older
-    // ones in this directory are for a build that no longer loads them.
+    Ok((compiled, drop_stale_blobs(cache, before)))
+}
+
+/// Whether compiling wrote a new blob into `cache`. One means a cache miss
+/// (a new OpenVINO, say), so the blobs from `before` are for a build that
+/// no longer loads them, and go.
+fn drop_stale_blobs(cache: &Path, before: Vec<PathBuf>) -> bool {
     let fresh = blobs(cache).iter().any(|b| !before.contains(b));
     if fresh {
         for old in before {
             let _ = std::fs::remove_file(old);
         }
     }
-    Ok((compiled, fresh))
+    fresh
 }
 
 /// Straight from the path: on a cache hit OpenVINO loads the blob without
@@ -262,23 +267,7 @@ impl Stage {
                 &cache,
                 |core| match crate::ml::model::static_path(model_dir, len).filter(|p| p.is_file()) {
                     Some(path) => compile_file(core, &path, device),
-                    // A model fetched before the static graphs were published.
-                    None => {
-                        let path = crate::ml::model::onnx_path(model_dir);
-                        let mut model = core
-                            .read_model_from_file(
-                                path.to_str().context("model path is not UTF-8")?,
-                                "",
-                            )
-                            .context("reading model")?;
-                        let tokens = PartialShape::new_static(2, &[1, len as i64])?;
-                        model
-                            .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
-                            .context("reshaping to static shapes")?;
-                        Ok(core
-                            .compile_model(&model, DeviceType::from(device))
-                            .context("compiling")?)
-                    }
+                    None => compile_reshaped(core, model_dir, len, device),
                 },
             )?;
         let requests = (0..in_flight)
@@ -342,6 +331,27 @@ impl Stage {
     }
 }
 
+/// For a model fetched before the static graphs were published: the dynamic
+/// one, reshaped to `len` tokens.
+fn compile_reshaped(
+    core: &mut Core,
+    model_dir: &Path,
+    len: usize,
+    device: &str,
+) -> Result<CompiledModel> {
+    let path = crate::ml::model::onnx_path(model_dir);
+    let mut model = core
+        .read_model_from_file(path.to_str().context("model path is not UTF-8")?, "")
+        .context("reading model")?;
+    let tokens = PartialShape::new_static(2, &[1, len as i64])?;
+    model
+        .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
+        .context("reshaping to static shapes")?;
+    Ok(core
+        .compile_model(&model, DeviceType::from(device))
+        .context("compiling")?)
+}
+
 /// After work that started at `t0`, leave the device to other programs for
 /// long enough that this work takes `share` of its time.
 pub(crate) fn yield_device(t0: Instant, share: f64) {
@@ -354,6 +364,31 @@ fn i64_tensor(dims: &[i64], data: &[i64]) -> Result<Tensor> {
     let mut t = Tensor::new(ElementType::I64, &Shape::new(dims)?)?;
     t.get_data_mut::<i64>()?.copy_from_slice(data);
     Ok(t)
+}
+
+/// OpenVINO's boolean is a byte, 0 or 1.
+fn bool_tensor(dims: &[i64], data: &[bool]) -> Result<Tensor> {
+    let mut t = Tensor::new(ElementType::Boolean, &Shape::new(dims)?)?;
+    let bytes: Vec<u8> = data.iter().copied().map(u8::from).collect();
+    t.get_data_mut::<u8>()?.copy_from_slice(&bytes);
+    Ok(t)
+}
+
+/// The text model's ids and mask around `tokens` media tokens:
+/// `[bos, begin, media, ..., end, eos]`, then padded to `len` with id 0 and
+/// mask 0. The text model merges the encoder's first `tokens` rows and
+/// ignores the rest. Padding with more media tokens instead would not be
+/// neutral: they are attended even when masked (pinned by
+/// `tests::a_media_prompt_is_padded_at_the_end_with_id_0_and_mask_0`).
+fn media_prompt(specials: [i64; 5], tokens: usize, len: usize) -> (Vec<i64>, Vec<i64>) {
+    let [bos, begin, media, end, eos] = specials;
+    let mut ids = vec![bos, begin];
+    ids.extend(std::iter::repeat_n(media, tokens));
+    ids.extend([end, eos]);
+    let mut mask = vec![1; ids.len()];
+    ids.resize(len, 0);
+    mask.resize(len, 0);
+    (ids, mask)
 }
 
 impl ImageStage {
@@ -429,18 +464,8 @@ impl ImageStage {
             &i64_tensor(&[1, PATCHES as i64, 2], &px.positions)?,
         )?;
         self.vision.infer()?;
-        // Every soft token's row; the text model merges the first `tokens`
-        // (one per image token in the prompt) and ignores the rest.
         let features = self.vision.get_tensor("image_features")?;
-        let [bos, boi, image, eoi, eos] = self.ids;
-        let mut ids = vec![bos, boi];
-        ids.extend(std::iter::repeat_n(image, px.tokens));
-        ids.extend([eoi, eos]);
-        let mut mask = vec![1; ids.len()];
-        // Padded at the end with id 0 and mask 0. More image tokens instead
-        // would not be neutral: they are attended even when masked.
-        ids.resize(IMAGE_LEN, 0);
-        mask.resize(IMAGE_LEN, 0);
+        let (ids, mask) = media_prompt(self.ids, px.tokens, IMAGE_LEN);
         let dims = [1, IMAGE_LEN as i64];
         self.text
             .set_tensor("input_ids", &i64_tensor(&dims, &ids)?)?;
@@ -513,22 +538,12 @@ impl AudioStage {
             &Shape::new(&[1, FRAMES as i64, MELS as i64])?,
         )?;
         values.get_data_mut::<f32>()?.copy_from_slice(&f.mel);
-        let mut mask = Tensor::new(ElementType::Boolean, &Shape::new(&[1, FRAMES as i64])?)?;
-        // OpenVINO's boolean is a byte, 0 or 1.
-        let bytes: Vec<u8> = f.mask().into_iter().map(u8::from).collect();
-        mask.get_data_mut::<u8>()?.copy_from_slice(&bytes);
+        let mask = bool_tensor(&[1, FRAMES as i64], &f.mask())?;
         self.audio.set_tensor("input_features", &values)?;
         self.audio.set_tensor("input_features_mask", &mask)?;
         self.audio.infer()?;
-        // All 250 rows; the text model merges the first `tokens`.
         let features = self.audio.get_tensor("audio_features")?;
-        let [bos, boa, audio, eoa, eos] = self.ids;
-        let mut ids = vec![bos, boa];
-        ids.extend(std::iter::repeat_n(audio, tokens));
-        ids.extend([eoa, eos]);
-        let mut mask = vec![1; ids.len()];
-        ids.resize(AUDIO_LEN, 0);
-        mask.resize(AUDIO_LEN, 0);
+        let (ids, mask) = media_prompt(self.ids, tokens, AUDIO_LEN);
         let dims = [1, AUDIO_LEN as i64];
         self.text
             .set_tensor("input_ids", &i64_tensor(&dims, &ids)?)?;
@@ -573,9 +588,9 @@ impl Compiled for AudioStage {
     }
 }
 
-/// `build` the stage on `device`, then hold it to the CPU's answer for the same input
-/// (#76): checked when compiled fresh or never checked under this OpenVINO, otherwise
-/// the recorded cosine stands. Below `parity::MIN_COSINE`, it's built on the CPU instead.
+/// `build` the stage on `device`, then hold it to the CPU's answer for the same
+/// input: checked when compiled fresh or never checked under this OpenVINO,
+/// otherwise the recorded cosine stands. Below `parity::MIN_COSINE`, it's built on the CPU instead.
 fn checked<S: Compiled>(
     name: &str,
     device: &str,
@@ -685,12 +700,16 @@ impl Embedder {
         let mut v = if fits(&self.tok, &text, QUERY_LEN)? {
             self.query.run(&self.tok, &[text], 1.0)?
         } else {
-            // Too long for the query shape: the document shape takes 256
-            // tokens, and is compiled already whenever the runner has indexed.
-            self.prepare_documents()?;
-            self.docs.as_mut().unwrap().run(&self.tok, &[text], 1.0)?
+            self.run_long_query(text)?
         };
         Ok(v.remove(0))
+    }
+
+    /// Too long for the query shape: the document shape takes 256 tokens, and
+    /// is compiled already whenever the runner has indexed.
+    fn run_long_query(&mut self, text: String) -> Result<Vec<Vec<f32>>> {
+        self.prepare_documents()?;
+        self.docs.as_mut().unwrap().run(&self.tok, &[text], 1.0)
     }
 
     /// Compile the document stage now, if it is not already.
@@ -747,7 +766,7 @@ impl Embedder {
         crate::ml::model::ocr_present(&self.ocr_dir)
     }
 
-    /// The lines of text in `img` (#106), at the document share of the device.
+    /// The lines of text in `img`, at the document share of the device.
     pub fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
         if self.ocr.is_none() {
             self.ocr = Some(crate::ml::ocr::Ocr::new(
@@ -995,13 +1014,13 @@ mod tests {
     use super::*;
 
     /// Writes `src/ml/parity/*.f32` from the CPU. Run after a model revision changes:
-    /// `cargo test --release write_parity_references -- --ignored`.
+    /// `cargo test --release write_parity_references -- --ignored`. The cache
+    /// isn't in the temp dir, which is RAM here: the CPU blobs are hundreds of MB.
     #[test]
     #[ignore = "needs the OpenVINO runtime and the model"]
     fn write_parity_references() {
         let prefix = crate::ml::runtime::default_prefix(None).unwrap();
         crate::ml::runtime::load(&prefix).unwrap();
-        // Not the temp dir, which is RAM here; the CPU blobs are hundreds of MB.
         let home = std::env::var_os("HOME").unwrap();
         let cache = Path::new(&home).join(".cache/vinosearch/parity-references");
         let mut e = Embedder::new(
@@ -1111,9 +1130,16 @@ mod tests {
 
     #[test]
     fn fit_counts_the_special_tokens() {
-        // "a b a" is 3 tokens, 5 with <bos> and <eos>.
-        assert!(fits(&tiny(), "a b a", 5).unwrap());
-        assert!(!fits(&tiny(), "a b a", 4).unwrap());
+        let five_with_bos_and_eos = "a b a";
+        assert!(fits(&tiny(), five_with_bos_and_eos, 5).unwrap());
+        assert!(!fits(&tiny(), five_with_bos_and_eos, 4).unwrap());
+    }
+
+    #[test]
+    fn a_media_prompt_is_padded_at_the_end_with_id_0_and_mask_0() {
+        let (ids, mask) = media_prompt([1, 2, 3, 4, 5], 2, 8);
+        assert_eq!(ids, [1, 2, 3, 3, 4, 5, 0, 0]);
+        assert_eq!(mask, [1, 1, 1, 1, 1, 1, 0, 0]);
     }
 
     #[test]

@@ -11,9 +11,9 @@ use egui_kittest::{Harness, Node};
 use super::*;
 use crate::control::{Partial, Request};
 
-/// Nothing in these tests may reach the bus, run `vinosearch` or open a portal: the link is
-/// detached, the doctor already answered and no test presses Add folder…, Turn on/off or
-/// Check again.
+/// Nothing in these tests may reach the bus, run `vinosearch`, open a portal or touch the
+/// user's own models: the link is detached, the doctor already answered, the models are in
+/// a temp dir and no test presses Add folder…, Turn on/off or Check again.
 fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     let dir =
         std::env::temp_dir().join(format!("vinosearch-settings-{}-{name}", std::process::id()));
@@ -39,7 +39,6 @@ fn window(page: Page, name: &str) -> (SettingsWindow, Receiver<Request>) {
     link.shared.lock().unwrap().largest = Some(vec![("/srv/notes/build".into(), 200)]);
     let mut w = SettingsWindow::with(Some(page), link, dir.join("config.toml"));
     w.estimator = estimated;
-    // Never the user's own models.
     w.models_dir = Some(dir.join("models"));
     w.editors = Some(vec![App {
         id: "org.kde.kate.desktop".into(),
@@ -88,6 +87,8 @@ fn until_estimated(h: &mut Harness<'_, SettingsWindow>) {
     panic!("the estimate never showed");
 }
 
+/// The first frame only styles the window: fonts set in a frame arrive with the next one, and
+/// the window needs its bold.
 fn harness(w: SettingsWindow, size: [f32; 2], theme: Theme) -> Harness<'static, SettingsWindow> {
     let mut styled = false;
     let mut h = Harness::builder()
@@ -95,7 +96,6 @@ fn harness(w: SettingsWindow, size: [f32; 2], theme: Theme) -> Harness<'static, 
         .with_theme(theme)
         .build_ui_state(
             move |ui, w: &mut SettingsWindow| {
-                // Fonts set in a frame arrive with the next one, and the window needs its bold.
                 if !styled {
                     theme::apply(ui.ctx());
                     theme::visible_scroll_handles(ui.ctx());
@@ -200,13 +200,18 @@ fn tab_reaches_the_page_switcher_and_enter_or_space_switches() {
     for size in [WIDE, NARROW] {
         let (w, _requests) = window(Page::Index, "keys");
         let mut h = harness(w, size, Theme::Light);
-        // Tab goes first to the switcher, in page order.
         h.key_press(Key::Tab);
         settle(&mut h);
-        assert!(h.get_by_role_and_label(Role::Tab, "Index").is_focused());
+        assert!(
+            h.get_by_role_and_label(Role::Tab, "Index").is_focused(),
+            "Tab goes first to the switcher at {size:?}"
+        );
         h.key_press(Key::Tab);
         settle(&mut h);
-        assert!(h.get_by_role_and_label(Role::Tab, "Folders").is_focused());
+        assert!(
+            h.get_by_role_and_label(Role::Tab, "Folders").is_focused(),
+            "then on in page order at {size:?}"
+        );
         h.key_press(Key::Enter);
         settle(&mut h);
         assert!(h.state().page == Page::Folders, "Enter at {size:?}");
@@ -252,8 +257,10 @@ fn removing_a_folder_confirms_moves_focus_and_escape_backs_out() {
     let mut h = harness(w, WIDE, Theme::Light);
     first_remove(&h).click();
     settle(&mut h);
-    // The button that was clicked is gone: focus lands on Cancel, not nowhere.
-    assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused());
+    assert!(
+        h.get_by_role_and_label(Role::Button, "Cancel").is_focused(),
+        "the button clicked is gone, so focus lands on Cancel, not nowhere"
+    );
     h.key_press(Key::Escape);
     settle(&mut h);
     assert!(h.state().confirm.is_none());
@@ -281,8 +288,10 @@ fn typed_folders_are_named_fields_that_take_enter() {
     settle(&mut h);
     h.key_press(Key::Enter);
     until_estimated(&mut h);
-    // Nothing is indexed until the estimate is confirmed.
-    assert!(sent(&requests).is_empty());
+    assert!(
+        sent(&requests).is_empty(),
+        "nothing is indexed until the estimate is confirmed"
+    );
     h.get_by_role_and_label(Role::Button, "Add and index /srv/photos")
         .click();
     settle(&mut h);
@@ -293,21 +302,29 @@ fn typed_folders_are_named_fields_that_take_enter() {
         "{sent:?}"
     );
     assert!(h.state().adding.is_none());
-    // Listed at once, though the service hasn't registered it yet.
-    assert!(h.query_by_label("/srv/photos").is_some());
-    assert!(h.query_by_label("Waiting to index").is_some());
-    // Once Status lists it, it's an ordinary root.
+    assert!(
+        h.query_by_label("/srv/photos").is_some() && h.query_by_label("Waiting to index").is_some(),
+        "listed at once, though the service hasn't registered it yet"
+    );
     if let Some(Ok(s)) = &mut h.state().link.shared.lock().unwrap().status {
         s.roots.push("/srv/photos".into());
     }
     settle(&mut h);
-    assert!(h.state().joining.is_empty());
+    assert!(
+        h.state().joining.is_empty(),
+        "once Status lists it, it's an ordinary root"
+    );
     assert!(h.query_by_label("Waiting to index").is_none());
     assert!(
         h.query_by_role_and_label(Role::Button, "Remove /srv/photos")
             .is_some()
     );
+}
 
+#[test]
+fn a_typed_folder_to_exclude_is_saved_on_enter() {
+    let (w, _requests) = window(Page::Folders, "typed-exclude");
+    let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_role_and_label(Role::TextInput, "Folder to exclude")
         .focus();
     settle(&mut h);
@@ -336,13 +353,13 @@ fn a_folder_to_add_shows_its_estimate_and_its_longest_subfolders() {
     let unnamed = unnamed_controls(&h);
     assert!(unnamed.is_empty(), "{unnamed:#?}");
 
-    // Excluding a subfolder saves it and estimates again.
     h.get_by_role_and_label(Role::Button, "Exclude /srv/photos/raw")
         .click();
     settle(&mut h);
     assert_eq!(
         h.state().config.exclude.last().map(String::as_str),
-        Some("/srv/photos/raw")
+        Some("/srv/photos/raw"),
+        "excluding a subfolder saves it, and estimates again"
     );
     until_estimated(&mut h);
     assert!(
@@ -362,53 +379,63 @@ fn a_folder_to_add_shows_its_estimate_and_its_longest_subfolders() {
     );
 }
 
-#[test]
-fn search_page_controls_are_named_by_their_row_labels() {
-    let (w, _requests) = window(Page::Search, "search");
+/// The Search page, with the format switch `label` turned on from off.
+fn search_page_with_switched_on(name: &str, label: &str) -> Harness<'static, SettingsWindow> {
+    let (w, _requests) = window(Page::Search, name);
     let mut h = harness(w, WIDE, Theme::Dark);
-    let images = h.get_by_role_and_label(Role::Switch, "Index images");
+    let switch = h.get_by_role_and_label(Role::Switch, label);
     assert_eq!(
-        images.accesskit_node().toggled(),
-        Some(accesskit::Toggled::False)
+        switch.accesskit_node().toggled(),
+        Some(accesskit::Toggled::False),
+        "{label} starts off"
     );
-    images.click();
+    switch.click();
     settle(&mut h);
+    h
+}
+
+fn saved_config(h: &Harness<'_, SettingsWindow>) -> String {
+    std::fs::read_to_string(&h.state().config_path).unwrap()
+}
+
+#[test]
+fn the_image_types_field_shows_once_images_are_on_named_by_its_row() {
+    let h = search_page_with_switched_on("search-images", "Index images");
     assert!(h.state().config.formats.images_enabled());
-    // Shown once images are on, named by its row label rather than only a placeholder.
     h.get_by_role_and_label(Role::TextInput, "Image types");
-    // Code is opt-in too (#110), and saved as it's turned on.
-    let code = h.get_by_role_and_label(Role::Switch, "Index code");
-    assert_eq!(
-        code.accesskit_node().toggled(),
-        Some(accesskit::Toggled::False)
-    );
-    code.click();
-    settle(&mut h);
+}
+
+#[test]
+fn code_is_opt_in_and_saved_as_it_is_turned_on() {
+    let h = search_page_with_switched_on("search-code", "Index code");
     assert!(h.state().config.formats.code_enabled());
-    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    let saved = saved_config(&h);
     assert!(saved.contains("[formats.code]\nenabled = true"), "{saved}");
-    // So are vinoWhisper sessions (#143), with a nudge towards encryption.
-    let sessions = h.get_by_role_and_label(Role::Switch, "Index vinoWhisper sessions");
-    sessions.click();
-    settle(&mut h);
+}
+
+#[test]
+fn sessions_are_opt_in_with_a_nudge_towards_encryption() {
+    let h = search_page_with_switched_on("search-sessions", "Index vinoWhisper sessions");
     assert!(h.state().config.formats.sessions_enabled());
     h.get_by_label("Turn on encryption (Security) to keep transcripts encrypted.");
-    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    let saved = saved_config(&h);
     assert!(
         saved.contains("[formats.sessions]\nenabled = true"),
         "{saved}"
     );
-    // And media, audio and video (#187).
-    let media = h.get_by_role_and_label(Role::Switch, "Index media");
-    assert_eq!(
-        media.accesskit_node().toggled(),
-        Some(accesskit::Toggled::False)
-    );
-    media.click();
-    settle(&mut h);
+}
+
+#[test]
+fn media_is_opt_in_and_saved_as_it_is_turned_on() {
+    let h = search_page_with_switched_on("search-media", "Index media");
     assert!(h.state().config.formats.media_enabled());
-    let saved = std::fs::read_to_string(&h.state().config_path).unwrap();
+    let saved = saved_config(&h);
     assert!(saved.contains("[formats.media]\nenabled = true"), "{saved}");
+}
+
+#[test]
+fn search_page_controls_are_named_by_their_row_labels() {
+    let h = search_page_with_switched_on("search", "Index images");
     for row in ["Text", "Images", "Code", "Media"] {
         h.get_by_role_and_label(Role::Slider, row);
         h.get_by_role_and_label(Role::SpinButton, row);
@@ -465,8 +492,11 @@ fn a_player_is_picked_or_typed_as_the_editor_is() {
     settle(&mut h);
     h.get_by_label("Custom command…").click();
     settle(&mut h);
-    // The app is dropped; nothing is saved until a command is typed.
-    assert_eq!(h.state().config.player, None);
+    assert_eq!(
+        h.state().config.player,
+        None,
+        "the app is dropped; nothing is saved until a command is typed"
+    );
     assert!(
         h.query_by_role_and_label(Role::TextInput, "Editor command")
             .is_none()
@@ -521,24 +551,19 @@ fn a_score_slider_moves_from_the_keyboard() {
     settle(&mut h);
     h.key_press(Key::ArrowRight);
     settle(&mut h);
-    // Right is closer: the bar the score has to clear goes up.
     let moved = h.state().config.formats.text.min_score;
     assert!(
         moved.is_some_and(|v| v > DEFAULT_TEXT_MIN_SCORE + 0.001),
-        "{moved:?}"
+        "right is closer, so the score to clear goes up: {moved:?}"
     );
-    // Text now has its Default button and Images hasn't, yet both bars and number boxes
-    // still line up (#203), and the hidden button isn't there for a screen reader.
     for role in [Role::Slider, Role::SpinButton] {
         let text = h.get_by_role_and_label(role, "Text").rect();
         let images = h.get_by_role_and_label(role, "Images").rect();
+        let lined_up =
+            (text.min.x - images.min.x).abs() < 0.5 && (text.max.x - images.max.x).abs() < 0.5;
         assert!(
-            (text.min.x - images.min.x).abs() < 0.5,
-            "{text:?} {images:?}"
-        );
-        assert!(
-            (text.max.x - images.max.x).abs() < 0.5,
-            "{text:?} {images:?}"
+            lined_up,
+            "Text has its Default button and Images hasn't, yet they line up: {text:?} {images:?}"
         );
     }
     let resets: Vec<_> = h
@@ -546,7 +571,11 @@ fn a_score_slider_moves_from_the_keyboard() {
         .filter_map(|n| n.accesskit_node().label())
         .filter(|l| l.starts_with("Default"))
         .collect();
-    assert_eq!(resets.len(), 1, "{resets:?}");
+    assert_eq!(
+        resets.len(),
+        1,
+        "a hidden Default button isn't there for a screen reader: {resets:?}"
+    );
 }
 
 #[test]
@@ -575,7 +604,6 @@ fn model_page_controls_are_named_and_delete_asks_first() {
 fn a_partial_download_can_be_deleted() {
     let (w, requests) = window(Page::Model, "partial");
     if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
-        // Images are on and only the text model came down.
         s.model_present = false;
         s.images_model_present = false;
         s.model_loaded = false;
@@ -639,7 +667,6 @@ fn without_the_service_the_models_are_deleted_from_disk() {
 
 #[test]
 fn a_service_that_answers_with_an_error_keeps_its_models() {
-    // It may have them loaded, or be downloading: only it may delete them.
     let (w, _requests) = window(Page::Model, "erroring");
     w.link.shared.lock().unwrap().status = Some(Err("the index is locked".into()));
     let models = w.models_dir.clone().unwrap();
@@ -647,7 +674,10 @@ fn a_service_that_answers_with_an_error_keeps_its_models() {
     let h = harness(w, WIDE, Theme::Light);
     h.get_by_label("the index is locked");
     assert!(h.query_by_role_and_label(Role::Button, "Delete…").is_none());
-    assert!(models.exists());
+    assert!(
+        models.exists(),
+        "it may have them loaded, or be downloading: only it may delete them"
+    );
 }
 
 #[test]
@@ -674,7 +704,6 @@ fn a_failed_probe_says_so_in_words() {
     let (w, _requests) = window(Page::Hardware, "doctor");
     let h = harness(w, WIDE, Theme::Light);
     h.get_by_label("This machine");
-    // Red too, but the words carry it.
     h.get_by_label("failed on NPU: no such device");
     h.get_by_role_and_label(Role::Button, "Check again");
 }
@@ -739,8 +768,6 @@ fn the_index_page_lists_documents_indexed_in_part() {
     }
     let h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Indexing the rest of long documents");
-    // The name and how far it got are two labels, so a long name can be cut
-    // short without losing the count.
     h.get_by_label("book0.pdf");
     h.get_by_label("book1.pdf");
     h.get_by_label(", 30 of 41 chapters");
@@ -781,8 +808,10 @@ fn a_greyed_out_button_says_it_is_disabled() {
             .accesskit_node()
             .is_disabled()
     };
-    // The window's status is mid-index.
-    assert!(disabled(&h, "Re-index /srv/notes"));
+    assert!(
+        disabled(&h, "Re-index /srv/notes"),
+        "the window's status is mid-index"
+    );
     assert!(disabled(&h, "Add to included"));
     h.get_by_role_and_label(Role::TextInput, "Folder to add")
         .click();
@@ -793,13 +822,13 @@ fn a_greyed_out_button_says_it_is_disabled() {
     assert!(!disabled(&h, "Add to included"));
 }
 
+/// With nothing changing the frames stop: `run` panics if the spinner keeps asking.
 #[test]
 fn reduced_motion_stops_the_spinner() {
     let (w, _requests) = window(Page::Index, "still");
     let mut h = harness(w, WIDE, Theme::Light);
     h.ctx.all_styles_mut(|style| style.animation_time = 0.0);
     h.run_steps(2);
-    // With nothing changing, the frames stop: run() would panic if the spinner kept asking.
     h.run();
 }
 
@@ -853,6 +882,7 @@ fn a_full_screen_window_puts_a_page_s_groups_in_two_columns() {
     }
 }
 
+/// Twice the size is past the sidebar's breakpoint, so the tabs take over.
 #[test]
 fn zoom_keeps_every_page_usable() {
     for page in Page::ALL {
@@ -860,7 +890,6 @@ fn zoom_keeps_every_page_usable() {
         let mut h = harness(w, WIDE, Theme::Light);
         h.ctx.set_zoom_factor(2.0);
         settle(&mut h);
-        // Twice the size is past the sidebar's breakpoint: the tabs take over.
         h.get_by_role_and_label(Role::Tab, page.title());
         assert!(unnamed_controls(&h).is_empty(), "{}", page.title());
     }
@@ -882,10 +911,10 @@ fn encryption_is_saved_and_applied_at_once() {
     let path = w.config_path.clone();
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Not encrypted");
-    // A TPM: nothing to say about doing without one.
     assert!(
         h.query_by_label("Use the host key instead (weaker)")
-            .is_none()
+            .is_none(),
+        "with a TPM there's nothing to say about doing without one"
     );
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
@@ -902,7 +931,7 @@ fn encryption_is_saved_and_applied_at_once() {
 }
 
 #[test]
-fn without_a_tpm_turning_it_on_is_refused_until_the_host_key_is_allowed() {
+fn no_tpm_refuses_encryption_until_the_host_key_is_allowed() {
     let (w, requests) = security("notpm", |_| {});
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
@@ -926,10 +955,10 @@ fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
     let (w, requests) = security("keyring", |s| s.new_seal = "keyring".into());
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_label_contains("desktop keyring, which your session can read");
-    // No TPM, but nothing to allow: the keyring is what there is.
     assert!(
         h.query_by_label("Use the host key instead (weaker)")
-            .is_none()
+            .is_none(),
+        "no TPM, but nothing to allow: the keyring is what there is"
     );
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
@@ -940,7 +969,10 @@ fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
             .iter()
             .any(|r| matches!(r, Request::ApplyEncryption))
     );
+}
 
+#[test]
+fn a_keyring_index_waiting_for_its_key_offers_to_unlock_it() {
     let (w, requests) = security("keyring-waiting", |s| {
         s.new_seal = "keyring".into();
         s.encrypted = true;
@@ -979,9 +1011,11 @@ fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
     assert!(sent(&requests).iter().any(|r| matches!(r, Request::Rekey)));
 }
 
-#[test]
-fn the_index_bar_shows_every_kind_indexed() {
-    let (w, _requests) = window(Page::Index, "bar");
+const LEGEND: [&str; 4] = ["Text 50%", "Code 25%", "Sessions <1%", "Media 25%"];
+
+/// The Index page narrow enough that the share bar's legend runs onto a second row.
+fn index_bar(name: &str) -> Harness<'static, SettingsWindow> {
+    let (w, _requests) = window(Page::Index, name);
     if let Some(Ok(s)) = w.link.shared.lock().unwrap().status.as_mut() {
         s.chunks = 400;
         s.text_chunks = 200;
@@ -989,15 +1023,25 @@ fn the_index_bar_shows_every_kind_indexed() {
         s.session_chunks = 1;
         s.media_chunks = 99;
     }
-    // Narrow, so the legend runs onto a second row.
     let mut h = harness(w, [420.0, 900.0], Theme::Light);
     settle(&mut h);
-    for legend in ["Text 50%", "Code 25%", "Sessions <1%", "Media 25%"] {
+    h
+}
+
+#[test]
+fn the_index_bar_shows_every_kind_indexed() {
+    let h = index_bar("bar");
+    for legend in LEGEND {
         h.get_by_label(legend);
     }
-    // Each entry on one line: a label squeezed into the row's end wraps a
-    // character a line, and stands far taller than it is wide.
-    for legend in ["Text 50%", "Code 25%", "Sessions <1%", "Media 25%"] {
+}
+
+/// A label squeezed into the row's end would wrap a character a line, and
+/// stand far taller than it is wide.
+#[test]
+fn each_legend_entry_stays_on_one_line() {
+    let h = index_bar("legend");
+    for legend in LEGEND {
         let rect = h.get_by_label(legend).rect();
         assert!(rect.height() < 24.0, "{legend} is {rect:?}");
     }

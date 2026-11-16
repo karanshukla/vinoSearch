@@ -9,6 +9,9 @@ use crate::window::{
 /// Documents indexed in part listed by name on the Index page; the rest are counted.
 const PARTIAL_SHOWN: usize = 3;
 
+/// About how wide a letter of the Index page's 12.5 pt rows is.
+const LETTER_WIDTH: f32 = 7.0;
+
 impl SettingsWindow {
     /// Beside the Index page's title: what the service is doing, in words.
     pub(in crate::window) fn index_status(
@@ -26,7 +29,6 @@ impl SettingsWindow {
                 if s.paused {
                     widgets::chip(ui, ChipKind::Neutral, "Stopped");
                 } else if power_hold(&s.power_hold).is_some() {
-                    // The Now row says what for.
                     widgets::chip(ui, ChipKind::Warn, "On hold");
                 } else if s.indexing {
                     widgets::chip(ui, ChipKind::Ok, "Indexing");
@@ -120,21 +122,7 @@ impl SettingsWindow {
                                 } else {
                                     format!("{name} {:.0}%", pct.round())
                                 };
-                                // The legend's label wraps rather than move to the next
-                                // row, so one that won't fit starts a row of its own.
-                                let width = LEGEND_SWATCH
-                                    + ui.painter()
-                                        .layout_no_wrap(
-                                            text.clone(),
-                                            egui::FontId::proportional(12.5),
-                                            p.muted,
-                                        )
-                                        .size()
-                                        .x;
-                                if width > ui.available_size_before_wrap().x {
-                                    ui.end_row();
-                                }
-                                widgets::legend(ui, color, &text);
+                                legend_entry(ui, p, color, text);
                             }
                         }
                     });
@@ -163,7 +151,6 @@ impl SettingsWindow {
                     self.link.send(Request::PauseIndexing);
                 }
             });
-            // Why it is indexing after a start: a model changed (#80).
             if !s.model_changed.is_empty() {
                 Row::new("Indexing again")
                     .help(&s.model_changed)
@@ -182,38 +169,7 @@ impl SettingsWindow {
             if !s.partial.is_empty() {
                 Row::new("In part")
                     .help("Long documents finish later.")
-                    .show(ui, |ui, _| {
-                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            // Part of the row only: a long file name is cut
-                            // short (whole on hover), not laid over the label.
-                            let width = (ui.available_width() * 0.6).max(160.0);
-                            for d in s.partial.iter().take(PARTIAL_SHOWN) {
-                                let (name, progress) = partial_line(d);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(width, 18.0),
-                                    Layout::right_to_left(Align::Center),
-                                    |ui| {
-                                        ui.spacing_mut().item_spacing.x = 0.0;
-                                        ui.label(RichText::new(format!(", {progress}")).size(12.5));
-                                        // About 7 px a letter at this size.
-                                        let room = (ui.available_width() / 7.0) as usize;
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(middle_cut(&name, room)).size(12.5),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&name);
-                                    },
-                                );
-                            }
-                            let more = s.partial.len().saturating_sub(PARTIAL_SHOWN);
-                            if more > 0 {
-                                widgets::small(ui, format!("and {} more", count(more as i64)));
-                            }
-                        });
-                    });
+                    .show(ui, |ui, _| partial_list(ui, &s.partial));
             }
             Row::new("Last change").show(ui, |ui, _| {
                 if s.last_indexed == 0 {
@@ -250,6 +206,12 @@ impl SettingsWindow {
         });
     }
 
+    /// Asked at once, then again whenever the index has changed and indexing
+    /// has settled: a first index can run for hours.
+    fn largest_is_stale(&self, s: &Status) -> bool {
+        (self.largest_for.is_none() || !s.indexing) && self.largest_for != Some(s.chunks)
+    }
+
     /// Where the index goes, with a one-click exclude: generated and copied
     /// trees are often most of it, which nobody would guess without seeing it.
     pub(in crate::window) fn largest(
@@ -259,9 +221,7 @@ impl SettingsWindow {
         largest: Option<&Vec<(String, u64)>>,
     ) {
         let p = theme::palette(ui.ctx());
-        // Asked at once, then again whenever the index has changed and indexing
-        // has settled: a first index can run for hours.
-        if (self.largest_for.is_none() || !s.indexing) && self.largest_for != Some(s.chunks) {
+        if self.largest_is_stale(s) {
             self.largest_for = Some(s.chunks);
             self.link.send(Request::LargestFolders(LARGEST));
         }
@@ -289,30 +249,7 @@ impl SettingsWindow {
                     ui,
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
-                        // The count first, whole and on one line; the path
-                        // has what is left and is cut short to fit. Path
-                        // first, a long one left the count a sliver to wrap in.
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 18.0),
-                            Layout::right_to_left(Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(format!(
-                                            "{} chunks · {:.0}%",
-                                            count(*chunks as i64),
-                                            share * 100.0
-                                        ))
-                                        .size(12.5)
-                                        .color(p.muted),
-                                    )
-                                    .extend(),
-                                );
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    widgets::mono(ui, &entry);
-                                });
-                            },
-                        );
+                        largest_heading(ui, p, &entry, *chunks, share);
                         let (rect, _) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), 4.0),
                             egui::Sense::hover(),
@@ -344,4 +281,77 @@ impl SettingsWindow {
             self.add(Target::Exclude, &path);
         }
     }
+}
+
+/// egui wraps a legend's label rather than move it to the next row, so one
+/// that won't fit starts a row of its own (pinned by
+/// `window::ui_tests::each_legend_entry_stays_on_one_line`).
+fn legend_entry(ui: &mut egui::Ui, p: &theme::Palette, color: egui::Color32, text: String) {
+    let width = LEGEND_SWATCH
+        + ui.painter()
+            .layout_no_wrap(text.clone(), egui::FontId::proportional(12.5), p.muted)
+            .size()
+            .x;
+    if width > ui.available_size_before_wrap().x {
+        ui.end_row();
+    }
+    widgets::legend(ui, color, &text);
+}
+
+/// The documents indexed in part, in part of the row only: a long file name
+/// is cut short (whole on hover), not laid over the row's label. The name and
+/// how far it got are two labels, so the cut never takes the count (pinned by
+/// `window::ui_tests::the_index_page_lists_documents_indexed_in_part`).
+fn partial_list(ui: &mut egui::Ui, partial: &[crate::control::Partial]) {
+    ui.with_layout(Layout::top_down(Align::Max), |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let width = (ui.available_width() * 0.6).max(160.0);
+        for d in partial.iter().take(PARTIAL_SHOWN) {
+            let (name, progress) = partial_line(d);
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 18.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(RichText::new(format!(", {progress}")).size(12.5));
+                    let room = (ui.available_width() / LETTER_WIDTH) as usize;
+                    ui.add(
+                        egui::Label::new(RichText::new(middle_cut(&name, room)).size(12.5))
+                            .truncate(),
+                    )
+                    .on_hover_text(&name);
+                },
+            );
+        }
+        let more = partial.len().saturating_sub(PARTIAL_SHOWN);
+        if more > 0 {
+            widgets::small(ui, format!("and {} more", count(more as i64)));
+        }
+    });
+}
+
+/// The count first, whole and on one line; the path gets what is left and is
+/// cut short to fit, so a long path can't leave the count a sliver to wrap in.
+fn largest_heading(ui: &mut egui::Ui, p: &theme::Palette, entry: &str, chunks: u64, share: f32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 18.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{} chunks · {:.0}%",
+                        count(chunks as i64),
+                        share * 100.0
+                    ))
+                    .size(12.5)
+                    .color(p.muted),
+                )
+                .extend(),
+            );
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                widgets::mono(ui, entry);
+            });
+        },
+    );
 }

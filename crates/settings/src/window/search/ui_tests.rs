@@ -195,6 +195,26 @@ fn options<'h>(h: &'h Harness<'_, SearchWindow>, list: &str) -> Vec<Node<'h>> {
         .collect()
 }
 
+fn show_the_action_bar(h: &mut Harness<'_, SearchWindow>) {
+    options(h, "Text and documents")[0].click();
+    settle(h);
+}
+
+/// The window drawing its own buttons, answered.
+fn with_window_buttons(size: [f32; 2], name: &str) -> (Harness<'static, SearchWindow>, PathBuf) {
+    let (mut w, _asked, dir) = window("camping", name);
+    w.app_title_bar = true;
+    let mut h = harness(w, size);
+    answered(&mut h);
+    (h, dir)
+}
+
+/// The margin the harness lays the window out inside.
+fn harness_margin(h: &Harness<'_, SearchWindow>) -> f32 {
+    let images = h.get_by_role_and_label(Role::CheckBox, "Images (2)");
+    images.rect().left() - HEADER_INSET
+}
+
 const CONTROLS: [Role; 7] = [
     Role::Button,
     Role::CheckBox,
@@ -237,8 +257,7 @@ fn the_query_from_the_command_line_is_searched_and_shown_by_kind() {
             "budget.pdf, page 3, in /srv/notes: Camping gear: 240 dollars",
         ]
     );
-    // The photos decode off the UI thread and land as textures.
-    until(&mut h, "the thumbnails", |w| {
+    until(&mut h, "the thumbnails decoded off the UI thread", |w| {
         w.results.iter().filter(|f| f.kind == Kind::Image).all(|f| {
             w.thumbs
                 .shown
@@ -255,9 +274,7 @@ fn every_control_has_a_name_wide_or_narrow() {
         let (w, _asked, dir) = window("camping", "names");
         let mut h = harness(w, size);
         answered(&mut h);
-        // Select one, so the action bar shows too.
-        options(&h, "Text and documents")[0].click();
-        settle(&mut h);
+        show_the_action_bar(&mut h);
         let unnamed: Vec<String> = h
             .query_all_by(|node| {
                 let focusable = node.data().supports_action(accesskit::Action::Focus);
@@ -318,8 +335,15 @@ fn filters_narrow_by_kind_folder_date_and_type() {
     h.state_mut().filters.extension = Some("pdf".into());
     settle(&mut h);
     assert_eq!(shown(&h), ["budget.pdf"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
-    // A filter that hides everything says so, and Clear filters is there.
+#[test]
+fn a_filter_that_hides_everything_says_so_and_offers_clear_filters() {
+    let (w, _asked, dir) = window("camping", "hidden");
+    let mut h = harness(w, WIDE);
+    answered(&mut h);
+    h.state_mut().filters.extension = Some("pdf".into());
     h.state_mut().filters.text = false;
     h.state_mut().filters.documents = false;
     settle(&mut h);
@@ -430,14 +454,8 @@ fn media_sessions_and_code_have_filters_and_media_a_section_of_its_own() {
 #[test]
 fn the_window_buttons_sit_in_the_top_right_corner() {
     for size in [WIDE, NARROW] {
-        let (mut w, _asked, dir) = window("camping", "corner");
-        w.app_title_bar = true;
-        let mut h = harness(w, size);
-        answered(&mut h);
-        // The harness lays the window out inside a margin of its own.
-        let images = h.get_by_role_and_label(Role::CheckBox, "Images (2)");
-        let margin = images.rect().left() - HEADER_INSET;
-        let gap = vino_ui::window::BAR_GAP + margin;
+        let (h, dir) = with_window_buttons(size, "corner");
+        let gap = vino_ui::window::BAR_GAP + harness_margin(&h);
         let close = h.get_by_role_and_label(Role::Button, "Close").rect();
         assert_eq!(close.top(), gap, "{size:?}");
         assert_eq!(close.right(), size[0] - gap, "{size:?}");
@@ -445,8 +463,15 @@ fn the_window_buttons_sit_in_the_top_right_corner() {
             let button = h.get_by_role_and_label(Role::Button, name).rect();
             assert_eq!(button.top(), gap, "{name} {size:?}");
         }
-        // The filters keep the header's inset on the right, wrapping
-        // before it: a menu is never squeezed past the edge.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn the_filters_wrap_before_the_headers_inset_so_no_menu_is_squeezed_past_the_edge() {
+    for size in [WIDE, NARROW] {
+        let (h, dir) = with_window_buttons(size, "inset");
+        let margin = harness_margin(&h);
         let clear_of = size[0] - margin - HEADER_INSET;
         for chip in h.query_all_by_role(Role::CheckBox) {
             assert!(chip.rect().right() <= clear_of, "{size:?}");
@@ -465,7 +490,10 @@ fn a_media_result_names_the_time_it_plays_from() {
     assert_eq!(clip.place(), "12:34");
     let long = found("/srv/v/film.mkv", Kind::Media, "", "second", 3723, 1);
     assert_eq!(long.place(), "1:02:03");
-    // The start of the file is a place too, as line 0 never is.
+}
+
+#[test]
+fn the_start_of_a_media_file_is_a_place_as_line_0_never_is() {
     let start = found("/srv/v/trip.mkv", Kind::Media, "", "second", 0, 1);
     assert_eq!(start.place(), "00:00");
     let note = found("/srv/n/a.md", Kind::Text, "x", "line", 0, 1);
@@ -509,14 +537,14 @@ fn a_selected_result_opens_at_its_match_its_folder_or_copies() {
 }
 
 #[test]
-fn the_keyboard_goes_from_the_query_to_the_results_and_opens_one() {
+fn the_keyboard_reaches_the_results_and_opens_one() {
     let (w, asked_, dir) = window("camping", "keys");
     let mut h = harness(w, WIDE);
     answered(&mut h);
-    // The search field has focus from the start.
     assert!(
         h.get_by_role_and_label(Role::TextInput, "Search")
-            .is_focused()
+            .is_focused(),
+        "the search field has focus from the start"
     );
     h.key_press(Key::ArrowDown);
     settle(&mut h);
@@ -524,28 +552,33 @@ fn the_keyboard_goes_from_the_query_to_the_results_and_opens_one() {
     assert!(first.is_focused());
     let beach = dir.join("beach.png").display().to_string();
     assert_eq!(h.state().selected.as_deref(), Some(beach.as_str()));
-    // The arrows move about the grid, and Tab on to the list, selecting as
-    // they go.
     h.key_press(Key::ArrowRight);
     settle(&mut h);
     let dog = dir.join("dog.png").display().to_string();
-    assert_eq!(h.state().selected.as_deref(), Some(dog.as_str()));
+    assert_eq!(
+        h.state().selected.as_deref(),
+        Some(dog.as_str()),
+        "the arrows move about the grid, selecting as they go"
+    );
     h.key_press(Key::Enter);
     asked(&asked_, &mut h, &Ask::Open(dog.clone(), 0));
     h.key_press(Key::Tab);
     settle(&mut h);
-    assert_eq!(h.state().selected.as_deref(), Some("/srv/notes/trip.md"));
+    assert_eq!(
+        h.state().selected.as_deref(),
+        Some("/srv/notes/trip.md"),
+        "Tab goes on to the list, selecting"
+    );
     h.key_press(Key::Enter);
     asked(&asked_, &mut h, &Ask::Open("/srv/notes/trip.md".into(), 12));
-    // Ctrl+C copies it.
     h.event(egui::Event::Copy);
     asked(&asked_, &mut h, &Ask::Copy("/srv/notes/trip.md".into()));
-    // Ctrl+F goes back to the query.
     h.key_press_modifiers(Modifiers::COMMAND, Key::F);
     settle(&mut h);
     assert!(
         h.get_by_role_and_label(Role::TextInput, "Search")
-            .is_focused()
+            .is_focused(),
+        "Ctrl+F goes back to the query"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -558,9 +591,11 @@ fn typing_searches_once_it_pauses_and_errors_are_said() {
     h.get_by_role_and_label(Role::TextInput, "Search")
         .type_text("fail");
     h.step();
-    // Nothing yet: the typing hasn't paused.
     assert!(h.state().typed_at.is_some());
-    assert!(asked_.lock().unwrap().is_empty());
+    assert!(
+        asked_.lock().unwrap().is_empty(),
+        "nothing yet: the typing hasn't paused"
+    );
     asked(&asked_, &mut h, &Ask::Search(0, "fail".into()));
     answered(&mut h);
     h.get_by_label("Couldn't search: the worker has stopped");

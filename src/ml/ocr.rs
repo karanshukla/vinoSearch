@@ -1,4 +1,4 @@
-//! Text in images (#106): screenshots, photographed pages and scanned PDFs,
+//! Text in images: screenshots, photographed pages and scanned PDFs,
 //! read with PaddleOCR's PP-OCRv6 small detector and recogniser on the NPU.
 //!
 //! Both graphs take dynamic shapes, which the NPU can't compile, so each is
@@ -120,10 +120,7 @@ impl Moments {
         let sxx = self.xx / self.n - mx * mx;
         let syy = self.yy / self.n - my * my;
         let sxy = self.xy / self.n - mx * my;
-        // Eigenvalues of the covariance: the spread along each axis.
-        let mid = (sxx + syy) / 2.0;
-        let gap = (((sxx - syy) / 2.0).powi(2) + sxy * sxy).sqrt();
-        let (major, minor) = (mid + gap, (mid - gap).max(0.0));
+        let (major, minor) = spread(sxx, syy, sxy);
         if major < f64::from(MIN_ELONGATION).powi(2) * minor.max(1e-9) {
             return (1.0, 0.0);
         }
@@ -137,10 +134,28 @@ impl Moments {
     }
 }
 
+/// The spread along the major and minor axes: the eigenvalues of the
+/// covariance `[[sxx, sxy], [sxy, syy]]`.
+fn spread(sxx: f64, syy: f64, sxy: f64) -> (f64, f64) {
+    let mid = (sxx + syy) / 2.0;
+    let gap = (((sxx - syy) / 2.0).powi(2) + sxy * sxy).sqrt();
+    (mid + gap, (mid - gap).max(0.0))
+}
+
+/// Black, normalised as the detector's input is.
+const BLACK: f32 = -1.0;
+
+/// An image as the detector's input.
+struct Letterbox {
+    input: Vec<f32>,
+    scale: f32,
+    /// The scaled image's (height, width), in the input's top left.
+    scaled: (usize, usize),
+}
+
 /// `img` scaled into a detector shape `(h, w)` and padded with black, as the
-/// detector's input: BGR, `(x / 255 - 0.5) / 0.5`, channels first. Returns
-/// the input, the scale and the scaled image's (height, width).
-fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> (Vec<f32>, f32, (usize, usize)) {
+/// detector's input: BGR, `(x / 255 - 0.5) / 0.5`, channels first.
+fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> Letterbox {
     let (ih, iw) = (img.height() as f32, img.width() as f32);
     let scale = (h as f32 / ih).min(w as f32 / iw).min(MAX_UPSCALE);
     let nh = ((ih * scale).round() as usize).clamp(1, h);
@@ -152,8 +167,7 @@ fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> (Vec<f32>, f32, (usize, 
         scaled = image::imageops::resize(img, nw as u32, nh as u32, FilterType::Triangle);
         &scaled
     };
-    // Black is -1 once normalised.
-    let mut x = vec![-1f32; 3 * h * w];
+    let mut x = vec![BLACK; 3 * h * w];
     let plane = h * w;
     for (px, py, p) in src.enumerate_pixels() {
         let at = py as usize * w + px as usize;
@@ -161,25 +175,18 @@ fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> (Vec<f32>, f32, (usize, 
             x[c * plane + at] = f32::from(v) / 127.5 - 1.0;
         }
     }
-    (x, scale, (nh, nw))
+    Letterbox {
+        input: x,
+        scale,
+        scaled: (nh, nw),
+    }
 }
 
 /// The detector's map `prob` (`w` wide), over the scaled image's `(nh, nw)`,
 /// to line boxes in the image's pixels. Each 8-connected region above
 /// `THRESH`, after a 2x2 dilation, is a line.
 fn boxes(prob: &[f32], w: usize, (nh, nw): (usize, usize), scale: f32) -> Vec<Rect> {
-    // Dilated by a 2x2 kernel anchored at its centre, as cv2.dilate does:
-    // a pixel is set when it or its left, upper or upper-left neighbour is.
-    let on = |x: usize, y: usize| prob[y * w + x] > THRESH;
-    let mut mask = vec![false; nh * nw];
-    for y in 0..nh {
-        for x in 0..nw {
-            mask[y * nw + x] = on(x, y)
-                || (x > 0 && on(x - 1, y))
-                || (y > 0 && on(x, y - 1))
-                || (x > 0 && y > 0 && on(x - 1, y - 1));
-        }
-    }
+    let mask = dilated(prob, w, (nh, nw));
     let mut seen = vec![false; nh * nw];
     let mut stack = Vec::new();
     let mut region = Vec::new();
@@ -213,34 +220,56 @@ fn boxes(prob: &[f32], w: usize, (nh, nw): (usize, usize), scale: f32) -> Vec<Re
         if m.prob / m.n < f64::from(BOX_THRESH) {
             continue;
         }
-        // The region's extent along its axis and across it, each pixel taken
-        // as its whole square.
-        let (cos, sin) = m.axis();
-        let (mx, my) = (m.x / m.n, m.y / m.n);
-        let (mut u0, mut u1, mut v0, mut v1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-        for &i in &region {
-            let (dx, dy) = ((i % nw) as f64 + 0.5 - mx, (i / nw) as f64 + 0.5 - my);
-            let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
-            (u0, u1, v0, v1) = (u0.min(u), u1.max(u), v0.min(v), v1.max(v));
-        }
-        let pad = 0.5 * (cos.abs() + sin.abs());
-        let (bw, bh) = (u1 - u0 + 2.0 * pad, v1 - v0 + 2.0 * pad);
-        if bw.min(bh) < MIN_SIDE as f64 {
-            continue;
-        }
-        let (um, vm) = ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
-        let grow = bw * bh * f64::from(UNCLIP) / (2.0 * (bw + bh));
-        let s = f64::from(scale);
-        out.push(Rect {
-            cx: ((mx + um * cos - vm * sin) / s) as f32,
-            cy: ((my + um * sin + vm * cos) / s) as f32,
-            w: ((bw + 2.0 * grow) / s) as f32,
-            h: ((bh + 2.0 * grow) / s) as f32,
-            cos: cos as f32,
-            sin: sin as f32,
-        });
+        out.extend(line_box(&region, &m, nw, scale));
     }
     reading_order(out)
+}
+
+/// The map over `THRESH` dilated by a 2x2 kernel anchored at its centre, as
+/// cv2.dilate does: a pixel is set when it or its left, upper or upper-left
+/// neighbour is (pinned by `tests::regions_become_boxes_grown_by_the_unclip_distance`).
+fn dilated(prob: &[f32], w: usize, (nh, nw): (usize, usize)) -> Vec<bool> {
+    let on = |x: usize, y: usize| prob[y * w + x] > THRESH;
+    let mut mask = vec![false; nh * nw];
+    for y in 0..nh {
+        for x in 0..nw {
+            mask[y * nw + x] = on(x, y)
+                || (x > 0 && on(x - 1, y))
+                || (y > 0 && on(x, y - 1))
+                || (x > 0 && y > 0 && on(x - 1, y - 1));
+        }
+    }
+    mask
+}
+
+/// The box around `region` (indices into a map `nw` wide) along its axis,
+/// each pixel taken as its whole square, grown by UNCLIP and scaled back to
+/// the image's pixels; None if it is thinner than MIN_SIDE.
+fn line_box(region: &[usize], m: &Moments, nw: usize, scale: f32) -> Option<Rect> {
+    let (cos, sin) = m.axis();
+    let (mx, my) = (m.x / m.n, m.y / m.n);
+    let (mut u0, mut u1, mut v0, mut v1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &i in region {
+        let (dx, dy) = ((i % nw) as f64 + 0.5 - mx, (i / nw) as f64 + 0.5 - my);
+        let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+        (u0, u1, v0, v1) = (u0.min(u), u1.max(u), v0.min(v), v1.max(v));
+    }
+    let pad = 0.5 * (cos.abs() + sin.abs());
+    let (bw, bh) = (u1 - u0 + 2.0 * pad, v1 - v0 + 2.0 * pad);
+    if bw.min(bh) < MIN_SIDE as f64 {
+        return None;
+    }
+    let (um, vm) = ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
+    let grow = bw * bh * f64::from(UNCLIP) / (2.0 * (bw + bh));
+    let s = f64::from(scale);
+    Some(Rect {
+        cx: ((mx + um * cos - vm * sin) / s) as f32,
+        cy: ((my + um * sin + vm * cos) / s) as f32,
+        w: ((bw + 2.0 * grow) / s) as f32,
+        h: ((bh + 2.0 * grow) / s) as f32,
+        cos: cos as f32,
+        sin: sin as f32,
+    })
 }
 
 /// Top to bottom, then left to right among boxes on the same row: within
@@ -280,10 +309,9 @@ fn crop(img: &RgbImage, r: Rect) -> Option<RgbImage> {
     let stride = img.width() as usize * 3;
     let at = |x: usize, y: usize, c: usize| f32::from(raw[y * stride + x * 3 + c]);
     let line = RgbImage::from_fn(w, h, |i, j| {
-        let (u, v) = (i as f32 + 0.5 - r.w / 2.0, j as f32 + 0.5 - r.h / 2.0);
-        // The source point, as a pixel's centre is at +0.5.
-        let x = (r.cx + u * r.cos - v * r.sin - 0.5).clamp(0.0, iw - 1.0);
-        let y = (r.cy + u * r.sin + v * r.cos - 0.5).clamp(0.0, ih - 1.0);
+        let (x, y) = source_point(&r, i, j);
+        let x = x.clamp(0.0, iw - 1.0);
+        let y = y.clamp(0.0, ih - 1.0);
         let (x0, y0) = (x.floor() as usize, y.floor() as usize);
         let (x1, y1) = ((x0 + 1).min(iw as usize - 1), (y0 + 1).min(ih as usize - 1));
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
@@ -298,6 +326,16 @@ fn crop(img: &RgbImage, r: Rect) -> Option<RgbImage> {
     } else {
         line
     })
+}
+
+/// Where the line's pixel `(i, j)` samples `img`, in pixel indices: a
+/// pixel's centre is at +0.5 from its index.
+fn source_point(r: &Rect, i: u32, j: u32) -> (f32, f32) {
+    let (u, v) = (i as f32 + 0.5 - r.w / 2.0, j as f32 + 0.5 - r.h / 2.0);
+    (
+        r.cx + u * r.cos - v * r.sin - 0.5,
+        r.cy + u * r.sin + v * r.cos - 0.5,
+    )
 }
 
 /// A line as the recogniser's input: scaled to its height, aspect kept up to
@@ -356,7 +394,7 @@ fn ctc(probs: &[f32], classes: usize, chars: &[String]) -> (String, f32) {
 /// Pages past this in a scanned PDF are left unread: at ~0.5 s a page, a
 /// 100-page scan takes under a minute.
 pub const MAX_SCAN_PAGES: usize = 100;
-/// pdfinfo and pdftoppm get what the document parser does (#84): memory and
+/// pdfinfo and pdftoppm get what the document parser does: memory and
 /// CPU seconds a run, and one deadline for the whole scan, so a crafted PDF
 /// that stalls every page holds indexing minutes, not a minute a page.
 const POPPLER_ADDRESS_SPACE: u64 = 1 << 30;
@@ -495,9 +533,9 @@ impl Graph {
     }
 
     /// Run on `input`, the graph's whole input, and hand its output to `read`.
+    /// Copied into the request's own input, rather than a new 25 MB tensor for
+    /// every image.
     fn run<T>(&mut self, input: &[f32], read: impl FnOnce(&[f32]) -> T) -> Result<T> {
-        // Into the request's own input, rather than a new 25 MB tensor for
-        // every image.
         let mut t = self.request.get_input_tensor()?;
         let data = t.get_data_mut::<f32>()?;
         ensure!(
@@ -602,7 +640,7 @@ impl Ocr {
     }
 
     /// Compile on `device`; on another than the CPU, check it against the
-    /// CPU on a fixed input, as the embedding stages are (#76), whenever it
+    /// CPU on a fixed input, as the embedding stages are, whenever it
     /// compiled fresh or wasn't checked under this OpenVINO. Off the CPU's
     /// answer, it runs on the CPU instead.
     pub fn new(core: &mut Core, dir: &Path, device: &str, cache_root: &Path) -> Result<Self> {
@@ -645,7 +683,7 @@ impl Ocr {
         });
         let mut out = Vec::new();
         for (g, &s) in self.det.iter_mut().zip(&DET_SHAPES) {
-            g.run(&letterbox(&page, s).0, |o| out.extend_from_slice(o))?;
+            g.run(&letterbox(&page, s).input, |o| out.extend_from_slice(o))?;
         }
         let line = image::imageops::crop_imm(&page, 30, 14, 880, 28).to_image();
         for (g, &w) in self.rec.iter_mut().zip(&REC_WIDTHS) {
@@ -663,7 +701,11 @@ impl Ocr {
         let t0 = Instant::now();
         let d = usize::from(img.height() > img.width());
         let shape = DET_SHAPES[d];
-        let (input, scale, scaled) = letterbox(img, shape);
+        let Letterbox {
+            input,
+            scale,
+            scaled,
+        } = letterbox(img, shape);
         let found = self.det[d].run(&input, |prob| boxes(prob, shape.1, scaled, scale))?;
         let mut lines = Vec::new();
         for r in found {
@@ -692,55 +734,58 @@ mod tests {
     #[test]
     fn letterbox_keeps_the_aspect_and_pads_black() {
         let img = RgbImage::from_pixel(960, 540, image::Rgb([255, 0, 0]));
-        let (x, scale, (nh, nw)) = letterbox(&img, (1088, 1920));
+        let Letterbox {
+            input: x,
+            scale,
+            scaled,
+        } = letterbox(&img, (1088, 1920));
         assert_eq!(scale, 2.0);
-        assert_eq!((nh, nw), (1080, 1920));
+        assert_eq!(scaled, (1080, 1920));
         let plane = 1088 * 1920;
-        // Red is the third channel (BGR), at +1; padding rows are -1 in all.
-        assert_eq!(x[2 * plane], 1.0);
-        assert_eq!(x[0], -1.0);
-        assert_eq!(x[1085 * 1920], -1.0);
+        assert_eq!(x[2 * plane], 1.0, "red is the third channel (BGR), at +1");
+        assert_eq!(x[0], BLACK, "blue and green are black");
+        assert_eq!(x[1085 * 1920], BLACK, "padding rows are black");
     }
 
     #[test]
     fn a_tiny_image_is_scaled_up_no_more_than_four_times() {
         let img = RgbImage::new(40, 20);
-        let (_, scale, (nh, nw)) = letterbox(&img, (1088, 1920));
+        let Letterbox { scale, scaled, .. } = letterbox(&img, (1088, 1920));
         assert_eq!(scale, MAX_UPSCALE);
-        assert_eq!((nh, nw), (80, 160));
+        assert_eq!(scaled, (80, 160));
     }
 
     #[test]
     fn regions_become_boxes_grown_by_the_unclip_distance() {
         let (w, h) = (64, 32);
         let mut prob = vec![0f32; w * h];
-        // A 20x4 line at (10, 5), and a speck too small to keep.
-        for y in 5..9 {
-            for x in 10..30 {
+        let (line_rows, line_columns) = (5..9, 10..30);
+        for y in line_rows {
+            for x in line_columns.clone() {
                 prob[y * w + x] = 0.9;
             }
         }
-        prob[20 * w + 50] = 0.9;
+        let speck = 20 * w + 50;
+        prob[speck] = 0.9;
         let b = boxes(&prob, w, (h, w), 2.0);
-        assert_eq!(b.len(), 1);
-        // Dilation adds a pixel right and down: 21x5 at (10, 5), grown by
-        // 21*5*1.6/52 a side, all halved by the scale.
-        let grow = 21.0 * 5.0 * 1.6 / 52.0;
+        assert_eq!(b.len(), 1, "the speck is too small to keep");
+        let (dilated_w, dilated_h) = (21.0, 5.0);
+        let grow = dilated_w * dilated_h * 1.6 / (2.0 * (dilated_w + dilated_h));
         let r = b[0];
         let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
         assert!(near(r.cos, 1.0) && near(r.sin, 0.0), "{r:?}");
         assert!(near(r.cx, 20.5 / 2.0) && near(r.cy, 7.5 / 2.0), "{r:?}");
-        assert!(near(r.w, (21.0 + 2.0 * grow) / 2.0), "{r:?}");
-        assert!(near(r.h, (5.0 + 2.0 * grow) / 2.0), "{r:?}");
+        assert!(near(r.w, (dilated_w + 2.0 * grow) / 2.0), "{r:?}");
+        assert!(near(r.h, (dilated_h + 2.0 * grow) / 2.0), "{r:?}");
     }
 
     #[test]
     fn a_skewed_line_is_boxed_along_its_slope() {
-        // A bar 200 long and 6 high, rising 1 pixel in 20 (about 2.9 degrees).
         let (w, h) = (240, 60);
         let mut prob = vec![0f32; w * h];
+        let rising_one_pixel_in_20 = |x: usize| 40 - (x - 20) / 20;
         for x in 20..220 {
-            let top = 40 - (x - 20) / 20;
+            let top = rising_one_pixel_in_20(x);
             for y in top..top + 6 {
                 prob[y * w + x] = 0.9;
             }
@@ -793,9 +838,12 @@ mod tests {
         let (w, x) = rec_input(&RgbImage::new(5000, 48));
         assert_eq!(w, 1280);
         assert_eq!(x.len(), 3 * 48 * 1280);
-        // Padding is 0, the black of the line itself -1.
         let (w, x) = rec_input(&RgbImage::new(100, 48));
-        assert_eq!((w, x[0], x[319]), (320, -1.0, 0.0));
+        assert_eq!(
+            (w, x[0], x[319]),
+            (320, BLACK, 0.0),
+            "the line's black is -1, padding 0"
+        );
     }
 
     #[test]
@@ -818,16 +866,14 @@ mod tests {
 
     #[test]
     fn a_turned_crop_samples_along_the_line() {
-        // A red dot at (60, 40); the box centred there and turned 90 degrees
-        // has it at its centre, and black (out of the dot) at its ends.
-        let img = RgbImage::from_fn(120, 80, |x, y| {
+        let red_dot_at_60_40 = RgbImage::from_fn(120, 80, |x, y| {
             image::Rgb(if (58..63).contains(&x) && (38..43).contains(&y) {
                 [255, 0, 0]
             } else {
                 [0, 0, 0]
             })
         });
-        let r = Rect {
+        let turned_90_degrees_on_the_dot = Rect {
             cx: 60.5,
             cy: 40.5,
             w: 30.0,
@@ -835,10 +881,10 @@ mod tests {
             cos: 0.0,
             sin: 1.0,
         };
-        let line = crop(&img, r).unwrap();
+        let line = crop(&red_dot_at_60_40, turned_90_degrees_on_the_dot).unwrap();
         assert_eq!(line.dimensions(), (30, 10));
-        assert_eq!(line.get_pixel(15, 5)[0], 255);
-        assert_eq!(line.get_pixel(0, 5)[0], 0);
+        assert_eq!(line.get_pixel(15, 5)[0], 255, "the dot at its centre");
+        assert_eq!(line.get_pixel(0, 5)[0], 0, "black past the dot at its ends");
     }
 
     #[test]
@@ -851,15 +897,16 @@ mod tests {
 
     #[test]
     fn texture_read_as_a_letter_or_two_is_dropped() {
-        // What photos with no text gave, and lines real text gave.
-        assert!(!is_text("x", 0.54));
-        assert!(!is_text("Il", 0.80));
-        assert!(!is_text("a-1", 0.70));
-        assert!(!is_text("", 1.0));
+        for (photo_without_text, score) in [("x", 0.54), ("Il", 0.80), ("a-1", 0.70), ("", 1.0)] {
+            assert!(!is_text(photo_without_text, score), "{photo_without_text}");
+        }
         assert!(is_text("Retry", 0.87));
         assert!(!is_text("Retry", 0.6));
         assert!(is_text("Request ID 7f3a9c21", 0.55));
-        // Two CJK characters are a word.
+    }
+
+    #[test]
+    fn two_cjk_characters_are_a_word() {
         assert!(is_text("出口", 0.9));
     }
 
@@ -875,8 +922,8 @@ mod tests {
     fn ctc_collapses_repeats_and_drops_blanks() {
         let chars: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let classes = chars.len() + 2;
-        // a a blank a b space b: "aab b".
-        let steps = [1, 1, 0, 1, 2, 3, 2];
+        let (blank, a, b, space) = (0, 1, 2, 3);
+        let steps = [a, a, blank, a, b, space, b];
         let mut probs = vec![0f32; steps.len() * classes];
         for (i, &c) in steps.iter().enumerate() {
             probs[i * classes + c] = 0.8;

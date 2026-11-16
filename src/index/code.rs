@@ -1,5 +1,5 @@
-//! Source code, indexed apart from text and only when it's turned on (#110):
-//! which files are code, which of those are left out, and chunks that
+//! Source code, indexed apart from text and only when it's turned on: which
+//! files are code, which of those are left out, and chunks that
 //! follow the code's own definitions.
 //!
 //! Left out by path: files git ignores (`.gitignore`, `.ignore`,
@@ -129,31 +129,38 @@ impl Ignores {
         {
             return true;
         }
-        // Deepest first: a nearer file's rules win over a further one's.
-        let mut levels: Vec<&Path> = dir
-            .ancestors()
-            .take_while(|d| d.starts_with(&repo))
-            .collect();
-        levels.dedup();
-        for d in levels {
+        for d in deepest_first(dir, &repo) {
             let rel = path.strip_prefix(d).expect("an ancestor");
-            for gi in cache.dir(d).iter() {
-                match gi.matched_path_or_any_parents(rel, false) {
-                    Match::Ignore(_) => return true,
-                    Match::Whitelist(_) => return false,
-                    Match::None => {}
-                }
+            if let Some(ignored) = verdict(&cache.dir(d), rel) {
+                return ignored;
             }
         }
-        for gi in cache.repo_wide(&repo).iter() {
-            match gi.matched_path_or_any_parents(inside, false) {
-                Match::Ignore(_) => return true,
-                Match::Whitelist(_) => return false,
-                Match::None => {}
-            }
-        }
-        false
+        verdict(&cache.repo_wide(&repo), inside).unwrap_or(false)
     }
+}
+
+/// `dir` and its ancestors up to `repo`, deepest first, so a nearer ignore
+/// file's rules win over a further one's (pinned by
+/// `tests::a_nearer_ignore_files_rule_wins`).
+fn deepest_first<'a>(dir: &'a Path, repo: &Path) -> Vec<&'a Path> {
+    let mut levels: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| d.starts_with(repo))
+        .collect();
+    levels.dedup();
+    levels
+}
+
+/// Whether the first of `rules` to name `rel` ignores it; None when none
+/// does.
+fn verdict(rules: &[Gitignore], rel: &Path) -> Option<bool> {
+    rules
+        .iter()
+        .find_map(|gi| match gi.matched_path_or_any_parents(rel, false) {
+            Match::Ignore(_) => Some(true),
+            Match::Whitelist(_) => Some(false),
+            Match::None => None,
+        })
 }
 
 impl Cache {
@@ -284,19 +291,27 @@ fn token(text: &str) -> bool {
         ("sk-proj-", 30),
         ("AIza", 35),
     ];
-    let body = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     PREFIXES.iter().any(|(prefix, len)| {
         text.match_indices(prefix).any(|(i, _)| {
-            // Not the middle of a longer word.
-            let before = text[..i].chars().next_back();
-            before.is_none_or(|c| !body(c))
+            starts_a_word(text, i)
                 && text[i + prefix.len()..]
                     .chars()
-                    .take_while(|&c| body(c))
+                    .take_while(|&c| token_char(c))
                     .count()
                     >= *len
         })
     })
+}
+
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Whether byte `i` of `text` isn't in the middle of a longer word (pinned by
+/// `tests::a_token_on_its_own_is_a_token`,
+/// `tests::a_token_inside_a_longer_word_is_not_a_token`).
+fn starts_a_word(text: &str, i: usize) -> bool {
+    text[..i].chars().next_back().is_none_or(|c| !token_char(c))
 }
 
 /// Leading whitespace, a tab as four.
@@ -308,7 +323,10 @@ fn indent(line: &str) -> usize {
 }
 
 /// A line that starts a definition in most languages: `fn`, `def`,
-/// `class`, `func`, `function` and the like, after any modifiers.
+/// `class`, `func`, `function` and the like, after any modifiers, which may
+/// take arguments as `pub(crate)` and `extern "C"` do (pinned by
+/// `tests::a_definition_after_modifiers_with_arguments_starts_one`,
+/// `tests::a_statement_is_not_a_definition`).
 fn starts_definition(line: &str) -> bool {
     const MODIFIERS: &[&str] = &[
         "pub",
@@ -363,7 +381,6 @@ fn starts_definition(line: &str) -> bool {
     ];
     let mut words = line.split_whitespace();
     for w in words.by_ref() {
-        // `pub(crate)`, `extern "C"`
         let w = w.split('(').next().unwrap_or(w);
         if KEYWORDS.contains(&w) {
             return true;
@@ -398,21 +415,28 @@ fn breaks(lines: &[&str], base: usize) -> Vec<usize> {
         if after_blank {
             out.push(i);
         } else if starts_definition(line.trim_start()) && !leads_in(line) {
-            let mut start = i;
-            while start > 0
-                && !lines[start - 1].trim().is_empty()
-                && indent(lines[start - 1]) == base
-                && leads_in(lines[start - 1])
-            {
-                start -= 1;
-            }
-            // Joined to a lead-in already split off after a blank line.
-            if out.last() != Some(&start) && start > *out.last().unwrap() {
+            let start = with_lead_in(lines, i, base);
+            let split_off_after_a_blank_line = start <= *out.last().expect("starts at 0");
+            if !split_off_after_a_blank_line {
                 out.push(start);
             }
         }
     }
     out
+}
+
+/// Where the definition on line `i` starts: at the comments and attributes
+/// right above it, at indentation `base`.
+fn with_lead_in(lines: &[&str], i: usize, base: usize) -> usize {
+    let mut start = i;
+    while start > 0
+        && !lines[start - 1].trim().is_empty()
+        && indent(lines[start - 1]) == base
+        && leads_in(lines[start - 1])
+    {
+        start -= 1;
+    }
+    start
 }
 
 /// A run of lines that belongs together, and the definition line it's
@@ -456,24 +480,59 @@ fn units(lines: &[&str], first: usize, header: Option<usize>, out: &mut Vec<Span
             out.push(whole);
             continue;
         }
-        // Too long: split inside, below its first line.
-        let mut inner = Vec::new();
-        units(&unit[1..], first + a + 1, Some(indent(unit[0])), &mut inner);
-        if inner.len() < 2 {
-            out.push(whole);
-            continue;
+        match split_below_first_line(unit, first + a) {
+            Some(inner) => out.extend(inner),
+            None => out.push(whole),
         }
-        inner[0].line -= 1;
-        inner[0].lines += 1;
-        // The definition itself, past the comments and attributes above it.
-        let def = unit
-            .iter()
-            .position(|l| !l.trim().is_empty() && !leads_in(l))
-            .map(|i| first + a + i);
-        for s in &mut inner[1..] {
-            s.inside = s.inside.or(def);
+    }
+}
+
+/// `unit`, from line `line`, too long for a chunk: split below its first
+/// line into units of its own, the first line kept with the first of them,
+/// the rest inside its definition. None when it doesn't split.
+fn split_below_first_line(unit: &[&str], line: usize) -> Option<Vec<Span>> {
+    let mut inner = Vec::new();
+    units(&unit[1..], line + 1, Some(indent(unit[0])), &mut inner);
+    if inner.len() < 2 {
+        return None;
+    }
+    inner[0].line -= 1;
+    inner[0].lines += 1;
+    let def = definition_line(unit).map(|i| line + i);
+    for s in &mut inner[1..] {
+        s.inside = s.inside.or(def);
+    }
+    Some(inner)
+}
+
+/// Where the definition itself is in `unit`, past the comments and
+/// attributes above it.
+fn definition_line(unit: &[&str]) -> Option<usize> {
+    unit.iter()
+        .position(|l| !l.trim().is_empty() && !leads_in(l))
+}
+
+/// A chunk being filled.
+struct Pending {
+    text: String,
+    /// Its first line.
+    start: usize,
+    /// The bytes of the definition line it starts with, if it does.
+    lead: usize,
+}
+
+impl Pending {
+    /// Moves the chunk into `out`, from its first line with anything on it
+    /// past the lead, and starts afresh.
+    fn flush(&mut self, out: &mut Vec<(usize, String)>) {
+        let (head, body) = self.text.split_at(self.lead);
+        let skipped = body.lines().take_while(|l| l.trim().is_empty()).count();
+        let body: String = body.lines().skip(skipped).flat_map(|l| [l, "\n"]).collect();
+        if !body.trim().is_empty() {
+            out.push((self.start + skipped, format!("{head}{body}")));
         }
-        out.extend(inner);
+        self.text.clear();
+        self.lead = 0;
     }
 }
 
@@ -488,33 +547,22 @@ pub fn chunk(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut spans = Vec::new();
     units(&lines, 1, None, &mut spans);
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let mut cur = String::new();
-    // The chunk's first line, and the bytes of the definition line it
-    // starts with, if it does.
-    let mut start = 1;
-    let mut lead = 0;
-    let flush = |cur: &mut String, start: usize, lead: usize, out: &mut Vec<(usize, String)>| {
-        // From its first line with anything on it.
-        let (head, body) = cur.split_at(lead);
-        let skipped = body.lines().take_while(|l| l.trim().is_empty()).count();
-        let body: String = body.lines().skip(skipped).flat_map(|l| [l, "\n"]).collect();
-        if !body.trim().is_empty() {
-            out.push((start + skipped, format!("{head}{body}")));
-        }
-        cur.clear();
-    };
     let joined = |from: usize, n: usize| -> String {
         lines[from - 1..from - 1 + n]
             .iter()
             .flat_map(|l| [*l, "\n"])
             .collect()
     };
+    let mut out = Vec::new();
+    let mut cur = Pending {
+        text: String::new(),
+        start: 1,
+        lead: 0,
+    };
     for s in spans {
         let unit = joined(s.line, s.lines);
         if unit.len() > CHUNK_CHARS {
-            flush(&mut cur, start, lead, &mut out);
-            lead = 0;
+            cur.flush(&mut out);
             out.extend(
                 crate::index::chunk(&unit)
                     .into_iter()
@@ -522,20 +570,19 @@ pub fn chunk(text: &str) -> Vec<(usize, String)> {
             );
             continue;
         }
-        if !cur.is_empty() && cur.len() + unit.len() > CHUNK_CHARS {
-            flush(&mut cur, start, lead, &mut out);
-            lead = 0;
+        if !cur.text.is_empty() && cur.text.len() + unit.len() > CHUNK_CHARS {
+            cur.flush(&mut out);
         }
-        if cur.is_empty() {
-            start = s.line;
+        if cur.text.is_empty() {
+            cur.start = s.line;
             if let Some(def) = s.inside {
-                cur = joined(def, 1);
-                lead = cur.len();
+                cur.text = joined(def, 1);
+                cur.lead = cur.text.len();
             }
         }
-        cur.push_str(&unit);
+        cur.text.push_str(&unit);
     }
-    flush(&mut cur, start, lead, &mut out);
+    cur.flush(&mut out);
     out
 }
 
@@ -551,13 +598,41 @@ mod tests {
         for text in ["md", "txt", "rst", "org", "tex", "html"] {
             assert!(!is_code(Path::new(&format!("/a/b.{text}"))), "{text}");
         }
-        // Config and data formats are no kind at all: they hold credentials.
-        for data in ["toml", "yaml", "json", "env", "pem", "lock", "csv"] {
-            assert!(!is_code(Path::new(&format!("/a/b.{data}"))), "{data}");
-        }
         for e in EXTENSIONS {
             assert!(!crate::index::TEXT_EXTENSIONS.contains(e), "{e} is both");
         }
+    }
+
+    #[test]
+    fn config_and_data_formats_are_not_code() {
+        for data in ["toml", "yaml", "json", "env", "pem", "lock", "csv"] {
+            assert!(
+                !is_code(Path::new(&format!("/a/b.{data}"))),
+                "{data} holds credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn a_definition_after_modifiers_with_arguments_starts_one() {
+        assert!(starts_definition("pub(crate) fn a() {"));
+        assert!(starts_definition("extern \"C\" fn b() {"));
+    }
+
+    #[test]
+    fn a_statement_is_not_a_definition() {
+        assert!(!starts_definition("let f = make(fn_name);"));
+        assert!(!starts_definition("pub(crate) use a::b;"));
+    }
+
+    #[test]
+    fn a_token_on_its_own_is_a_token() {
+        assert!(token("key: AKIAIOSFODNN7EXAMPLE\n"));
+    }
+
+    #[test]
+    fn a_token_inside_a_longer_word_is_not_a_token() {
+        assert!(!token("key: XAKIAIOSFODNN7EXAMPLE\n"));
     }
 
     #[test]
@@ -598,7 +673,10 @@ mod tests {
         assert_eq!(unwanted(aws), Some("holds an API token"));
         let gh = format!("TOKEN = 'ghp_{}'\n", "a1B2".repeat(9));
         assert_eq!(unwanted(&gh), Some("holds an API token"));
-        // Talking about keys is fine.
+    }
+
+    #[test]
+    fn talking_about_keys_is_not_holding_one() {
         for ok in [
             "fn main() {\n    println!(\"hi\");\n}\n",
             "// -----BEGIN PUBLIC KEY----- is what we expect\n",
@@ -617,22 +695,27 @@ mod tests {
             .collect()
     }
 
+    /// A documented function of about 400 bytes: two fit in a chunk, three
+    /// don't.
+    fn function_of_400_bytes(name: &str) -> String {
+        format!(
+            "/// Does {name}.\nfn {name}() {{\n{}}}\n",
+            "    let x = compute_something_long(1, 2, 3);\n".repeat(8)
+        )
+    }
+
     #[test]
     fn functions_stay_whole() {
-        // Each about 400 bytes: two fit in a chunk, three don't.
-        let f = |name: &str| {
-            format!(
-                "/// Does {name}.\nfn {name}() {{\n{}}}\n",
-                "    let x = compute_something_long(1, 2, 3);\n".repeat(8)
-            )
-        };
+        let f = function_of_400_bytes;
         let text = format!("use std::fs;\n\n{}\n{}\n{}", f("a"), f("b"), f("c"));
         let chunks = chunk(&text);
         assert_eq!(chunks.len(), 2, "{chunks:#?}");
-        // Lines: 1 use, 2 blank, 3 doc of a, ..., 15 doc of b, 27 doc of c.
         assert_eq!(chunks[0].0, 1);
         assert!(chunks[0].1.contains("fn a()") && chunks[0].1.contains("fn b()"));
-        assert_eq!(chunks[1].0, 27);
+        assert_eq!(
+            chunks[1].0, 27,
+            "c's doc is line 27: 1 use, 2 blank, 3 a's doc, 15 b's doc"
+        );
         assert!(chunks[1].1.starts_with("/// Does c."));
         assert!(chunks.iter().all(|(_, c)| c.len() <= CHUNK_CHARS));
     }
@@ -644,15 +727,17 @@ mod tests {
         assert_eq!(spans(&text), [(1, 14), (15, 14)]);
     }
 
+    /// A method of about 600 bytes: one to a chunk.
+    fn method_of_600_bytes(name: &str) -> String {
+        format!(
+            "    def {name}(self):\n{}\n",
+            "        self.value = compute_something_long(1, 2, 3)\n".repeat(11)
+        )
+    }
+
     #[test]
     fn a_long_class_splits_at_its_methods() {
-        // Each about 600 bytes: one to a chunk.
-        let method = |name: &str| {
-            format!(
-                "    def {name}(self):\n{}\n",
-                "        self.value = compute_something_long(1, 2, 3)\n".repeat(11)
-            )
-        };
+        let method = method_of_600_bytes;
         let text = format!(
             "class Thing:\n{}{}{}",
             method("a"),
@@ -679,9 +764,11 @@ mod tests {
                 .1
                 .starts_with("/// Docs.\nfn long_one() {\n    let x")
         );
-        // From line 16, after the blank line, with the function's line first.
-        assert_eq!(chunks[1].0, 16);
-        assert!(chunks[1].1.starts_with("fn long_one() {\n    let x"));
+        assert_eq!(chunks[1].0, 16, "from after the blank line");
+        assert!(
+            chunks[1].1.starts_with("fn long_one() {\n    let x"),
+            "the function's line first"
+        );
         assert!(chunks[1].1.ends_with("}\n"));
     }
 
@@ -743,12 +830,24 @@ mod tests {
         assert!(out("x.out.py"));
         assert!(out("sub/local.rs"));
         assert!(!out("local.rs"));
-        // A nearer file's rule wins.
-        assert!(!out("sub/keep.out.py"));
         assert!(out("scratch.rs"));
         assert!(out("mine.rs"));
         assert!(out("third_party/zlib/inflate.c"));
-        // Outside a work tree, nothing is git-ignored.
+    }
+
+    #[test]
+    fn a_nearer_ignore_files_rule_wins() {
+        let r = Repo::new("nearer");
+        r.write(".gitignore", "*.out.py\n");
+        r.write("sub/.gitignore", "!keep.out.py\n");
+        let ig = Ignores::default();
+        assert!(!ig.left_out(&r.0.join("sub/keep.out.py")));
+        assert!(ig.left_out(&r.0.join("keep.out.py")));
+    }
+
+    #[test]
+    fn outside_a_work_tree_nothing_is_git_ignored() {
+        let ig = Ignores::default();
         assert!(!ig.left_out(Path::new("/nonexistent-vinosearch/third_party/a.rs")));
     }
 }

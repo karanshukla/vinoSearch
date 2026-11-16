@@ -166,7 +166,6 @@ impl SettingsWindow {
     /// bottom of a group.
     pub(in crate::window) fn adder(&mut self, ui: &mut egui::Ui, target: Target) {
         widgets::group_section(ui, |ui| {
-            // Wrapped: with large text on a narrow window the field and Add go under the button.
             ui.horizontal_wrapped(|ui| {
                 let (button, hint) = match target {
                     Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
@@ -188,13 +187,8 @@ impl SettingsWindow {
                 };
                 let width = (room - 60.0).clamp(120.0, 320.0);
                 let edit = ui.add(widgets::field(text, hint, width));
-                // The hint is only a placeholder; say what the field is for.
-                let name = match target {
-                    Target::Root => "Folder to add",
-                    Target::Exclude => "Folder to exclude",
-                };
                 ui.ctx()
-                    .accesskit_node_builder(edit.id, |node| node.set_label(name));
+                    .accesskit_node_builder(edit.id, |node| node.set_label(field_name(target)));
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let typed = !text.trim().is_empty();
                 let to = match target {
@@ -207,5 +201,14 @@ impl SettingsWindow {
                 }
             });
         });
+    }
+}
+
+/// What the path field is for, read out in place of its hint, which is only a
+/// placeholder.
+fn field_name(target: Target) -> &'static str {
+    match target {
+        Target::Root => "Folder to add",
+        Target::Exclude => "Folder to exclude",
     }
 }

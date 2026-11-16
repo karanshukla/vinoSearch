@@ -1,6 +1,6 @@
-//! vinoWhisper sessions (#143): a `.vwsession` bundle is a zip holding a
+//! vinoWhisper sessions: a `.vwsession` bundle is a zip holding a
 //! transcript, its summary once vinoWhisper has made one, and an attestation
-//! of how each was made (karanshukla/vinoWhisper#123). Both texts are
+//! of how each was made. Both texts are
 //! indexed as chunks of the one file: the transcript's numbered by its line,
 //! the summary's by its line from SUMMARY_LINES up, so a hit says which part
 //! it came from.
@@ -67,7 +67,7 @@ struct Session {
     /// RFC 3339, to the second.
     started: String,
     duration_s: u64,
-    /// Only on a session made from a recording (vinoWhisper#162).
+    /// Only on a session made from a recording.
     #[serde(default)]
     file: Option<SourceFile>,
 }
@@ -92,24 +92,29 @@ pub struct About {
     /// The attestation marks the summary as written by a model.
     pub ai_summary: bool,
     /// The SHA-256 of the recording it was transcribed from, for a session
-    /// made from a file: its stamps are times in that file (#188).
+    /// made from a file: its stamps are times in that file.
     pub source_sha256: Option<Vec<u8>>,
 }
 
 impl About {
     /// "2026-10-27 14:05, 42 min"
     pub fn when(&self) -> String {
-        // RFC 3339's date and minute, without parsing the rest.
-        let started = match self.started.get(..16) {
-            Some(s) if s.as_bytes().get(10) == Some(&b'T') => s.replacen('T', " ", 1),
-            _ => self.started.clone(),
-        };
+        let started = date_and_minute(&self.started);
         let mins = self.duration_s.div_ceil(60);
         if mins < 60 {
             format!("{started}, {mins} min")
         } else {
             format!("{started}, {} h {:02} min", mins / 60, mins % 60)
         }
+    }
+}
+
+/// An RFC 3339 time's date and minute, "2026-10-27 14:05", without parsing
+/// the rest; anything else as it is.
+fn date_and_minute(rfc3339: &str) -> String {
+    match rfc3339.get(..16) {
+        Some(s) if s.as_bytes().get(10) == Some(&b'T') => s.replacen('T', " ", 1),
+        _ => rfc3339.to_owned(),
     }
 }
 
@@ -218,12 +223,44 @@ const MIN_PARAGRAPHS_CHARS: usize = crate::index::CHUNK_CHARS / 4;
 /// by its first stamped line, so the header before `[00:00]` doesn't leave
 /// the first chunk without a stamp. Text with no stamps is chunked as text.
 fn transcript_chunks(text: &str) -> Vec<(usize, String)> {
-    use crate::index::CHUNK_CHARS;
     if !text.lines().any(|l| stamp(l).is_some()) {
         return crate::index::chunk(text);
     }
-    // (first line, first stamped line, text) of each run of paragraphs.
-    let mut runs: Vec<(usize, usize, String)> = Vec::new();
+    let mut out: Vec<(usize, String)> = paragraph_runs(text)
+        .into_iter()
+        .flat_map(Run::chunks)
+        .collect();
+    out.retain(|(_, c)| !c.trim().is_empty());
+    out
+}
+
+/// Paragraphs joined up to a chunk's worth, each run starting at a stamp.
+struct Run {
+    /// The line it starts on.
+    first: usize,
+    /// Its first stamped line.
+    stamped: usize,
+    text: String,
+}
+
+impl Run {
+    /// The run as one chunk, or a paragraph too long for one cut into pieces
+    /// that each keep their own line, none before the run's stamp (pinned by
+    /// `tests::a_paragraph_too_long_for_a_chunk_is_cut_under_its_stamp`).
+    fn chunks(self) -> Vec<(usize, String)> {
+        if self.text.len() <= crate::index::CHUNK_CHARS {
+            return vec![(self.stamped, self.text)];
+        }
+        crate::index::chunk(&self.text)
+            .into_iter()
+            .map(|(line, piece)| ((self.first + line - 1).max(self.stamped), piece))
+            .collect()
+    }
+}
+
+fn paragraph_runs(text: &str) -> Vec<Run> {
+    use crate::index::CHUNK_CHARS;
+    let mut runs: Vec<Run> = Vec::new();
     let mut cur = String::new();
     let mut first = 1;
     let mut stamped: Option<usize> = None;
@@ -233,7 +270,11 @@ fn transcript_chunks(text: &str) -> Vec<(usize, String)> {
             if let Some(s) = stamped.filter(|_| {
                 cur.trim().len() >= MIN_PARAGRAPHS_CHARS || cur.len() + line.len() + 1 > CHUNK_CHARS
             }) {
-                runs.push((first, s, std::mem::take(&mut cur)));
+                runs.push(Run {
+                    first,
+                    stamped: s,
+                    text: std::mem::take(&mut cur),
+                });
                 stamped = None;
             }
             stamped.get_or_insert(n);
@@ -244,20 +285,12 @@ fn transcript_chunks(text: &str) -> Vec<(usize, String)> {
         cur.push_str(line);
         cur.push('\n');
     }
-    runs.push((first, stamped.unwrap_or(first), cur));
-    let mut out = Vec::new();
-    for (first, stamped, run) in runs {
-        if run.len() <= CHUNK_CHARS {
-            out.push((stamped, run));
-            continue;
-        }
-        // One paragraph too long for a chunk: its pieces keep its line.
-        for (line, piece) in crate::index::chunk(&run) {
-            out.push(((first + line - 1).max(stamped), piece));
-        }
-    }
-    out.retain(|(_, c)| !c.trim().is_empty());
-    out
+    runs.push(Run {
+        first,
+        stamped: stamped.unwrap_or(first),
+        text: cur,
+    });
+    runs
 }
 
 pub fn about(bytes: &[u8]) -> Result<About> {
@@ -375,8 +408,10 @@ pub(crate) mod tests {
     fn transcript_by_line_then_summary_past_it() {
         let c = chunks(&bundle(Some(SUMMARY_TEXT), "vinowhisper-session/1")).unwrap();
         assert_eq!(c.len(), 2);
-        // The header joins [00:00]'s chunk, numbered by [00:00]'s line.
-        assert_eq!(c[0].0, 3);
+        assert_eq!(
+            c[0].0, 3,
+            "the header joins [00:00]'s chunk, numbered by its line"
+        );
         assert!(c[0].1.starts_with("vinoWhisper transcript"));
         assert!(c[0].1.contains("[01:12] The second item"));
         assert_eq!(c[1].0, SUMMARY_LINES + 1);
@@ -429,11 +464,10 @@ pub(crate) mod tests {
         w.write_all(attestation("vinowhisper-session/1").as_bytes())
             .unwrap();
         w.start_file(TRANSCRIPT, deflated).unwrap();
-        // Deflates to a few KiB.
         w.write_all(&vec![b'a'; MAX_PART_BYTES as usize + 1])
             .unwrap();
         let b = w.finish().unwrap().into_inner();
-        assert!(b.len() < 64 << 10);
+        assert!(b.len() < 64 << 10, "deflates to a few KiB");
         assert!(chunks(&b).is_err());
     }
 
@@ -456,7 +490,10 @@ pub(crate) mod tests {
         let sha = "ab".repeat(32);
         let made = about(&bundle_from(&sha)).unwrap();
         assert_eq!(made.source_sha256, Some(vec![0xab; 32]));
-        // Not a SHA-256: no file to look for.
+    }
+
+    #[test]
+    fn a_hash_that_isnt_a_sha256_names_no_file() {
         assert_eq!(about(&bundle_from("zz")).unwrap().source_sha256, None);
         assert_eq!(about(&bundle_from("abcd")).unwrap().source_sha256, None);
     }
@@ -470,7 +507,7 @@ pub(crate) mod tests {
         assert_eq!(seconds("99999999999:00"), None);
     }
 
-    /// Bundles vinoWhisper's own writer made (vinoWhisper#123, b244bb8).
+    /// Bundles vinoWhisper's own writer made.
     #[test]
     fn vinowhispers_own_bundles_read() {
         let with = include_bytes!("../../tests/fixtures/session_v1.vwsession");
@@ -561,13 +598,19 @@ pub(crate) mod tests {
 
     #[test]
     fn a_line_is_under_the_last_stamp_before_it() {
-        // Line 1 is the header, with no stamp.
-        assert_eq!(stamp_at(TRANSCRIPT_TEXT, 1), None);
         assert_eq!(stamp_at(TRANSCRIPT_TEXT, 3).as_deref(), Some("00:00"));
-        // "It happens in March." is in the [01:12] paragraph.
-        assert_eq!(stamp_at(TRANSCRIPT_TEXT, 6).as_deref(), Some("01:12"));
+        assert_eq!(
+            stamp_at(TRANSCRIPT_TEXT, 6).as_deref(),
+            Some("01:12"),
+            "\"It happens in March.\" is in the [01:12] paragraph"
+        );
         assert_eq!(stamp_at(TRANSCRIPT_TEXT, 99).as_deref(), Some("61:05"));
         assert_eq!(stamp("[1:01:05] no"), None);
         assert_eq!(stamp("[00:00]no space"), None);
+    }
+
+    #[test]
+    fn the_header_line_has_no_stamp() {
+        assert_eq!(stamp_at(TRANSCRIPT_TEXT, 1), None);
     }
 }

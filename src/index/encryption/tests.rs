@@ -60,17 +60,23 @@ impl Setup {
         .unwrap();
     }
 
+    /// `apply`, retried while the stand-in tool is busy. `retry` looks at
+    /// the error, so a busy tool reported in `waiting` (as one run on the
+    /// host is) is named there too.
     fn apply(&self, on: bool, allow_host: bool, rekey: bool) -> State {
         retry(|| {
             let st = apply(&self.db(), Want { on, allow_host }, rekey, &self.sealer);
-            // Named in the error, which is what `retry` looks at: a busy
-            // tool run on the host is reported as waiting, with no error.
             if st.error.contains("Text file busy") || st.waiting.contains("Text file busy") {
                 bail!("Text file busy: {} {}", st.error, st.waiting);
             }
             Ok(st)
         })
         .unwrap()
+    }
+
+    /// As a new process sees it: no key held.
+    fn restart(&self) {
+        hold(&self.db(), None);
     }
 
     /// Every byte of the database and its journal.
@@ -113,52 +119,125 @@ impl Drop for Setup {
     }
 }
 
+/// The note indexed and encrypted.
+fn encrypted(name: &str) -> Setup {
+    let s = Setup::new(name, TPM_HEAD);
+    s.index();
+    let st = s.apply(true, false, false);
+    assert_eq!(st.error, "");
+    s
+}
+
+/// The note indexed and encrypted, its key in `mock`'s keyring.
+fn encrypted_in_keyring(name: &str, mock: &Mock) -> Setup {
+    let s = Setup::keyring(name, mock);
+    s.index();
+    let st = s.apply(true, false, false);
+    assert_eq!((st.error.as_str(), st.seal), ("", "keyring"));
+    s
+}
+
+fn mode(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+/// A sealer whose `systemd-creds` no longer unseals anything, as after the
+/// TPM was cleared.
+fn cleared_tpm(fake: &Fake) -> Sealer {
+    Sealer::at(
+        &fake.tool("echo 'Failed to unseal secret using TPM2: State not recoverable' >&2; exit 1"),
+    )
+}
+
+/// The flock another process holding `db` open has: on an open file
+/// description of its own.
+fn held_by_another_process(db: &Path) -> File {
+    let other = private_lock(db).unwrap();
+    flock(&other, libc::LOCK_SH).unwrap();
+    other
+}
+
+/// A sealer whose flatpak-spawn can't reach the host, failing with `body`.
+fn host_out_of_reach(s: &Setup, body: &str) -> Sealer {
+    let creds = s.fake.tool(&creds_body(TPM_HEAD));
+    Sealer::on_host(&spawner(&s.fake, body), &creds, Duration::from_secs(10))
+}
+
+const NO_SESSION_HELPER: &str =
+    "echo 'Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1";
+
+const ON: Want = Want {
+    on: true,
+    allow_host: false,
+};
+
+const OFF: Want = Want {
+    on: false,
+    allow_host: false,
+};
+
 fn contains(hay: &[u8], needle: &str) -> bool {
     hay.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
 
 #[test]
-fn turning_it_on_encrypts_what_is_there_and_off_decrypts_it() {
-    let s = Setup::new("onoff", TPM_HEAD);
+fn turning_it_on_leaves_no_text_name_or_header_on_disk() {
+    let s = Setup::new("ondisk", TPM_HEAD);
     s.index();
     assert!(contains(&s.on_disk(), "QUOKKA"));
-    let before = index::counts(&index::open(&s.db()).unwrap()).unwrap();
-
     let st = s.apply(true, false, false);
     assert_eq!(st.error, "");
     assert!(st.encrypted);
     assert_eq!(st.seal, "tpm");
     assert!(key_file(&s.db()).exists());
-    // Not the text, not a file name, not SQLite's header, and plain SQLite
-    // can't read it.
     let disk = s.on_disk();
     assert!(!contains(&disk, "QUOKKA"));
     assert!(!contains(&disk, "ledger.md"));
     assert!(!contains(&disk, "SQLite format 3"));
     assert!(!s.plain_sqlite_reads());
     assert!(!sibling(&s.db(), ".new").exists());
-    // Nothing lost: the same counts, and both searches still find it.
+}
+
+#[test]
+fn turning_it_on_loses_nothing() {
+    let s = Setup::new("lossless", TPM_HEAD);
+    s.index();
+    let before = index::counts(&index::open(&s.db()).unwrap()).unwrap();
+    assert_eq!(s.apply(true, false, false).error, "");
     assert_eq!(
         index::counts(&index::open(&s.db()).unwrap()).unwrap(),
         before
     );
     assert!(s.finds_the_note());
-    // The folder list is kept beside it for a rebuild.
+}
+
+#[test]
+fn turning_it_on_keeps_the_folder_list_beside_it() {
+    let s = encrypted("roots");
     let roots = fs::read_to_string(roots_file(&s.db())).unwrap();
     assert_eq!(roots.trim(), s.dir.join("root").to_str().unwrap());
-    let mode = |p: &Path| {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(p).unwrap().permissions().mode() & 0o777
-    };
+}
+
+#[test]
+fn the_key_the_folder_list_and_the_index_are_the_users_alone() {
+    let s = encrypted("modes");
     assert_eq!(mode(&key_file(&s.db())), 0o600);
     assert_eq!(mode(&roots_file(&s.db())), 0o600);
     assert_eq!(mode(&s.db()), 0o600);
+}
 
-    // Applying the same again changes nothing.
+#[test]
+fn applying_the_same_again_changes_nothing() {
+    let s = encrypted("same");
     let credential = fs::read(key_file(&s.db())).unwrap();
     assert_eq!(s.apply(true, false, false).error, "");
     assert_eq!(fs::read(key_file(&s.db())).unwrap(), credential);
+}
 
+#[test]
+fn turning_it_off_decrypts_it() {
+    let s = encrypted("off");
     let st = s.apply(false, false, false);
     assert_eq!(st, State::default());
     assert!(!key_file(&s.db()).exists());
@@ -179,9 +258,7 @@ fn a_new_index_is_encrypted_from_the_start() {
 
 #[test]
 fn rekeying_replaces_the_key() {
-    let s = Setup::new("rekey", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
+    let s = encrypted("rekey");
     let old = fs::read(key_file(&s.db())).unwrap();
     let old_key = s.sealer.unseal(&old).unwrap();
     let st = s.apply(true, false, true);
@@ -193,17 +270,23 @@ fn rekeying_replaces_the_key() {
 }
 
 #[test]
-fn without_a_tpm_it_is_refused_unless_the_host_key_is_allowed() {
+fn without_a_tpm_it_is_refused_and_left_plaintext() {
     let s = Setup::new("notpm", HOST_HEAD);
     s.index();
     let st = s.apply(true, false, false);
     assert!(st.error.contains("no TPM"), "{}", st.error);
     assert!(!st.encrypted);
     assert!(!key_file(&s.db()).exists());
-    // Left as it was, and said so: not encrypted behind the user's back
-    // with something weaker.
-    assert!(s.plain_sqlite_reads());
+    assert!(
+        s.plain_sqlite_reads(),
+        "not encrypted behind the user's back with something weaker"
+    );
+}
 
+#[test]
+fn without_a_tpm_the_host_key_seals_once_allowed() {
+    let s = Setup::new("notpmhost", HOST_HEAD);
+    s.index();
     let st = s.apply(true, true, false);
     assert_eq!(st.error, "");
     assert_eq!(st.seal, "host");
@@ -213,25 +296,11 @@ fn without_a_tpm_it_is_refused_unless_the_host_key_is_allowed() {
 
 #[test]
 fn a_key_that_wont_unseal_rebuilds_the_index_encrypted() {
-    let s = Setup::new("broken", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
-    // The TPM was cleared: this credential no longer unseals.
-    hold(&s.db(), None);
-    let broken = Sealer::at(
-        &s.fake
-            .tool("echo 'Failed to unseal secret using TPM2: State not recoverable' >&2; exit 1"),
-    );
+    let s = encrypted("broken");
+    s.restart();
+    let broken = cleared_tpm(&s.fake);
     let st = retry(|| {
-        let st = apply(
-            &s.db(),
-            Want {
-                on: true,
-                allow_host: false,
-            },
-            false,
-            &broken,
-        );
+        let st = apply(&s.db(), ON, false, &broken);
         if st.broken.contains("Text file busy") {
             bail!("busy");
         }
@@ -239,22 +308,24 @@ fn a_key_that_wont_unseal_rebuilds_the_index_encrypted() {
     })
     .unwrap();
     assert!(st.broken.contains("State not recoverable"), "{st:?}");
-    // Encrypting the new index failed too (the same stand-in), so its key
-    // is in memory: still not plaintext.
-    assert_eq!(st.seal, "memory");
+    assert_eq!(
+        st.seal, "memory",
+        "the new index's key won't seal either, so it is held in memory"
+    );
     assert!(!s.plain_sqlite_reads());
     let conn = index::open(&s.db()).unwrap();
     assert_eq!(index::counts(&conn).unwrap(), (0, 0));
-    // The folders are kept, for the watcher to index again.
-    assert_eq!(index::roots(&conn).unwrap(), [s.dir.join("root")]);
+    assert_eq!(
+        index::roots(&conn).unwrap(),
+        [s.dir.join("root")],
+        "the folders are kept, for the watcher to index again"
+    );
 }
 
 #[test]
 fn a_corrupt_key_file_rebuilds_with_a_new_sealed_key() {
-    let s = Setup::new("corrupt", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
-    hold(&s.db(), None);
+    let s = encrypted("corrupt");
+    s.restart();
     fs::write(key_file(&s.db()), "AAAA garbage").unwrap();
     let st = s.apply(true, false, false);
     assert!(!st.broken.is_empty());
@@ -266,17 +337,17 @@ fn a_corrupt_key_file_rebuilds_with_a_new_sealed_key() {
 
 #[test]
 fn an_encrypted_index_without_its_key_is_unusable_not_empty() {
-    let s = Setup::new("nokey", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
-    hold(&s.db(), None);
+    let s = encrypted("nokey");
+    s.restart();
     fs::remove_file(key_file(&s.db())).unwrap();
     let e = index::open(&s.db()).unwrap_err();
     assert!(is_unusable(&e), "{e:#}");
-    // apply rebuilds it, and with encryption off now that is plaintext.
     let st = s.apply(false, false, false);
     assert!(st.broken.contains("key file is gone"), "{st:?}");
-    assert!(s.plain_sqlite_reads());
+    assert!(
+        s.plain_sqlite_reads(),
+        "rebuilt by apply, plaintext with encryption off"
+    );
 }
 
 #[test]
@@ -286,9 +357,12 @@ fn live_connections_follow_the_conversion() {
     let live = Live::open(&s.db()).unwrap();
     assert_eq!(index::counts(&live.lock().unwrap()).unwrap().0, 1);
     s.apply(true, false, false);
-    // Closed by apply, opened again with the key.
-    assert!(live.conn.lock().unwrap().is_none());
-    assert_eq!(index::counts(&live.lock().unwrap()).unwrap().0, 1);
+    assert!(live.conn.lock().unwrap().is_none(), "closed by apply");
+    assert_eq!(
+        index::counts(&live.lock().unwrap()).unwrap().0,
+        1,
+        "opened again with the key"
+    );
     s.apply(false, false, false);
     assert_eq!(index::counts(&live.lock().unwrap()).unwrap().0, 1);
 }
@@ -297,9 +371,7 @@ fn live_connections_follow_the_conversion() {
 fn another_process_holding_the_index_blocks_a_conversion() {
     let s = Setup::new("lock", TPM_HEAD);
     s.index();
-    // Another open file description, as another process would have.
-    let other = private_lock(&s.db()).unwrap();
-    flock(&other, libc::LOCK_SH).unwrap();
+    let other = held_by_another_process(&s.db());
     let st = s.apply(true, false, false);
     assert!(st.error.contains("another vinoSearch process"), "{st:?}");
     assert!(s.plain_sqlite_reads());
@@ -318,27 +390,37 @@ fn a_memory_key_opens_a_throwaway_index() {
 }
 
 #[test]
-fn without_systemd_creds_the_key_is_in_the_keyring() {
+fn without_systemd_creds_the_key_is_in_the_keyring_alone() {
     let Some(mock) = Mock::start("enc-keyring") else {
         eprintln!("no dbus-daemon: skipped");
         return;
     };
-    let s = Setup::keyring("keyring", &mock);
-    s.index();
-    let st = s.apply(true, false, false);
-    assert_eq!(st.error, "");
-    assert_eq!(st.seal, "keyring");
-    // The key file names the item; the key is in the keyring alone.
+    let s = encrypted_in_keyring("keyring", &mock);
     let file = fs::read(key_file(&s.db())).unwrap();
     assert!(file.starts_with(b"secret-service 1 "));
     assert_eq!(mock.state().items.len(), 1);
     assert!(!s.plain_sqlite_reads());
     assert!(s.finds_the_note());
-    // A new process unseals it the same way.
-    hold(&s.db(), None);
+}
+
+#[test]
+fn a_new_process_unseals_a_keyring_key_the_same_way() {
+    let Some(mock) = Mock::start("enc-keyring-again") else {
+        return;
+    };
+    let s = encrypted_in_keyring("keyringagain", &mock);
+    s.restart();
     assert!(s.apply(true, false, false).encrypted);
     assert!(s.finds_the_note());
-    // A new key replaces the item, and turning it off removes it.
+}
+
+#[test]
+fn a_new_keyring_key_replaces_the_item_and_turning_it_off_removes_it() {
+    let Some(mock) = Mock::start("enc-keyring-rekey") else {
+        return;
+    };
+    let s = encrypted_in_keyring("keyringrekey", &mock);
+    let file = fs::read(key_file(&s.db())).unwrap();
     let st = s.apply(true, false, true);
     assert_eq!(st.error, "");
     assert_ne!(fs::read(key_file(&s.db())).unwrap(), file);
@@ -354,36 +436,36 @@ fn a_locked_keyring_is_waited_for_and_the_index_kept() {
     let Some(mock) = Mock::start("enc-locked") else {
         return;
     };
-    let s = Setup::keyring("locked", &mock);
-    s.index();
-    s.apply(true, false, false);
+    let s = encrypted_in_keyring("locked", &mock);
     let before = s.on_disk();
-    // The next start: locked, and no prompt allowed.
-    hold(&s.db(), None);
+    s.restart();
     mock.state().locked = true;
-    let want = Want {
-        on: true,
-        allow_host: false,
-    };
-    let st = apply(&s.db(), want, false, &s.sealer.quiet());
+    let st = apply(&s.db(), ON, false, &s.sealer.quiet());
     assert!(st.waiting.contains("locked"), "{st:?}");
     assert_eq!((st.error.as_str(), st.broken.as_str()), ("", ""));
     assert!(st.encrypted);
     assert_eq!(st.seal, "keyring");
-    // Nothing dropped, nothing plaintext, and every open fails at once
-    // without asking the keyring again.
-    assert_eq!(s.on_disk(), before);
+    assert_eq!(s.on_disk(), before, "nothing dropped, nothing plaintext");
     let e = index::open(&s.db()).unwrap_err();
     assert!(seal::is_unavailable(&e) && !is_unusable(&e), "{e:#}");
-    assert_eq!(mock.state().prompts, 0);
-    // Dismissed at the prompt: still waiting.
+    assert_eq!(
+        mock.state().prompts,
+        0,
+        "every open fails at once, without asking the keyring again"
+    );
     mock.state().answer = Answer::Dismiss;
     let st = s.apply(true, false, false);
-    assert!(st.waiting.contains("dismissed"), "{st:?}");
-    // Unlocked: opens as it was.
+    assert!(
+        st.waiting.contains("dismissed"),
+        "dismissed at the prompt: still waiting, {st:?}"
+    );
     mock.state().answer = Answer::Unlock;
     let st = s.apply(true, false, false);
-    assert_eq!((st.waiting.as_str(), st.broken.as_str()), ("", ""));
+    assert_eq!(
+        (st.waiting.as_str(), st.broken.as_str()),
+        ("", ""),
+        "unlocked: opens as it was"
+    );
     assert!(s.finds_the_note());
 }
 
@@ -392,47 +474,51 @@ fn a_keyring_item_gone_is_waited_for_until_encryption_starts_over() {
     let Some(mock) = Mock::start("enc-gone") else {
         return;
     };
-    let s = Setup::keyring("gone", &mock);
-    s.index();
-    s.apply(true, false, false);
+    let s = encrypted_in_keyring("gone", &mock);
     let before = s.on_disk();
-    // Another keyring serves the session now, or the item was deleted.
-    hold(&s.db(), None);
+    s.restart();
     mock.state().items.clear();
     let st = s.apply(true, false, false);
     assert!(st.waiting.contains("no item"), "{st:?}");
     assert!(st.waiting.contains("another keyring"), "{st:?}");
     assert_eq!((st.broken.as_str(), st.seal), ("", "keyring"));
-    // Kept as it was, and no new key made behind the user's back.
-    assert_eq!(s.on_disk(), before);
-    assert!(mock.state().items.is_empty());
+    assert_eq!(s.on_disk(), before, "kept as it was");
+    assert!(
+        mock.state().items.is_empty(),
+        "no new key made behind the user's back"
+    );
     assert!(seal::is_unavailable(&index::open(&s.db()).unwrap_err()));
-    // Not at a quiet try either, with encryption off.
-    let off = Want {
-        on: false,
-        allow_host: false,
-    };
-    let st = apply(&s.db(), off, false, &s.sealer.quiet());
-    assert!(!st.waiting.is_empty() && st.broken.is_empty(), "{st:?}");
-    assert_eq!(s.on_disk(), before);
-    // Nor at a try that may prompt but that nobody asked for: the start,
-    // `vinosearch index`.
-    let st = apply(&s.db(), off, false, &s.sealer);
-    assert!(!st.waiting.is_empty() && st.broken.is_empty(), "{st:?}");
-    assert_eq!(s.on_disk(), before);
-    // Turned off (the Security page's switch): started over, plaintext,
-    // without the old key, the folders kept.
-    let st = apply(&s.db(), off, false, &s.sealer.asked());
-    assert!(st.broken.contains("no item"), "{st:?}");
+
+    for (when, sealer) in [
+        ("a quiet try", s.sealer.quiet()),
+        ("the start or `vinosearch index`", s.sealer.clone()),
+    ] {
+        let st = apply(&s.db(), OFF, false, &sealer);
+        assert!(
+            !st.waiting.is_empty() && st.broken.is_empty(),
+            "turned off at {when}: still waiting, {st:?}"
+        );
+        assert_eq!(s.on_disk(), before, "turned off at {when}: kept");
+    }
+
+    let st = apply(&s.db(), OFF, false, &s.sealer.asked());
+    assert!(
+        st.broken.contains("no item"),
+        "turned off by the user: started over, {st:?}"
+    );
     assert_eq!((st.waiting.as_str(), st.encrypted), ("", false));
     assert!(s.plain_sqlite_reads());
     let conn = index::open(&s.db()).unwrap();
     assert_eq!(index::counts(&conn).unwrap(), (0, 0));
     assert_eq!(index::roots(&conn).unwrap(), [s.dir.join("root")]);
     drop(conn);
-    // And on again: a new key in this keyring.
+
     let st = s.apply(true, false, false);
-    assert_eq!((st.error.as_str(), st.seal), ("", "keyring"));
+    assert_eq!(
+        (st.error.as_str(), st.seal),
+        ("", "keyring"),
+        "on again: a new key in this keyring"
+    );
     assert_eq!(mock.state().items.len(), 1);
     s.index();
     assert!(s.finds_the_note());
@@ -440,19 +526,12 @@ fn a_keyring_item_gone_is_waited_for_until_encryption_starts_over() {
 
 #[test]
 fn from_the_flatpak_a_host_out_of_reach_is_waited_for_and_the_index_kept() {
-    let mut s = Setup::new("hostgone", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
+    let mut s = encrypted("hostgone");
     let before = s.on_disk();
     let file = fs::read(key_file(&s.db())).unwrap();
-    // The next start, in the Flatpak: flatpak-spawn can't reach the host.
-    hold(&s.db(), None);
+    s.restart();
     let creds = s.fake.tool(&creds_body(TPM_HEAD));
-    let gone = spawner(
-        &s.fake,
-        "echo 'Portal call failed: org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1",
-    );
-    s.sealer = Sealer::on_host(&gone, &creds, Duration::from_secs(10));
+    s.sealer = host_out_of_reach(&s, NO_SESSION_HELPER);
     let st = s.apply(true, false, false);
     assert!(st.waiting.contains("Portal call failed"), "{st:?}");
     assert_eq!((st.error.as_str(), st.broken.as_str()), ("", ""));
@@ -461,10 +540,13 @@ fn from_the_flatpak_a_host_out_of_reach_is_waited_for_and_the_index_kept() {
     assert_eq!(fs::read(key_file(&s.db())).unwrap(), file);
     let e = index::open(&s.db()).unwrap_err();
     assert!(seal::is_unavailable(&e) && !is_unusable(&e), "{e:#}");
-    // Back: opens as it was.
     s.sealer = Sealer::on_host(&spawner(&s.fake, HOST), &creds, Duration::from_secs(10));
     let st = s.apply(true, false, false);
-    assert_eq!((st.waiting.as_str(), st.broken.as_str()), ("", ""));
+    assert_eq!(
+        (st.waiting.as_str(), st.broken.as_str()),
+        ("", ""),
+        "the host back: opens as it was"
+    );
     assert!(s.finds_the_note());
 }
 
@@ -472,12 +554,12 @@ fn from_the_flatpak_a_host_out_of_reach_is_waited_for_and_the_index_kept() {
 fn from_the_flatpak_a_host_out_of_reach_leaves_a_plaintext_index_plaintext() {
     let mut s = Setup::new("hostoff", TPM_HEAD);
     s.index();
-    let creds = s.fake.tool(&creds_body(TPM_HEAD));
-    let gone = spawner(&s.fake, "echo \"Can't find bus\" >&2; exit 1");
-    s.sealer = Sealer::on_host(&gone, &creds, Duration::from_secs(10));
-    // Not in the keyring instead, nor with the host key: refused, and said so.
+    s.sealer = host_out_of_reach(&s, "echo \"Can't find bus\" >&2; exit 1");
     let st = s.apply(true, true, false);
-    assert!(st.error.contains("Can't find bus"), "{st:?}");
+    assert!(
+        st.error.contains("Can't find bus"),
+        "refused, not sealed in the keyring or with the host key: {st:?}"
+    );
     assert!(!st.encrypted);
     assert!(!key_file(&s.db()).exists());
     assert!(s.plain_sqlite_reads());
@@ -488,17 +570,19 @@ fn a_tpm_sealed_index_is_never_moved_to_the_keyring() {
     let Some(mock) = Mock::start("enc-stay") else {
         return;
     };
-    let mut s = Setup::new("stay", TPM_HEAD);
-    s.index();
-    s.apply(true, false, false);
+    let mut s = encrypted("stay");
     let file = fs::read(key_file(&s.db())).unwrap();
-    // systemd-creds gone (or not found): waited for, not dropped, and not
-    // sealed again in the keyring.
-    hold(&s.db(), None);
+    s.restart();
     s.sealer = Sealer::keyring_only(mock.keyring(Some(Duration::from_secs(5))));
     let st = s.apply(true, false, false);
-    assert!(st.waiting.contains("systemd-creds"), "{st:?}");
+    assert!(
+        st.waiting.contains("systemd-creds"),
+        "systemd-creds gone: waited for, {st:?}"
+    );
     assert_eq!((st.broken.as_str(), st.seal), ("", "tpm"));
     assert_eq!(fs::read(key_file(&s.db())).unwrap(), file);
-    assert!(mock.state().items.is_empty());
+    assert!(
+        mock.state().items.is_empty(),
+        "not sealed again in the keyring"
+    );
 }

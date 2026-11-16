@@ -84,11 +84,10 @@ pub fn install(args: &[String]) -> Result<()> {
 
 /// `krunner --uninstall` in the Flatpak: every search place off, no start
 /// at login, and the service stopped. Its files stay until the Flatpak is
-/// uninstalled, but nothing starts it.
+/// uninstalled, but nothing starts it; the menu entry, a file on the host
+/// which uninstalling the Flatpak would leave behind, goes now. The places go
+/// before the service stops: a search between the two would start it again.
 pub fn uninstall(app: &str) -> Result<()> {
-    // The places first: a search between the two would start it again.
-    // The menu entry is a file on the host, which uninstalling the Flatpak
-    // would leave behind.
     for place in Place::ALL {
         if let Err(e) = set_place(place, false) {
             eprintln!("{e:#}");
@@ -116,95 +115,104 @@ pub fn integrate(place: Place, on: bool) -> Result<()> {
 
 /// Turn `place` on or off in the desktop's setting for it.
 fn set_place(place: Place, on: bool) -> Result<()> {
-    let n = names();
     match place {
-        Place::Kde => {
-            let key = format!("{}Enabled", n.krunner_plugin_id);
-            // Off is the key gone, as Flatpak's export leaves the plugin off
-            // by default. --notify: KRunner rereads its plugins when the
-            // group changes.
-            let value = if on { "true" } else { "--delete" };
-            let wrote = ["kwriteconfig6", "kwriteconfig5"].into_iter().any(|tool| {
-                sandbox::host_output(&[
-                    tool,
-                    "--notify",
-                    "--file",
-                    "krunnerrc",
-                    "--group",
-                    "Plugins",
-                    "--key",
-                    &key,
-                    value,
-                ])
-                .is_some()
-            });
-            if !wrote {
-                bail!("KRunner's setting wasn't written: no kwriteconfig6 on the host");
-            }
-            println!(
-                "KRunner and the Plasma launcher: {}",
-                if on { "on" } else { "off" }
-            );
+        Place::Kde => set_krunner(on),
+        Place::Gnome => set_gnome(on),
+        Place::Menu => set_menu_entry(on),
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// Off is the key gone, as Flatpak's export leaves the plugin off by
+/// default. With `--notify`, KRunner rereads its plugins when the group
+/// changes.
+fn set_krunner(on: bool) -> Result<()> {
+    let key = format!("{}Enabled", names().krunner_plugin_id);
+    let value = if on { "true" } else { "--delete" };
+    let wrote = ["kwriteconfig6", "kwriteconfig5"].into_iter().any(|tool| {
+        sandbox::host_output(&[
+            tool,
+            "--notify",
+            "--file",
+            "krunnerrc",
+            "--group",
+            "Plugins",
+            "--key",
+            &key,
+            value,
+        ])
+        .is_some()
+    });
+    if !wrote {
+        bail!("KRunner's setting wasn't written: no kwriteconfig6 on the host");
+    }
+    println!("KRunner and the Plasma launcher: {}", on_off(on));
+    Ok(())
+}
+
+/// Off when never turned on here writes nothing, so needs no gsettings.
+fn set_gnome(on: bool) -> Result<()> {
+    let id = &names().desktop_id;
+    let enabled = sandbox::gnome_providers("enabled");
+    if !on && !enabled.as_ref().is_some_and(|l| l.contains(id)) {
+        println!("GNOME Shell: off");
+        return Ok(());
+    }
+    let enabled =
+        enabled.context("GNOME Shell's setting wasn't read: no gsettings or schema on the host")?;
+    let disabled = sandbox::gnome_providers("disabled").unwrap_or_default();
+    let set = |key: &str, list: Vec<String>| {
+        sandbox::host_output(&[
+            "gsettings",
+            "set",
+            sandbox::GNOME_SEARCH,
+            key,
+            &sandbox::strv(&list),
+        ])
+        .with_context(|| format!("GNOME Shell's {key} providers weren't written"))
+    };
+    let without = |list: Vec<String>| list.into_iter().filter(|p| p != id).collect();
+    if on {
+        let mut list: Vec<String> = without(enabled);
+        list.push(id.clone());
+        set("enabled", list)?;
+        if disabled.contains(id) {
+            set("disabled", without(disabled))?;
         }
-        Place::Gnome => {
-            let id = &n.desktop_id;
-            let enabled = sandbox::gnome_providers("enabled");
-            if !on && !enabled.as_ref().is_some_and(|l| l.contains(id)) {
-                // Never turned on here: nothing to write, or nowhere to.
-                println!("GNOME Shell: off");
-                return Ok(());
-            }
-            let enabled = enabled
-                .context("GNOME Shell's setting wasn't read: no gsettings or schema on the host")?;
-            let disabled = sandbox::gnome_providers("disabled").unwrap_or_default();
-            let set = |key: &str, list: Vec<String>| {
-                sandbox::host_output(&[
-                    "gsettings",
-                    "set",
-                    sandbox::GNOME_SEARCH,
-                    key,
-                    &sandbox::strv(&list),
-                ])
-                .with_context(|| format!("GNOME Shell's {key} providers weren't written"))
-            };
-            let without = |list: Vec<String>| list.into_iter().filter(|p| p != id).collect();
-            if on {
-                let mut list: Vec<String> = without(enabled);
-                list.push(id.clone());
-                set("enabled", list)?;
-                if disabled.contains(id) {
-                    set("disabled", without(disabled))?;
-                }
-            } else {
-                set("enabled", without(enabled))?;
-            }
-            println!("GNOME Shell: {}", if on { "on" } else { "off" });
-        }
-        Place::Menu => {
-            let entry = sandbox::host_data_home()
-                .context("no home directory")?
-                .join(&n.search_entry);
-            if on {
-                // On the host, where the menu runs it, as `launch_settings`
-                // opens the window.
-                let settings = format!("flatpak run --command=vinosearch-settings {}", n.app_id);
-                fs::create_dir_all(entry.parent().unwrap())?;
-                let launcher = sandbox::info_value("Instance", "app-path")
-                    .and_then(|path| sandbox::exported_launcher(&path, &n.app_id))
-                    .filter(|l| !l.chars().any(|c| c.is_control() || c == ' '));
-                fs::write(
-                    &entry,
-                    install::search_entry(&settings, launcher.as_deref()),
-                )
-                .with_context(|| format!("writing {}", entry.display()))?;
-                println!("wrote {}", entry.display());
-            } else if entry.exists() {
-                fs::remove_file(&entry).with_context(|| format!("removing {}", entry.display()))?;
-                println!("removed {}", entry.display());
-            } else {
-                println!("the search window's app menu entry was already off");
-            }
-        }
+    } else {
+        set("enabled", without(enabled))?;
+    }
+    println!("GNOME Shell: {}", on_off(on));
+    Ok(())
+}
+
+/// The entry runs the window through `flatpak run` on the host, where the
+/// menu runs it, as `launch_settings` opens it.
+fn set_menu_entry(on: bool) -> Result<()> {
+    let n = names();
+    let entry = sandbox::host_data_home()
+        .context("no home directory")?
+        .join(&n.search_entry);
+    if on {
+        let settings = format!("flatpak run --command=vinosearch-settings {}", n.app_id);
+        fs::create_dir_all(entry.parent().unwrap())?;
+        let launcher = sandbox::info_value("Instance", "app-path")
+            .and_then(|path| sandbox::exported_launcher(&path, &n.app_id))
+            .filter(|l| !l.chars().any(|c| c.is_control() || c == ' '));
+        fs::write(
+            &entry,
+            install::search_entry(&settings, launcher.as_deref()),
+        )
+        .with_context(|| format!("writing {}", entry.display()))?;
+        println!("wrote {}", entry.display());
+    } else if entry.exists() {
+        fs::remove_file(&entry).with_context(|| format!("removing {}", entry.display()))?;
+        println!("removed {}", entry.display());
+    } else {
+        println!("the search window's app menu entry was already off");
     }
     Ok(())
 }
@@ -230,23 +238,26 @@ fn remember_asked(on: bool) {
     }
 }
 
+/// Where the portal answers a request: an object named from our unique bus
+/// name and the request's token (pinned by
+/// `tests::the_portal_answers_at_a_path_named_from_the_bus_name_and_token`).
+fn request_path(unique_name: &str, token: &str) -> String {
+    let sender = unique_name.trim_start_matches(':').replace('.', "_");
+    format!("/org/freedesktop/portal/desktop/request/{sender}/{token}")
+}
+
 /// Ask the Background portal to run `command` at login, or with None to
-/// stop doing so. Fails when the portal refuses or the user says no.
+/// stop doing so. Fails when the portal refuses or the user says no. The
+/// answer is listened for before asking, so it can't be missed.
 fn request_background(command: Option<&[String]>) -> Result<()> {
     zbus::block_on(async {
         let conn = Connection::session().await?;
-        // The answer comes on a Request object named from our bus name and
-        // this token; listening there first means it can't be missed.
         let token = format!("vinosearch{}", std::process::id());
-        let sender = conn
-            .unique_name()
-            .context("no unique bus name")?
-            .trim_start_matches(':')
-            .replace('.', "_");
+        let sender = conn.unique_name().context("no unique bus name")?;
         let request = Proxy::new(
             &conn,
             PORTAL,
-            format!("/org/freedesktop/portal/desktop/request/{sender}/{token}"),
+            request_path(sender, &token),
             "org.freedesktop.portal.Request",
         )
         .await?;
@@ -292,4 +303,17 @@ fn request_background(command: Option<&[String]>) -> Result<()> {
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_portal_answers_at_a_path_named_from_the_bus_name_and_token() {
+        assert_eq!(
+            request_path(":1.42", "vinosearch7"),
+            "/org/freedesktop/portal/desktop/request/1_42/vinosearch7"
+        );
+    }
 }

@@ -1502,7 +1502,7 @@ mod test_support;
 mod tests {
     use super::test_support::Scratch;
     use super::vectors::{dot, quantize};
-    use super::words::{WORDS_MAX_CHUNKS, expression, ranked};
+    use super::words::{Expression, WORDS_MAX_CHUNKS, expression, ranked};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2540,7 +2540,7 @@ mod tests {
 
     /// Chunk ids whose name or text hold `query`'s words, in id order.
     fn matching(conn: &Connection, query: &str) -> Vec<i64> {
-        let (terms, _) = expression(query).unwrap();
+        let terms = expression(query).unwrap().terms;
         let mut ids: Vec<i64> = conn
             .prepare("SELECT rowid FROM chunk_words WHERE chunk_words MATCH ?1")
             .unwrap()
@@ -2579,7 +2579,7 @@ mod tests {
             "OR",
             "NOT",
         ] {
-            if let Some((terms, _)) = expression(q) {
+            if let Some(Expression { terms, .. }) = expression(q) {
                 assert!(ranked(&conn, &terms).is_ok(), "{q} -> {terms:?}");
             }
         }
@@ -2610,7 +2610,7 @@ mod tests {
             "v2.1",
             "\"lunch with sam\"",
         ] {
-            assert!(expression(q).unwrap().1, "{q}");
+            assert!(expression(q).unwrap().exact, "{q}");
         }
         for q in [
             "invoice",
@@ -2620,7 +2620,7 @@ mod tests {
             "\"a\" b \"c\"",
             "photos from 2019",
         ] {
-            assert!(!expression(q).unwrap().1, "{q}");
+            assert!(!expression(q).unwrap().exact, "{q}");
         }
     }
 
