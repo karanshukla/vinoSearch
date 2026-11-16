@@ -535,23 +535,34 @@ pub fn index_file<E: Embed>(
         Kind::Document | Kind::Session => document_chunks(conn, emb, &seen, &content, between)?,
         Kind::Image => image_chunks(conn, emb, &seen, &content, between)?,
     };
+    let chunked = match built {
+        ControlFlow::Break(outcome) => return Ok(outcome),
+        ControlFlow::Continue(chunked) => chunked,
+    };
+    write_file(conn, &seen, &content.hash, &chunked)
+}
+
+/// The file's row, its chunks and, for a long one, what is left for
+/// `index_rest`, in one transaction.
+fn write_file(
+    conn: &mut Connection,
+    seen: &Seen,
+    hash: &[u8],
+    chunked: &Chunked,
+) -> Result<Outcome> {
     let Chunked {
         first,
         vectors,
         kinds,
-    } = match built {
-        ControlFlow::Break(outcome) => return Ok(outcome),
-        ControlFlow::Continue(chunked) => chunked,
-    };
-
+    } = chunked;
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
+    tx.execute("DELETE FROM files WHERE path = ?1", [seen.key])?;
     tx.execute(
         "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
-        params![key, seen.mtime, seen.size, content.hash],
+        params![seen.key, seen.mtime, seen.size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
-    insert_chunks(&tx, file_id, &first.chunks, &vectors, &kinds)?;
+    insert_chunks(&tx, file_id, &first.chunks, vectors, kinds)?;
     // The rest of a long one waits for `index_rest`.
     let total = first.parts.min(MAX_PARTS);
     if total > PARTS_AT_ONCE {
