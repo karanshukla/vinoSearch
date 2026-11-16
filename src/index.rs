@@ -9,12 +9,14 @@ pub mod code;
 pub mod encryption;
 pub mod estimate;
 pub mod media;
+mod purge;
 mod query;
 mod schema;
 pub mod seal;
 mod vectors;
 mod words;
 
+pub use purge::*;
 pub use query::*;
 pub use schema::open;
 pub use vectors::Vectors;
@@ -1020,8 +1022,7 @@ pub fn index_rest<E: Embed>(
     }))
 }
 
-/// Keep what of `chunks` fits in MAX_TEXT_BYTES with `have` bytes of the
-/// document in already. True when some had to go.
+/// Trim `chunks` to MAX_TEXT_BYTES with `have` already in; true if some went.
 fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
     let mut total = have;
     let fits = chunks
@@ -1101,8 +1102,7 @@ pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// What a file `walk` found is indexed as, with its metadata: None if it
-/// isn't a wanted type or is over its kind's size cap. Reads no contents.
+/// What a file `walk` found is indexed as, with its metadata, or None. Reads no contents.
 pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
     let kind = types.kind(entry.path())?;
     let meta = entry.metadata().ok()?;
@@ -1138,224 +1138,6 @@ pub fn stale(
     // Indexed, but not found by the walk: deleted, or now excluded or skipped.
     out.extend(known.into_keys().map(PathBuf::from));
     Ok(out)
-}
-
-/// Drop everything indexed under an excluded path. Returns files removed.
-pub fn purge(conn: &Connection, ex: &Excludes) -> Result<usize> {
-    let mut n = 0;
-    for p in ex.paths() {
-        n += remove(conn, p)?;
-    }
-    if n > 0 {
-        compact(conn)?;
-    }
-    Ok(n)
-}
-
-/// Drop every indexed file `types` no longer takes (images, once turned
-/// off), and hold media to the longest it now allows (`media::fit`).
-/// Returns files removed.
-pub fn purge_types(conn: &Connection, types: &FileTypes) -> Result<usize> {
-    let paths: Vec<String> = conn
-        .prepare("SELECT path FROM files")?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let tx = conn.unchecked_transaction()?;
-    let mut n = 0;
-    for p in paths.iter().filter(|p| !wanted(Path::new(p), types)) {
-        n += tx.execute("DELETE FROM files WHERE path = ?1", [p])?;
-    }
-    tx.commit()?;
-    let left_out = if types.media {
-        media::fit(conn, types.max_media_seconds)?.0
-    } else {
-        0
-    };
-    if n + left_out > 0 {
-        compact(conn)?;
-    }
-    Ok(n)
-}
-
-/// Drop the vectors of every kind made by a model other than this build's,
-/// and record this build's (#80). The files holding them go too (with their
-/// copies), so the next check of each root indexes them afresh. An index
-/// with no record for a kind is taken as this build's and tagged: nothing
-/// else has shipped for it. Returns (kind, files dropped) per kind purged.
-pub fn purge_other_models(conn: &Connection) -> Result<Vec<(Kind, usize)>> {
-    let tags: Vec<(Kind, String)> = Kind::ALL.iter().map(|k| (*k, k.model_tag())).collect();
-    purge_models_but(conn, &tags)
-}
-
-fn purge_models_but(conn: &Connection, tags: &[(Kind, String)]) -> Result<Vec<(Kind, usize)>> {
-    let mut out = Vec::new();
-    let tx = conn.unchecked_transaction()?;
-    for (kind, tag) in tags {
-        let was: Option<String> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                [kind.meta_key()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if was.as_deref().is_some_and(|w| w != tag) {
-            out.push((*kind, drop_kind(&tx, *kind)?));
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![kind.meta_key(), tag],
-        )?;
-    }
-    tx.commit()?;
-    if out.iter().any(|(_, n)| *n > 0) {
-        compact(conn)?;
-    }
-    Ok(out)
-}
-
-/// Every chunk of `kind`, and the files holding them and their copies.
-/// Returns files removed.
-fn drop_kind(tx: &Connection, kind: Kind) -> Result<usize> {
-    tx.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS dropped (id INTEGER, sha BLOB); DELETE FROM dropped;",
-    )?;
-    tx.execute(
-        "INSERT INTO dropped SELECT DISTINCT f.id, f.sha256 FROM files f
-         JOIN chunks c ON c.file_id = f.id WHERE c.kind = ?1",
-        [kind as i64],
-    )?;
-    // Chunks first: deleting a file with chunks hands them to a copy
-    // (files_hand_over), and these must go.
-    tx.execute("DELETE FROM chunks WHERE kind = ?1", [kind as i64])?;
-    let n = tx.execute(
-        "DELETE FROM files WHERE id IN (SELECT id FROM dropped)
-         OR sha256 IN (SELECT sha FROM dropped WHERE sha IS NOT NULL)",
-        [],
-    )?;
-    tx.execute_batch("DROP TABLE dropped")?;
-    Ok(n)
-}
-
-/// `LIKE` patterns for files with a HEIF extension (#79).
-fn heif_patterns() -> Vec<String> {
-    crate::ml::vision::HEIF_EXTENSIONS
-        .iter()
-        .map(|e| format!("%.{e}"))
-        .collect()
-}
-
-/// Images recorded without chunks for want of a HEIF decoder: by extension,
-/// leaving out copies of a file that did decode. What the Index page counts
-/// while heif-convert is missing (#79).
-pub fn undecodable(conn: &Connection) -> Result<i64> {
-    let mut n = 0;
-    for pattern in heif_patterns() {
-        n += conn.query_row(
-            "SELECT count(*) FROM files f
-             WHERE lower(f.path) LIKE ?1
-               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
-               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
-                               WHERE g.sha256 = f.sha256)",
-            [pattern],
-            |r| r.get::<_, i64>(0),
-        )?;
-    }
-    Ok(n)
-}
-
-/// Forget the images recorded as undecodable once a decoder is there, so the
-/// next check of each root indexes them. Returns files dropped.
-pub fn retry_undecodable(conn: &Connection) -> Result<usize> {
-    if crate::ml::vision::heif_convert().is_none() {
-        return Ok(0);
-    }
-    let mut n = 0;
-    for pattern in heif_patterns() {
-        n += conn.execute(
-            "DELETE FROM files WHERE lower(path) LIKE ?1
-               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
-               AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
-                               WHERE g.sha256 = files.sha256)",
-            [pattern],
-        )?;
-    }
-    Ok(n)
-}
-
-/// Forget the PDFs recorded with no text once OCR could read them as scans
-/// (#106): with this OCR model, and poppler installed. Recorded in `meta`, so
-/// it happens once for each, not at every start. Returns files dropped.
-pub fn retry_scans(conn: &Connection, ocr: bool) -> Result<usize> {
-    if !ocr || !crate::ml::ocr::poppler() {
-        return Ok(0);
-    }
-    let key = "reading.scans";
-    let now = format!(
-        "{}/{}",
-        crate::ml::model::OCR_REVISION,
-        crate::ml::ocr::READING
-    );
-    let now = now.as_str();
-    let was: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-        .optional()?;
-    if was.as_deref() == Some(now) {
-        return Ok(0);
-    }
-    let tx = conn.unchecked_transaction()?;
-    let n = tx.execute(
-        "DELETE FROM files WHERE lower(path) LIKE '%.pdf'
-           AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = files.id)
-           AND NOT EXISTS (SELECT 1 FROM files g JOIN chunks c ON c.file_id = g.id
-                           WHERE g.sha256 = files.sha256)",
-        [],
-    )?;
-    tx.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-        params![key, now],
-    )?;
-    tx.commit()?;
-    Ok(n)
-}
-
-/// Formats whose text is read differently now, with the reading's version:
-/// HTML through `extract::html` since 1 (#97), PDFs without their headers,
-/// footers and page numbers since 1 (#158). Mtime and size don't show the
-/// change, so files read the old way are dropped once instead.
-const READINGS: &[(&str, &[&str], u32)] = &[("html", &["html", "htm"], 1), ("pdf", &["pdf"], 1)];
-
-/// Forget the files of each format in `READINGS` indexed under an older
-/// reading, so the next check of each root indexes them again. Returns files
-/// dropped.
-pub fn reread_formats(conn: &Connection) -> Result<usize> {
-    let mut n = 0;
-    let tx = conn.unchecked_transaction()?;
-    for (format, extensions, version) in READINGS {
-        let key = format!("reading.{format}");
-        let was: Option<String> = tx
-            .query_row("SELECT value FROM meta WHERE key = ?1", [&key], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if was == Some(version.to_string()) {
-            continue;
-        }
-        for e in *extensions {
-            n += tx.execute(
-                "DELETE FROM files WHERE lower(path) LIKE ?1",
-                [format!("%.{e}")],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, version.to_string()],
-        )?;
-    }
-    tx.commit()?;
-    if n > 0 {
-        compact(conn)?;
-    }
-    Ok(n)
 }
 
 /// Hand freed space back once over a quarter of the file is free pages.
@@ -1586,7 +1368,7 @@ mod tests {
     }
 
     /// `chunks` as (kind, line) on a new file at `path`.
-    fn file_with(conn: &Connection, path: &str, chunks: &[(Kind, i64)]) {
+    pub(super) fn file_with(conn: &Connection, path: &str, chunks: &[(Kind, i64)]) {
         conn.execute(
             "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?1)",
             [path],
@@ -1620,32 +1402,6 @@ mod tests {
         let counts = counts_by_kind(&conn).unwrap();
         // Kind::ALL's order: text, documents, images.
         assert_eq!(counts, [(1, 1), (1, 2), (1, 3), (0, 0), (0, 0), (0, 0)]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn pdfs_with_no_text_are_read_again_once_ocr_can() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-scans-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        file_with(&conn, "/scan.PDF", &[]);
-        file_with(&conn, "/text.pdf", &[(Kind::Document, 1)]);
-        file_with(&conn, "/broken.jpg", &[]);
-        let paths = |conn: &Connection| -> Vec<String> {
-            conn.prepare("SELECT path FROM files ORDER BY path")
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(retry_scans(&conn, false).unwrap(), 0);
-        if crate::ml::ocr::poppler() {
-            assert_eq!(retry_scans(&conn, true).unwrap(), 1);
-            assert_eq!(paths(&conn), ["/broken.jpg", "/text.pdf"]);
-            // Once per OCR model: a scan recorded again isn't dropped at every start.
-            file_with(&conn, "/scan.PDF", &[]);
-            assert_eq!(retry_scans(&conn, true).unwrap(), 0);
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2322,6 +2078,48 @@ mod tests {
     }
 
     #[test]
+    fn text_exactly_at_the_budget_is_kept() {
+        let mut run = vec![(1, "x".repeat(600))];
+        assert!(!text_budget(&mut run, MAX_TEXT_BYTES - 600));
+        assert_eq!(run.len(), 1);
+    }
+
+    #[test]
+    fn text_one_byte_past_the_budget_is_left_out() {
+        let mut run = vec![(1, "x".repeat(600))];
+        assert!(text_budget(&mut run, MAX_TEXT_BYTES - 599));
+        assert!(run.is_empty());
+    }
+
+    fn indexable_html_of(name: &str, len: u64) -> Option<Kind> {
+        let dir = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = fs::File::create(dir.join("page.html")).unwrap();
+        file.set_len(len).unwrap();
+        let entry = WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().is_file())
+            .unwrap();
+        let kind = indexable(&entry, &FileTypes::default()).map(|(k, _)| k);
+        fs::remove_dir_all(&dir).unwrap();
+        kind
+    }
+
+    #[test]
+    fn a_file_exactly_at_its_kinds_size_cap_is_indexable() {
+        assert_eq!(
+            indexable_html_of("cap-at", MAX_FILE_BYTES),
+            Some(Kind::Text)
+        );
+    }
+
+    #[test]
+    fn a_file_one_byte_over_its_kinds_size_cap_is_not_indexable() {
+        assert_eq!(indexable_html_of("cap-over", MAX_FILE_BYTES + 1), None);
+    }
+
+    #[test]
     fn prose_may_be_a_book_but_code_may_not() {
         assert_eq!(
             Kind::Text.max_bytes(Path::new("/b/Moby Dick.TXT")),
@@ -2336,26 +2134,6 @@ mod tests {
             Kind::Text.max_bytes(Path::new("/b/page.html")),
             MAX_FILE_BYTES
         );
-    }
-
-    #[test]
-    fn html_indexed_before_it_was_read_as_html_is_indexed_again_once() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-reread-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        for p in [
-            "/site/index.html",
-            "/site/OLD.HTM",
-            "/notes.md",
-            "/docs/a.pdf",
-        ] {
-            add_file(&conn, p, &[0]);
-        }
-        assert_eq!(reread_formats(&conn).unwrap(), 3);
-        assert!(is_indexed(&conn, "/notes.md").unwrap());
-        assert!(!is_indexed(&conn, "/site/index.html").unwrap());
-        add_file(&conn, "/site/index.html", &[0]);
-        assert_eq!(reread_formats(&conn).unwrap(), 0);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2443,102 +2221,14 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn undecodable_photos_are_counted_but_not_their_decoded_copies() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-heif-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        let file = |path: &str, hash: &[u8]| {
-            conn.execute(
-                "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?2)",
-                params![path, hash],
-            )
-            .unwrap();
-            conn.last_insert_rowid()
-        };
-        file("/p/IMG_1.HEIC", b"a");
-        file("/p/IMG_2.heic", b"b");
-        file("/p/render.avif", b"c");
-        // Decoded, and a byte-identical copy of it holding no chunks.
-        let decoded = file("/p/IMG_3.heic", b"d");
-        conn.execute(
-            "INSERT INTO chunks (file_id, start_line, text, embedding, kind) VALUES (?1, 0, '', ?2, 1)",
-            params![decoded, axis(0)],
-        )
-        .unwrap();
-        file("/p/copy.heic", b"d");
-        // Not HEIF: a document with no text.
-        file("/p/scan.pdf", b"e");
-        assert_eq!(undecodable(&conn).unwrap(), 3);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn vectors_from_another_model_are_dropped_with_their_files() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-model-{}", std::process::id()));
-        let conn = open(&dir.join("i.sqlite")).unwrap();
-        let tag = |kind: Kind, t: &str| (kind, t.to_owned());
-        let v1 = [
-            tag(Kind::Text, "text-1"),
-            tag(Kind::Document, "text-1"),
-            tag(Kind::Image, "text-1+vision-1/140"),
-        ];
-        // A fresh index has no record: nothing to drop, this build is recorded.
-        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
-        add_file(&conn, "/notes.md", &[0, 1]);
-        add_file(&conn, "/cat.png", &[2]);
-        conn.execute("UPDATE chunks SET kind = 1 WHERE file_id = (SELECT id FROM files WHERE path = '/cat.png')", []).unwrap();
-        // A byte-identical copy of the photo, holding no chunks of its own.
-        conn.execute(
-            "UPDATE files SET sha256 = x'01' WHERE path = '/cat.png'",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO files (path, mtime, size, sha256) VALUES ('/copy.png', 0, 0, x'01')",
-            [],
-        )
-        .unwrap();
-        // Same models again: nothing happens.
-        assert!(purge_models_but(&conn, &v1).unwrap().is_empty());
-        assert_eq!(counts(&conn).unwrap(), (3, 3));
-
-        // A new vision encoder: the images go, the copy included; text stays.
-        let v2 = [
-            tag(Kind::Text, "text-1"),
-            tag(Kind::Document, "text-1"),
-            tag(Kind::Image, "text-1+vision-2/140"),
-        ];
-        assert_eq!(purge_models_but(&conn, &v2).unwrap(), [(Kind::Image, 2)]);
-        assert_eq!(counts(&conn).unwrap(), (1, 2));
-        assert!(is_indexed(&conn, "/notes.md").unwrap());
-        assert!(purge_models_but(&conn, &v2).unwrap().is_empty());
-
-        // A new text model: everything of that kind goes.
-        let v3 = [
-            tag(Kind::Text, "text-2"),
-            tag(Kind::Document, "text-2"),
-            tag(Kind::Image, "text-1+vision-2/140"),
-        ];
-        let purged = purge_models_but(&conn, &v3).unwrap();
-        assert_eq!(purged, [(Kind::Text, 1), (Kind::Document, 0)]);
-        assert_eq!(counts(&conn).unwrap(), (0, 0));
-        let recorded: String = conn
-            .query_row("SELECT value FROM meta WHERE key = 'model.text'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(recorded, "text-2");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// A unit vector along `axis`, as an embedding blob.
-    fn axis(axis: usize) -> Vec<u8> {
+    pub(super) fn axis(axis: usize) -> Vec<u8> {
         let mut v = vec![0f32; DIM];
         v[axis] = 1.0;
         to_blob(&v)
     }
 
-    fn add_file(conn: &Connection, path: &str, axes: &[usize]) -> Vec<i64> {
+    pub(super) fn add_file(conn: &Connection, path: &str, axes: &[usize]) -> Vec<i64> {
         conn.execute(
             "INSERT INTO files (path, mtime, size) VALUES (?1, 0, 0)",
             [path],

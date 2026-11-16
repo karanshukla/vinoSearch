@@ -1,6 +1,10 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    Align, Button, ChipKind, Column, LARGEST, LEGEND_SWATCH, Layout, Path, PathBuf, Request,
+    RichText, Row, SettingsWindow, Status, Target, Tone, a11y, ago, config, count, kind_colors,
+    middle_cut, partial_line, power_hold, size, theme, tilde, widgets,
+};
 
 /// Documents indexed in part listed by name on the Index page; the rest are counted.
 const PARTIAL_SHOWN: usize = 3;

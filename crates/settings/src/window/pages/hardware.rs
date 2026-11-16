@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{Arc, Button, ChipKind, Column, Row, SettingsWindow, Tone, doctor, widgets};
 
 impl SettingsWindow {
     /// What `vinosearch doctor` reports, run the first time the page shows.
