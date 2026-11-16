@@ -641,7 +641,6 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::html::*;
     use super::pdf::*;
     use super::*;
     use std::io::Write;
