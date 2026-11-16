@@ -10,7 +10,7 @@ mod service;
 use cli::service::KrunnerMode;
 use ml::{embed, model, runtime};
 use search::menu;
-use service::{krunner, worker};
+use service::{install, krunner, worker};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -84,7 +84,7 @@ enum Command {
     /// gnome is GNOME Shell's overview search, from the next login, menu is the search window
     /// in the app menu.
     Integrate {
-        place: krunner::Place,
+        place: install::Place,
         /// Remove this place's files instead of writing them. The service stays.
         #[arg(long)]
         off: bool,
@@ -345,7 +345,7 @@ fn run(cli: Cli) -> Result<bool> {
             worker,
         } => match KrunnerMode::of(install, uninstall, worker) {
             KrunnerMode::Install => {
-                krunner::install(
+                install::install(
                     openvino_dir.as_deref(),
                     device.as_deref(),
                     idle_unload_minutes,
@@ -353,14 +353,14 @@ fn run(cli: Cli) -> Result<bool> {
                 Ok(true)
             }
             KrunnerMode::Uninstall => {
-                krunner::uninstall()?;
+                install::uninstall()?;
                 Ok(true)
             }
             KrunnerMode::Worker => cli::service::serve_and_exit(worker_options(openvino_dir, s)?),
             KrunnerMode::Supervise => krunner::supervise(),
         },
         Command::Integrate { place, off } => {
-            krunner::integrate(place, !off)?;
+            install::integrate(place, !off)?;
             Ok(true)
         }
         Command::Menu { launcher } => {

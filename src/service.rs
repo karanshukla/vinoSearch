@@ -4,6 +4,7 @@
 pub mod flatpak;
 pub mod flatpak_installed;
 pub mod flatpak_update;
+pub mod install;
 pub mod krunner;
 pub mod power;
 pub mod sched;
