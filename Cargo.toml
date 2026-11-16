@@ -45,6 +45,8 @@ zbus = "6"
 futures-lite = "2"
 toml = "1.1"
 futures-channel = "0.3"
+# file:// URLs for results.
+percent-encoding = "2.3"
 libc = "0.2"
 # Document text (#55): PDF pages, the XML inside Office/OpenDocument zips, and
 # spreadsheets.

@@ -23,6 +23,8 @@ futures-lite = "2"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff", "pnm"] }
 # The freedesktop thumbnail cache names files by the MD5 of their URI.
 md-5 = "0.11"
+# file:// URIs as GLib writes them, for that hash.
+percent-encoding = "2.3"
 
 
 [dev-dependencies]

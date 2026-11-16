@@ -9,7 +9,7 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{Harness, Node};
 
 use super::*;
-use crate::control::Request;
+use crate::control::{Partial, Request};
 
 /// Nothing in these tests may reach the bus, run `vinosearch` or open a portal: the link is
 /// detached, the doctor already answered and no test presses Add folder…, Turn on/off or

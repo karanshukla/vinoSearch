@@ -1,0 +1,117 @@
+use eframe::egui;
+
+use crate::window::*;
+
+impl SettingsWindow {
+    pub(in crate::window) fn integration(&mut self, ui: &mut egui::Ui) {
+        let state = self.integration.lock().unwrap().clone();
+        let (kde, gnome) = integration::desktops();
+        let fixed = integration::places_fixed();
+        let mut flip: Option<(integration::Switch, bool)> = None;
+        let mut switch_row = |ui: &mut egui::Ui,
+                              label: &str,
+                              help: &str,
+                              switch: integration::Switch,
+                              absent: Option<&str>| {
+            let help = match absent {
+                Some(note) => format!("{help} {note}"),
+                None => help.to_owned(),
+            };
+            Row::new(label).help(&help).show(ui, |ui, _| {
+                let on = state.is_on(switch);
+                let button = if on { "Turn off" } else { "Turn on" };
+                let button = ui.add_enabled(!state.running, Button::secondary(button));
+                if a11y::for_what(button, label).clicked() {
+                    flip = Some((switch, !on));
+                }
+                if state.running {
+                    widgets::chip(ui, ChipKind::Neutral, "Working…");
+                } else if on {
+                    widgets::chip(ui, ChipKind::Ok, "On");
+                } else {
+                    widgets::chip(ui, ChipKind::Neutral, "Off");
+                }
+            });
+        };
+        widgets::columns(ui, |ui, column| match column {
+            Column::Left => {
+                widgets::group_label(ui, "Search places");
+                widgets::group_help(
+                    ui,
+                    "Each place has its own switch; only what's on is installed.",
+                );
+                widgets::group(ui, |ui| {
+                    switch_row(
+                        ui,
+                        "KRunner",
+                        "Alt+Space, and the search in the Plasma app launcher.",
+                        integration::Switch::Kde,
+                        (!kde).then_some("Plasma isn't running in this session."),
+                    );
+                    switch_row(
+                        ui,
+                        "GNOME Shell",
+                        if fixed {
+                            "The overview's search."
+                        } else {
+                            "The overview's search, from the next login."
+                        },
+                        integration::Switch::Gnome,
+                        (!gnome).then_some("GNOME isn't running in this session."),
+                    );
+                    switch_row(
+                        ui,
+                        "App menu",
+                        if fixed {
+                            "The search window as an app of its own. Search Files, in vinoSearch's \
+                             menu entry's actions, opens it either way."
+                        } else {
+                            "The search window as an app of its own."
+                        },
+                        integration::Switch::Menu,
+                        None,
+                    );
+                });
+            }
+            Column::Right => {
+                widgets::group_label(ui, "Service");
+                widgets::group(ui, |ui| {
+                    switch_row(
+                        ui,
+                        "Search service",
+                        if fixed {
+                            "Runs at login. Turning it off turns every search place off too."
+                        } else {
+                            "Runs at login. Turning it off removes every search place too."
+                        },
+                        integration::Switch::Service,
+                        None,
+                    );
+                    if let Some(output) = &state.output {
+                        widgets::group_section(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(output).monospace()).wrap());
+                        });
+                    }
+                });
+                widgets::group_label(ui, "Command line");
+                widgets::group(ui, |ui| {
+                    for (what, command) in [
+                        ("Search", "vinosearch search \"what you're looking for\""),
+                        (
+                            "Similar photos",
+                            "vinosearch similar ~/Pictures/IMG_2041.jpg",
+                        ),
+                        ("Check the NPU", "vinosearch doctor"),
+                    ] {
+                        Row::new(what).show(ui, |ui, _| {
+                            widgets::mono(ui, command);
+                        });
+                    }
+                });
+            }
+        });
+        if let Some((switch, on)) = flip {
+            integration::run(Arc::clone(&self.integration), ui.ctx(), switch, on);
+        }
+    }
+}

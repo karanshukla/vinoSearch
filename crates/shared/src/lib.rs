@@ -7,5 +7,6 @@ pub mod config;
 pub mod dbus;
 pub mod limits;
 pub mod models;
+pub mod numbers;
 pub mod sandbox;
 pub mod xdg;

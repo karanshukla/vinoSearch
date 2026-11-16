@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 use eframe::egui;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use md5::{Digest, Md5};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use vinosearch_shared::limits::{MAX_DECODED_BYTES, MAX_IMAGE_BYTES};
 
 /// Longest side of a thumbnail decoded here: the cache's "large".
@@ -116,16 +117,29 @@ fn load(cache: Option<&Path>, path: &Path) -> Result<egui::ColorImage, String> {
 /// photo decoded instead.
 pub fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
-    let mut uri = String::from("file://");
-    for &b in path.as_os_str().as_bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=:@/".contains(&b) {
-            uri.push(b as char);
-        } else {
-            uri.push_str(&format!("%{b:02X}"));
-        }
-    }
-    uri
+    let bytes = path.as_os_str().as_bytes();
+    format!("file://{}", percent_encode(bytes, GLIB_ESCAPED))
 }
+
+/// Everything but what `g_filename_to_uri` leaves alone.
+const GLIB_ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/');
 
 /// Where the spec puts `path`'s thumbnail in `size` (normal, large, ...).
 fn cache_file(cache: &Path, size: &str, path: &Path) -> PathBuf {
@@ -281,6 +295,21 @@ mod tests {
             )
             .ends_with("large/c6ee772d9e49320e97ec29a7eb5b1697.png")
         );
+    }
+
+    #[test]
+    fn every_byte_glib_escapes_is_escaped_and_no_other() {
+        use std::os::unix::ffi::OsStrExt;
+        for b in 1u8..=255 {
+            let kept = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=:@/".contains(&b);
+            let want = if kept {
+                format!("file://{}", b as char)
+            } else {
+                format!("file://%{b:02X}")
+            };
+            let path = Path::new(std::ffi::OsStr::from_bytes(std::slice::from_ref(&b)));
+            assert_eq!(file_uri(path), want, "byte {b}");
+        }
     }
 
     #[test]

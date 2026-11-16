@@ -11,7 +11,7 @@
 //! login goes through the Background portal, which writes and removes the
 //! autostart entry on the host.
 
-use crate::service::krunner::{self, Place};
+use crate::service::install::{self, Place};
 use crate::service::start;
 use anyhow::{Context, Result, bail};
 use futures_lite::StreamExt;
@@ -32,19 +32,19 @@ pub fn export(share: &Path, app: &str) -> Result<()> {
     let files = [
         (
             format!("applications/{}", n.desktop_id),
-            krunner::launcher_entry(
+            install::launcher_entry(
                 &n,
                 "vinosearch-settings",
                 Some("vinosearch-settings --search"),
             ),
         ),
-        (krunner::icon_file(&n), krunner::ICON_SVG.to_owned()),
+        (install::icon_file(&n), install::ICON_SVG.to_owned()),
         (
             n.dbus_service_file.clone(),
-            krunner::dbus_service(&n, "vinosearch krunner"),
+            install::dbus_service(&n, "vinosearch krunner"),
         ),
-        (n.krunner_plugin.clone(), krunner::krunner_plugin(&n)),
-        (n.gnome_provider.clone(), krunner::gnome_provider(&n)),
+        (n.krunner_plugin.clone(), install::krunner_plugin(&n)),
+        (n.gnome_provider.clone(), install::gnome_provider(&n)),
     ];
     for (path, text) in files {
         let path = share.join(path);
@@ -68,7 +68,7 @@ pub fn install(args: &[String]) -> Result<()> {
         Err(e) => println!("not started at login: {e:#}"),
     }
     remember_asked(true);
-    for place in krunner::current_places() {
+    for place in install::current_places() {
         if let Err(e) = set_place(place, true) {
             println!("{e:#}");
         }
@@ -194,7 +194,7 @@ fn set_place(place: Place, on: bool) -> Result<()> {
                     .filter(|l| !l.chars().any(|c| c.is_control() || c == ' '));
                 fs::write(
                     &entry,
-                    krunner::search_entry(&settings, launcher.as_deref()),
+                    install::search_entry(&settings, launcher.as_deref()),
                 )
                 .with_context(|| format!("writing {}", entry.display()))?;
                 println!("wrote {}", entry.display());

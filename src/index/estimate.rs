@@ -9,6 +9,7 @@ use crate::index::{self, FileTypes, Kind};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use vinosearch_shared::numbers::thousands;
 
 /// Text and document chunks embedded per second on the NPU: 113,341 chunks
 /// in 66 min indexing `~/Development` (README's Performance table, Core 5
@@ -136,7 +137,7 @@ impl Estimate {
             format!(
                 "{} new or changed file{s} ({} indexed already)",
                 about(n),
-                count(self.up_to_date)
+                thousands(self.up_to_date)
             )
         } else {
             format!("{} file{}", about(n), if n == 1 { "" } else { "s" })
@@ -208,7 +209,7 @@ pub fn folder_summary(secs: f64, files: u64) -> String {
 
 /// "1 file", "1,300 files".
 fn files(n: u64) -> String {
-    format!("{} file{}", count(n), if n == 1 { "" } else { "s" })
+    format!("{} file{}", thousands(n), if n == 1 { "" } else { "s" })
 }
 
 /// Walk `root` as indexing it would, counting what is still to index:
@@ -269,27 +270,14 @@ pub fn estimate(
     Ok(est)
 }
 
-/// `n` with thousands separators.
-fn count(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// `n` to two significant figures past 1,000, since it is an estimate:
 /// 4,213 reads ~4,200.
 fn about(n: u64) -> String {
     if n < 1000 {
-        return count(n);
+        return thousands(n);
     }
     let step = 10u64.pow(n.ilog10() - 1);
-    format!("~{}", count((n + step / 2) / step * step))
+    format!("~{}", thousands((n + step / 2) / step * step))
 }
 
 /// "under a minute", "~35 min", "~1.5 h", "~12 h".
