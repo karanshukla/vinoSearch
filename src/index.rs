@@ -490,7 +490,9 @@ pub fn index_file<E: Embed>(
         return Ok(Outcome::Skipped);
     };
     let seen = Seen {
+        path,
         key,
+        kind,
         mtime: meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64,
         size: meta.len() as i64,
     };
@@ -507,121 +509,46 @@ pub fn index_file<E: Embed>(
     } else {
         None
     };
-    let Some(Content { bytes, hash }) = read_and_hash(conn, emb, path, kind, between)? else {
+    let Some(content) = read_and_hash(conn, emb, path, kind, between)? else {
         remove(conn, path)?;
         return Ok(Outcome::Skipped);
     };
-    let holder = holder_of(conn, &hash, key)?;
+    let holder = holder_of(conn, &content.hash, key)?;
     if let Some(known) = known
-        && let Some(outcome) = settle_known(conn, &seen, &known, &hash, holder.is_some())?
+        && let Some(outcome) = settle_known(conn, &seen, &known, &content.hash, holder.is_some())?
     {
         return Ok(outcome);
     }
-    let record = |conn: &mut Connection| seen.record(conn, &hash);
     if holder.is_some() {
-        record(conn)?;
+        seen.record(conn, &content.hash)?;
         if let Some(p) = &probed {
             media::note(conn, key, p)?;
         }
         return Ok(Outcome::Duplicate);
     }
     if kind == Kind::Media {
-        return media::start(conn, (key, seen.mtime, seen.size, &hash), probed);
+        return media::start(conn, (key, seen.mtime, seen.size, &content.hash), probed);
     }
-    let title = title_of(path);
-    let (first, vectors, kinds) = match kind {
+    let built = match kind {
         Kind::Media => unreachable!("started above"),
-        Kind::Text | Kind::Code => {
-            let text = String::from_utf8(bytes).expect("read as a string");
-            // Kept as a row with no chunks, so it isn't read again until it
-            // changes.
-            if let Some(why) = (kind == Kind::Code)
-                .then(|| crate::index::code::unwanted(&text))
-                .flatten()
-            {
-                eprintln!("skip {}: {why}", path.display());
-                record(conn)?;
-                return Ok(Outcome::Unreadable { no_decoder: false });
-            }
-            let first = text_parts(path, &text, 0, PARTS_AT_ONCE);
-            let vectors = embed_chunks(conn, emb, &title, &first.chunks, between)?;
-            let kinds = vec![kind; first.chunks.len()];
-            (first, vectors, kinds)
-        }
-        // A file that can't be read, or has no text (a scan), keeps a row with
-        // no chunks, so it isn't parsed again until it changes. So does a
-        // session in a format this build doesn't read.
-        Kind::Document | Kind::Session => {
-            // Recorded first: the parser runs in a child with limits, but a
-            // file the child cannot parse must not be parsed again on every
-            // restart, and a stop while embedding must leave it to be indexed
-            // next time, so the record goes once it parses.
-            record(conn)?;
-            let mut first = document_parts(path, &bytes, 0, parser(kind)).unwrap_or_else(|e| {
-                eprintln!("skip {}: {e:#}", path.display());
-                Extract::default()
-            });
-            // No text layer: a scan, read by OCR when it can be (#106).
-            let scan = first.chunks.is_empty() && is_scannable(path) && emb.can_read_text();
-            if !first.chunks.is_empty() || scan {
-                conn.execute("DELETE FROM files WHERE path = ?1", [key])?;
-            }
-            if scan {
-                // Read whole, up to ocr::MAX_SCAN_PAGES: never left in part.
-                first = Extract {
-                    parts: 1,
-                    chunks: scan_chunks(conn, emb, path, &bytes, between)?,
-                };
-            }
-            let vectors = embed_chunks(conn, emb, &title, &first.chunks, between)?;
-            let kinds = vec![kind; first.chunks.len()];
-            (first, vectors, kinds)
-        }
-        // A chunk with no text and line 0 from the pixels, then the text OCR
-        // reads in them as document chunks (#106). One that doesn't decode
-        // keeps a row with no chunks, like a document with no text, so it
-        // isn't decoded again at every check.
-        Kind::Image => {
-            // From the bytes hashed, so the file can't change in between.
-            let decoded = crate::ml::vision::load(&bytes)
-                .and_then(|img| Ok((crate::ml::vision::prepare(&img)?, img)));
-            let (pixels, img) = match decoded {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("skip {}: {e:#}", path.display());
-                    record(conn)?;
-                    return Ok(Outcome::Unreadable {
-                        no_decoder: e.downcast_ref::<crate::ml::vision::NoDecoder>().is_some(),
-                    });
-                }
-            };
-            let v = emb.image(&pixels)?;
-            drop(pixels);
-            between(conn, emb)?;
-            let lines = emb.read_text(&img)?;
-            let lines = if crate::ml::ocr::text_size(&lines) >= crate::ml::ocr::MIN_IMAGE_TEXT {
-                lines
-            } else {
-                Vec::new()
-            };
-            let text = chunk(&lines.join("\n"));
-            drop(img);
-            between(conn, emb)?;
-            let mut chunks = vec![(0, String::new())];
-            let mut vectors = vec![v];
-            vectors.extend(embed_chunks(conn, emb, &title, &text, between)?);
-            let mut kinds = vec![Kind::Image];
-            kinds.extend(std::iter::repeat_n(Kind::Document, text.len()));
-            chunks.extend(text);
-            (Extract { parts: 1, chunks }, vectors, kinds)
-        }
+        Kind::Text | Kind::Code => text_chunks(conn, emb, &seen, &content, between)?,
+        Kind::Document | Kind::Session => document_chunks(conn, emb, &seen, &content, between)?,
+        Kind::Image => image_chunks(conn, emb, &seen, &content, between)?,
+    };
+    let Chunked {
+        first,
+        vectors,
+        kinds,
+    } = match built {
+        ControlFlow::Break(outcome) => return Ok(outcome),
+        ControlFlow::Continue(chunked) => chunked,
     };
 
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
     tx.execute(
         "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
-        params![key, seen.mtime, seen.size, hash],
+        params![key, seen.mtime, seen.size, content.hash],
     )?;
     let file_id = tx.last_insert_rowid();
     insert_chunks(&tx, file_id, &first.chunks, &vectors, &kinds)?;
@@ -639,7 +566,9 @@ pub fn index_file<E: Embed>(
 
 /// A file as the walk found it: its path and what the filesystem says of it.
 struct Seen<'a> {
+    path: &'a Path,
     key: &'a str,
+    kind: Kind,
     mtime: i64,
     size: i64,
 }
@@ -778,6 +707,146 @@ fn read_and_hash<E: Embed>(
         _ => Sha256::digest(&bytes).to_vec(),
     };
     Ok(Some(Content { bytes, hash }))
+}
+
+/// A file's first parts as chunks, each with its vector and the kind it is
+/// stored as.
+struct Chunked {
+    first: Extract,
+    vectors: Vec<Vec<f32>>,
+    kinds: Vec<Kind>,
+}
+
+impl Chunked {
+    fn all_of(kind: Kind, first: Extract, vectors: Vec<Vec<f32>>) -> Self {
+        let kinds = vec![kind; first.chunks.len()];
+        Self {
+            first,
+            vectors,
+            kinds,
+        }
+    }
+}
+
+type Built = ControlFlow<Outcome, Chunked>;
+
+fn text_chunks<E: Embed>(
+    conn: &mut Connection,
+    emb: &mut E,
+    seen: &Seen,
+    content: &Content,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Built> {
+    let text = std::str::from_utf8(&content.bytes).expect("read as a string");
+    // Kept as a row with no chunks, so it isn't read again until it changes.
+    if let Some(why) = (seen.kind == Kind::Code)
+        .then(|| crate::index::code::unwanted(text))
+        .flatten()
+    {
+        eprintln!("skip {}: {why}", seen.path.display());
+        seen.record(conn, &content.hash)?;
+        return Ok(ControlFlow::Break(Outcome::Unreadable {
+            no_decoder: false,
+        }));
+    }
+    let first = text_parts(seen.path, text, 0, PARTS_AT_ONCE);
+    let vectors = embed_chunks(conn, emb, &title_of(seen.path), &first.chunks, between)?;
+    Ok(ControlFlow::Continue(Chunked::all_of(
+        seen.kind, first, vectors,
+    )))
+}
+
+// A file that can't be read, or has no text (a scan), keeps a row with no
+// chunks, so it isn't parsed again until it changes. So does a session in a
+// format this build doesn't read.
+fn document_chunks<E: Embed>(
+    conn: &mut Connection,
+    emb: &mut E,
+    seen: &Seen,
+    content: &Content,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Built> {
+    // Recorded first: the parser runs in a child with limits, but a file the
+    // child cannot parse must not be parsed again on every restart, and a
+    // stop while embedding must leave it to be indexed next time, so the
+    // record goes once it parses.
+    seen.record(conn, &content.hash)?;
+    let mut first =
+        document_parts(seen.path, &content.bytes, 0, parser(seen.kind)).unwrap_or_else(|e| {
+            eprintln!("skip {}: {e:#}", seen.path.display());
+            Extract::default()
+        });
+    // No text layer: a scan, read by OCR when it can be (#106).
+    let scan = first.chunks.is_empty() && is_scannable(seen.path) && emb.can_read_text();
+    if !first.chunks.is_empty() || scan {
+        conn.execute("DELETE FROM files WHERE path = ?1", [seen.key])?;
+    }
+    if scan {
+        // Read whole, up to ocr::MAX_SCAN_PAGES: never left in part.
+        first = Extract {
+            parts: 1,
+            chunks: scan_chunks(conn, emb, seen.path, &content.bytes, between)?,
+        };
+    }
+    let vectors = embed_chunks(conn, emb, &title_of(seen.path), &first.chunks, between)?;
+    Ok(ControlFlow::Continue(Chunked::all_of(
+        seen.kind, first, vectors,
+    )))
+}
+
+// A chunk with no text and line 0 from the pixels, then the text OCR reads in
+// them as document chunks (#106). One that doesn't decode keeps a row with no
+// chunks, like a document with no text, so it isn't decoded again at every
+// check.
+fn image_chunks<E: Embed>(
+    conn: &mut Connection,
+    emb: &mut E,
+    seen: &Seen,
+    content: &Content,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Built> {
+    // From the bytes hashed, so the file can't change in between.
+    let decoded = crate::ml::vision::load(&content.bytes)
+        .and_then(|img| Ok((crate::ml::vision::prepare(&img)?, img)));
+    let (pixels, img) = match decoded {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skip {}: {e:#}", seen.path.display());
+            seen.record(conn, &content.hash)?;
+            return Ok(ControlFlow::Break(Outcome::Unreadable {
+                no_decoder: e.downcast_ref::<crate::ml::vision::NoDecoder>().is_some(),
+            }));
+        }
+    };
+    let picture = emb.image(&pixels)?;
+    drop(pixels);
+    between(conn, emb)?;
+    let lines = emb.read_text(&img)?;
+    let lines = if crate::ml::ocr::text_size(&lines) >= crate::ml::ocr::MIN_IMAGE_TEXT {
+        lines
+    } else {
+        Vec::new()
+    };
+    let text = chunk(&lines.join("\n"));
+    drop(img);
+    between(conn, emb)?;
+    let mut chunks = vec![(0, String::new())];
+    let mut vectors = vec![picture];
+    vectors.extend(embed_chunks(
+        conn,
+        emb,
+        &title_of(seen.path),
+        &text,
+        between,
+    )?);
+    let mut kinds = vec![Kind::Image];
+    kinds.extend(std::iter::repeat_n(Kind::Document, text.len()));
+    chunks.extend(text);
+    Ok(ControlFlow::Continue(Chunked {
+        first: Extract { parts: 1, chunks },
+        vectors,
+        kinds,
+    }))
 }
 
 fn insert_chunks(
