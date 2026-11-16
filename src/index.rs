@@ -488,17 +488,14 @@ pub fn index_file<E: Embed>(
     let Some(key) = path.to_str() else {
         return Ok(Outcome::Skipped);
     };
-    let mtime = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let size = meta.len() as i64;
-    let known: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
-        .query_row(
-            "SELECT id, mtime, size, sha256 FROM files WHERE path = ?1",
-            [key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?;
-    let unchanged = known.as_ref().is_some_and(|k| (k.1, k.2) == (mtime, size));
-    if unchanged && known.as_ref().is_some_and(|k| k.3.is_some()) {
+    let seen = Seen {
+        key,
+        mtime: meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs() as i64,
+        size: meta.len() as i64,
+    };
+    let known = known_row(conn, key)?;
+    let unchanged = known.as_ref().is_some_and(|k| k.is_stamped(&seen));
+    if unchanged && known.as_ref().is_some_and(|k| k.sha256.is_some()) {
         return Ok(Outcome::Unchanged);
     }
     // Media is probed before it is hashed, so a film over the longest
@@ -506,13 +503,13 @@ pub fn index_file<E: Embed>(
     // row stands while the file and the limit do.
     let probed = match (kind, &known) {
         (Kind::Media, Some(k))
-            if unchanged && media::left_out(conn, k.0, types.max_media_seconds)? =>
+            if unchanged && media::left_out(conn, k.id, types.max_media_seconds)? =>
         {
             return Ok(Outcome::Unchanged);
         }
         (Kind::Media, _) => match media::probe(path, types.max_media_seconds) {
             media::Probed::TooLong(seconds) => {
-                media::leave_out(conn, (key, mtime, size), seconds)?;
+                media::leave_out(conn, (key, seen.mtime, seen.size), seconds)?;
                 return Ok(Outcome::Unreadable { no_decoder: false });
             }
             media::Probed::Ok(p) => Some(p),
@@ -542,39 +539,12 @@ pub fn index_file<E: Embed>(
         _ => Sha256::digest(&bytes).to_vec(),
     };
     let holder = holder_of(conn, &hash, key)?;
-    if let Some((id, _, _, old_hash)) = known {
-        if old_hash.as_ref() == Some(&hash) {
-            // Touched, not changed.
-            conn.execute(
-                "UPDATE files SET mtime = ?1, size = ?2 WHERE id = ?3",
-                params![mtime, size, id],
-            )?;
-            return Ok(Outcome::Unchanged);
-        }
-        if unchanged {
-            // Indexed before content hashes: record this one, and if another
-            // file already holds the same chunks, drop this file's copy.
-            conn.execute(
-                "UPDATE files SET sha256 = ?1 WHERE id = ?2",
-                params![hash, id],
-            )?;
-            if holder.is_some() && conn.execute("DELETE FROM chunks WHERE file_id = ?1", [id])? > 0
-            {
-                return Ok(Outcome::Duplicate);
-            }
-            return Ok(Outcome::Unchanged);
-        }
+    if let Some(known) = known
+        && let Some(outcome) = settle_known(conn, &seen, &known, &hash, holder.is_some())?
+    {
+        return Ok(outcome);
     }
-    // A file indexed with no chunks of its own.
-    let record = |conn: &mut Connection| -> Result<()> {
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
-        tx.execute(
-            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
-            params![key, mtime, size, hash],
-        )?;
-        Ok(tx.commit()?)
-    };
+    let record = |conn: &mut Connection| seen.record(conn, &hash);
     if holder.is_some() {
         record(conn)?;
         if let Some(p) = &probed {
@@ -583,7 +553,7 @@ pub fn index_file<E: Embed>(
         return Ok(Outcome::Duplicate);
     }
     if kind == Kind::Media {
-        return media::start(conn, (key, mtime, size, &hash), probed);
+        return media::start(conn, (key, seen.mtime, seen.size, &hash), probed);
     }
     let title = title_of(path);
     let (first, vectors, kinds) = match kind {
@@ -678,7 +648,7 @@ pub fn index_file<E: Embed>(
     tx.execute("DELETE FROM files WHERE path = ?1", [key])?;
     tx.execute(
         "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
-        params![key, mtime, size, hash],
+        params![key, seen.mtime, seen.size, hash],
     )?;
     let file_id = tx.last_insert_rowid();
     insert_chunks(&tx, file_id, &first.chunks, &vectors, &kinds)?;
@@ -692,6 +662,89 @@ pub fn index_file<E: Embed>(
     }
     tx.commit()?;
     Ok(Outcome::Embedded(first.chunks.len()))
+}
+
+/// A file as the walk found it: its path and what the filesystem says of it.
+struct Seen<'a> {
+    key: &'a str,
+    mtime: i64,
+    size: i64,
+}
+
+impl Seen<'_> {
+    /// A row with no chunks of its own, replacing any earlier one.
+    fn record(&self, conn: &mut Connection, hash: &[u8]) -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM files WHERE path = ?1", [self.key])?;
+        tx.execute(
+            "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, ?2, ?3, ?4)",
+            params![self.key, self.mtime, self.size, hash],
+        )?;
+        Ok(tx.commit()?)
+    }
+}
+
+/// The row an earlier run left for a path.
+struct Known {
+    id: i64,
+    mtime: i64,
+    size: i64,
+    sha256: Option<Vec<u8>>,
+}
+
+impl Known {
+    fn is_stamped(&self, seen: &Seen) -> bool {
+        (self.mtime, self.size) == (seen.mtime, seen.size)
+    }
+}
+
+fn known_row(conn: &Connection, key: &str) -> Result<Option<Known>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, mtime, size, sha256 FROM files WHERE path = ?1",
+            [key],
+            |r| {
+                Ok(Known {
+                    id: r.get(0)?,
+                    mtime: r.get(1)?,
+                    size: r.get(2)?,
+                    sha256: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// What is left to do for a file with a row, once its content is hashed:
+/// None when the content is new and has to be indexed.
+fn settle_known(
+    conn: &Connection,
+    seen: &Seen,
+    known: &Known,
+    hash: &[u8],
+    has_holder: bool,
+) -> Result<Option<Outcome>> {
+    if known.sha256.as_deref() == Some(hash) {
+        // Touched, not changed.
+        conn.execute(
+            "UPDATE files SET mtime = ?1, size = ?2 WHERE id = ?3",
+            params![seen.mtime, seen.size, known.id],
+        )?;
+        return Ok(Some(Outcome::Unchanged));
+    }
+    if !known.is_stamped(seen) {
+        return Ok(None);
+    }
+    // Indexed before content hashes: record this one, and if another file
+    // already holds the same chunks, drop this file's copy.
+    conn.execute(
+        "UPDATE files SET sha256 = ?1 WHERE id = ?2",
+        params![hash, known.id],
+    )?;
+    if has_holder && conn.execute("DELETE FROM chunks WHERE file_id = ?1", [known.id])? > 0 {
+        return Ok(Some(Outcome::Duplicate));
+    }
+    Ok(Some(Outcome::Unchanged))
 }
 
 fn insert_chunks(
