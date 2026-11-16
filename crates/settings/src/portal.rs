@@ -75,23 +75,7 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
     if !rest.starts_with('/') {
         return None;
     }
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let Some(b) = bytes
-                .get(i + 1..i + 3)
-                .and_then(|hex| std::str::from_utf8(hex).ok())
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(b);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
+    let out: Vec<u8> = percent_encoding::percent_decode_str(rest).collect();
     Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
 }
 
@@ -115,5 +99,23 @@ mod tests {
         );
         assert_eq!(file_uri_path("https://example.com/x"), None);
         assert_eq!(file_uri_path("file://host/x"), None);
+    }
+
+    #[test]
+    fn a_percent_followed_by_two_hex_digits_is_a_byte() {
+        assert_eq!(
+            file_uri_path("file:///a%2Fb%7e"),
+            Some(PathBuf::from("/a/b~"))
+        );
+    }
+
+    #[test]
+    fn a_percent_not_followed_by_two_hex_digits_stays_as_written() {
+        for uri_path in ["/a%+f", "/a%-1", "/a%2", "/a%zz", "/a%"] {
+            assert_eq!(
+                file_uri_path(&format!("file://{uri_path}")),
+                Some(PathBuf::from(uri_path))
+            );
+        }
     }
 }
