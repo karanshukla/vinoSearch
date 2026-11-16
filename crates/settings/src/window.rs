@@ -96,7 +96,7 @@ const TITLE: &str = "vinoSearch settings";
 
 const DEVICES: [&str; 3] = ["NPU", "GPU", "CPU"];
 
-/// What the Index page says while indexing is held for power (#109).
+/// What the Index page says while indexing is held for power.
 fn power_hold(key: &str) -> Option<&'static str> {
     match key {
         hold::CHARGER => Some("Waiting for a charger"),
@@ -186,8 +186,7 @@ fn app_picker(
                 let next = match &pick {
                     Pick::Default => None,
                     Pick::App(id) => Some(id.clone()),
-                    // Kept until a command is typed, unless it was an app.
-                    Pick::Custom => current.clone().filter(|e| !apps::is_entry_id(e)),
+                    Pick::Custom => command_kept(current.as_ref()),
                 };
                 if next != *setting {
                     *setting = next;
@@ -242,7 +241,7 @@ struct SettingsWindow {
     custom_editor: bool,
     /// The apps the editor can be, read when the Search page first shows.
     editors: Option<Vec<App>>,
-    /// The same three for the `player` setting (#188).
+    /// The same three for the `player` setting.
     player: Option<String>,
     custom_player: bool,
     players: Option<Vec<App>>,
@@ -266,7 +265,7 @@ struct SettingsWindow {
     /// The chunk count Largest folders was last asked for at, to ask again
     /// once the index changes.
     largest_for: Option<i64>,
-    /// A folder chosen to add, shown with its estimate until confirmed (#112).
+    /// A folder chosen to add, shown with its estimate until confirmed.
     adding: Option<estimate::Pending>,
     estimator: estimate::Estimator,
     focused: bool,
@@ -480,9 +479,20 @@ fn kind_colors(p: &theme::Palette, dark: bool) -> [egui::Color32; 6] {
     [text, documents, images, code, sessions, media]
 }
 
+/// Switching to a custom command keeps the one set until another is typed;
+/// an app's entry id isn't a command.
+fn command_kept(current: Option<&String>) -> Option<String> {
+    current.filter(|e| !apps::is_entry_id(e)).cloned()
+}
+
 /// A minimum score as a slider, strict on the left and loose on the right,
 /// with a way back to the default. Some(new value) when it changed, None
 /// meaning the default.
+///
+/// Left to right as the number rises, so dragging, the number and the end
+/// labels all agree: further right, closer matches only. Laid out right to
+/// left: Default, the number, Closer, the bar, Looser. Default keeps its
+/// space when hidden, so every row's bar lines up.
 fn score_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -492,8 +502,6 @@ fn score_row(
 ) -> Option<Option<f32>> {
     let mut out = None;
     Row::new(label).show(ui, |ui, named| {
-        // Left to right as the number rises, so dragging, the number and
-        // the end labels all agree: further right, closer matches only.
         let p = theme::palette(ui.ctx());
         let mut v = current.unwrap_or(default);
         let text = |ui: &egui::Ui, t: &str| {
@@ -504,8 +512,6 @@ fn score_row(
                 egui::TextStyle::Small,
             )
         };
-        // Right to left: Default, the number, Closer, the bar, Looser.
-        // Default keeps its space when hidden, so every row's bar lines up.
         let reset = ui.add_visible(current.is_some(), Button::ghost("Default").small());
         if current.is_some() && a11y::for_what(reset, label).clicked() {
             out = Some(None);
@@ -526,15 +532,22 @@ fn score_row(
         ui.label(looser);
         let response = bar | number;
         if response.changed() {
-            // Stored rounded, as the slider shows it; the default is left unwritten.
-            let v = (v * 100.0).round() / 100.0;
-            out = Some(((v - default).abs() > 0.001).then_some(v));
+            out = Some(stored_score(v, default));
         }
     });
     out
 }
 
-/// A slider and its number box, both named by the row's label. egui's Slider draws the box
+/// Rounded to hundredths, as the slider shows it; None for the default, which
+/// is left unwritten (pinned by `tests::a_score_is_stored_rounded_to_hundredths`
+/// and `tests::a_score_that_rounds_to_the_default_is_left_unwritten`).
+fn stored_score(v: f32, default: f32) -> Option<f32> {
+    let v = (v * 100.0).round() / 100.0;
+    ((v - default).abs() > 0.001).then_some(v)
+}
+
+/// A slider and its number box, both named by the row's label, the box on
+/// the right. egui's Slider draws the box
 /// itself but leaves it unnamed, and while the box has focus the response it returns is the
 /// box's, so naming that response would name the slider only some of the time.
 fn slider<N: egui::emath::Numeric>(
@@ -546,7 +559,6 @@ fn slider<N: egui::emath::Numeric>(
     decimals: usize,
     suffix: &str,
 ) -> egui::Response {
-    // Right to left: the number box, then the bar.
     let number = egui::DragValue::new(value)
         .range(range.clone())
         .speed(step)
@@ -592,208 +604,201 @@ impl SettingsWindow {
         let shared = self.link.shared.lock().unwrap().clone();
         if let Some(refused) = shared.refused {
             self.link.shared.lock().unwrap().refused = None;
-            // Which request it was isn't known; an add refused would show forever.
-            self.joining.clear();
-            self.notice = Some(refused);
+            self.show_refusal(refused);
         }
-
-        // The title bar is the compositor's: give the tree's window the same name.
-        ctx.accesskit_node_builder(egui::accesskit_root_id(), |node| node.set_label(TITLE));
-
+        name_like_the_title_bar(ctx);
         if self.confirm.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.confirm = None;
         }
 
         let p = theme::palette(ctx);
-        let header = theme::header(ctx, self.kde_header.as_ref(), focused);
         let window = ctx.content_rect().width();
         let wide = window >= widgets::SIDEBAR_FROM;
         let status = shared.status.as_ref();
-
         if wide {
-            egui::Panel::left("pages")
-                .resizable(false)
-                .show_separator_line(false)
-                .exact_size(widgets::sidebar_width(window))
-                .frame(widgets::sidebar_frame(p))
-                .show(root, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    // vino-ui's, which the window bar's row is centred on:
-                    // the logo on the nav items' icon column.
-                    let brand = ui
-                        .scope(|ui| {
-                            ui.style_mut().interaction.selectable_labels = false;
-                            widgets::sidebar_brand(
-                                ui,
-                                Some(vino_ui::logo::search),
-                                "vinoSearch",
-                                "Settings",
-                            );
-                        })
-                        .response
-                        .rect;
-                    if self.app_title_bar {
-                        // After the brand, so its name drags the window.
-                        let clip = ui.clip_rect();
-                        vino_ui::window::drag(
-                            ui,
-                            egui::Rect::from_x_y_ranges(
-                                clip.x_range(),
-                                clip.top()..=brand.bottom(),
-                            ),
-                            "brand",
-                        );
-                    }
-                    ui.add_space(14.0);
-                    a11y::tab_list(ui, "Pages");
-                    for page in Page::ALL {
-                        if widgets::nav_item(
-                            ui,
-                            page.icon(),
-                            page.title(),
-                            page.title(),
-                            self.page == page,
-                            None,
-                        )
-                        .clicked()
-                        {
-                            self.page = page;
-                        }
-                    }
-                    ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(4.0);
-                            let shown = match status {
-                                None => widgets::chip(ui, ChipKind::Neutral, "Connecting…"),
-                                Some(Err(_)) => widgets::chip(ui, ChipKind::Err, "Service stopped"),
-                                Some(Ok(_)) => widgets::chip(ui, ChipKind::Ok, "Service running"),
-                            };
-                            a11y::live(&shown);
-                        });
-                    });
-                    widgets::panel_rule(ui, widgets::Edge::Left);
-                });
+            self.sidebar(root, p, window, status);
         } else {
-            egui::Panel::top("header")
-                .show_separator_line(false)
-                .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
-                    left: 16,
-                    right: 16,
-                    top: 8,
-                    bottom: 0,
-                }))
-                .show(root, |ui| {
-                    if self.app_title_bar {
-                        vino_ui::window::drag(ui, ui.clip_rect(), "header");
-                    }
-                    ui.horizontal(|ui| {
-                        vino_ui::logo::search(ui, 22.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new("vinoSearch")
-                                    .size(15.0)
-                                    .family(theme::bold())
-                                    .color(header.text),
-                            )
-                            .selectable(false),
-                        );
-                        if self.app_title_bar {
-                            vino_ui::window::controls(ui);
-                        }
-                    });
-                    // Seven tabs: wrap rather than clip at the narrowest widths.
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(18.0, 0.0);
-                        a11y::tab_list(ui, "Pages");
-                        for page in Page::ALL {
-                            if widgets::tab(ui, page.title(), self.page == page, true, header)
-                                .clicked()
-                            {
-                                self.page = page;
-                            }
-                        }
-                    });
-                });
+            let header = theme::header(ctx, self.kde_header.as_ref(), focused);
+            self.header(root, p, header);
         }
-
-        // With the app's title bar, a wide window's page title moves up out of
-        // the scroll area into a bar of its own, with the window buttons at
-        // its end: that bar is what the window is dragged by.
         let bar = wide && self.app_title_bar;
         if bar {
-            let title = self.page.title();
-            let index = self.page == Page::Index;
-            vino_ui::window::bar(
-                root,
-                widgets::page_inset(window),
-                |ui| {
-                    widgets::title(ui, title);
-                },
-                // Beside the buttons, as it was beside the title.
-                |ui| {
-                    if index {
-                        Self::index_status(ui, status);
-                    }
-                },
-            );
+            self.page_title_bar(root, window, status);
         }
-
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(p.bg)
-                    // No right margin: the scroll bar belongs on the window's edge, and the
-                    // content keeps its own gap from it below.
-                    .inner_margin(egui::Margin {
-                        left: if wide {
-                            widgets::page_inset(window) as i8
-                        } else {
-                            16
-                        },
-                        right: 0,
-                        top: match (wide, bar) {
-                            // The same 15 from title to content as in the
-                            // scroll area.
-                            (_, true) => 2,
-                            (true, false) => 20,
-                            (false, false) => 12,
-                        },
-                        bottom: 0,
-                    }),
+                    .inner_margin(page_margin(window, wide, bar)),
             )
             .show(root, |ui| {
-                widgets::page_scroll(ui, self.page.title(), self.page.max_width(), |ui| {
-                    if !bar {
-                        ui.horizontal(|ui| {
-                            widgets::title(ui, self.page.title());
-                            if self.page == Page::Index {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    Self::index_status(ui, status);
-                                });
-                            }
-                        });
+                self.page(ui, bar, status, shared.largest.as_ref());
+            });
+        self.save_once_numbers_settle(ctx);
+    }
+
+    /// A refusal doesn't say which request it was, so every folder still
+    /// joining is dropped: an add refused would show forever.
+    fn show_refusal(&mut self, refused: String) {
+        self.joining.clear();
+        self.notice = Some(refused);
+    }
+
+    fn sidebar(
+        &mut self,
+        root: &mut egui::Ui,
+        p: &theme::Palette,
+        window: f32,
+        status: Option<&Result<Status, String>>,
+    ) {
+        egui::Panel::left("pages")
+            .resizable(false)
+            .show_separator_line(false)
+            .exact_size(widgets::sidebar_width(window))
+            .frame(widgets::sidebar_frame(p))
+            .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let brand = brand(ui);
+                if self.app_title_bar {
+                    drag_by_brand(ui, brand);
+                }
+                ui.add_space(14.0);
+                a11y::tab_list(ui, "Pages");
+                for page in Page::ALL {
+                    if widgets::nav_item(
+                        ui,
+                        page.icon(),
+                        page.title(),
+                        page.title(),
+                        self.page == page,
+                        None,
+                    )
+                    .clicked()
+                    {
+                        self.page = page;
                     }
-                    if let Some(notice) = self.notice.clone() {
-                        ui.add_space(12.0);
-                        if widgets::notice(ui, Tone::Error, &notice) {
-                            self.notice = None;
-                        }
-                    }
-                    match self.page {
-                        Page::Index => self.index(ui, status, shared.largest.as_ref()),
-                        Page::Folders => self.folders(ui, status),
-                        Page::Search => self.search(ui, status),
-                        Page::Security => self.security(ui, status),
-                        Page::Model => self.model(ui, status),
-                        Page::Hardware => self.hardware(ui),
-                        Page::Integration => self.integration(ui),
-                        Page::About => vino_ui::about::page_with_updates(ui, &mut self.updater),
+                }
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        service_chip(ui, status);
+                    });
+                });
+                widgets::panel_rule(ui, widgets::Edge::Left);
+            });
+    }
+
+    fn header(&mut self, root: &mut egui::Ui, p: &theme::Palette, header: theme::Header) {
+        egui::Panel::top("header")
+            .show_separator_line(false)
+            .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 8,
+                bottom: 0,
+            }))
+            .show(root, |ui| {
+                if self.app_title_bar {
+                    vino_ui::window::drag(ui, ui.clip_rect(), "header");
+                }
+                ui.horizontal(|ui| {
+                    vino_ui::logo::search(ui, 22.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("vinoSearch")
+                                .size(15.0)
+                                .family(theme::bold())
+                                .color(header.text),
+                        )
+                        .selectable(false),
+                    );
+                    if self.app_title_bar {
+                        vino_ui::window::controls(ui);
                     }
                 });
+                self.page_tabs(ui, header);
             });
+    }
 
-        // Typing or dragging a number changes it every frame; write the file once it settles.
+    /// Wrapped rather than clipped at the narrowest widths.
+    fn page_tabs(&mut self, ui: &mut egui::Ui, header: theme::Header) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(18.0, 0.0);
+            a11y::tab_list(ui, "Pages");
+            for page in Page::ALL {
+                if widgets::tab(ui, page.title(), self.page == page, true, header).clicked() {
+                    self.page = page;
+                }
+            }
+        });
+    }
+
+    /// With the app's title bar, a wide window's page title moves up out of
+    /// the scroll area into a bar of its own, with the window buttons at its
+    /// end: that bar is what the window is dragged by.
+    fn page_title_bar(
+        &self,
+        root: &mut egui::Ui,
+        window: f32,
+        status: Option<&Result<Status, String>>,
+    ) {
+        let title = self.page.title();
+        let index = self.page == Page::Index;
+        vino_ui::window::bar(
+            root,
+            widgets::page_inset(window),
+            |ui| {
+                widgets::title(ui, title);
+            },
+            |ui| {
+                if index {
+                    Self::index_status(ui, status);
+                }
+            },
+        );
+    }
+
+    fn page(
+        &mut self,
+        ui: &mut egui::Ui,
+        bar: bool,
+        status: Option<&Result<Status, String>>,
+        largest: Option<&Vec<(String, u64)>>,
+    ) {
+        widgets::page_scroll(ui, self.page.title(), self.page.max_width(), |ui| {
+            if !bar {
+                ui.horizontal(|ui| {
+                    widgets::title(ui, self.page.title());
+                    if self.page == Page::Index {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            Self::index_status(ui, status);
+                        });
+                    }
+                });
+            }
+            if let Some(notice) = self.notice.clone() {
+                ui.add_space(12.0);
+                if widgets::notice(ui, Tone::Error, &notice) {
+                    self.notice = None;
+                }
+            }
+            match self.page {
+                Page::Index => self.index(ui, status, largest),
+                Page::Folders => self.folders(ui, status),
+                Page::Search => self.search(ui, status),
+                Page::Security => self.security(ui, status),
+                Page::Model => self.model(ui, status),
+                Page::Hardware => self.hardware(ui),
+                Page::Integration => self.integration(ui),
+                Page::About => vino_ui::about::page_with_updates(ui, &mut self.updater),
+            }
+        });
+    }
+
+    /// Typing or dragging a number changes it every frame, so the file is
+    /// written once it settles.
+    fn save_once_numbers_settle(&mut self, ctx: &egui::Context) {
         if self.idle_dirty && ctx.dragged_id().is_none() && !ctx.egui_wants_keyboard_input() {
             self.idle_dirty = false;
             self.save_config();
@@ -846,12 +851,7 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
                 .with_min_inner_size([340.0, 320.0]),
             app_title_bar,
         ),
-        // With vsync, a swap waits on a frame callback KWin holds back from a
-        // window it considers hidden, and the window stops answering pings.
-        glow_options: eframe::egui_glow::GlowConfiguration {
-            vsync: false,
-            ..Default::default()
-        },
+        glow_options: without_vsync(),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -870,6 +870,71 @@ pub fn run(app_id: &str, page: Option<&str>) -> ExitCode {
             eprintln!("vinosearch-settings: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// With vsync, a swap waits on a frame callback KWin holds back from a window
+/// it considers hidden, and the window stops answering pings.
+fn without_vsync() -> eframe::egui_glow::GlowConfiguration {
+    eframe::egui_glow::GlowConfiguration {
+        vsync: false,
+        ..Default::default()
+    }
+}
+
+/// The title bar is the compositor's, so the accessibility tree's window
+/// gets the same name.
+fn name_like_the_title_bar(ctx: &egui::Context) {
+    ctx.accesskit_node_builder(egui::accesskit_root_id(), |node| node.set_label(TITLE));
+}
+
+/// vino-ui's brand, which the window bar's row is centred on: the logo on
+/// the nav items' icon column.
+fn brand(ui: &mut egui::Ui) -> egui::Rect {
+    ui.scope(|ui| {
+        ui.style_mut().interaction.selectable_labels = false;
+        widgets::sidebar_brand(ui, Some(vino_ui::logo::search), "vinoSearch", "Settings");
+    })
+    .response
+    .rect
+}
+
+/// Added after the brand, so its name drags the window.
+fn drag_by_brand(ui: &mut egui::Ui, brand: egui::Rect) {
+    let clip = ui.clip_rect();
+    vino_ui::window::drag(
+        ui,
+        egui::Rect::from_x_y_ranges(clip.x_range(), clip.top()..=brand.bottom()),
+        "brand",
+    );
+}
+
+fn service_chip(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
+    let shown = match status {
+        None => widgets::chip(ui, ChipKind::Neutral, "Connecting…"),
+        Some(Err(_)) => widgets::chip(ui, ChipKind::Err, "Service stopped"),
+        Some(Ok(_)) => widgets::chip(ui, ChipKind::Ok, "Service running"),
+    };
+    a11y::live(&shown);
+}
+
+/// No right margin: the scroll bar belongs on the window's edge, and the
+/// content keeps its own gap from it. Under a title bar, 2 keeps the same 15
+/// from title to content as in the scroll area.
+fn page_margin(window: f32, wide: bool, bar: bool) -> egui::Margin {
+    egui::Margin {
+        left: if wide {
+            widgets::page_inset(window) as i8
+        } else {
+            16
+        },
+        right: 0,
+        top: match (wide, bar) {
+            (_, true) => 2,
+            (true, false) => 20,
+            (false, false) => 12,
+        },
+        bottom: 0,
     }
 }
 
@@ -892,5 +957,17 @@ mod tests {
         assert!(Page::parse("search") == Some(Page::Search));
         assert!(Page::parse("Security") == Some(Page::Security));
         assert!(Page::parse("nope").is_none());
+    }
+
+    #[test]
+    fn a_score_is_stored_rounded_to_hundredths() {
+        assert_eq!(stored_score(0.7049, 0.65), Some(0.7));
+        assert_eq!(stored_score(0.706, 0.65), Some(0.71));
+    }
+
+    #[test]
+    fn a_score_that_rounds_to_the_default_is_left_unwritten() {
+        assert_eq!(stored_score(0.6501, 0.65), None);
+        assert_eq!(stored_score(0.66, 0.65), Some(0.66));
     }
 }

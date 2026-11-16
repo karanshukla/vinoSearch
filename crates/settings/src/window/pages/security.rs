@@ -6,7 +6,13 @@ use crate::window::{
 };
 
 impl SettingsWindow {
-    /// Encrypting the index at rest (#4): the switch, what the key is sealed with, and a new
+    /// Never weaker than asked (pinned by
+    /// `window::ui_tests::no_tpm_refuses_encryption_until_the_host_key_is_allowed`).
+    fn refused_as_the_runner_would(&self, on: bool, no_tpm: bool) -> bool {
+        on && no_tpm && !self.config.encryption.host_key_allowed()
+    }
+
+    /// Encrypting the index at rest: the switch, what the key is sealed with, and a new
     /// key on demand.
     pub(in crate::window) fn security(
         &mut self,
@@ -36,8 +42,7 @@ impl SettingsWindow {
             );
             return;
         }
-        // Without systemd-creds the keyring is all there is: no TPM to ask about.
-        let keyring = s.is_some_and(|s| s.new_seal == seal::KEYRING);
+        let keyring = keyring_only(s);
         let no_tpm = s.is_some_and(|s| !s.tpm) && !keyring;
         let mut changed = false;
         let rekeying = self.confirm == Some(Confirm::Rekey);
@@ -53,8 +58,7 @@ impl SettingsWindow {
                 .show(ui, |ui, _| {
                     let mut on = self.config.encryption.on();
                     if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
-                        if on && no_tpm && !self.config.encryption.host_key_allowed() {
-                            // Refused here as the runner would refuse it: never weaker than asked.
+                        if self.refused_as_the_runner_would(on, no_tpm) {
                             self.notice = Some(
                                 "This machine has no TPM that systemd can use, so the key can't \
                                  be sealed to it. Allow the host key below, or leave encryption \
@@ -130,7 +134,6 @@ impl SettingsWindow {
                     ))
                     .tone(Tone::Warn)
                     .show(ui, |ui, _| {
-                        // Asks the keyring again, with its unlock prompt.
                         let label = if s.seal == seal::KEYRING {
                             "Unlock…"
                         } else {
@@ -193,4 +196,10 @@ impl SettingsWindow {
             }
         }
     }
+}
+
+/// Without systemd-creds the keyring is all there is: no TPM to ask about
+/// (pinned by `window::ui_tests::without_systemd_creds_the_keyring_is_used_and_waited_for`).
+fn keyring_only(s: Option<&Status>) -> bool {
+    s.is_some_and(|s| s.new_seal == seal::KEYRING)
 }

@@ -85,13 +85,18 @@ pub fn supervise(worker: Command) -> Result<Option<ExitStatus>> {
     let changed = flatpak_installed::spawn();
     let status = supervised(worker, &changed)?;
     if changed.get() == Some(&Change::Updated) {
-        // The new build's `krunner` takes the lock, and the name, from here.
-        drop(held);
-        if let Err(e) = start(&names().service) {
-            eprintln!("starting the new build: {e:#}");
-        }
+        hand_over_to_new_build(held);
     }
     Ok(Some(status))
+}
+
+/// Let go of the instance lock and start the new build, whose `krunner`
+/// takes the lock and the name from here.
+fn hand_over_to_new_build(held: File) {
+    drop(held);
+    if let Err(e) = start(&names().service) {
+        eprintln!("starting the new build: {e:#}");
+    }
 }
 
 /// `$XDG_RUNTIME_DIR`, which logind empties at logout, else the cache. In
@@ -112,7 +117,9 @@ fn instance_lock_path() -> Result<PathBuf> {
 /// The instance lock, held while the file is open; None once the runner
 /// another `krunner` holds it for owns the bus name, or after `wait`. Tried
 /// again meanwhile, so a `krunner` started while the last one exits (a
-/// restart) takes over from it.
+/// restart) takes over from it. Not given up before the other's runner owns
+/// the name: an activation that started this one is answered only then, and
+/// exiting sooner would fail it.
 fn single_instance(path: &Path, wait: Duration) -> Result<Option<File>> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -134,8 +141,6 @@ fn single_instance(path: &Path, wait: Duration) -> Result<Option<File>> {
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(e).with_context(|| format!("locking {}", path.display()));
         }
-        // An activation that started this one is answered once the other's
-        // runner owns the name: exiting before then would fail it.
         if Instant::now() >= deadline || owned(&names().service) == Some(true) {
             return Ok(None);
         }
@@ -151,7 +156,8 @@ enum After {
 }
 
 /// As systemd's Restart=on-failure: not after a clean exit or a stop
-/// signal; nor when it never came up, as starting it again won't help.
+/// signal; nor when it never came up, as starting it again won't help
+/// (pinned by `tests::a_crash_restarts_the_runner_and_a_stop_does_not`).
 fn after(status: ExitStatus) -> After {
     match (status.code(), status.signal()) {
         (Some(0), _) => After::Stop,
@@ -162,7 +168,8 @@ fn after(status: ExitStatus) -> After {
 }
 
 /// The wait before starting again a runner that crashed after `ran`, the
-/// last wait being `last`.
+/// last wait being `last`
+/// (pinned by `tests::crashes_in_a_row_wait_longer_up_to_a_minute`).
 fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
     match last {
         Some(d) if ran < HEALTHY => (d * 2).min(RESTART_MAX),
@@ -170,19 +177,45 @@ fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
     }
 }
 
+/// Run `worker` until it stops for good. A build that changed or went is not
+/// started again, crashed or not.
 fn supervised(mut worker: Command, changed: &OnceLock<Change>) -> Result<ExitStatus> {
-    // Started by systemd (D-Bus activation, the autostart entry), stderr is
-    // the journal's already: timestamps, rotation and a rate limit for
-    // nothing. A file only where there is neither that nor a terminal, and
-    // with no HOME to keep one under, output stays where it was going.
-    let log = (!std::io::stderr().is_terminal() && !systemd_journal_logger::connected_to_journal())
-        .then(|| log_path().ok())
-        .flatten();
+    let log = log_file();
+    stop_with_this_process(&mut worker);
+    let mut wait = None;
+    loop {
+        if let Some(log) = &log {
+            log_to_or_warn(log);
+        }
+        let started = Instant::now();
+        let status = worker.status().context("starting the runner")?;
+        if after(status) == After::Stop || changed.get().is_some() {
+            return Ok(status);
+        }
+        let d = backoff(wait, started.elapsed());
+        eprintln!("the runner stopped ({status}); starting it again in {d:?}");
+        std::thread::sleep(d);
+        wait = Some(d);
+    }
+}
+
+/// Where to keep the runner's output: nowhere new under a terminal, or where
+/// systemd started it (D-Bus activation, the autostart entry), since stderr
+/// is the journal's already, with timestamps, rotation and a rate limit. With
+/// no HOME to keep a file under, output stays where it was going.
+fn log_file() -> Option<PathBuf> {
+    let elsewhere =
+        std::io::stderr().is_terminal() || systemd_journal_logger::connected_to_journal();
+    (!elsewhere).then(|| log_path().ok()).flatten()
+}
+
+/// Stopping this process (logout, a signal) stops the runner, unless it has
+/// already been reparented.
+fn stop_with_this_process(worker: &mut Command) {
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: prctl and getppid are async-signal-safe, and nothing allocates.
     unsafe {
         worker.pre_exec(move || {
-            // Stopping this process (logout, a signal) stops the runner.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -192,25 +225,20 @@ fn supervised(mut worker: Command, changed: &OnceLock<Change>) -> Result<ExitSta
             Ok(())
         });
     }
-    let mut wait = None;
-    loop {
-        // A full or read-only disk costs the log, not search.
-        if let Some(log) = &log
-            && let Err(e) = log_to(log)
-        {
-            eprintln!("no log at {}: {e:#}", log.display());
-        }
-        let started = Instant::now();
-        let status = worker.status().context("starting the runner")?;
-        // A build that went is not started again, crashed or not.
-        if after(status) == After::Stop || changed.get().is_some() {
-            return Ok(status);
-        }
-        let d = backoff(wait, started.elapsed());
-        eprintln!("the runner stopped ({status}); starting it again in {d:?}");
-        std::thread::sleep(d);
-        wait = Some(d);
+}
+
+/// A full or read-only disk costs the log, not search.
+fn log_to_or_warn(log: &Path) {
+    if let Err(e) = log_to(log) {
+        eprintln!("no log at {}: {e:#}", log.display());
     }
+}
+
+/// Set `path`'s mode, for one that was there before (or made by hand) with
+/// the umask's.
+fn restrict(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 /// Send this process's stdout and stderr, which the runner inherits, to the
@@ -222,8 +250,7 @@ fn log_to(path: &Path) -> Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        // One that was there already, with the umask's mode.
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        restrict(dir, 0o700)?;
     }
     if fs::metadata(path).is_ok_and(|m| m.len() > LOG_MAX) {
         fs::rename(path, path.with_extension("log.old"))?;
@@ -234,8 +261,7 @@ fn log_to(path: &Path) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    // One made before this, or by hand, with the umask's mode.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    restrict(path, 0o600)?;
     for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
         // SAFETY: dup2 onto the standard descriptors, from one this owns.
         if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
@@ -270,7 +296,9 @@ fn wait_owned(name: &str, want: bool, wait: Duration) -> bool {
 
 /// Stop whatever owns `name`: call `quit` (path, interface, method) on it,
 /// or signal it when it has no such method (a runner from before Quit), and
-/// wait for the name to go. True when something was running.
+/// wait for the name to go. True when something was running. Any other
+/// error from the call is ignored: exiting can beat the reply, which the bus
+/// then answers NoReply for.
 pub fn stop(name: &str, quit: (&str, &str, &str)) -> Result<bool> {
     if owned(name) != Some(true) {
         return Ok(false);
@@ -281,7 +309,6 @@ pub fn stop(name: &str, quit: (&str, &str, &str)) -> Result<bool> {
         let reply = conn
             .call_method(Some(name), path, Some(interface), method, &())
             .await;
-        // Exiting can beat the reply, which the bus then answers NoReply for.
         Ok::<_, zbus::Error>(matches!(
             reply,
             Err(zbus::Error::MethodError(ref e, _, _))
@@ -311,13 +338,12 @@ pub fn stop_runner() -> Result<bool> {
 /// Have the bus start `name` from its activation file, rereading the files
 /// first so one just written counts. The bus starts it, so it doesn't
 /// depend on the process asking (a terminal, the settings window).
+/// dbus-broker rereads the files only when asked. Not asked from the
+/// Flatpak, whose bus proxy refuses it (and whose file is installed with it).
 pub fn start(name: &str) -> Result<()> {
     zbus::block_on(async {
         let conn = zbus::Connection::session().await?;
         let bus = zbus::fdo::DBusProxy::new(&conn).await?;
-        // dbus-broker rereads them only when asked; dbus-daemon also on its
-        // own. Not from the Flatpak, whose bus proxy refuses it (and whose
-        // file is installed with it).
         if sandbox::flatpak_id().is_none() {
             let _ = bus.reload_config().await;
         }
@@ -329,7 +355,8 @@ pub fn start(name: &str) -> Result<()> {
 
 /// Stop, disable and remove the systemd user unit an older install wrote,
 /// so it and the autostart entry never both start the runner. Quiet where
-/// there is no systemctl. The unit's path when there was one.
+/// there is no systemctl, whose `disable` link is removed by hand too. The
+/// unit's path when there was one.
 pub fn remove_old_unit() -> Result<Option<PathBuf>> {
     let dir = config_home()?.join("systemd/user");
     let unit = dir.join(OLD_UNIT);
@@ -347,7 +374,6 @@ pub fn remove_old_unit() -> Result<Option<PathBuf>> {
     };
     systemctl(&["disable", "--now", OLD_UNIT]);
     fs::remove_file(&unit)?;
-    // What `disable` removes, for when systemctl couldn't.
     let wants = dir.join("default.target.wants").join(OLD_UNIT);
     if wants.symlink_metadata().is_ok() {
         fs::remove_file(&wants)?;
@@ -402,8 +428,10 @@ mod tests {
         let path = dir.join("runner.lock");
         let held = single_instance(&path, Duration::ZERO).unwrap();
         assert!(held.is_some());
-        // Another open file description, as another process would have.
-        assert!(single_instance(&path, Duration::ZERO).unwrap().is_none());
+        assert!(
+            single_instance(&path, Duration::ZERO).unwrap().is_none(),
+            "another open file description, as another process would have, waits"
+        );
         drop(held);
         assert!(single_instance(&path, Duration::ZERO).unwrap().is_some());
         fs::remove_dir_all(&dir).unwrap();

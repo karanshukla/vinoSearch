@@ -170,6 +170,11 @@ fn cached(cache: &Path, path: &Path) -> Option<DynamicImage> {
         })
 }
 
+/// `tEXt` is Latin-1, which is ASCII for the keys the thumbnail spec defines.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
 /// A PNG's `tEXt` value for `key`.
 fn png_text(png: &[u8], key: &str) -> Option<String> {
     let mut rest = png.strip_prefix(b"\x89PNG\r\n\x1a\n")?;
@@ -181,8 +186,7 @@ fn png_text(png: &[u8], key: &str) -> Option<String> {
             && let Some(nul) = data.iter().position(|&b| b == 0)
             && &data[..nul] == key.as_bytes()
         {
-            // Latin-1, which is ASCII for the keys the spec defines.
-            return Some(data[nul + 1..].iter().map(|&b| b as char).collect());
+            return Some(latin1(&data[nul + 1..]));
         }
         rest = rest.get(12 + len..)?;
     }
@@ -268,8 +272,11 @@ mod tests {
             cache_dir_from(xdg.map(OsString::from), Some("/home/u".into())).unwrap()
         };
         assert_eq!(dir(Some("/c")), Path::new("/c/thumbnails"));
-        // As in the Flatpak, where the sandbox's own isn't asked.
-        assert_eq!(dir(None), Path::new("/home/u/.cache/thumbnails"));
+        assert_eq!(
+            dir(None),
+            Path::new("/home/u/.cache/thumbnails"),
+            "the Flatpak's case: the sandbox's own isn't asked"
+        );
         assert_eq!(dir(Some("")), Path::new("/home/u/.cache/thumbnails"));
     }
 
@@ -283,7 +290,10 @@ mod tests {
             file_uri(Path::new("/p/caf\u{e9}.png")),
             "file:///p/caf%C3%A9.png"
         );
-        // The spec's own example.
+    }
+
+    #[test]
+    fn a_cache_file_is_named_as_in_the_thumbnail_specs_example() {
         let digest = Md5::digest(b"file:///home/jens/photos/me.png");
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "c6ee772d9e49320e97ec29a7eb5b1697");
@@ -341,14 +351,17 @@ mod tests {
         assert_eq!(image.size, [128, 85]);
         assert_eq!(image.pixels[0], egui::Color32::from_rgb(0, 0, 200));
 
-        // Stale: the photo is decoded instead.
         std::fs::write(
             &thumb,
             with_text(&png(128, 85, [0, 0, 200]), "Thumb::MTime", "12"),
         )
         .unwrap();
         let image = load(Some(&cache), &photo).unwrap();
-        assert_eq!(image.size, [256, 171]);
+        assert_eq!(
+            image.size,
+            [256, 171],
+            "a stale one: the photo is decoded instead"
+        );
         assert_eq!(image.pixels[0], egui::Color32::from_rgb(200, 0, 0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -356,8 +369,6 @@ mod tests {
     #[test]
     fn decoding_stays_under_the_indexers_limits() {
         let dir = temp("limits");
-        // A header claiming 60000 x 60000 RGB: 10 GB of pixels, refused
-        // before any are decoded.
         let mut huge = png(1, 1, [0, 0, 0]);
         huge[16..20].copy_from_slice(&60000u32.to_be_bytes());
         huge[20..24].copy_from_slice(&60000u32.to_be_bytes());
@@ -365,7 +376,10 @@ mod tests {
         huge[29..33].copy_from_slice(&crc.to_be_bytes());
         let path = dir.join("huge.png");
         std::fs::write(&path, &huge).unwrap();
-        assert!(decode(&path).is_err());
+        assert!(
+            decode(&path).is_err(),
+            "60000 x 60000 RGB is 10 GB of pixels, refused before any are decoded"
+        );
 
         assert!(decode(&dir.join("missing.png")).is_err());
         std::fs::write(dir.join("note.png"), "not a png").unwrap();

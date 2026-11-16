@@ -1,5 +1,5 @@
 //! How long indexing a folder will take and how much index it makes, before
-//! it starts (#112). The folder is walked with the indexer's own rules
+//! it starts. The folder is walked with the indexer's own rules
 //! (`index::walk` and `index::indexable`: exclusions, skipped directories,
 //! the formats turned on, each kind's size cap), reading no file contents,
 //! and what it finds is priced at rates measured on the NPU.
@@ -16,7 +16,7 @@ use vinosearch_shared::numbers::thousands;
 /// 320, 2026-10-18). Other devices differ, the CPU by a lot.
 pub const CHUNKS_PER_SEC: f64 = 28.6;
 /// Seconds per image on the NPU: 1.3 for both vision stages (README,
-/// `vision.rs`), and OCR's 0.1 for a photo to 0.4 for a screenshot (#106).
+/// `vision.rs`), and OCR's 0.1 for a photo to 0.4 for a screenshot.
 pub const SECS_PER_IMAGE: f64 = 1.5;
 /// Index bytes per chunk: the same run's 470 MB for 113,341 chunks. That is
 /// the 768-float vector (3 KB), the chunk's text and SQLite's overhead. An
@@ -33,12 +33,16 @@ const TEXT_BYTES_PER_CHUNK: u64 = 800;
 /// that estimate 7% high, as text's is.
 const CODE_BYTES_PER_CHUNK: u64 = 600;
 /// Media file bytes per chunk, a guess: video at about 1 GB an hour makes
-/// some 360 sound windows and 240 to 360 frames an hour (#192), so ~1.5 MB
+/// some 360 sound windows and 240 to 360 frames an hour, so ~1.5 MB
 /// a chunk. Audio alone is far smaller per hour, so its estimate errs long.
 const MEDIA_BYTES_PER_CHUNK: u64 = 1_500_000;
-/// NPU seconds per media chunk: about 0.1 s a sound window (#190) and 1.3 s
+/// NPU seconds per media chunk: about 0.1 s a sound window and 1.3 s
 /// a frame, taken half and half.
 const SECS_PER_MEDIA_CHUNK: f64 = 0.7;
+
+/// The share of a `.vwsession` that comes out as text: a deflated
+/// transcript, plain text about a third its size zipped.
+const SESSION_TEXT_SHARE: f64 = 2.0;
 
 /// The share of a document's file that comes out as text. Guesses, not
 /// measured, set high so the estimate errs long: a PDF is mostly fonts,
@@ -54,8 +58,7 @@ fn document_text_share(path: &Path) -> f64 {
         .to_ascii_lowercase();
     match ext.as_str() {
         "csv" | "tsv" | "srt" | "vtt" => 1.0,
-        // A deflated transcript: plain text, about a third its size zipped.
-        "vwsession" => 2.0,
+        "vwsession" => SESSION_TEXT_SHARE,
         "pdf" => 0.25,
         _ => 0.5,
     }
@@ -68,13 +71,25 @@ fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
         Kind::Code => return bytes.div_ceil(CODE_BYTES_PER_CHUNK),
         Kind::Media => return bytes.div_ceil(MEDIA_BYTES_PER_CHUNK),
         Kind::Text => bytes,
-        // Text past MAX_FILE_BYTES is skipped, so a document makes at most
-        // that much.
-        Kind::Document | Kind::Session => {
-            ((bytes as f64 * document_text_share(path)) as u64).min(index::MAX_FILE_BYTES)
-        }
+        Kind::Document | Kind::Session => document_text(path, bytes),
     };
     text.div_ceil(TEXT_BYTES_PER_CHUNK)
+}
+
+/// The text a document of `bytes` is expected to hold, up to MAX_FILE_BYTES:
+/// text past it is skipped (pinned by
+/// `tests::a_document_at_the_text_cap_is_priced_in_full`,
+/// `tests::a_document_past_the_text_cap_is_priced_at_the_cap`).
+fn document_text(path: &Path, bytes: u64) -> u64 {
+    ((bytes as f64 * document_text_share(path)) as u64).min(index::MAX_FILE_BYTES)
+}
+
+/// Whether a folder taking `ms` of the root's `total_ms` is worth naming as
+/// one to exclude: 2% of the time or more (pinned by
+/// `tests::a_folder_with_2_percent_of_the_time_is_worth_excluding`,
+/// `tests::a_folder_with_under_2_percent_of_the_time_is_not`).
+fn worth_excluding(ms: u64, total_ms: u64) -> bool {
+    ms * 50 >= total_ms
 }
 
 /// Seconds to embed `chunks` of `kind`.
@@ -228,9 +243,8 @@ pub fn estimate(
         root: root.clone(),
         ..Estimate::default()
     };
-    // Milliseconds and files under each folder below the root.
-    let mut millis: HashMap<PathBuf, u64> = HashMap::new();
-    let mut files: HashMap<PathBuf, u64> = HashMap::new();
+    let mut millis_under: HashMap<PathBuf, u64> = HashMap::new();
+    let mut files_under: HashMap<PathBuf, u64> = HashMap::new();
     let mut total_ms = 0;
     for entry in index::walk(&root, ex).filter(|e| e.file_type().is_file()) {
         let Some((kind, meta)) = index::indexable(&entry, types) else {
@@ -254,16 +268,15 @@ pub fn estimate(
         let ms = (secs_of(kind, chunks) * 1000.0).ceil() as u64;
         total_ms += ms;
         for dir in path.ancestors().skip(1).take_while(|d| *d != root) {
-            *millis.entry(dir.to_owned()).or_default() += ms;
-            *files.entry(dir.to_owned()).or_default() += 1;
+            *millis_under.entry(dir.to_owned()).or_default() += ms;
+            *files_under.entry(dir.to_owned()).or_default() += 1;
         }
     }
-    // A folder with under 2% of the time isn't worth excluding.
-    millis.retain(|_, ms| *ms * 50 >= total_ms);
-    est.folders = index::biggest(&millis, limit)
+    millis_under.retain(|_, ms| worth_excluding(*ms, total_ms));
+    est.folders = index::biggest(&millis_under, limit)
         .into_iter()
         .map(|(dir, ms)| {
-            let n = files.get(&dir).copied().unwrap_or_default();
+            let n = files_under.get(&dir).copied().unwrap_or_default();
             (dir, ms as f64 / 1000.0, n)
         })
         .collect();
@@ -440,10 +453,45 @@ mod tests {
         )
         .unwrap();
         let names: Vec<_> = est.folders.iter().map(|(p, _, _)| p.clone()).collect();
-        // data/set holds nearly all of data, so it is named instead.
-        assert_eq!(names, [dir.join("data/set"), dir.join("src")]);
+        assert_eq!(
+            names,
+            [dir.join("data/set"), dir.join("src")],
+            "data/set holds nearly all of data, so it is named instead"
+        );
         assert_eq!(est.folders[0].2, 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_with_2_percent_of_the_time_is_worth_excluding() {
+        assert!(worth_excluding(20, 1000));
+    }
+
+    #[test]
+    fn a_folder_with_under_2_percent_of_the_time_is_not() {
+        assert!(!worth_excluding(19, 1000));
+    }
+
+    #[test]
+    fn a_document_at_the_text_cap_is_priced_in_full() {
+        let at_cap = index::MAX_FILE_BYTES;
+        assert_eq!(
+            chunks_of(Kind::Document, Path::new("/a.csv"), at_cap),
+            at_cap.div_ceil(TEXT_BYTES_PER_CHUNK)
+        );
+        assert!(
+            chunks_of(Kind::Document, Path::new("/a.csv"), at_cap - 4096)
+                < chunks_of(Kind::Document, Path::new("/a.csv"), at_cap)
+        );
+    }
+
+    #[test]
+    fn a_document_past_the_text_cap_is_priced_at_the_cap() {
+        let cap = index::MAX_FILE_BYTES;
+        assert_eq!(
+            chunks_of(Kind::Document, Path::new("/a.csv"), 10 * cap),
+            cap.div_ceil(TEXT_BYTES_PER_CHUNK)
+        );
     }
 
     #[test]

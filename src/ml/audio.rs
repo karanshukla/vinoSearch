@@ -1,6 +1,6 @@
-//! Audio windows to the audio encoder's input (#187): log-mel features as
+//! Audio windows to the audio encoder's input: log-mel features as
 //! transformers' `Gemma4AudioFeatureExtractor` makes them, for the static 10 s
-//! graph (#190). 128 HTK mels from 0 to 8 kHz over the magnitude of a 512-point
+//! graph. 128 HTK mels from 0 to 8 kHz over the magnitude of a 512-point
 //! FFT, 320-sample periodic Hann frames every 160 samples, the first centred
 //! on sample 0, then `ln(mel + 0.001)`. No preemphasis, dither or per-bin
 //! normalisation. `bench/log_mel_ref.py` writes the reference.
@@ -48,15 +48,21 @@ fn valid_frames(samples: usize) -> usize {
     samples.saturating_sub(1) / HOP
 }
 
-/// Up to `WINDOW_SAMPLES` of 16 kHz mono audio.
+/// A sample times its window weight, multiplied in f32 as the extractor does.
+fn windowed(sample: f32, weight: f32) -> f64 {
+    f64::from(sample * weight)
+}
+
+/// Up to `WINDOW_SAMPLES` of 16 kHz mono audio. A float file can hold NaN or
+/// infinity, which would go through every bin to the encoder and come back as
+/// no embedding at all, so it is refused (pinned by
+/// `tests::samples_that_are_not_numbers_are_refused`).
 pub fn log_mel(samples: &[f32]) -> Result<Features> {
     ensure!(
         samples.len() <= WINDOW_SAMPLES,
         "{} samples, more than a {WINDOW_SAMPLES}-sample window",
         samples.len()
     );
-    // A float file can hold NaN or infinity, which would go through every
-    // bin to the encoder and come back as no embedding at all.
     ensure!(
         samples.iter().all(|x| x.is_finite()),
         "samples that are not numbers"
@@ -80,8 +86,7 @@ pub fn log_mel(samples: &[f32]) -> Result<Features> {
         for (n, w) in t.window.iter().enumerate() {
             let at = start + n as isize;
             if at >= 0 {
-                // In f32, as the extractor windows.
-                re[n] = f64::from(samples[at as usize] * w);
+                re[n] = windowed(samples[at as usize], *w);
             }
         }
         fft(&mut re, &mut im, &t.twiddles);
@@ -225,9 +230,9 @@ mod tests {
         assert_eq!((f.frames, f.tokens()), (FRAMES, 250));
     }
 
+    /// 6 s gives 599 frames and 150 tokens, as audio_check.py's "siren 6 s".
     #[test]
     fn short_windows_count_frames_and_tokens_as_the_extractor_does() {
-        // 6 s, from audio_check.py's "siren 6 s": 599 frames, 150 tokens.
         let f = log_mel(&vec![0.0; 6 * SAMPLE_RATE]).unwrap();
         assert_eq!((f.frames, f.tokens()), (599, 150));
         assert_eq!(f.mask().iter().filter(|&&m| m).count(), 599);
@@ -259,7 +264,7 @@ mod tests {
         assert!(w < 1e-4, "worst bin off by {w}");
     }
 
-    /// The #187 acceptance check, on the spike's clip, which isn't checked in
+    /// The acceptance check, on the spike's clip, which isn't checked in
     /// (ESC-50 is CC BY-NC). bench/av_spike/make_clip.sh, then
     /// bench/log_mel_ref.py on its audio.f32, then:
     /// `VINOSEARCH_AV_SPIKE=~/.cache/vinosearch/bench/av_spike cargo test -- --ignored spike`

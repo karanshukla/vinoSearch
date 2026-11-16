@@ -1,9 +1,9 @@
-//! Text out of documents (#55): PDF pages, the XML inside Office and
+//! Text out of documents: PDF pages, the XML inside Office and
 //! OpenDocument zips, spreadsheets, CSV with its header on every chunk, EPUB
-//! chapters, subtitles, and Word 97, PowerPoint 97 and RTF files (#97).
+//! chapters, subtitles, and Word 97, PowerPoint 97 and RTF files.
 //! What comes out is chunked like any text file, numbered by page, slide or
-//! row instead of line. The indexer runs it in a child process with limits
-//! (#84), since the files come from anywhere.
+//! row instead of line. The indexer runs it in a child process with limits,
+//! since the files come from anywhere.
 
 use crate::index::{CHUNK_CHARS, MAX_DOCUMENT_BYTES, MAX_FILE_BYTES, chunk};
 use anyhow::{Context, Result, bail};
@@ -23,7 +23,7 @@ use html::entity;
 pub use html::html;
 use pdf::pdf;
 
-/// Address space the extracting child may map (#84). The runner's own share
+/// Address space the extracting child may map. The runner's own share
 /// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
 /// streams, decompressed, and lopdf's objects for them fit many times over.
 const CHILD_ADDRESS_SPACE: u64 = 1 << 30;
@@ -34,7 +34,7 @@ const CHILD_CPU_SECONDS: u64 = 30;
 /// runs at idle priority, so a busy machine can stretch 30 CPU seconds out.
 const CHILD_WALL: Duration = Duration::from_secs(120);
 
-/// Long documents are read and embedded a run of parts at a time (#108):
+/// Long documents are read and embedded a run of parts at a time:
 /// the first run with everything else, the rest after. A part is a page,
 /// slide or chapter, or for formats without them PART_CHUNKS chunks.
 pub const PARTS_AT_ONCE: usize = 30;
@@ -58,7 +58,7 @@ pub type Parser = fn(&Path, &[u8], usize, usize) -> Result<Extract>;
 /// `parts`, run in a child process (the runner executing itself as
 /// `vinosearch extract <path>`, with `bytes` on its stdin) under memory, CPU
 /// and wall-clock limits, so a parser that aborts, overflows its stack, eats
-/// memory or hangs costs that process, not the runner (#84). The limits are
+/// memory or hangs costs that process, not the runner. The limits are
 /// for each run of parts, so a long document gets them afresh each run. Err
 /// for a parser error, a child its limits stopped, or one that failed to
 /// start.
@@ -211,7 +211,7 @@ pub fn is_document(path: &Path) -> bool {
     EXTENSIONS.contains(&ext(path).as_str())
 }
 
-/// A vinoWhisper session bundle (#143), by its name.
+/// A vinoWhisper session bundle, by its name.
 pub fn is_session(path: &Path) -> bool {
     ext(path) == session::EXTENSION
 }
@@ -293,7 +293,6 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
             &Tags::DOCX,
         ))),
         "odt" | "ott" => Ok(chunk(&xml_text(&part(bytes, "content.xml")?, &Tags::ODF))),
-        // Flat OpenDocument: the same XML, unzipped.
         "fodt" => Ok(chunk(&xml_text(utf8(bytes)?, &Tags::ODF))),
         e if SLIDES.contains(&e) => pptx(bytes),
         "odp" | "otp" => Ok(numbered(
@@ -302,13 +301,8 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
         "fodp" => Ok(numbered(xml_text(utf8(bytes)?, &Tags::ODF).split('\u{c}'))),
         "epub" => epub(bytes),
         session::EXTENSION => session::chunks(bytes),
-        // Older Words saved RTF under .doc, and a renamed .docx or .pptx is
-        // still one.
-        "doc" | "dot" if bytes.starts_with(b"{\\rtf") => Ok(chunk(&rtf::rtf(bytes)?)),
-        "doc" | "dot" if bytes.starts_with(b"PK") => chunks(Path::new("a.docx"), bytes),
-        "doc" | "dot" => Ok(chunk(&ole::doc(bytes)?)),
-        "ppt" | "pot" | "pps" if bytes.starts_with(b"PK") => chunks(Path::new("a.pptx"), bytes),
-        "ppt" | "pot" | "pps" => Ok(numbered(ole::ppt(bytes)?.iter())),
+        "doc" | "dot" => legacy_doc(bytes),
+        "ppt" | "pot" | "pps" => legacy_ppt(bytes),
         "rtf" => Ok(chunk(&rtf::rtf(bytes)?)),
         "srt" | "vtt" => Ok(chunk(&subtitles(&String::from_utf8_lossy(bytes)))),
         "csv" | "tsv" => {
@@ -318,6 +312,30 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
             Ok(table(header, lines.map(str::to_owned), 2))
         }
         _ => sheets(bytes),
+    }
+}
+
+/// A Word 97 .doc, or what else goes by that name: RTF, as older Words
+/// saved it, or a renamed .docx (pinned by
+/// `tests::an_rtf_file_saved_as_doc_reads_as_rtf`,
+/// `tests::a_docx_renamed_to_doc_reads_as_a_docx`).
+fn legacy_doc(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+    if bytes.starts_with(b"{\\rtf") {
+        Ok(chunk(&rtf::rtf(bytes)?))
+    } else if bytes.starts_with(b"PK") {
+        chunks(Path::new("a.docx"), bytes)
+    } else {
+        Ok(chunk(&ole::doc(bytes)?))
+    }
+}
+
+/// A PowerPoint 97 .ppt, or a renamed .pptx (pinned by
+/// `tests::a_pptx_renamed_to_ppt_reads_as_a_pptx`).
+fn legacy_ppt(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
+    if bytes.starts_with(b"PK") {
+        chunks(Path::new("a.pptx"), bytes)
+    } else {
+        Ok(numbered(ole::ppt(bytes)?.iter()))
     }
 }
 
@@ -374,7 +392,7 @@ fn subtitles(text: &str) -> String {
     out
 }
 
-/// Read as text, but through `html` (#97).
+/// Read as text, but through `html`.
 const HTML: &[&str] = &["html", "htm"];
 
 pub fn is_html(path: &Path) -> bool {
@@ -389,6 +407,8 @@ fn numbered<S: AsRef<str>>(parts: impl Iterator<Item = S>) -> Vec<(usize, String
         .collect()
 }
 
+/// Each slide in slide order; MAX_PART_BYTES caps the slides together, not
+/// each one.
 fn pptx(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
     let slide = |name: &str| {
@@ -403,7 +423,6 @@ fn pptx(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
         .filter_map(|n| Some((slide(&n)?, n.into_owned())))
         .collect();
     slides.sort();
-    // MAX_PART_BYTES across all slides, not each.
     let mut total = 0;
     let mut texts = Vec::with_capacity(slides.len());
     for (_, n) in &slides {
@@ -580,23 +599,27 @@ impl Tags {
     };
 }
 
+impl Tags {
+    /// The whitespace an opening or empty element stands for. ODF's run of
+    /// spaces, `<text:s text:c="3"/>`, is one: enough to keep words apart
+    /// (pinned by `tests::an_odf_run_of_spaces_reads_as_one_space`).
+    fn mark(&self, out: &mut String, name: &str) {
+        if self.tab.contains(&name) {
+            out.push('\t');
+        } else if self.line_break.contains(&name) {
+            out.push('\n');
+        } else if name == "text:s" {
+            out.push(' ');
+        }
+    }
+}
+
 /// The text in `xml`, a newline at each paragraph's end.
 fn xml_text(xml: &str, tags: &Tags) -> String {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut out = String::new();
     let mut in_text = tags.text.is_empty();
     let mut skipped = 0u32;
-    // ODF's run of spaces, <text:s text:c="3"/>, counts as one: enough to
-    // keep words apart.
-    let mark = |out: &mut String, name: &str| {
-        if tags.tab.contains(&name) {
-            out.push('\t');
-        } else if tags.line_break.contains(&name) {
-            out.push('\n');
-        } else if name == "text:s" {
-            out.push(' ');
-        }
-    };
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -608,9 +631,9 @@ fn xml_text(xml: &str, tags: &Tags) -> String {
                 if tags.skip.contains(&name) {
                     skipped += 1;
                 }
-                mark(&mut out, name);
+                tags.mark(&mut out, name);
             }
-            Ok(Event::Empty(e)) => mark(&mut out, e.name().into_inner()),
+            Ok(Event::Empty(e)) => tags.mark(&mut out, e.name().into_inner()),
             Ok(Event::End(e)) => {
                 let name = e.name();
                 let name = name.into_inner();
@@ -700,9 +723,12 @@ mod tests {
         for (row, text) in &c {
             assert!(text.starts_with("n,payee,amount\n"));
             assert!(text.len() <= CHUNK_CHARS);
-            // Numbered by the file line its first row is on.
             let first = text.lines().nth(1).unwrap();
-            assert_eq!(csv.lines().nth(row - 1), Some(first));
+            assert_eq!(
+                csv.lines().nth(row - 1),
+                Some(first),
+                "numbered by the file line its first row is on"
+            );
         }
     }
 
@@ -822,24 +848,37 @@ mod tests {
         out
     }
 
-    #[test]
-    fn a_pdf_is_read_a_run_of_pages_at_a_time() {
-        // Each different: a line on every page is a running header.
+    /// Seven pages with no line in common: one on every page would be a
+    /// running header.
+    fn seven_page_pdf() -> Vec<u8> {
         let pages: Vec<String> = ["one", "two", "three", "four", "five", "six", "seven"]
             .iter()
             .map(|n| format!("This is page {n}"))
             .collect();
-        let pdf = text_pdf(&pages);
-        let run = parts(Path::new("a.pdf"), &pdf, 2, 3).unwrap();
+        text_pdf(&pages)
+    }
+
+    #[test]
+    fn a_pdf_is_read_a_run_of_pages_at_a_time() {
+        let run = parts(Path::new("a.pdf"), &seven_page_pdf(), 2, 3).unwrap();
         assert_eq!(run.parts, 7);
         let numbers: Vec<usize> = run.chunks.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, [3, 4, 5]);
         assert!(run.chunks[0].1.contains("This is page three"), "{run:?}");
-        // Past the end there is nothing, but still the count.
-        let past = parts(Path::new("a.pdf"), &pdf, 7, 30).unwrap();
+    }
+
+    #[test]
+    fn a_run_past_the_last_page_is_empty_but_still_counts_the_pages() {
+        let past = parts(Path::new("a.pdf"), &seven_page_pdf(), 7, 30).unwrap();
         assert_eq!((past.parts, past.chunks.len()), (7, 0));
-        // Every page, as reading aloud takes it.
-        assert_eq!(chunks(Path::new("a.pdf"), &pdf).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn a_whole_pdf_reads_every_page() {
+        assert_eq!(
+            chunks(Path::new("a.pdf"), &seven_page_pdf()).unwrap().len(),
+            7
+        );
     }
 
     /// Page `n`'s own word: with its digits blanked, "page 3" is on every page.
@@ -890,8 +929,6 @@ mod tests {
 
     #[test]
     fn a_line_in_a_slot_on_under_half_the_pages_stays() {
-        // The footer's on every page; the opening line on 4 of 10, two odd and
-        // two even, so it's the text.
         let opens = [1, 2, 5, 6];
         let pages: Vec<String> = (1..=10)
             .map(|n| {
@@ -905,9 +942,15 @@ mod tests {
             .collect();
         let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
         let out = without_furniture(&pages);
-        assert_eq!(out[0], "Water the beds at dawn.\nThe rest of page one.");
+        assert_eq!(
+            out[0], "Water the beds at dawn.\nThe rest of page one.",
+            "the opening line is on 4 of 10 pages, two odd and two even: it's the text"
+        );
         assert_eq!(out[2], "Page three begins here.\nThe rest of page three.");
-        assert!(out.iter().all(|p| !p.contains("Example Press")), "{out:?}");
+        assert!(
+            out.iter().all(|p| !p.contains("Example Press")),
+            "the footer is on every page: {out:?}"
+        );
     }
 
     #[test]
@@ -920,7 +963,10 @@ mod tests {
             out,
             ["Annual Report\nFirst page.", "Annual Report\nSecond page."]
         );
-        // A number in the body is the text.
+    }
+
+    #[test]
+    fn a_number_in_the_body_is_not_a_page_number() {
         let page = "alpha\nbravo\ncharlie\n42\ndelta\necho\nfoxtrot";
         assert_eq!(without_furniture(&[page]), [page]);
     }
@@ -960,14 +1006,16 @@ mod tests {
         assert_eq!(blanked("v2.10"), "v#.#");
     }
 
+    const FURNITURE: &str = "tests/fixtures/furniture.pdf";
+    /// Four pages, each with a header on two lines, a footer and a page
+    /// number; made by make-furniture-pdf.py next to it.
+    const FURNITURE_PDF: &[u8] = include_bytes!("../tests/fixtures/furniture.pdf");
+
     #[test]
     fn a_pdf_reads_without_its_headers_footers_and_page_numbers() {
-        // Made by make-furniture-pdf.py next to it: four pages, each with a
-        // header on two lines and a footer and page number.
-        let path = Path::new("tests/fixtures/furniture.pdf");
-        let pdf = include_bytes!("../tests/fixtures/furniture.pdf");
+        let path = Path::new(FURNITURE);
         assert_eq!(
-            join(path, chunks(path, pdf).unwrap()),
+            join(path, chunks(path, FURNITURE_PDF).unwrap()),
             "Clay holds water well but drains slowly after rain. \
              Adding compost each autumn loosens it over a few years.\n\n\
              Sandy beds dry out within a day of watering. \
@@ -977,8 +1025,11 @@ mod tests {
              Test the pH before liming, since most vegetables like it near neutral. \
              These notes will be updated after the next season."
         );
-        // Indexing too, a run at a time: a run of 2 keeps the header, not the number.
-        let run = parts(path, pdf, 2, 2).unwrap();
+    }
+
+    #[test]
+    fn a_run_of_two_pages_keeps_the_header_but_not_the_page_number() {
+        let run = parts(Path::new(FURNITURE), FURNITURE_PDF, 2, 2).unwrap();
         assert!(
             run.chunks[0].1.starts_with("Field Notes on Garden Soil\n"),
             "{run:?}"
@@ -1007,7 +1058,6 @@ mod tests {
 
     #[test]
     fn parts_without_pages_are_runs_of_chunks() {
-        // Numbered by line, as a text file's are.
         let all: Vec<(usize, String)> = (1..=10).map(|i| (i * 4, format!("c{i}"))).collect();
         let run = select(all.clone(), false, 1, 2);
         assert_eq!(run.parts, 10usize.div_ceil(PART_CHUNKS));
@@ -1172,7 +1222,6 @@ mod tests {
 
     #[test]
     fn epub_chapters_are_numbered_in_reading_order() {
-        // Listed out of name order: the spine decides.
         let book = epub_of(&[
             ("b.xhtml", "<h1>Two</h1><p>Fish&#160;&amp; chips</p>"),
             ("a.xhtml", "<p>Second<br/>line</p><script>var x;</script>"),
@@ -1184,7 +1233,8 @@ mod tests {
             vec![
                 (1, "Two\nFish\u{a0}& chips\n".to_owned()),
                 (2, "Second\nline\n".to_owned())
-            ]
+            ],
+            "listed out of name order: the spine decides"
         );
         assert_eq!(unit(path), "chapter");
         assert_eq!(join(path, c), "Two\nFish\u{a0}& chips\n\nSecond\nline\n");
@@ -1306,24 +1356,26 @@ mod tests {
             let _ = html(page);
         }
         assert_eq!(html("<a title=don't>it</a>s"), "its");
-        // Each of these once scanned to the end of the page per occurrence:
-        // minutes at this size. Linear is about 1 s on CI in a debug build.
+        assert!(is_html(Path::new("A.HTM")) && !is_html(Path::new("a.md")));
+    }
+
+    #[test]
+    fn a_megabyte_of_bare_ampersands_or_scripts_reads_in_linear_time() {
         for unit in ["&", "<script>a</script>"] {
             let page = unit.repeat((1 << 20) / unit.len());
             let t0 = std::time::Instant::now();
             html(&page);
             assert!(
                 t0.elapsed() < Duration::from_secs(10),
-                "{unit}: {:?}",
+                "{unit}: {:?}, where linear is about 1 s on CI in a debug build",
                 t0.elapsed()
             );
         }
-        assert!(is_html(Path::new("A.HTM")) && !is_html(Path::new("a.md")));
     }
 
-    /// A compound file holding `streams`.
+    /// A compound file holding `streams`, version 3 (512-byte sectors) as
+    /// Office writes them.
     fn ole_of(streams: &[(&str, &[u8])]) -> Vec<u8> {
-        // Version 3, 512-byte sectors, as Office writes them.
         let mut file =
             cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
                 .unwrap();
@@ -1338,11 +1390,11 @@ mod tests {
     /// Windows-1252 (true) or UTF-16, the main document being the first
     /// `main` characters.
     fn doc_of(pieces: &[(&str, bool)], main: u32) -> Vec<u8> {
+        const F_WHICH_TBL_STM_IS_1TABLE: u16 = 0x0200;
         let mut word = vec![0u8; 1024];
         word[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes());
         word[2..4].copy_from_slice(&0xC1u16.to_le_bytes());
-        // fWhichTblStm: the table is 1Table.
-        word[0x0A..0x0C].copy_from_slice(&0x0200u16.to_le_bytes());
+        word[0x0A..0x0C].copy_from_slice(&F_WHICH_TBL_STM_IS_1TABLE.to_le_bytes());
         word[32..34].copy_from_slice(&14u16.to_le_bytes());
         let lw = 34 + 28;
         word[lw..lw + 2].copy_from_slice(&22u16.to_le_bytes());
@@ -1371,10 +1423,12 @@ mod tests {
             plc.extend(fc.to_le_bytes());
             plc.extend([0, 0]);
         }
-        // A Prc to step over, then the Pcdt.
+        const PRC_TO_STEP_OVER: [u8; 5] = [1, 2, 0, 0xAA, 0xBB];
+        const PCDT: u8 = 2;
         let mut table = vec![0u8; 16];
         let fc_clx = table.len() as u32;
-        table.extend([1, 2, 0, 0xAA, 0xBB, 2]);
+        table.extend(PRC_TO_STEP_OVER);
+        table.push(PCDT);
         table.extend((plc.len() as u32).to_le_bytes());
         table.extend(&plc);
         let clx = fc_lcb + 2 + 33 * 8;
@@ -1444,7 +1498,8 @@ mod tests {
 
     /// `slides`' placeholder texts in the slide list, in order, and each
     /// slide's own texts in its container. An old version of a slide sits
-    /// in the stream unreferenced, as a fast save leaves it.
+    /// in the stream unreferenced, as a fast save leaves it, and the list
+    /// runs in reverse of the stream's order, so only the list can order them.
     fn ppt_of(slides: &[(&[&str], &[&str])]) -> Vec<u8> {
         let mut stream = slide_container(&["stale"]);
         let mut offsets = Vec::new();
@@ -1453,7 +1508,6 @@ mod tests {
             stream.extend(slide_container(own));
         }
         let mut list = Vec::new();
-        // The slide list in reverse of the stream's order: it decides.
         for (i, (listed, _)) in slides.iter().enumerate().rev() {
             let mut persist = (i as u32 + 2).to_le_bytes().to_vec();
             persist.extend([0; 16]);
@@ -1577,16 +1631,6 @@ Caf\'e9 \u233?s, \u-10179?\u-8704? and {\uc2\u8364 EU} done\par
         );
         let sjis = b"{\\rtf1\\ansi\\ansicpg932 \\'82\\'a0\\'82\\'a2\\par}";
         assert_eq!(rtf::rtf(sjis).unwrap(), "\u{3042}\u{3044}\n");
-        // The codepage from the font's charset, back to the document's after
-        // its group.
-        let fonts = br"{\rtf1\ansi{\fonttbl{\f0 Arial;}{\f1\fcharset204 Arial Cyr;}}
-{\f1 \'cf\'f0\'e8\'e2\'e5\'f2} \'e9\par}";
-        assert_eq!(rtf::rtf(fonts).unwrap(), "Привет é\n");
-        // An RTF file saved as .doc, as older Words did.
-        assert_eq!(
-            chunks(Path::new("a.doc"), RTF.as_bytes()).unwrap(),
-            chunks(path, RTF.as_bytes()).unwrap()
-        );
         assert!(
             rtf::rtf(
                 &b"{\\rtf1"
@@ -1596,6 +1640,56 @@ Caf\'e9 \u233?s, \u-10179?\u-8704? and {\uc2\u8364 EU} done\par
                     .collect::<Vec<_>>()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_fonts_charset_sets_the_codepage_until_its_group_ends() {
+        let fonts = br"{\rtf1\ansi{\fonttbl{\f0 Arial;}{\f1\fcharset204 Arial Cyr;}}
+{\f1 \'cf\'f0\'e8\'e2\'e5\'f2} \'e9\par}";
+        assert_eq!(rtf::rtf(fonts).unwrap(), "Привет é\n");
+    }
+
+    #[test]
+    fn an_rtf_file_saved_as_doc_reads_as_rtf() {
+        assert_eq!(
+            chunks(Path::new("a.doc"), RTF.as_bytes()).unwrap(),
+            chunks(Path::new("a.rtf"), RTF.as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_docx_renamed_to_doc_reads_as_a_docx() {
+        let word = zipped(&[(
+            "word/document.xml",
+            "<w:document><w:body><w:p><w:r><w:t>renamed</w:t></w:r></w:p></w:body></w:document>",
+        )]);
+        assert_eq!(
+            chunks(Path::new("a.doc"), &word).unwrap(),
+            vec![(1, "renamed\n".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_pptx_renamed_to_ppt_reads_as_a_pptx() {
+        let slides = zipped(&[(
+            "ppt/slides/slide1.xml",
+            "<p:sld><a:p><a:r><a:t>renamed</a:t></a:r></a:p></p:sld>",
+        )]);
+        assert_eq!(
+            chunks(Path::new("a.ppt"), &slides).unwrap(),
+            vec![(1, "renamed\n".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_odf_run_of_spaces_reads_as_one_space() {
+        let odf = "<office:document-content><office:body><office:text>\
+                   <text:p>a<text:s text:c=\"3\"/>b</text:p>\
+                   </office:text></office:body></office:document-content>";
+        assert_eq!(
+            chunks(Path::new("a.fodt"), odf.as_bytes()).unwrap(),
+            vec![(1, "a b\n".to_owned())]
         );
     }
 
@@ -1628,8 +1722,13 @@ Caf\'e9 \u233?s, \u-10179?\u-8704? and {\uc2\u8364 EU} done\par
         for e in EXTENSIONS {
             let path = format!("a.{e}");
             assert!(is_document(Path::new(&path)));
-            // Garbage in: an error or nothing, never a panic.
-            let _ = chunks(Path::new(&path), b"not a document");
+        }
+    }
+
+    #[test]
+    fn garbage_under_any_document_extension_is_an_error_or_nothing_not_a_panic() {
+        for e in EXTENSIONS {
+            let _ = chunks(Path::new(&format!("a.{e}")), b"not a document");
         }
     }
 

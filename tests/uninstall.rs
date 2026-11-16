@@ -3,13 +3,16 @@
 //! `delete-model` deletes the models with no service running.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 fn temp_home(name: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     home
 }
+
+/// A file of another app's, under the same cache: never touched.
+const ANOTHER_APPS: &str = "cache/vinospeak/kokoro.onnx";
 
 fn put(path: &Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -25,8 +28,7 @@ fn installed(home: &Path) {
         "cache/vinosearch/ov-cache/blob.cl",
         "config/vinosearch/config.toml",
         "runtime/lib/libopenvino.so",
-        // Another app's, under the same cache.
-        "cache/vinospeak/kokoro.onnx",
+        ANOTHER_APPS,
     ] {
         put(&home.join(file));
     }
@@ -48,12 +50,32 @@ fn install_sh(home: &Path, args: &[&str]) {
         .env_remove("VINOSEARCH_CONFIG")
         .output()
         .unwrap();
+    assert_ok(&out);
+}
+
+fn assert_ok(out: &Output) {
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `vinosearch` with its files under `home`, and no session bus: never the
+/// runner of whoever runs the tests.
+fn vinosearch_in(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vinosearch"));
+    command
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
+    command
+}
+
+/// No systemctl either: never the user's service, and the files go all the
+/// same.
+const NO_SYSTEMCTL: &str = "";
 
 #[test]
 fn uninstall_deletes_the_models_and_keeps_the_index() {
@@ -66,13 +88,13 @@ fn uninstall_deletes_the_models_and_keeps_the_index() {
     assert!(home.join("data/vinosearch/index.sqlite").is_file());
     assert!(home.join("config/vinosearch/config.toml").is_file());
     assert!(home.join("runtime/lib/libopenvino.so").is_file());
-    assert!(home.join("cache/vinospeak/kokoro.onnx").is_file());
+    assert!(home.join(ANOTHER_APPS).is_file());
 
     install_sh(&home, &["--uninstall", "--purge"]);
     assert!(!home.join("data/vinosearch").exists());
     assert!(!home.join("runtime").exists());
     assert!(home.join("config/vinosearch/config.toml").is_file());
-    assert!(home.join("cache/vinospeak/kokoro.onnx").is_file());
+    assert!(home.join(ANOTHER_APPS).is_file());
 
     std::fs::remove_dir_all(&home).unwrap();
 }
@@ -91,22 +113,12 @@ fn uninstall_removes_the_autostart_entry_and_an_older_installs_unit() {
     let wants = home.join("config/systemd/user/default.target.wants");
     std::fs::create_dir_all(&wants).unwrap();
     std::os::unix::fs::symlink("../vinosearch.service", wants.join("vinosearch.service")).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_vinosearch"))
+    let out = vinosearch_in(&home)
         .args(["krunner", "--uninstall"])
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        // No systemctl and no bus: never the real service of whoever runs
-        // the tests, and the files go all the same.
-        .env("PATH", "")
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("PATH", NO_SYSTEMCTL)
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_ok(&out);
     for f in files {
         assert!(!home.join(f).exists(), "{f} is still there");
     }
@@ -118,24 +130,15 @@ fn uninstall_removes_the_autostart_entry_and_an_older_installs_unit() {
 fn delete_model_deletes_them_without_a_service() {
     let home = temp_home("delete-model");
     installed(&home);
-    let out = Command::new(env!("CARGO_BIN_EXE_vinosearch"))
+    let out = vinosearch_in(&home)
         .arg("delete-model")
-        .env("HOME", &home)
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_CONFIG_HOME", home.join("config"))
         .env(
             "VINOSEARCH_CONFIG",
             home.join("config/vinosearch/config.toml"),
         )
-        // No bus, so no runner: never the real one of whoever runs the tests.
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_ok(&out);
     assert!(!home.join("data/vinosearch/models").exists());
     assert!(home.join("data/vinosearch/index.sqlite").is_file());
     std::fs::remove_dir_all(&home).unwrap();

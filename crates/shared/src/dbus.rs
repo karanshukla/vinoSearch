@@ -16,7 +16,7 @@ pub struct Names {
     /// Icon name, installed under hicolor/scalable/apps.
     pub icon: String,
     /// KRunner's plugin file, under the XDG data directory. Its presence is
-    /// the KDE search place being on (#45).
+    /// the KDE search place being on.
     pub krunner_plugin: String,
     /// The plugin's id in KRunner's settings.
     pub krunner_plugin_id: String,
@@ -91,22 +91,22 @@ pub mod status {
     pub const DEVICE: &str = "device";
     pub const FILES: &str = "files";
     pub const CHUNKS: &str = "chunks";
-    /// The same, per format (#73): a file counts under its chunks' kind.
+    /// The same, per format: a file counts under its chunks' kind.
     pub const TEXT_FILES: &str = "text_files";
     pub const TEXT_CHUNKS: &str = "text_chunks";
     pub const DOCUMENT_FILES: &str = "document_files";
     pub const DOCUMENT_CHUNKS: &str = "document_chunks";
     /// One chunk per image, so no chunk count.
     pub const IMAGE_FILES: &str = "image_files";
-    /// Source code (#110).
+    /// Source code.
     pub const CODE_FILES: &str = "code_files";
     pub const CODE_CHUNKS: &str = "code_chunks";
-    /// vinoWhisper sessions (#143), and those not read: in a format this
+    /// vinoWhisper sessions, and those not read: in a format this
     /// build doesn't know, or broken.
     pub const SESSION_FILES: &str = "session_files";
     pub const SESSION_CHUNKS: &str = "session_chunks";
     pub const SESSIONS_UNREAD: &str = "sessions_unread";
-    /// Audio and video files (#187), and their sound windows and frames.
+    /// Audio and video files, and their sound windows and frames.
     pub const MEDIA_FILES: &str = "media_files";
     pub const MEDIA_CHUNKS: &str = "media_chunks";
     /// What images (the vision encoder and OCR) and media (the vision and
@@ -118,19 +118,19 @@ pub mod status {
     pub const ROOTS: &str = "roots";
     /// Files embedded so far by the current run of indexing.
     pub const INDEXED_FILES: &str = "indexed_files";
-    /// The indexing job is the rest of a long document (#108).
+    /// The indexing job is the rest of a long document.
     pub const INDEXING_REST: &str = "indexing_rest";
-    /// Documents indexed in part so far (#108), next in line first, at most
+    /// Documents indexed in part so far, next in line first, at most
     /// PARTIAL_MAX: `a(sstt)` of (path, unit, parts in, parts in all), the
     /// unit "page", "slide", "chapter" or "part".
     pub const PARTIAL: &str = "partial";
     pub const PARTIAL_MAX: usize = 100;
-    /// Audio and video files waiting for a charger to be embedded (#192):
+    /// Audio and video files waiting for a charger to be embedded:
     /// the media rows in `partial` while on battery, else 0.
     pub const MEDIA_WAITING_FOR_AC: &str = "media_waiting_for_ac";
     /// PauseIndexing was called and ResumeIndexing not since.
     pub const PAUSED: &str = "paused";
-    /// Why indexing is held for power (#109): a `hold` value, or empty.
+    /// Why indexing is held for power: a `hold` value, or empty.
     pub const POWER_HOLD: &str = "power_hold";
     pub const MODEL_PRESENT: &str = "model_present";
     pub const FETCHING: &str = "fetching";
@@ -147,11 +147,11 @@ pub mod status {
     pub const LAST_CHECKED: &str = "last_checked";
     pub const LAST_INDEXED: &str = "last_indexed";
     /// Why files are being indexed again after a start: a model changed
-    /// (#80). Empty otherwise, and once that indexing is done.
+    ///. Empty otherwise, and once that indexing is done.
     pub const MODEL_CHANGED: &str = "model_changed";
-    /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed (#79).
+    /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed.
     pub const NO_DECODER: &str = "no_decoder";
-    /// The index on disk is encrypted (#4).
+    /// The index on disk is encrypted.
     pub const ENCRYPTED: &str = "encrypted";
     /// What its key is sealed with: a `seal` value, empty while it isn't
     /// encrypted.
@@ -205,16 +205,16 @@ pub mod recent {
 }
 
 /// `Control1.Search`: the kinds a result is, and the most files of each kind
-/// it returns. Text read in an image (#106) is an `IMAGE`, as KRunner lists it.
+/// it returns. Text read in an image is an `IMAGE`, as KRunner lists it.
 pub mod results {
     pub const TEXT: &str = "text";
     pub const DOCUMENT: &str = "document";
     pub const IMAGE: &str = "image";
-    /// Source code, only ever alone, for a query starting `code:` (#110).
+    /// Source code, only ever alone, for a query starting `code:`.
     pub const CODE: &str = "code";
-    /// A vinoWhisper session's transcript or summary (#143).
+    /// A vinoWhisper session's transcript or summary.
     pub const SESSION: &str = "session";
-    /// An audio or video file, by its sound or picture (#187).
+    /// An audio or video file, by its sound or picture.
     pub const MEDIA: &str = "media";
     pub const MAX: u32 = 100;
 }
@@ -240,8 +240,11 @@ mod tests {
         ] {
             assert!(name.starts_with(app), "{name}");
         }
-        // The activation file is named after the bus name it starts.
-        assert_eq!(file(&n.dbus_service_file), format!("{}.service", n.service));
+        assert_eq!(
+            file(&n.dbus_service_file),
+            format!("{}.service", n.service),
+            "the activation file is named after the bus name it starts"
+        );
         assert_ne!(n.service, Names::native().service);
     }
 }

@@ -1,4 +1,4 @@
-//! Whether the model runs right on a device (#76). The NPU can compile a graph
+//! Whether the model runs right on a device. The NPU can compile a graph
 //! and answer wrongly without an error: the INT8 vision encoder gave cosine
 //! 0.67 against the CPU, and a static batch over 1 mixed rows. So each stage,
 //! when it compiles fresh on a device other than the CPU, embeds a fixed input

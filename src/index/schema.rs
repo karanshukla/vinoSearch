@@ -7,6 +7,7 @@ use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::Duration;
 
 /// Log entries kept. A Vectors further behind than this reloads in full,
 /// which at that many changes is no slower than applying them.
@@ -19,20 +20,7 @@ const CHUNK_LOG_KEEP: i64 = 100_000;
 /// empty or plaintext index.
 pub fn open(path: &Path) -> Result<Connection> {
     let key = crate::index::encryption::key_for(path)?;
-    if let Some(dir) = path.parent() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| path.display().to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    make_private(path)?;
     let conn = Connection::open(path)?;
     crate::index::encryption::unlock(&conn, key.as_deref())?;
     conn.execute_batch(&format!(
@@ -55,7 +43,7 @@ pub fn open(path: &Path) -> Result<Connection> {
          CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);
          -- Every chunk id inserted or deleted, in commit order, so a loaded
          -- Vectors can catch up without rereading the table. AUTOINCREMENT
-         -- because seq must never be reused; chunks.id can be (#27). The
+         -- because seq must never be reused; chunks.id can be. The
          -- triggers also see deletes cascaded from files.
          CREATE TABLE IF NOT EXISTS chunk_log (
              seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,41 +56,26 @@ pub fn open(path: &Path) -> Result<Connection> {
          CREATE TRIGGER IF NOT EXISTS chunk_log_prune AFTER INSERT ON chunk_log
          BEGIN DELETE FROM chunk_log WHERE seq <= NEW.seq - {CHUNK_LOG_KEEP}; END;
          -- Facts about the index as a whole: which model made each kind's
-         -- vectors (#80), under model.<kind>.
+         -- vectors, under model.<kind>.
          CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     ))?;
-    // Content hashes (#28), added to databases from before them. Their rows
-    // stay NULL until `index` next sees the file.
-    let has_hash: bool = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('files') WHERE name = 'sha256'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_hash {
-        conn.execute_batch("ALTER TABLE files ADD COLUMN sha256 BLOB")?;
-    }
-    // What each chunk was embedded from (#73), added to databases from before
-    // images: everything in those is text.
-    let has_kind: bool = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('chunks') WHERE name = 'kind'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_kind {
-        conn.execute_batch("ALTER TABLE chunks ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")?;
-    }
+    add_column(&conn, "files", "sha256 BLOB")?;
+    add_column(&conn, "chunks", "kind INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256);
-         -- Long documents indexed in part (#108): `done` of their `total`
+         -- Long documents indexed in part: `done` of their `total`
          -- parts have chunks, the rest wait for `index_rest`. Gone once the
          -- last part is in, and with the file. A copy takes it over with
-         -- the chunks (`hand_over`).
+         -- the chunks (`hand_over`). `media` marks media in part, which
+         -- waits for every document's rest, and only on AC. `tries` counts
+         -- the times the model failed on a file's next run: one that keeps
+         -- failing goes behind the others instead of ahead of them.
          CREATE TABLE IF NOT EXISTS partial (
              file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
              done INTEGER NOT NULL,
              total INTEGER NOT NULL
          );
-         -- How long each audio or video file runs (#187), and whether it is
+         -- How long each audio or video file runs, and whether it is
          -- left out for running over `formats.media.max_hours`, so a change
          -- to that setting reaches files already seen (`media::fit`).
          CREATE TABLE IF NOT EXISTS media (
@@ -111,26 +84,47 @@ pub fn open(path: &Path) -> Result<Connection> {
              too_long INTEGER NOT NULL DEFAULT 0
          );",
     )?;
-    // Media in part (#187) waits for every document's rest, and only on AC.
-    // `tries` counts the times the model failed on a file's next run: one
-    // that keeps failing goes behind the others instead of ahead of them.
-    for (column, sql) in [
-        ("media", "media INTEGER NOT NULL DEFAULT 0"),
-        ("tries", "tries INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        let has: bool = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('partial') WHERE name = ?1",
-            [column],
-            |r| r.get(0),
-        )?;
-        if !has {
-            conn.execute_batch(&format!("ALTER TABLE partial ADD COLUMN {sql}"))?;
-        }
-    }
+    add_column(&conn, "partial", "media INTEGER NOT NULL DEFAULT 0")?;
+    add_column(&conn, "partial", "tries INTEGER NOT NULL DEFAULT 0")?;
     hand_over(&conn)?;
     words_table(&conn)?;
     code_apart(&conn)?;
     Ok(conn)
+}
+
+/// `path`'s folder 0700 and `path` 0600, created if missing.
+fn make_private(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| path.display().to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Adds the column `definition` names to `table`, for an index from before
+/// it. Existing rows get its default, or NULL (a `sha256` until `index` next
+/// sees the file).
+fn add_column(conn: &Connection, table: &str, definition: &str) -> Result<()> {
+    let column = definition.split_whitespace().next().unwrap_or_default();
+    let has: bool = conn.query_row(
+        &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
+    }
+    Ok(())
 }
 
 /// A file whose content another file already has keeps no chunks of its
@@ -140,13 +134,35 @@ pub fn open(path: &Path) -> Result<Connection> {
 ///
 /// One trigger, so both go to the same copy, and only when no copy holds
 /// chunks or a partial row of its own: the heir would hold every chunk
-/// twice, or two partial rows. That can't come about any more, since a file
-/// waiting in `partial` counts as holding its content (`holder_of`), but
-/// before it did two copies of a film each got a row (#187), and deleting
-/// either failed on `partial.file_id`. Those indexes have the two triggers
-/// this replaces: they go, and of files with the same content that each
-/// hold it, all but the first become plain copies.
+/// twice, or two partial rows.
 fn hand_over(conn: &Connection) -> Result<()> {
+    drop_split_hand_over(conn)?;
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS hand_over BEFORE DELETE ON files
+         WHEN OLD.sha256 IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM files f WHERE f.sha256 = OLD.sha256 AND f.id != OLD.id
+                 AND (EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+                      OR EXISTS (SELECT 1 FROM partial p WHERE p.file_id = f.id)))
+         BEGIN
+             UPDATE chunks
+             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
+             WHERE file_id = OLD.id
+               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
+             UPDATE partial
+             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
+             WHERE file_id = OLD.id
+               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
+         END;",
+    )?;
+    Ok(())
+}
+
+/// Drops the two triggers `hand_over` replaces, which could leave two copies
+/// each holding the content (deleting either then failed on
+/// `partial.file_id`): of files with the same content that each hold it, all
+/// but the first become plain copies.
+fn drop_split_hand_over(conn: &Connection) -> Result<()> {
     let old: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
          AND name IN ('files_hand_over', 'partial_hand_over')",
@@ -177,28 +193,10 @@ fn hand_over(conn: &Connection) -> Result<()> {
             holds("g"),
         ))?;
     }
-    conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS hand_over BEFORE DELETE ON files
-         WHEN OLD.sha256 IS NOT NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM files f WHERE f.sha256 = OLD.sha256 AND f.id != OLD.id
-                 AND (EXISTS (SELECT 1 FROM chunks c WHERE c.file_id = f.id)
-                      OR EXISTS (SELECT 1 FROM partial p WHERE p.file_id = f.id)))
-         BEGIN
-             UPDATE chunks
-             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
-             WHERE file_id = OLD.id
-               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
-             UPDATE partial
-             SET file_id = (SELECT min(id) FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id)
-             WHERE file_id = OLD.id
-               AND EXISTS (SELECT 1 FROM files WHERE sha256 = OLD.sha256 AND id != OLD.id);
-         END;",
-    )?;
     Ok(())
 }
 
-/// Code indexed as text before it was a kind of its own (#110), moved over
+/// Code indexed as text before it was a kind of its own, moved over
 /// once: relabelled, not embedded again, since the model and the text it
 /// embedded are the same. What indexing code leaves out now goes, though:
 /// files git ignores or named as generated go at the next check of their
@@ -220,20 +218,10 @@ fn code_apart(conn: &Connection) -> Result<()> {
     if done(&tx)? {
         return Ok(());
     }
-    // Files with text chunks, of a code extension.
-    let mut files: Vec<(i64, String)> = tx
-        .prepare(
-            "SELECT DISTINCT f.id, f.path FROM files f JOIN chunks c ON c.file_id = f.id
-             WHERE c.kind = ?1",
-        )?
-        .query_map([Kind::Text as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    files.retain(|(_, p)| crate::index::code::is_code(Path::new(p)));
+    let files = code_indexed_as_text(&tx)?;
     let mut text = tx.prepare("SELECT text FROM chunks WHERE file_id = ?1 ORDER BY id")?;
     let mut relabel = tx.prepare("UPDATE chunks SET kind = ?1 WHERE file_id = ?2")?;
-    // So loaded Vectors read these chunks' new kind (`Vectors::catch_up`).
-    let mut log =
-        tx.prepare("INSERT INTO chunk_log (chunk_id) SELECT id FROM chunks WHERE file_id = ?1")?;
+    let mut log = tx.prepare(LOG_FILES_CHUNKS)?;
     let mut dropped = Vec::new();
     for (id, path) in &files {
         let all: String = text
@@ -249,12 +237,7 @@ fn code_apart(conn: &Connection) -> Result<()> {
     }
     drop((text, relabel, log));
     for id in &dropped {
-        // Its chunks first, so they aren't handed to a copy, then the copies.
-        tx.execute("DELETE FROM chunks WHERE file_id = ?1", [id])?;
-        tx.execute(
-            "DELETE FROM files WHERE sha256 = (SELECT sha256 FROM files WHERE id = ?1) OR id = ?1",
-            [id],
-        )?;
+        drop_with_copies(&tx, *id)?;
     }
     tx.execute("INSERT INTO meta (key, value) VALUES (?1, '1')", [KEY])?;
     tx.commit()?;
@@ -267,15 +250,53 @@ fn code_apart(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Logs a file's chunks again, so loaded Vectors read their new kind
+/// (`Vectors::catch_up`).
+const LOG_FILES_CHUNKS: &str =
+    "INSERT INTO chunk_log (chunk_id) SELECT id FROM chunks WHERE file_id = ?1";
+
+/// Files with text chunks and a code extension: `(id, path)`.
+fn code_indexed_as_text(tx: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut files: Vec<(i64, String)> = tx
+        .prepare(
+            "SELECT DISTINCT f.id, f.path FROM files f JOIN chunks c ON c.file_id = f.id
+             WHERE c.kind = ?1",
+        )?
+        .query_map([Kind::Text as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    files.retain(|(_, p)| crate::index::code::is_code(Path::new(p)));
+    Ok(files)
+}
+
+/// Drops file `id` and its copies: its chunks first, so they aren't handed
+/// to a copy.
+fn drop_with_copies(tx: &Connection, id: i64) -> Result<()> {
+    tx.execute("DELETE FROM chunks WHERE file_id = ?1", [id])?;
+    tx.execute(
+        "DELETE FROM files WHERE sha256 = (SELECT sha256 FROM files WHERE id = ?1) OR id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// How long a connection opening an index from before the word index waits
+/// for another filling it: 16 s for 113k chunks in the VM (2026-10-25).
+const WORDS_FILL_WAIT: Duration = Duration::from_secs(300);
+/// rusqlite's own busy timeout.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
 /// A chunk's file name, from `files f`: what follows the last `/`.
 const FILE_NAME: &str = "substr(f.path, length(rtrim(f.path, replace(f.path, '/', ''))) + 1)";
 
-/// The word index (#104): FTS5 over each chunk's text and its file's name,
+/// The word index: FTS5 over each chunk's text and its file's name,
 /// rowid = chunk id, for the exact strings embeddings lose (invoice numbers,
 /// error codes, names). Contentless, so the text is not stored a second time;
 /// `contentless_delete` lets the triggers drop a row by its id alone. A chunk
-/// handed to a copy (files_hand_over) is reindexed under the copy's name. An
-/// index from before it is filled once, in the transaction that creates it.
+/// handed to a copy (`hand_over`) is reindexed under the copy's name. An
+/// index from before it is filled once, in an immediate transaction that
+/// creates it, so two connections opening it at once can't both fill it. The
+/// table and its triggers come into being together, so with the table there
+/// is nothing to do, and no write lock to wait for.
 fn words_table(conn: &Connection) -> Result<()> {
     let has = |c: &Connection| -> rusqlite::Result<bool> {
         c.query_row(
@@ -284,15 +305,10 @@ fn words_table(conn: &Connection) -> Result<()> {
             |r| r.get(0),
         )
     };
-    // The table and its triggers come into being together, so with one
-    // there is nothing to do, and no write lock to wait for.
     if has(conn)? {
         return Ok(());
     }
-    // Immediate, so two connections opening an old index at once can't both
-    // fill it; the second waits out the first's fill (16 s for 113k chunks
-    // in the VM) rather than the usual 5 s.
-    conn.busy_timeout(std::time::Duration::from_secs(300))?;
+    conn.busy_timeout(WORDS_FILL_WAIT)?;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let had = has(&tx)?;
     tx.execute_batch(&format!(
@@ -324,6 +340,6 @@ fn words_table(conn: &Connection) -> Result<()> {
         )?;
     }
     tx.commit()?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_WAIT)?;
     Ok(())
 }

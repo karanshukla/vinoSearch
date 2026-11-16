@@ -100,8 +100,9 @@ fn pick_device(mut has: impl FnMut(&str) -> bool) -> &'static str {
 /// itself, in the order `ovfetch-preload.txt` lists and with `RTLD_GLOBAL`;
 /// when the driver later asks for them by soname, the dynamic linker hands
 /// back the copies already loaded. After OpenVINO (the compiler needs its
-/// TBB) and before anything opens the NPU. Returns what was loaded; nothing
-/// when there is no prefix or no preload list.
+/// TBB) and before anything opens the NPU. They stay loaded for the life of
+/// the process, as OpenVINO does. Returns what was loaded; nothing when there
+/// is no prefix or no preload list.
 pub fn preload_npu(npu_prefix: Option<&Path>) -> Result<Vec<PathBuf>> {
     use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
 
@@ -122,7 +123,6 @@ pub fn preload_npu(npu_prefix: Option<&Path>) -> Result<Vec<PathBuf>> {
         // prefix loaded above.
         let lib = unsafe { Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL) }
             .map_err(|e| anyhow::anyhow!("loading {name} (from {}): {e}", list.display()))?;
-        // Stays loaded for the life of the process, like OpenVINO itself.
         std::mem::forget(lib);
         loaded.push(PathBuf::from(name));
     }
@@ -302,7 +302,12 @@ mod tests {
         assert!(preload_npu(None).unwrap().is_empty());
         let dir = prefix("npu", None);
         assert!(preload_npu(Some(&dir)).unwrap().is_empty());
-        // An empty list loads nothing either.
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_preload_list_loads_nothing() {
+        let dir = prefix("npu-empty", None);
         fs::write(dir.join(ovfetch::detect::NPU_PRELOAD), "\n  \n").unwrap();
         assert!(preload_npu(Some(&dir)).unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
@@ -332,8 +337,7 @@ mod tests {
             }),
             "NPU"
         );
-        // The GPU isn't even asked about when there is an NPU.
-        assert_eq!(asked, ["NPU"]);
+        assert_eq!(asked, ["NPU"], "the GPU isn't even asked about when there is an NPU");
         assert_eq!(pick_device(|d| d == "GPU"), "GPU");
         assert_eq!(pick_device(|_| false), "CPU");
     }

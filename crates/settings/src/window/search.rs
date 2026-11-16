@@ -1,4 +1,4 @@
-//! The search window (#111): `vinosearch-settings --search "query"`, opened
+//! The search window: `vinosearch-settings --search "query"`, opened
 //! from KRunner's Show all results and GNOME Shell's provider icon. Every file
 //! a query finds, photos and media as grids of thumbnails and text, documents,
 //! code and sessions as a list with their snippet, narrowed by kind, folder,
@@ -50,6 +50,9 @@ const MENU_MIN: f32 = 140.0;
 const MENU_ICON: f32 = 16.0 + 6.0;
 /// The header's content, from the window's left and right edges.
 const HEADER_INSET: f32 = 20.0;
+/// The sections shown as grids: a video's thumbnail is its picture, so media
+/// is a grid as photos are.
+const GRIDS: [(&str, [Kind; 1]); 2] = [("Images", [Kind::Image]), ("Media", [Kind::Media])];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Modified {
@@ -263,12 +266,7 @@ impl SearchWindow {
                 Ok(results) => {
                     self.results = results;
                     self.error = None;
-                    // Filters for what these results don't have would hide everything.
-                    if let Some(e) = &self.filters.extension
-                        && !self.results.iter().any(|f| f.extension() == *e)
-                    {
-                        self.filters.extension = None;
-                    }
+                    self.drop_a_type_filter_these_results_lack();
                     if self.selected().is_none() {
                         self.selected = None;
                     }
@@ -286,38 +284,80 @@ impl SearchWindow {
         }
     }
 
+    /// A filter for a type these results don't have would hide everything.
+    fn drop_a_type_filter_these_results_lack(&mut self) {
+        if let Some(e) = &self.filters.extension
+            && !self.results.iter().any(|f| f.extension() == *e)
+        {
+            self.filters.extension = None;
+        }
+    }
+
     pub fn show(&mut self, root: &mut egui::Ui) {
         let ctx = &root.ctx().clone();
         self.link.attach(ctx);
         let focused = ctx.input(|i| i.focused);
         if focused && !self.focused {
-            theme::follow_desktop(ctx);
-            self.kde_header = theme::kde_header();
-            let scale = theme::text_scale();
-            if scale != self.text_scale {
-                self.text_scale = scale;
-                ctx.set_zoom_factor(scale);
-            }
+            self.catch_up_on_focus(ctx);
         }
         self.focused = focused;
         self.take_answers();
         ctx.accesskit_node_builder(egui::accesskit_root_id(), |node| node.set_label(TITLE));
+        self.search_once_typing_pauses(ctx);
+        self.shortcuts(ctx);
 
-        if let Some(at) = self.typed_at {
-            let left = TYPING_PAUSE - (ctx.input(|i| i.time) - at);
-            if left <= 0.0 {
-                if self.query.trim().chars().count() >= MIN_QUERY_CHARS {
-                    self.search();
-                } else {
-                    self.typed_at = None;
-                }
-            } else {
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
-            }
+        let p = theme::palette(ctx);
+        let header = theme::header(ctx, self.kde_header.as_ref(), focused);
+        let shown = self.shown();
+        self.header(root, p, header);
+        if let Some(f) = self.selected().cloned() {
+            self.actions(root, p, &f);
         }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin {
+                left: 20,
+                right: 0,
+                top: 4,
+                bottom: 0,
+            }))
+            .show(root, |ui| {
+                widgets::page_scroll(ui, "Results", f32::INFINITY, |ui| {
+                    self.notice_line(ui);
+                    self.results(ui, &shown);
+                });
+            });
+    }
 
-        // Ctrl+F or Ctrl+L: back to the search field. Ctrl+C copies the
-        // selected file while it, or nothing, has focus: not from the field.
+    /// Back from the background: the desktop's light/dark switch or text
+    /// size may have changed.
+    fn catch_up_on_focus(&mut self, ctx: &egui::Context) {
+        theme::follow_desktop(ctx);
+        self.kde_header = theme::kde_header();
+        let scale = theme::text_scale();
+        if scale != self.text_scale {
+            self.text_scale = scale;
+            ctx.set_zoom_factor(scale);
+        }
+    }
+
+    fn search_once_typing_pauses(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.typed_at else {
+            return;
+        };
+        let left = TYPING_PAUSE - (ctx.input(|i| i.time) - at);
+        if left > 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+        } else if self.query.trim().chars().count() >= MIN_QUERY_CHARS {
+            self.search();
+        } else {
+            self.typed_at = None;
+        }
+    }
+
+    /// Ctrl+F or Ctrl+L goes back to the search field. Ctrl+C copies the
+    /// selected file while it, or nothing, has focus: not from the field
+    /// (pinned by `window::search::ui_tests::the_keyboard_reaches_the_results_and_opens_one`).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
         let (find, copy) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::COMMAND, Key::F)
@@ -336,17 +376,17 @@ impl SearchWindow {
         {
             self.act(Act::Copy, &f);
         }
+    }
 
-        let p = theme::palette(ctx);
-        let header = theme::header(ctx, self.kde_header.as_ref(), focused);
-        let shown = self.shown();
-
+    /// The query and the filters. With the app's title bar the window's
+    /// buttons go up in the corner, as in the settings window's bar, and the
+    /// filters keep the inset the buttons gave up (pinned by
+    /// `window::search::ui_tests::the_window_buttons_sit_in_the_top_right_corner`).
+    fn header(&mut self, root: &mut egui::Ui, p: &theme::Palette, header: theme::Header) {
         egui::Panel::top("search-header")
             .show_separator_line(false)
             .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
                 left: HEADER_INSET as i8,
-                // The window's buttons go up in the corner, as in the
-                // settings window's bar.
                 right: if self.app_title_bar {
                     vino_ui::window::BAR_GAP as i8
                 } else {
@@ -364,134 +404,112 @@ impl SearchWindow {
                 if self.app_title_bar {
                     vino_ui::window::drag(ui, ui.clip_rect(), "header");
                 }
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    vino_ui::logo::search(ui, 28.0);
-                    // The window's buttons take the row's right end.
-                    let buttons = if self.app_title_bar {
-                        vino_ui::window::controls_width() + 12.0
-                    } else {
-                        0.0
-                    };
-                    let width =
-                        (ui.available_width() - 24.0 - right_inset - buttons).clamp(120.0, 640.0);
-                    let field = widgets::search_field(
-                        ui,
-                        &mut self.query,
-                        "Describe what you're looking for",
-                        "Search",
-                        width,
-                    );
-                    if self.focus_query {
-                        self.focus_query = false;
-                        field.request_focus();
-                    }
-                    if field.changed() {
-                        self.typed_at = Some(ui.input(|i| i.time));
-                    }
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        if !self.query.trim().is_empty() {
-                            self.search();
-                        }
-                        // Enter again goes to the results, as Down does.
-                        field.request_focus();
-                    }
-                    if field.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowDown)) {
-                        self.focus_first = true;
-                    }
-                    if self.searching {
-                        widgets::spinner(ui);
-                    }
-                    if self.app_title_bar {
-                        // At the row's top, not centred on the taller field.
-                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(
-                                    vino_ui::window::controls_width(),
-                                    vino_ui::window::BUTTON,
-                                ),
-                                Layout::right_to_left(Align::Center),
-                                vino_ui::window::controls,
-                            );
-                        });
-                    }
-                });
+                ui.horizontal(|ui| self.query_row(ui, right_inset));
                 ui.add_space(4.0);
-                // The filters keep the inset the buttons gave up.
                 let width = ui.max_rect().right() - right_inset - ui.cursor().left();
                 ui.allocate_ui(egui::vec2(width, 0.0), |ui| self.filter_bar(ui));
             });
+    }
 
-        if let Some(f) = self.selected().cloned() {
-            egui::Panel::bottom("actions")
-                .show_separator_line(false)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(p.surface)
-                        .stroke(egui::Stroke::new(1.0_f32, p.rule))
-                        .inner_margin(egui::Margin::symmetric(20, 10)),
-                )
-                .show(root, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        tile(ui, &f, 20.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let named = |r| a11y::for_what(r, f.name());
-                            let open = if f.timed() {
-                                format!("Play at {}", f.place())
-                            } else if f.place().is_empty() {
-                                "Open".to_owned()
-                            } else {
-                                format!("Open at {}", f.place())
-                            };
-                            if named(ui.add(Button::primary(open)))
-                                .on_hover_text("Enter")
-                                .clicked()
-                            {
-                                self.act(Act::Open, &f);
-                            }
-                            if f.timed()
-                                && format_of(&f.path).is_none()
-                                && named(ui.add(Button::secondary("Open transcript"))).clicked()
-                            {
-                                self.act(Act::OpenTranscript, &f);
-                            }
-                            if named(ui.add(Button::secondary("Open folder"))).clicked() {
-                                self.act(Act::OpenFolder, &f);
-                            }
-                            if named(ui.add(Button::secondary("Copy file")))
-                                .on_hover_text("Ctrl+C")
-                                .clicked()
-                            {
-                                self.act(Act::Copy, &f);
-                            }
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(tilde(Path::new(&f.path)))
-                                            .monospace()
-                                            .color(p.muted),
-                                    )
-                                    .truncate(),
+    /// Enter searches and keeps the field focused, so Enter again goes to the
+    /// results, as Down does.
+    fn query_row(&mut self, ui: &mut egui::Ui, right_inset: f32) {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        vino_ui::logo::search(ui, 28.0);
+        let window_buttons = if self.app_title_bar {
+            vino_ui::window::controls_width() + 12.0
+        } else {
+            0.0
+        };
+        let width =
+            (ui.available_width() - 24.0 - right_inset - window_buttons).clamp(120.0, 640.0);
+        let field = widgets::search_field(
+            ui,
+            &mut self.query,
+            "Describe what you're looking for",
+            "Search",
+            width,
+        );
+        if self.focus_query {
+            self.focus_query = false;
+            field.request_focus();
+        }
+        if field.changed() {
+            self.typed_at = Some(ui.input(|i| i.time));
+        }
+        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            if !self.query.trim().is_empty() {
+                self.search();
+            }
+            field.request_focus();
+        }
+        if field.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+            self.focus_first = true;
+        }
+        if self.searching {
+            widgets::spinner(ui);
+        }
+        if self.app_title_bar {
+            window_buttons_at_the_top(ui);
+        }
+    }
+
+    /// The selected result's actions, along the bottom.
+    fn actions(&mut self, root: &mut egui::Ui, p: &theme::Palette, f: &Found) {
+        egui::Panel::bottom("actions")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.surface)
+                    .stroke(egui::Stroke::new(1.0_f32, p.rule))
+                    .inner_margin(egui::Margin::symmetric(20, 10)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    tile(ui, f, 20.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let named = |r| a11y::for_what(r, f.name());
+                        let open = if f.timed() {
+                            format!("Play at {}", f.place())
+                        } else if f.place().is_empty() {
+                            "Open".to_owned()
+                        } else {
+                            format!("Open at {}", f.place())
+                        };
+                        if named(ui.add(Button::primary(open)))
+                            .on_hover_text("Enter")
+                            .clicked()
+                        {
+                            self.act(Act::Open, f);
+                        }
+                        if f.timed()
+                            && format_of(&f.path).is_none()
+                            && named(ui.add(Button::secondary("Open transcript"))).clicked()
+                        {
+                            self.act(Act::OpenTranscript, f);
+                        }
+                        if named(ui.add(Button::secondary("Open folder"))).clicked() {
+                            self.act(Act::OpenFolder, f);
+                        }
+                        if named(ui.add(Button::secondary("Copy file")))
+                            .on_hover_text("Ctrl+C")
+                            .clicked()
+                        {
+                            self.act(Act::Copy, f);
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(tilde(Path::new(&f.path)))
+                                        .monospace()
+                                        .color(p.muted),
                                 )
-                                .on_hover_text(&f.path);
-                            });
+                                .truncate(),
+                            )
+                            .on_hover_text(&f.path);
                         });
                     });
-                });
-        }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin {
-                left: 20,
-                right: 0,
-                top: 4,
-                bottom: 0,
-            }))
-            .show(root, |ui| {
-                widgets::page_scroll(ui, "Results", f32::INFINITY, |ui| {
-                    self.notice_line(ui);
-                    self.results(ui, &shown);
                 });
             });
     }
@@ -518,7 +536,6 @@ impl SearchWindow {
         let wrap_at = ui.max_rect().right();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            // The kinds the settings count on their Index page.
             for (on, label, kind) in [
                 (&mut filters.images, "Images", Kind::Image),
                 (&mut filters.text, "Text", Kind::Text),
@@ -529,15 +546,7 @@ impl SearchWindow {
             ] {
                 widgets::toggle_chip(ui, on, label, Some(count(kind)));
             }
-            // The three menus stay together: on the chips' row behind a
-            // rule where they fit, else on a row of their own.
-            let menus = 3.0 * (MENU_ICON + MENU_WIDTH) + 2.0 * 8.0;
-            if wrap_at - ui.cursor().left() < 1.0 + 8.0 + menus {
-                ui.end_row();
-            } else {
-                let (rule, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), Sense::hover());
-                ui.painter().rect_filled(rule, 0.0, p.rule);
-            }
+            keep_the_menus_together(ui, p, wrap_at);
 
             let folder = filters
                 .folder
@@ -616,8 +625,7 @@ impl SearchWindow {
             shown.iter().filter(|f| kinds.contains(&f.kind)).collect()
         };
         let mut any = false;
-        // A video's thumbnail is its picture, so media is a grid as photos are.
-        for (title, kinds) in [("Images", [Kind::Image]), ("Media", [Kind::Media])] {
+        for (title, kinds) in GRIDS {
             let tiles = of(&kinds);
             if !tiles.is_empty() {
                 if std::mem::replace(&mut any, true) {
@@ -668,7 +676,6 @@ impl SearchWindow {
                 let size = texture.size_vec2();
                 let fit = (picture.size() / size).min_elem();
                 let at = egui::Rect::from_center_size(picture.center(), size * fit);
-                // Rounded by the ring over it; a photo narrower than the tile keeps its corners.
                 painter.image(
                     texture.id(),
                     at,
@@ -677,8 +684,6 @@ impl SearchWindow {
                 );
             }
             Thumb::Loading => {}
-            // The same tile the list draws, so a photo without a thumbnail
-            // still reads as a file of its format.
             Thumb::Failed => file_tile::paint(
                 painter,
                 egui::Rect::from_center_size(picture.center(), egui::vec2(GRID_TILE, GRID_TILE)),
@@ -786,18 +791,17 @@ impl SearchWindow {
             ui.painter()
                 .set(bg, egui::Shape::rect_filled(rect, TILE_RADIUS, p.field));
         }
-        // The labels inside are read as the row's name.
         a11y::decorative(ui, inner.response.id);
         response
     }
 
-    /// Focus and select `f`, which an arrow key moved to.
+    /// Focus and select `f`, which an arrow key moved to. egui's own
+    /// arrow-key move is dropped: it goes to the nearest widget, which in a
+    /// wrapped grid is often the wrong one.
     fn move_to(&mut self, ui: &egui::Ui, f: Option<&Found>) {
         if let Some(f) = f {
             ui.memory_mut(|m| {
                 m.request_focus(result_id(f));
-                // egui's own arrow-key move goes to the nearest widget, which
-                // in a wrapped grid is often the wrong one.
                 m.move_focus(egui::FocusDirection::None);
             });
             self.selected = Some(f.path.clone());
@@ -906,6 +910,8 @@ fn result_id(f: &Found) -> egui::Id {
 /// A filter's menu with an icon before it, named by `label` for a screen
 /// reader and kept on one line with its icon when the bar wraps, which it
 /// does at `wrap_at`: a wrapping row's own width grows with what overflows it.
+/// A group of its own doesn't wrap as a widget does, and the combo would
+/// shrink into whatever the row has left, so it goes on to the next row.
 fn menu(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -915,8 +921,6 @@ fn menu(
     items: impl FnOnce(&mut egui::Ui),
 ) {
     let p = theme::palette(ui.ctx());
-    // A group of its own doesn't wrap as a widget does, and the combo would
-    // shrink into whatever the row has left: so on to the next row.
     let left = ui.cursor().left();
     if left > ui.max_rect().left() && wrap_at - left < MENU_ICON + MENU_MIN {
         ui.end_row();
@@ -927,6 +931,30 @@ fn menu(
         let shown = widgets::combo(ui, label, selected, MENU_WIDTH).show_ui(ui, items);
         ui.ctx()
             .accesskit_node_builder(shown.response.id, |node| node.set_label(label));
+    });
+}
+
+/// The three filter menus stay together: on the chips' row behind a rule
+/// where they fit, else on a row of their own.
+fn keep_the_menus_together(ui: &mut egui::Ui, p: &theme::Palette, wrap_at: f32) {
+    const MENUS: f32 = 3.0 * (MENU_ICON + MENU_WIDTH) + 2.0 * 8.0;
+    if wrap_at - ui.cursor().left() < 1.0 + 8.0 + MENUS {
+        ui.end_row();
+    } else {
+        let (rule, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), Sense::hover());
+        ui.painter().rect_filled(rule, 0.0, p.rule);
+    }
+}
+
+/// At the row's top, not centred on the taller field (pinned by
+/// `window::search::ui_tests::the_window_buttons_sit_in_the_top_right_corner`).
+fn window_buttons_at_the_top(ui: &mut egui::Ui) {
+    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(vino_ui::window::controls_width(), vino_ui::window::BUTTON),
+            Layout::right_to_left(Align::Center),
+            vino_ui::window::controls,
+        );
     });
 }
 

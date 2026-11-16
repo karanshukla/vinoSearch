@@ -1,4 +1,4 @@
-//! `vinosearch eval` (#107): index a testbed into a throwaway index, run
+//! `vinosearch eval`: index a testbed into a throwaway index, run
 //! every query in a queries file through the search KRunner uses, and score
 //! where the expected files land.
 
@@ -85,6 +85,12 @@ pub struct Outcome {
     pub margin: Option<f32>,
 }
 
+/// A hair under a threshold still passes, so one written as the measured
+/// value does despite float rounding (pinned by
+/// `tests::a_metric_a_rounding_error_under_its_threshold_passes` and
+/// `tests::a_metric_measurably_under_its_threshold_fails`).
+const THRESHOLD_SLACK: f64 = 1e-9;
+
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Metrics {
     pub queries: usize,
@@ -113,7 +119,7 @@ impl Metrics {
         m
     }
 
-    /// The metrics below their threshold, by name.
+    /// The metrics below their threshold, by name, less THRESHOLD_SLACK.
     pub fn below(&self, t: &Thresholds) -> Vec<String> {
         [
             ("recall@1", self.recall_at_1, t.recall_at_1),
@@ -121,8 +127,7 @@ impl Metrics {
             ("MRR", self.mrr, t.mrr),
         ]
         .into_iter()
-        // A hair of slack, so a threshold written as the measured value passes.
-        .filter(|(_, got, min)| *got + 1e-9 < *min)
+        .filter(|(_, got, min)| *got + THRESHOLD_SLACK < *min)
         .map(|(name, got, min)| format!("{name} {got:.3} is below {min:.3}"))
         .collect()
     }
@@ -186,13 +191,27 @@ pub struct Options {
     pub testbed: PathBuf,
     pub images: bool,
     pub json: bool,
-    /// The index encrypted, with a key held in memory (#4).
+    /// The index encrypted, with a key held in memory.
     pub encrypted: bool,
     pub thresholds: Thresholds,
 }
 
 /// A directory removed when dropped, for the throwaway index.
 struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new directory under the temp directory. Made with create_dir, not
+    /// create_dir_all: an index already there is never reused.
+    fn new() -> Result<Scratch> {
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "vinosearch-eval-{}-{}",
+            std::process::id(),
+            worker::unix_now()
+        )));
+        fs::create_dir(&scratch.0).with_context(|| scratch.0.display().to_string())?;
+        Ok(scratch)
+    }
+}
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -210,13 +229,7 @@ pub fn run(
 ) -> Result<bool> {
     let root = fs::canonicalize(&opts.testbed)
         .with_context(|| format!("testbed {}", opts.testbed.display()))?;
-    let scratch = Scratch(std::env::temp_dir().join(format!(
-        "vinosearch-eval-{}-{}",
-        std::process::id(),
-        worker::unix_now()
-    )));
-    // create_dir, not create_dir_all: never reuse an index that's there.
-    fs::create_dir(&scratch.0).with_context(|| scratch.0.display().to_string())?;
+    let scratch = Scratch::new()?;
     let db = scratch.0.join("index.sqlite");
     if opts.encrypted {
         crate::index::encryption::hold_in_memory(&db)?;
@@ -426,6 +439,36 @@ mod tests {
             mrr: 0.1,
         };
         assert_eq!(m.below(&t), ["recall@5 0.500 is below 0.600"]);
+    }
+
+    /// Which metrics fall below a threshold of 0.3 on every metric.
+    fn below_three_tenths(got: f64) -> Vec<String> {
+        let m = Metrics {
+            queries: 1,
+            recall_at_1: got,
+            recall_at_5: got,
+            mrr: got,
+        };
+        let t = Thresholds {
+            recall_at_1: 0.3,
+            recall_at_5: 0.3,
+            mrr: 0.3,
+        };
+        m.below(&t)
+    }
+
+    #[test]
+    fn a_metric_a_rounding_error_under_its_threshold_passes() {
+        let got = 0.7 - 0.4;
+        assert!(
+            below_three_tenths(got).is_empty(),
+            "{got} is a rounding error under 0.3"
+        );
+    }
+
+    #[test]
+    fn a_metric_measurably_under_its_threshold_fails() {
+        assert_eq!(below_three_tenths(0.3 - 1e-6).len(), 3);
     }
 
     #[test]

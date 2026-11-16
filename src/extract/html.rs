@@ -16,25 +16,13 @@ pub(super) const HTML_INLINE: &[&str] = &[
 /// is the line it starts on in the file.
 pub fn html(text: &str) -> String {
     let mut out = String::with_capacity(text.len() / 2);
-    // Kept in place of skipped source: its newlines.
-    let newlines = |out: &mut String, skipped: &str| {
-        out.extend(std::iter::repeat_n('\n', skipped.matches('\n').count()));
-    };
-    // Lowercased once for finding closing tags: ASCII lowercasing keeps
-    // byte offsets, so it indexes like `text`.
     let lower = text.to_ascii_lowercase();
     let mut rest = text;
     while let Some(i) = rest.find(['<', '&']) {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
         if rest.starts_with('&') {
-            // Bounded, so a page of bare `&`s isn't a scan to the end each.
-            let decoded = rest[1..]
-                .bytes()
-                .take(33)
-                .position(|b| b == b';')
-                .and_then(|end| Some((char_ref(&rest[1..=end])?, end + 2)));
-            match decoded {
+            match decode_ref(rest) {
                 Some((s, len)) => {
                     out.push_str(&s);
                     rest = &rest[len..];
@@ -72,10 +60,7 @@ pub fn html(text: &str) -> String {
         let self_closing = rest[..end].ends_with("/>");
         rest = &rest[end..];
         if !closing && !self_closing && HTML_SKIP.contains(&name.as_str()) {
-            let close = format!("</{name}");
-            let body = lower[text.len() - rest.len()..]
-                .find(&close)
-                .unwrap_or(rest.len());
+            let body = closing_tag(&lower, rest, &name);
             newlines(&mut out, &rest[..body]);
             rest = &rest[body..];
             let end = tag_end(rest);
@@ -91,6 +76,35 @@ pub fn html(text: &str) -> String {
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Stands in for skipped source: its newlines, so the lines after keep their
+/// numbers.
+fn newlines(out: &mut String, skipped: &str) {
+    out.extend(std::iter::repeat_n('\n', skipped.matches('\n').count()));
+}
+
+/// The longest entity name or numeric reference looked for after a `&`.
+const LONGEST_REF: usize = 32;
+
+/// The `&...;` reference `rest` starts with, decoded, and its length. Looks
+/// no further than LONGEST_REF, so a page of bare `&`s isn't a scan to the
+/// end each (pinned by
+/// `extract::tests::a_megabyte_of_bare_ampersands_or_scripts_reads_in_linear_time`).
+fn decode_ref(rest: &str) -> Option<(String, usize)> {
+    rest[1..]
+        .bytes()
+        .take(LONGEST_REF + 1)
+        .position(|b| b == b';')
+        .and_then(|end| Some((char_ref(&rest[1..=end])?, end + 2)))
+}
+
+/// Where `</name` is in `rest`, a tail of the page `lower` is the ASCII
+/// lowercase of: that keeps byte offsets, so it indexes like the page.
+fn closing_tag(lower: &str, rest: &str, name: &str) -> usize {
+    lower[lower.len() - rest.len()..]
+        .find(&format!("</{name}"))
+        .unwrap_or(rest.len())
 }
 
 /// Where the tag `s` starts with ends, past its `>`. A `>` inside a quoted

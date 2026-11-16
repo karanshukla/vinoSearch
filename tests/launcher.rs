@@ -1,6 +1,5 @@
 //! The app menu entry belongs to the install, not to the GNOME search place:
-//! `integrate gnome --off` used to delete it, taking vinoSearch out of
-//! Plasma's menu too.
+//! `integrate gnome --off` leaves it, so vinoSearch stays in Plasma's menu.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,11 +20,11 @@ fn integrate(home: &Path, args: &[&str]) {
     );
 }
 
+/// A home where the service counts as installed, so `integrate` doesn't
+/// install it and restart the runner of the user running the tests.
 fn temp_home(name: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
-    // The service counts as installed, so `integrate` doesn't install it and
-    // restart the runner of the user running the tests.
     let service = home.join("data/dbus-1/services/dev.vinosearch.Runner.service");
     std::fs::create_dir_all(service.parent().unwrap()).unwrap();
     std::fs::write(&service, "").unwrap();

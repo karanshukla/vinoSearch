@@ -1,4 +1,4 @@
-//! Near-duplicate images collapsed into one result (#78): a burst, an edit,
+//! Near-duplicate images collapsed into one result: a burst, an edit,
 //! a resized or recompressed copy. Byte-identical files already share one
 //! result as `copies`; these come back as `similar` on the best-scoring one.
 //! Grouped at query time among the hits only, nothing stored, after Orchard
@@ -127,7 +127,8 @@ fn same_but_suffix(a: &str, b: &str) -> bool {
     stem(a) == stem(b)
 }
 
-/// A file stem less any trailing size or copy suffixes, lowercased.
+/// A file stem less any trailing size or copy suffixes, lowercased (pinned by
+/// `tests::copy_suffixes_come_off_the_name`).
 fn base(stem: &str) -> String {
     let mut s = stem.trim().to_lowercase();
     loop {
@@ -137,26 +138,11 @@ fn base(stem: &str) -> String {
                 s = rest.trim_end().to_owned();
             }
         }
-        // " (1)", "-1x" are left alone, only "(n)".
-        if s.ends_with(')')
-            && let Some(open) = s.rfind('(')
-            && s[open + 1..s.len() - 1].bytes().all(|c| c.is_ascii_digit())
-            && open + 2 < s.len()
-        {
-            s = s[..open].trim_end().to_owned();
+        if let Some(rest) = without_copy_number(&s) {
+            s = rest.to_owned();
         }
-        // -800x400, _1920x1080, -scaled
-        if let Some(i) = s.rfind(['-', '_']) {
-            let tail = &s[i + 1..];
-            let dims = tail.split_once('x').is_some_and(|(w, h)| {
-                !w.is_empty()
-                    && !h.is_empty()
-                    && w.bytes().all(|c| c.is_ascii_digit())
-                    && h.bytes().all(|c| c.is_ascii_digit())
-            });
-            if dims || tail == "scaled" {
-                s.truncate(i);
-            }
+        if let Some(rest) = without_size_suffix(&s) {
+            s = rest.to_owned();
         }
         if s.len() == before {
             return s;
@@ -164,11 +150,32 @@ fn base(stem: &str) -> String {
     }
 }
 
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// `s` less a trailing copy number, `(n)`, and the space before it.
+fn without_copy_number(s: &str) -> Option<&str> {
+    let inner = s.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    all_digits(&inner[open + 1..]).then(|| s[..open].trim_end())
+}
+
+/// `s` less a trailing size suffix: `-800x400`, `_1920x1080`, `-scaled`.
+fn without_size_suffix(s: &str) -> Option<&str> {
+    let i = s.rfind(['-', '_'])?;
+    let tail = &s[i + 1..];
+    let dims = tail
+        .split_once('x')
+        .is_some_and(|(w, h)| all_digits(w) && all_digits(h));
+    (dims || tail == "scaled").then(|| &s[..i])
+}
+
 /// An image's size and whether its EXIF names a camera, from its header
-/// alone.
+/// alone. Decoded under indexing's limits: the same files, in the same
+/// process.
 fn look(path: &Path) -> Option<Look> {
     let mut reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-    // As indexing decodes them: these are the same files, in the same process.
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(vinosearch_shared::limits::MAX_DECODED_BYTES);
     reader.limits(limits);
@@ -306,8 +313,6 @@ mod tests {
 
     #[test]
     fn a_slow_series_does_not_chain() {
-        // Each frame close to the last, the last far from the first: each
-        // is held to the first.
         let frames: Vec<Hit> = (0..8)
             .map(|i| {
                 let t = i as f32 * 0.12;
@@ -315,13 +320,15 @@ mod tests {
             })
             .collect();
         let got = photos(frames);
-        assert!(got.len() > 1, "{got:?}");
+        assert!(
+            got.len() > 1,
+            "each frame is close to the last, the last far from the first, and each \
+             is held to the first: {got:?}"
+        );
     }
 
     #[test]
     fn a_borderline_member_does_not_drag_its_own_scene_in() {
-        // A beach; another scene's photo just over the bar to it; that
-        // scene's other copy, close to the second and not to the beach.
         let got = photos(vec![
             image("/p/beach.jpg", 0.70, &[1.0, 0.0, 0.0]),
             image("/p/dunes.jpg", 0.69, &[1.0, 0.41, 0.0]), // 0.925 to the beach
@@ -332,7 +339,9 @@ mod tests {
             [
                 ("/p/beach.jpg".into(), vec!["/p/dunes.jpg".into()]),
                 ("/p/dunes (1).jpg".into(), vec![]),
-            ]
+            ],
+            "dunes.jpg is just over the bar to the beach; its other copy is close \
+             to it and not to the beach"
         );
     }
 
@@ -355,53 +364,48 @@ mod tests {
         );
     }
 
+    fn two_shots() -> Vec<Hit> {
+        vec![
+            image("/s/a.png", 0.7, &[1.0, 0.0]),
+            image("/s/b.png", 0.69, &[1.0, 0.01]),
+        ]
+    }
+
+    /// The results for `a.png` (1280x800) and `b.png` (`b_size`), with
+    /// pixels that differ by 0.5.
+    fn shots_with_b_sized(b_size: (u32, u32)) -> usize {
+        let look = move |p: &Path| {
+            Some(Look {
+                size: if p.ends_with("a.png") {
+                    (1280, 800)
+                } else {
+                    b_size
+                },
+                camera: false,
+            })
+        };
+        collapse_with(two_shots(), look, |_, _| Some(0.5)).len()
+    }
+
     #[test]
     fn screenshots_must_match_pixel_for_pixel() {
         let shot = Look {
             size: (1280, 800),
             camera: false,
         };
-        let hits = || {
-            vec![
-                image("/s/a.png", 0.7, &[1.0, 0.0]),
-                image("/s/b.png", 0.69, &[1.0, 0.01]),
-            ]
-        };
-        let n = |d: f32| collapse_with(hits(), |_| Some(shot), move |_, _| Some(d)).len();
+        let n = |d: f32| collapse_with(two_shots(), |_| Some(shot), move |_, _| Some(d)).len();
         assert_eq!(n(0.02), 2);
         assert_eq!(n(0.001), 1);
-        // Different shapes: not the same screen, the vectors decide.
-        let got = collapse_with(
-            hits(),
-            |p| {
-                Some(Look {
-                    size: if p.ends_with("a.png") {
-                        (1280, 800)
-                    } else {
-                        (800, 800)
-                    },
-                    camera: false,
-                })
-            },
-            |_, _| Some(0.5),
-        );
-        assert_eq!(got.len(), 1);
-        // Half the size: a resized copy, which the vectors decide.
-        let got = collapse_with(
-            hits(),
-            |p| {
-                Some(Look {
-                    size: if p.ends_with("a.png") {
-                        (1280, 800)
-                    } else {
-                        (640, 400)
-                    },
-                    camera: false,
-                })
-            },
-            |_, _| Some(0.5),
-        );
-        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn screenshots_of_different_shapes_are_left_to_the_vectors() {
+        assert_eq!(shots_with_b_sized((800, 800)), 1);
+    }
+
+    #[test]
+    fn a_screenshot_at_half_the_size_is_a_resized_copy_left_to_the_vectors() {
+        assert_eq!(shots_with_b_sized((640, 400)), 1);
     }
 
     /// Through real files: a brightened copy matches, a changed panel doesn't.
@@ -463,12 +467,11 @@ mod tests {
 
     #[test]
     fn exif_naming_a_camera() {
-        // Little-endian TIFF, one IFD entry: Make, ASCII.
-        let make = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x0f\x01\x02\0\x06\0\0\0\x1a\0\0\0";
-        assert!(names_camera(make));
-        // Only Orientation.
-        let orientation = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0";
-        assert!(!names_camera(orientation));
+        let little_endian_make_only =
+            b"Exif\0\0II*\0\x08\0\0\0\x01\0\x0f\x01\x02\0\x06\0\0\0\x1a\0\0\0";
+        assert!(names_camera(little_endian_make_only));
+        let orientation_only = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0";
+        assert!(!names_camera(orientation_only));
         assert!(!names_camera(b"Exif\0\0junk"));
         assert!(!names_camera(b"II*\0\xff\xff\0\0"));
     }

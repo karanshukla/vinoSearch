@@ -7,16 +7,17 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Checks the runtime and models, and says where the service's log is (not
+/// this command's: in the Flatpak it is under ~/.var/app).
 pub fn doctor(openvino_dir: Option<PathBuf>, s: &Settings) -> Result<bool> {
     let prefix = runtime::default_prefix(openvino_dir)?;
     let ok = runtime::doctor(&prefix, &s.device)?;
     print_parity(&s.device)?;
-    // The service's log, not this command's: in the Flatpak it is under ~/.var/app.
     println!("log:       {}", start::log_where()?);
     Ok(ok)
 }
 
-/// What the runner found when it last compiled each stage on `device` (#76).
+/// What the runner found when it last compiled each stage on `device`.
 fn print_parity(device: &str) -> Result<()> {
     if device == "CPU" {
         println!("parity:    CPU is the reference");

@@ -47,17 +47,7 @@ impl SettingsWindow {
             Some(Ok(s)) => Some(s),
             _ => None,
         };
-        // What a format holds now and its share of the index, so the switch
-        // says what it costs (#73).
-        let share = |files: i64, chunks: Option<i64>| -> Option<String> {
-            let s = s.filter(|_| files > 0)?;
-            let what = match chunks {
-                Some(_) => format!("{} files", count(files)),
-                None => format!("{} photos", count(files)),
-            };
-            let pct = chunks.unwrap_or(files) as f64 * 100.0 / s.chunks.max(1) as f64;
-            Some(format!("{what} · {pct:.0}%"))
-        };
+        let share = |files, chunks| share_of_index(s, files, chunks);
         widgets::group_label(ui, "What to index");
         widgets::group(ui, |ui| {
             Row::new("Text")
@@ -349,4 +339,16 @@ impl SettingsWindow {
         });
         changed
     }
+}
+
+/// What a format holds now and its share of the index, so its switch says what
+/// it costs. Images count files, as each is one chunk.
+fn share_of_index(s: Option<&Status>, files: i64, chunks: Option<i64>) -> Option<String> {
+    let s = s.filter(|_| files > 0)?;
+    let what = match chunks {
+        Some(_) => format!("{} files", count(files)),
+        None => format!("{} photos", count(files)),
+    };
+    let pct = chunks.unwrap_or(files) as f64 * 100.0 / s.chunks.max(1) as f64;
+    Some(format!("{what} · {pct:.0}%"))
 }

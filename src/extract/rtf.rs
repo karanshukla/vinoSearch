@@ -1,4 +1,4 @@
-//! RTF's text (#97): control words and the groups that hold no text (fonts,
+//! RTF's text: control words and the groups that hold no text (fonts,
 //! styles, pictures, field codes, ...) stripped, a line per paragraph.
 
 use crate::index::MAX_TEXT_BYTES;
@@ -132,6 +132,60 @@ impl Out {
     }
 }
 
+/// The document's codepage, `\ansicpg`, and those of the fonts that have one
+/// of their own, set in the font table for the font just named (pinned by
+/// `extract::tests::a_fonts_charset_sets_the_codepage_until_its_group_ends`).
+struct Codepages {
+    ansi: &'static Encoding,
+    fonts: HashMap<i64, &'static Encoding>,
+}
+
+impl Codepages {
+    fn encoding(&self, font: Option<i64>) -> &'static Encoding {
+        font.and_then(|f| self.fonts.get(&f).copied())
+            .unwrap_or(self.ansi)
+    }
+}
+
+/// A control word, `\wordN` and an optional space.
+struct ControlWord<'a> {
+    word: &'a str,
+    param: Option<i64>,
+    /// Where it ends, past its space.
+    end: usize,
+}
+
+/// The control word whose backslash is at `bytes[at]`: up to 32 letters, then
+/// up to 11 digits after an optional `-`.
+fn control_word(bytes: &[u8], at: usize) -> ControlWord<'_> {
+    let start = at + 1;
+    let mut end = start;
+    while end < bytes.len() && end - start < 32 && bytes[end].is_ascii_alphabetic() {
+        end += 1;
+    }
+    let word = std::str::from_utf8(&bytes[start..end]).unwrap_or_default();
+    let num_start = end;
+    if bytes.get(end) == Some(&b'-') {
+        end += 1;
+    }
+    while end < bytes.len() && end - num_start < 11 && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let param = std::str::from_utf8(&bytes[num_start..end])
+        .ok()
+        .and_then(|n| n.parse::<i64>().ok());
+    if bytes.get(end) == Some(&b' ') {
+        end += 1;
+    }
+    ControlWord { word, param, end }
+}
+
+/// `\uN`'s UTF-16 unit: N is a signed 16-bit value, Word writing U+8000 and up
+/// as negative (pinned by `extract::tests::rtf_keeps_the_text_and_drops_the_rest`).
+fn utf16_unit(param: i64) -> u16 {
+    param as u16
+}
+
 /// `bytes`' text, a line per paragraph.
 pub fn rtf(bytes: &[u8]) -> Result<String> {
     if !bytes.starts_with(b"{\\rtf") {
@@ -149,14 +203,11 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
         uc: 1,
         font: None,
     };
-    // The document's codepage, and the fonts' that have one of their own.
-    let mut ansi = WINDOWS_1252;
-    let mut fonts: HashMap<i64, &'static Encoding> = HashMap::new();
-    let encoding = |fonts: &HashMap<_, _>, ansi, font: Option<i64>| {
-        font.and_then(|f| fonts.get(&f).copied()).unwrap_or(ansi)
+    let mut pages = Codepages {
+        ansi: WINDOWS_1252,
+        fonts: HashMap::new(),
     };
-    // Fallback characters after a `\u` still to skip.
-    let mut fallback = 0u32;
+    let mut fallback_to_skip = 0u32;
     let mut group_start = false;
     let mut i = 0;
     while i < bytes.len() {
@@ -171,14 +222,14 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
                 }
                 stack.push(group);
                 group_start = true;
-                fallback = 0;
+                fallback_to_skip = 0;
                 i += 1;
             }
             b'}' => {
                 group = stack.pop().unwrap_or(group);
                 out.flush();
-                out.encoding = encoding(&fonts, ansi, group.font);
-                fallback = 0;
+                out.encoding = pages.encoding(group.font);
+                fallback_to_skip = 0;
                 i += 1;
             }
             b'\r' | b'\n' => i += 1,
@@ -198,8 +249,8 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
                         group.skip |= starting;
                         continue;
                     }
-                    if fallback > 0 {
-                        fallback -= 1;
+                    if fallback_to_skip > 0 {
+                        fallback_to_skip -= 1;
                         continue;
                     }
                     if group.skip {
@@ -219,34 +270,15 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
                     }
                     continue;
                 }
-                let start = i + 1;
-                let mut end = start;
-                while end < bytes.len() && end - start < 32 && bytes[end].is_ascii_alphabetic() {
-                    end += 1;
-                }
-                let word = std::str::from_utf8(&bytes[start..end]).unwrap_or_default();
-                let num_start = end;
-                if bytes.get(end) == Some(&b'-') {
-                    end += 1;
-                }
-                while end < bytes.len() && end - num_start < 11 && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-                let param = std::str::from_utf8(&bytes[num_start..end])
-                    .ok()
-                    .and_then(|n| n.parse::<i64>().ok());
-                if bytes.get(end) == Some(&b' ') {
-                    end += 1;
-                }
+                let ControlWord { word, param, end } = control_word(bytes, i);
                 i = end;
                 if word == "bin" {
-                    // Raw bytes, `param` of them.
-                    let n = usize::try_from(param.unwrap_or(0)).unwrap_or(0);
-                    i = i.saturating_add(n).min(bytes.len());
+                    let raw_bytes = usize::try_from(param.unwrap_or(0)).unwrap_or(0);
+                    i = i.saturating_add(raw_bytes).min(bytes.len());
                     continue;
                 }
-                if fallback > 0 {
-                    fallback -= 1;
+                if fallback_to_skip > 0 {
+                    fallback_to_skip -= 1;
                     continue;
                 }
                 if SKIP.contains(&word) {
@@ -254,19 +286,18 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
                 }
                 match word {
                     "ansicpg" => {
-                        ansi = param
+                        pages.ansi = param
                             .and_then(|p| u16::try_from(p).ok())
                             .and_then(codepage::to_encoding_no_replacement)
                             .unwrap_or(WINDOWS_1252);
                         out.flush();
-                        out.encoding = encoding(&fonts, ansi, group.font);
+                        out.encoding = pages.encoding(group.font);
                     }
                     "f" => {
                         group.font = param;
                         out.flush();
-                        out.encoding = encoding(&fonts, ansi, group.font);
+                        out.encoding = pages.encoding(group.font);
                     }
-                    // In the font table, for the font just named.
                     "fcharset" | "cpg" => {
                         let page = match word {
                             "cpg" => param.and_then(|p| u16::try_from(p).ok()),
@@ -276,15 +307,14 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
                             group.font,
                             page.and_then(codepage::to_encoding_no_replacement),
                         ) {
-                            fonts.insert(font, e);
+                            pages.fonts.insert(font, e);
                         }
                     }
                     "uc" => group.uc = param.and_then(|p| u32::try_from(p).ok()).unwrap_or(1),
                     _ if group.skip => {}
                     "u" => {
-                        // A signed 16-bit value: Word writes U+8000 and up as negative.
-                        out.unit(param.unwrap_or(0) as u16);
-                        fallback = group.uc;
+                        out.unit(utf16_unit(param.unwrap_or(0)));
+                        fallback_to_skip = group.uc;
                     }
                     "par" | "line" | "row" | "sect" | "page" => out.push("\n"),
                     "tab" | "cell" => out.push("\t"),
@@ -301,8 +331,8 @@ pub fn rtf(bytes: &[u8]) -> Result<String> {
             }
             b => {
                 i += 1;
-                if fallback > 0 {
-                    fallback -= 1;
+                if fallback_to_skip > 0 {
+                    fallback_to_skip -= 1;
                 } else if !group.skip {
                     out.bytes.push(b);
                 }

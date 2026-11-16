@@ -215,7 +215,6 @@ mod tests {
              MimeType=application/x-code-workspace;\n\n\
              [Desktop Action new-empty-window]\nName=New Empty Window\n",
         );
-        // The user's copy hides the system's.
         write(
             &user,
             "code.desktop",
@@ -223,7 +222,11 @@ mod tests {
         );
         let apps = editors_in(&[user, system]);
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["Code (mine)", "Kate", "Visual Studio Code"]);
+        assert_eq!(
+            names,
+            ["Code (mine)", "Kate", "Visual Studio Code"],
+            "the user's code.desktop hides the system's"
+        );
         assert_eq!(apps[1].id, "org.kde.kate.desktop");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -249,7 +252,6 @@ mod tests {
             "Name=Elisa\nMimeType=audio/flac;\n",
         );
         write("org.kde.kate.desktop", "Name=Kate\nMimeType=text/plain;\n");
-        // A streaming client plays nothing from disk.
         write(
             "stream.desktop",
             "Name=Stream\nCategories=AudioVideo;Player;\n",
@@ -260,7 +262,11 @@ mod tests {
         );
         let apps = players_in(std::slice::from_ref(&root));
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["Elisa", "mpv Media Player"]);
+        assert_eq!(
+            names,
+            ["Elisa", "mpv Media Player"],
+            "a streaming client with no MimeType plays nothing from disk"
+        );
         assert_eq!(apps[1].id, "mpv.desktop");
         fs::remove_dir_all(&root).unwrap();
     }
