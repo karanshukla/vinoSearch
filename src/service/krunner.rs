@@ -18,6 +18,7 @@ use crate::service::watch;
 use crate::service::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
 use futures_channel::oneshot;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -331,16 +332,16 @@ pub(crate) fn relevance(h: &Hit, floors: Floors) -> f64 {
 /// `path` as a file:// URL, percent-encoded so `#`, `%`, `?` and spaces
 /// survive (RFC 8089; `/` stays as the separator).
 fn file_url(path: &str) -> String {
-    let mut url = String::from("file://");
-    for &b in path.as_bytes() {
-        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
-            url.push(b as char);
-        } else {
-            url.push_str(&format!("%{b:02X}"));
-        }
-    }
-    url
+    format!("file://{}", utf8_percent_encode(path, FILE_URL_ESCAPED))
 }
+
+/// Everything but RFC 3986's unreserved characters and the `/` separator.
+const FILE_URL_ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// Whether `id` is an indexed file. Ids come from callers on the session
 /// bus, so anything this runner could not have returned is refused.
