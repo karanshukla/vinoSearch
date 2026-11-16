@@ -30,6 +30,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -498,45 +499,17 @@ pub fn index_file<E: Embed>(
     if unchanged && known.as_ref().is_some_and(|k| k.sha256.is_some()) {
         return Ok(Outcome::Unchanged);
     }
-    // Media is probed before it is hashed, so a film over the longest
-    // indexed is never read whole: it keeps a row with no hash, and that
-    // row stands while the file and the limit do.
-    let probed = match (kind, &known) {
-        (Kind::Media, Some(k))
-            if unchanged && media::left_out(conn, k.id, types.max_media_seconds)? =>
-        {
-            return Ok(Outcome::Unchanged);
+    let probed = if kind == Kind::Media {
+        match probe_media(conn, path, &seen, known.as_ref(), types.max_media_seconds)? {
+            ControlFlow::Break(outcome) => return Ok(outcome),
+            ControlFlow::Continue(probed) => probed,
         }
-        (Kind::Media, _) => match media::probe(path, types.max_media_seconds) {
-            media::Probed::TooLong(seconds) => {
-                media::leave_out(conn, (key, seen.mtime, seen.size), seconds)?;
-                return Ok(Outcome::Unreadable { no_decoder: false });
-            }
-            media::Probed::Ok(p) => Some(p),
-            media::Probed::Unreadable => None,
-        },
-        _ => None,
+    } else {
+        None
     };
-    let read = match kind {
-        Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
-        Kind::Image | Kind::Document | Kind::Session => fs::read(path),
-        // Hashed as it streams instead.
-        Kind::Media => Ok(Vec::new()),
-    };
-    let Ok(bytes) = read else {
+    let Some(Content { bytes, hash }) = read_and_hash(conn, emb, path, kind, between)? else {
         remove(conn, path)?;
         return Ok(Outcome::Skipped);
-    };
-    let hash = match kind {
-        // An error is `between`'s: a stop, which leaves the file as it was.
-        Kind::Media => match media::hash(path, &mut || between(conn, emb))? {
-            Some(h) => h,
-            None => {
-                remove(conn, path)?;
-                return Ok(Outcome::Skipped);
-            }
-        },
-        _ => Sha256::digest(&bytes).to_vec(),
     };
     let holder = holder_of(conn, &hash, key)?;
     if let Some(known) = known
@@ -745,6 +718,66 @@ fn settle_known(
         return Ok(Some(Outcome::Duplicate));
     }
     Ok(Some(Outcome::Unchanged))
+}
+
+/// Media is probed before it is hashed, so a film over the longest indexed is
+/// never read whole: it keeps a row with no hash, and that row stands while
+/// the file and the limit do.
+fn probe_media(
+    conn: &mut Connection,
+    path: &Path,
+    seen: &Seen,
+    known: Option<&Known>,
+    max_seconds: f64,
+) -> Result<ControlFlow<Outcome, Option<crate::extract::media::Probe>>> {
+    if let Some(known) = known
+        && known.is_stamped(seen)
+        && media::left_out(conn, known.id, max_seconds)?
+    {
+        return Ok(ControlFlow::Break(Outcome::Unchanged));
+    }
+    Ok(match media::probe(path, max_seconds) {
+        media::Probed::TooLong(seconds) => {
+            media::leave_out(conn, (seen.key, seen.mtime, seen.size), seconds)?;
+            ControlFlow::Break(Outcome::Unreadable { no_decoder: false })
+        }
+        media::Probed::Ok(p) => ControlFlow::Continue(Some(p)),
+        media::Probed::Unreadable => ControlFlow::Continue(None),
+    })
+}
+
+/// What a file held when it was read, and its sha256.
+struct Content {
+    bytes: Vec<u8>,
+    hash: Vec<u8>,
+}
+
+/// None if the file can't be read now. Media is hashed as it streams, and
+/// its bytes are left empty.
+fn read_and_hash<E: Embed>(
+    conn: &Connection,
+    emb: &mut E,
+    path: &Path,
+    kind: Kind,
+    between: &mut dyn FnMut(&Connection, &mut E) -> Result<()>,
+) -> Result<Option<Content>> {
+    let read = match kind {
+        Kind::Text | Kind::Code => fs::read_to_string(path).map(String::into_bytes),
+        Kind::Image | Kind::Document | Kind::Session => fs::read(path),
+        Kind::Media => Ok(Vec::new()),
+    };
+    let Ok(bytes) = read else {
+        return Ok(None);
+    };
+    let hash = match kind {
+        // An error is `between`'s: a stop, which leaves the file as it was.
+        Kind::Media => match media::hash(path, &mut || between(conn, emb))? {
+            Some(h) => h,
+            None => return Ok(None),
+        },
+        _ => Sha256::digest(&bytes).to_vec(),
+    };
+    Ok(Some(Content { bytes, hash }))
 }
 
 fn insert_chunks(
