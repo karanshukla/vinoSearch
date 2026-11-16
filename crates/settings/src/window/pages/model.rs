@@ -1,6 +1,10 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    Button, ChipKind, Column, Confirm, DEFAULT_DEVICE, DEFAULT_IDLE_UNLOAD_MINUTES,
+    DEFAULT_INDEX_BUSY_PERCENT, DEVICES, Icon, NOT_INSTALLED, Request, Row, SettingsWindow, Status,
+    Tone, fetch_progress, models, size, slider, theme, widgets,
+};
 
 impl SettingsWindow {
     /// The models on disk while the search service isn't installed: nothing has them loaded

@@ -1,6 +1,11 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    AppPicker, Button, ChipKind, Column, DEFAULT_CODE_MIN_SCORE, DEFAULT_IMAGE_EXTENSIONS,
+    DEFAULT_IMAGE_MIN_SCORE, DEFAULT_MEDIA_MIN_SCORE, DEFAULT_TEXT_MIN_SCORE, Icon, Request, Row,
+    SettingsWindow, Status, Tone, a11y, app_picker, apps, count, fetch_progress, icons, score_row,
+    theme, widgets,
+};
 
 impl SettingsWindow {
     /// What gets indexed, and how close a result must be to show.

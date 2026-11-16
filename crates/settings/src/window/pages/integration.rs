@@ -1,6 +1,8 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    Arc, Button, ChipKind, Column, RichText, Row, SettingsWindow, a11y, integration, widgets,
+};
 
 impl SettingsWindow {
     pub(in crate::window) fn integration(&mut self, ui: &mut egui::Ui) {

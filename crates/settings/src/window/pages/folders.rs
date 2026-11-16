@@ -1,6 +1,9 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    Button, Column, Confirm, Icon, Path, Request, Row, SettingsWindow, Status, Target, Tone, a11y,
+    path_label, theme, tilde, widgets,
+};
 
 impl SettingsWindow {
     /// What is indexed and what never is.

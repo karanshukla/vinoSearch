@@ -1,6 +1,9 @@
 use eframe::egui;
 
-use crate::window::*;
+use crate::window::{
+    Button, ChipKind, Confirm, Icon, Request, Row, SettingsWindow, Status, Tone, a11y, seal, theme,
+    widgets,
+};
 
 impl SettingsWindow {
     /// Encrypting the index at rest (#4): the switch, what the key is sealed with, and a new
