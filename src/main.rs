@@ -1,3 +1,4 @@
+mod cli;
 mod eval;
 mod extract;
 mod index;
@@ -6,14 +7,14 @@ mod proc;
 mod search;
 mod service;
 
-use index::{encryption, estimate};
-use ml::{embed, model, ocr, parity, runtime, vision};
+use cli::service::KrunnerMode;
+use ml::{embed, model, runtime};
 use search::menu;
-use service::{krunner, power, watch, worker};
+use service::{krunner, worker};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 use vinosearch_shared::config;
@@ -178,12 +179,7 @@ enum Command {
 
 /// OpenVINO's compiled-model cache.
 pub(crate) fn cache_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("no HOME"))?)
-            .join(".cache"),
-    };
-    Ok(base.join("vinosearch/ov-cache"))
+    Ok(vinosearch_shared::xdg::cache_home()?.join("vinosearch/ov-cache"))
 }
 
 pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<embed::Embedder> {
@@ -211,37 +207,6 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
         t0.elapsed().as_secs_f64()
     );
     Ok(emb)
-}
-
-/// What the runner found when it last compiled each stage on `device` (#76).
-fn print_parity(device: &str) -> Result<()> {
-    if device == "CPU" {
-        println!("parity:    CPU is the reference");
-        return Ok(());
-    }
-    let min = parity::MIN_COSINE;
-    let checks = embed::parity(&cache_dir()?, device);
-    if checks.iter().all(|(_, cosine)| cosine.is_none()) {
-        println!("parity:    not checked yet; each stage is the next time it loads on {device}");
-        return Ok(());
-    }
-    let found: Vec<String> = checks
-        .iter()
-        .map(|(stage, cosine)| match cosine {
-            Some(c) => format!("{stage} {c:.5}"),
-            None => format!("{stage} not checked yet"),
-        })
-        .collect();
-    println!(
-        "parity:    {} against the CPU (min {min})",
-        found.join(", ")
-    );
-    for (stage, cosine) in &checks {
-        if let Some(c) = cosine.filter(|c| *c < min) {
-            println!("warning:   the {stage} stage gave {c:.4} on {device}, so it runs on CPU");
-        }
-    }
-    Ok(())
 }
 
 /// Flags over the config file over defaults.
@@ -316,9 +281,9 @@ fn loads_model(command: &Command) -> bool {
     }
 }
 
-fn worker_options(cli: &Cli, s: Settings) -> Result<worker::Options> {
+fn worker_options(openvino_dir: Option<PathBuf>, s: Settings) -> Result<worker::Options> {
     Ok(worker::Options {
-        openvino_dir: cli.openvino_dir.clone(),
+        openvino_dir,
         status: std::sync::Arc::new(worker::Status::new(&s.device)),
         device: s.device,
         default_device: s.default_device,
@@ -340,325 +305,60 @@ pub(crate) fn snippet(text: &str) -> String {
     }
 }
 
-/// Subfolders `estimate` names as taking longest.
-const BIGGEST_FOLDERS: usize = 5;
-
-/// What indexing each of `paths` would cost, leaving out files the index
-/// already has unchanged.
-fn estimates(paths: &[PathBuf], s: &Settings) -> Result<Vec<estimate::Estimate>> {
-    let db = index::default_db()?;
-    // Read-only, and not created just to look: an estimate must not write
-    // to the index or leave an empty one behind.
-    let conn = if db.exists() {
-        Some(encryption::open_read_only(&db)?)
-    } else {
-        None
-    };
-    paths
-        .iter()
-        .map(|p| {
-            let root = index::resolve_root(p, &s.excludes)?;
-            let known = match &conn {
-                Some(c) => index::stamps_under(c, &root)?,
-                None => Default::default(),
-            };
-            estimate::estimate(&root, &s.excludes, &s.types, &known, BIGGEST_FOLDERS)
-        })
-        .collect()
-}
-
-fn print_rates_note(device: &str) {
-    if let Some(note) = estimate::rates_note(device) {
-        eprintln!("{note}");
-    }
-}
-
-/// Say what indexing `paths` will cost and, at a terminal and without
-/// `yes`, ask. False if the answer was no.
-fn confirm_index(paths: &[PathBuf], s: &Settings, yes: bool) -> Result<bool> {
-    use std::io::{BufRead, IsTerminal, Write};
-    let ests = estimates(paths, s)?;
-    let ask = !yes && std::io::stdin().is_terminal();
-    let mut total = estimate::Estimate::default();
-    for est in &ests {
-        for (t, add) in total.kinds.iter_mut().zip(&est.kinds) {
-            t.files += add.files;
-            t.bytes += add.bytes;
-            t.chunks += add.chunks;
+/// Commands that must work whatever the config file says, so they run
+/// before it is read: every document's parser child, and the update that
+/// is how a broken release gets fixed.
+fn run_without_settings(command: &Command) -> Option<Result<bool>> {
+    match command {
+        Command::Extract { path, from, count } => {
+            Some(extract::child_main(path, *from, *count).map(|()| true))
         }
-        total.up_to_date += est.up_to_date;
-    }
-    if ask && total.secs() >= 60.0 {
-        for est in &ests {
-            if !est.folders.is_empty() {
-                eprintln!("Longest to index under {}:", est.root.display());
-            }
-            for (dir, secs, files) in &est.folders {
-                eprintln!(
-                    "  {}  {}",
-                    dir.display(),
-                    estimate::folder_summary(*secs, *files)
-                );
-            }
+        Command::FlatpakExports { share, app_id } => {
+            Some(service::flatpak::export(share, app_id).map(|()| true))
         }
-        eprintln!(
-            "Leave one out with `exclude` in config.toml or the settings window's Folders page."
-        );
-        print_rates_note(&s.device);
+        Command::FlatpakUpdate { tag } => Some(service::flatpak_update::run(tag.clone())),
+        _ => None,
     }
-    let line = match ests.as_slice() {
-        [one] => format!("{}: {}", one.root.display(), one.summary()),
-        _ => {
-            for est in &ests {
-                eprintln!("{}: {}", est.root.display(), est.summary());
-            }
-            format!("All together: {}", total.summary())
-        }
-    };
-    if !ask || total.files() == 0 {
-        eprintln!("{line}");
-        return Ok(true);
-    }
-    eprint!("{line}. Continue? [Y/n] ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
-        eprintln!();
-        return Ok(false);
-    }
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "" | "y" | "yes"
-    ))
 }
 
 fn run(cli: Cli) -> Result<bool> {
-    // Before the settings: a broken config file must not stop every document.
-    if let Command::Extract { path, from, count } = &cli.command {
-        extract::child_main(path, *from, *count)?;
-        return Ok(true);
-    }
-    if let Command::FlatpakExports { share, app_id } = &cli.command {
-        service::flatpak::export(share, app_id)?;
-        return Ok(true);
-    }
-    // Nor an update: it is how a broken release gets fixed.
-    if let Command::FlatpakUpdate { tag } = &cli.command {
-        return service::flatpak_update::run(tag.clone());
+    if let Some(done) = run_without_settings(&cli.command) {
+        return done;
     }
     let s = settings(&cli)?;
-    match cli.command {
-        Command::Doctor => {
-            let prefix = runtime::default_prefix(cli.openvino_dir)?;
-            let ok = runtime::doctor(&prefix, &s.device)?;
-            print_parity(&s.device)?;
-            // The service's, not this command's: in the Flatpak it is under
-            // ~/.var/app.
-            println!("log:       {}", service::start::log_where()?);
-            Ok(ok)
-        }
-        Command::FetchModel => {
-            let mut last = String::new();
-            let mut shown = 0;
-            model::fetch(
-                model::Wants::of(&s.file.formats),
-                &mut |name, done, total| {
-                    // A line per file, then a percentage every 10%.
-                    let pct = done * 100 / total.max(1);
-                    if name != last || pct >= shown + 10 {
-                        eprintln!("{pct:3}%  {name}");
-                        last = name.to_owned();
-                        shown = pct - pct % 10;
-                    }
-                },
-            )?;
-            eprintln!("model ready: {}", model::default_dir()?.display());
-            Ok(true)
-        }
-        Command::DeleteModel => {
-            let bytes = model::bytes()?;
-            let dir = model::default_dir()?;
-            let dir = dir.parent().unwrap_or(&dir);
-            if krunner::delete_models()? {
-                eprintln!(
-                    "asked the running service to delete {} MB of models in {}",
-                    bytes / 1_000_000,
-                    dir.display()
-                );
-            } else {
-                eprintln!(
-                    "deleted {} MB of models in {}",
-                    bytes / 1_000_000,
-                    dir.display()
-                );
-            }
-            Ok(true)
-        }
-        Command::Index { paths, yes } => {
-            if paths.is_empty() {
-                bail!("give at least one path to index");
-            }
-            if !confirm_index(&paths, &s, yes)? {
-                eprintln!(
-                    "Nothing indexed. Add folders later with vinosearch index DIR or the settings window."
-                );
-                return Ok(true);
-            }
-            let mut emb = embedder(cli.openvino_dir.clone(), &s.device)?;
-            let db = index::default_db()?;
-            // As the config file asks before anything is written (#4); held
-            // meanwhile, so the runner doesn't convert it underneath.
-            let enc = encryption::apply(
-                &db,
-                encryption::Want::of(&s.file),
-                false,
-                &index::seal::Sealer::default(),
-            );
-            for msg in [&enc.broken, &enc.error] {
-                if !msg.is_empty() {
-                    eprintln!("encryption: {msg}");
-                }
-            }
-            encryption::hold_shared(&db)?;
-            let mut conn = index::open(&db)?;
-            if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
-                eprintln!("{why}");
-            }
-            index::retry_undecodable(&conn)?;
-            index::reread_formats(&conn)?;
-            for p in &paths {
-                let t0 = Instant::now();
-                let mut shown = 0;
-                let st = index::index(
-                    &mut conn,
-                    &mut emb,
-                    Path::new(p),
-                    &s.excludes,
-                    &s.types,
-                    &mut |st, _, _| {
-                        if st.files_embedded != shown {
-                            shown = st.files_embedded;
-                            eprint!(
-                                "\r{} files, {} chunks, {:.1} chunks/s   ",
-                                st.files_embedded,
-                                st.chunks,
-                                st.chunks as f64 / t0.elapsed().as_secs_f64()
-                            );
-                        }
-                        Ok(())
-                    },
-                )?;
-                if st.files_embedded > 0 {
-                    eprintln!();
-                }
-                println!(
-                    "{}: {} files seen, {} embedded ({} chunks), {} duplicates, {} removed",
-                    p.display(),
-                    st.files_seen,
-                    st.files_embedded,
-                    st.chunks,
-                    st.duplicates,
-                    st.removed
-                );
-                if st.no_decoder > 0 {
-                    eprintln!(
-                        "{} photos skipped: HEIC and AVIF need heif-convert installed ({})",
-                        st.no_decoder,
-                        config::HEIF_CONVERT_PACKAGES
-                    );
-                }
-            }
-            encryption::save_roots(&db, &conn)?;
-            // Then the rest of long documents (#108), which the service
-            // leaves until nothing else is waiting.
-            let t0 = Instant::now();
-            let mut chunks = 0;
-            while let Some(rest) =
-                index::index_rest(&mut conn, &mut emb, &s.types, &mut |_, _| Ok(()))?
-            {
-                if let index::Rest::Parts {
-                    path,
-                    done,
-                    total,
-                    chunks: n,
-                } = rest
-                {
-                    chunks += n;
-                    eprint!(
-                        "\r{path}: {done} of {total} parts, {:.1} chunks/s   ",
-                        chunks as f64 / t0.elapsed().as_secs_f64()
-                    );
-                    if done >= total {
-                        eprintln!();
-                    }
-                }
-            }
-            Ok(true)
-        }
-        Command::Estimate { paths, json } => {
-            if paths.is_empty() {
-                bail!("give at least one path to estimate");
-            }
-            for est in estimates(&paths, &s)? {
-                if json {
-                    println!("{}", est.to_json(&s.device));
-                    continue;
-                }
-                println!("{}: {}", est.root.display(), est.summary());
-                for (dir, secs, files) in &est.folders {
-                    println!(
-                        "  {}  {}",
-                        dir.display(),
-                        estimate::folder_summary(*secs, *files)
-                    );
-                }
-            }
-            if !json {
-                print_rates_note(&s.device);
-            }
-            Ok(true)
-        }
+    let Cli {
+        openvino_dir,
+        device,
+        idle_unload_minutes,
+        command,
+        ..
+    } = cli;
+    match command {
+        Command::Doctor => cli::models::doctor(openvino_dir, &s),
+        Command::FetchModel => cli::models::fetch(&s),
+        Command::DeleteModel => cli::models::delete(),
+        Command::Index { paths, yes } => cli::index::index(&paths, yes, openvino_dir, &s),
+        Command::Estimate { paths, json } => cli::index::estimate(&paths, json, &s),
         Command::Krunner {
             install,
             uninstall,
             worker,
-        } => {
-            if install {
+        } => match KrunnerMode::of(install, uninstall, worker) {
+            KrunnerMode::Install => {
                 krunner::install(
-                    cli.openvino_dir.as_deref(),
-                    cli.device.as_deref(),
-                    cli.idle_unload_minutes,
+                    openvino_dir.as_deref(),
+                    device.as_deref(),
+                    idle_unload_minutes,
                 )?;
-            } else if uninstall {
-                krunner::uninstall()?;
-            } else if worker {
-                let served = krunner::serve(worker_options(&cli, s)?);
-                // The worker's thread is still running, in OpenVINO as likely
-                // as not: returning would run the process's destructors under
-                // it, which segfaults, and a runner asked to quit that dies
-                // of a signal is started again. Left as a kill leaves it,
-                // which the index (WAL) is written for.
-                let code = match served {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        eprintln!("error: {e:#}");
-                        if e.downcast_ref::<krunner::NotStarted>().is_some() {
-                            i32::from(service::start::NOT_STARTED)
-                        } else {
-                            1
-                        }
-                    }
-                };
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
-                let _ = std::io::stdout().flush();
-                // SAFETY: _exit takes no pointers and doesn't return.
-                unsafe { libc::_exit(code) }
-            } else {
-                return krunner::supervise();
+                Ok(true)
             }
-            Ok(true)
-        }
+            KrunnerMode::Uninstall => {
+                krunner::uninstall()?;
+                Ok(true)
+            }
+            KrunnerMode::Worker => cli::service::serve_and_exit(worker_options(openvino_dir, s)?),
+            KrunnerMode::Supervise => krunner::supervise(),
+        },
         Command::Integrate { place, off } => {
             krunner::integrate(place, !off)?;
             Ok(true)
@@ -671,86 +371,8 @@ fn run(cli: Cli) -> Result<bool> {
             )?;
             Ok(true)
         }
-        Command::Watch => {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let opts = worker_options(&cli, s)?;
-            worker::prepare(&opts.status, &opts.file)?;
-            power::spawn(tx.clone(), opts.status.clone());
-            let _watcher = watch::spawn(
-                tx,
-                opts.config.clone(),
-                opts.file.clone(),
-                opts.status.clone(),
-            )?;
-            worker::run(rx, opts)?;
-            Ok(true)
-        }
-        Command::Search { query, n } => {
-            let mut emb = embedder(cli.openvino_dir, &s.device)?;
-            let conn = index::open(&index::default_db()?)?;
-            index::purge(&conn, &s.excludes)?;
-            index::purge_types(&conn, &s.types)?;
-            index::purge_other_models(&conn)?;
-            let t0 = Instant::now();
-            let (text, kinds) = index::scope(&query);
-            let q = emb.query_for(text, kinds)?;
-            let t1 = Instant::now();
-            let vectors = index::Vectors::load(&conn)?;
-            let words = index::Words::find(&conn, text);
-            let mut hits = Vec::new();
-            for kind in kinds {
-                hits.extend(index::search(
-                    &conn,
-                    &vectors,
-                    &q,
-                    words.as_ref(),
-                    *kind,
-                    n,
-                )?);
-            }
-            eprintln!(
-                "query {:.1} ms, search {:.1} ms",
-                (t1 - t0).as_secs_f64() * 1e3,
-                t1.elapsed().as_secs_f64() * 1e3
-            );
-            for h in hits {
-                if h.kind == index::Kind::Image {
-                    println!("{:.3}  {}  (image)", h.score, h.path);
-                    continue;
-                }
-                let at = match h.kind {
-                    index::Kind::Document if !extract::is_document(Path::new(&h.path)) => {
-                        " (text in the image)".to_owned()
-                    }
-                    index::Kind::Document => {
-                        format!(", {} {}", extract::unit(Path::new(&h.path)), h.line)
-                    }
-                    index::Kind::Session => match extract::session::Part::of(h.line) {
-                        (extract::session::Part::Transcript, l) => format!(", transcript:{l}"),
-                        (extract::session::Part::Summary, l) => format!(", summary:{l}"),
-                    },
-                    index::Kind::Media => match extract::media::Track::of(h.line) {
-                        (extract::media::Track::Sound, s) => {
-                            format!(", heard at {}", extract::media::stamp(s))
-                        }
-                        (extract::media::Track::Picture, s) => {
-                            format!(", seen at {}", extract::media::stamp(s))
-                        }
-                    },
-                    _ => format!(":{}", h.line),
-                };
-                println!(
-                    "{:.3}  {}{at}\n       {}",
-                    h.score,
-                    h.path,
-                    snippet(&h.text)
-                );
-                if !h.copies.is_empty() {
-                    println!("       same as: {}", h.copies.join(", "));
-                }
-            }
-            Ok(true)
-        }
+        Command::Watch => cli::service::watch(worker_options(openvino_dir, s)?),
+        Command::Search { query, n } => cli::search::search(&query, n, openvino_dir, &s),
         Command::Eval {
             testbed,
             queries,
@@ -777,90 +399,15 @@ fn run(cli: Cli) -> Result<bool> {
                     mrr: min_mrr.unwrap_or(t.mrr),
                 },
             };
-            let emb = embedder(cli.openvino_dir, &s.device)?;
+            let emb = embedder(openvino_dir, &s.device)?;
             eval::run(&opts, &q, &s.device, emb)
         }
-        Command::ReadText { path } => {
-            let prefix = runtime::default_prefix(cli.openvino_dir)?;
-            runtime::load(&prefix)?;
-            let mut core = openvino::Core::new()?;
-            let t0 = Instant::now();
-            let mut ocr = ocr::Ocr::new(&mut core, &model::ocr_dir()?, &s.device, &cache_dir()?)?;
-            eprintln!(
-                "ocr ready on {} in {:.1} s",
-                ocr.device,
-                t0.elapsed().as_secs_f64()
-            );
-            let bytes = std::fs::read(&path)?;
-            let deadline = Instant::now() + ocr::SCAN_WALL;
-            let pages = if extract::is_document(&path) {
-                ocr::pdf_pages(&bytes, deadline)?.min(ocr::MAX_SCAN_PAGES)
-            } else {
-                1
-            };
-            for page in 1..=pages {
-                let img = if extract::is_document(&path) {
-                    ocr::render_page(&bytes, page, deadline)?
-                } else {
-                    vision::load(&bytes)?
-                };
-                let t = Instant::now();
-                let lines = ocr.read(&img, 1.0)?;
-                eprintln!(
-                    "{}x{}: {} lines in {:.0} ms",
-                    img.width(),
-                    img.height(),
-                    lines.len(),
-                    t.elapsed().as_secs_f64() * 1e3
-                );
-                if pages > 1 {
-                    println!("--- page {page}");
-                }
-                for l in lines {
-                    println!("{l}");
-                }
-            }
-            Ok(true)
-        }
+        Command::ReadText { path } => cli::models::read_text(&path, openvino_dir, &s),
         Command::Similar {
             image,
             n,
             min_score,
-        } => {
-            let conn = index::open(&index::default_db()?)?;
-            let path = std::fs::canonicalize(&image).unwrap_or(image);
-            let key = path.to_string_lossy().into_owned();
-            let t0 = Instant::now();
-            let q = match index::image_vector(&conn, &key)? {
-                Some(v) => v,
-                None => {
-                    let bytes = std::fs::read(&path)?;
-                    let pixels = vision::prepare(&vision::load(&bytes)?)?;
-                    let mut emb = embedder(cli.openvino_dir, &s.device)?;
-                    emb.image(&pixels)?
-                }
-            };
-            let t1 = Instant::now();
-            let vectors = index::Vectors::load(&conn)?;
-            // One more than asked, for the image itself.
-            let hits = index::search(&conn, &vectors, &q, None, index::Kind::Image, n + 1)?;
-            eprintln!(
-                "vector {:.1} ms, search {:.1} ms",
-                (t1 - t0).as_secs_f64() * 1e3,
-                t1.elapsed().as_secs_f64() * 1e3
-            );
-            let shown = hits
-                .into_iter()
-                .filter(|h| h.path != key && min_score.is_none_or(|m| h.score >= m))
-                .take(n);
-            for h in shown {
-                println!("{:.3}  {}", h.score, h.path);
-                if !h.copies.is_empty() {
-                    println!("       same as: {}", h.copies.join(", "));
-                }
-            }
-            Ok(true)
-        }
+        } => cli::search::similar(image, n, min_score, openvino_dir, &s),
         Command::Extract { .. }
         | Command::FlatpakExports { .. }
         | Command::FlatpakUpdate { .. } => {
@@ -875,10 +422,7 @@ fn main() -> ExitCode {
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("error: {e:#}");
-            if e.downcast_ref::<krunner::NotStarted>().is_some() {
-                return ExitCode::from(service::start::NOT_STARTED);
-            }
-            ExitCode::FAILURE
+            ExitCode::from(cli::service::failure_code(&e))
         }
     }
 }

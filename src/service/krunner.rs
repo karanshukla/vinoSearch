@@ -13,7 +13,7 @@ use crate::index::{self, Hit, Kind};
 use crate::ml::model;
 use crate::search::open::At;
 use crate::service::flatpak;
-use crate::service::start::{self, config_home, data_home};
+use crate::service::start;
 use crate::service::watch;
 use crate::service::worker::{self, Job, Options, Request, Status};
 use anyhow::{Context, Result, bail};
@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use vinosearch_shared::sandbox;
+use vinosearch_shared::xdg::{config_home, data_home};
 use zbus::interface;
 use zbus::{OwnedVariant, Variant};
 
@@ -1237,7 +1238,7 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
 /// A runner that stopped before it owned the bus name, which exits with
 /// start::NOT_STARTED so `krunner` doesn't start it again.
 #[derive(Debug)]
-pub struct NotStarted(anyhow::Error);
+pub struct NotStarted(pub(crate) anyhow::Error);
 
 impl std::fmt::Display for NotStarted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

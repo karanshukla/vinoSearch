@@ -52,10 +52,7 @@ pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
 
 /// $XDG_DATA_HOME, then $XDG_DATA_DIRS, as the spec orders them.
 fn data_dirs() -> Vec<PathBuf> {
-    let home = match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")),
-    };
+    let home = vinosearch_shared::xdg::data_home().ok();
     let dirs = std::env::var("XDG_DATA_DIRS")
         .ok()
         .filter(|d| !d.is_empty())

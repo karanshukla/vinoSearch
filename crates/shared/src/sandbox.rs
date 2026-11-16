@@ -91,10 +91,7 @@ pub fn exported_launcher(app_path: &str, app: &str) -> Option<String> {
 /// Set once start at login was first asked for (or turned off), so the
 /// settings window asks only the first time it opens.
 pub fn autostart_asked_path() -> Option<PathBuf> {
-    let state = match std::env::var_os("XDG_STATE_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
-    };
+    let state = crate::xdg::state_home().ok()?;
     Some(state.join("vinosearch/autostart-asked"))
 }
 

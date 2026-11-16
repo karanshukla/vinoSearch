@@ -109,10 +109,7 @@ fn desktops_in(desktop: Option<&str>) -> (bool, bool) {
 }
 
 fn data_home() -> Option<PathBuf> {
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")),
-    }
+    vinosearch_shared::xdg::data_home().ok()
 }
 
 /// The `vinosearch` installed beside this binary, as `cargo install` puts

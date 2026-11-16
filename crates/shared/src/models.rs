@@ -16,11 +16,7 @@ pub const ALL: [&str; 4] = [TEXT, VISION, OCR, AUDIO];
 
 /// `$XDG_DATA_HOME/vinosearch/models`.
 pub fn dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    };
-    Ok(base.join("vinosearch/models"))
+    Ok(crate::xdg::data_home()?.join("vinosearch/models"))
 }
 
 /// Bytes of files in the models' directories under `base`. Only those: a

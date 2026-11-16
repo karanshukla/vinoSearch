@@ -95,11 +95,7 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cache_dir_from(xdg_cache: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    let base = xdg_cache
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("thumbnails"))
+    Some(vinosearch_shared::xdg::resolve(xdg_cache, home, ".cache")?.join("thumbnails"))
 }
 
 fn load(cache: Option<&Path>, path: &Path) -> Result<egui::ColorImage, String> {

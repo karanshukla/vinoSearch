@@ -18,15 +18,7 @@ pub fn data_dirs() -> Vec<PathBuf> {
     if crate::sandbox::flatpak_id().is_some() {
         return host_data_dirs();
     }
-    let mut dirs = Vec::new();
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => dirs.push(PathBuf::from(d)),
-        _ => {
-            if let Some(h) = std::env::var_os("HOME") {
-                dirs.push(PathBuf::from(h).join(".local/share"));
-            }
-        }
-    }
+    let mut dirs: Vec<PathBuf> = crate::xdg::data_home().into_iter().collect();
     let system = std::env::var("XDG_DATA_DIRS")
         .ok()
         .filter(|d| !d.is_empty())
@@ -136,19 +128,24 @@ fn for_media(key: &str, value: &str) -> bool {
             .any(|m| m.starts_with("video/") || m.starts_with("audio/"))
 }
 
-/// The entry's Name when it is a shown, graphical app `wanted` accepts.
-fn app_name(text: &str, wanted: fn(&str, &str) -> bool) -> Option<String> {
+/// Each `key=value` of a desktop file's `[Desktop Entry]` group, both
+/// trimmed. Its other groups (actions) are passed over.
+pub fn entry_keys(text: &str) -> impl Iterator<Item = (&str, &str)> {
     let mut in_entry = false;
-    let (mut name, mut fits, mut app) = (None, false, false);
-    for line in text.lines().map(str::trim) {
+    text.lines().map(str::trim).filter_map(move |line| {
         if line.starts_with('[') {
             in_entry = line == "[Desktop Entry]";
-            continue;
+            return None;
         }
-        let Some((key, value)) = line.split_once('=').filter(|_| in_entry) else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
+        let (key, value) = line.split_once('=').filter(|_| in_entry)?;
+        Some((key.trim(), value.trim()))
+    })
+}
+
+/// The entry's Name when it is a shown, graphical app `wanted` accepts.
+fn app_name(text: &str, wanted: fn(&str, &str) -> bool) -> Option<String> {
+    let (mut name, mut fits, mut app) = (None, false, false);
+    for (key, value) in entry_keys(text) {
         fits |= wanted(key, value);
         match key {
             "Name" => name = Some(value.to_owned()),
@@ -164,6 +161,14 @@ fn app_name(text: &str, wanted: fn(&str, &str) -> bool) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn only_the_desktop_entry_groups_keys_are_read() {
+        let text = "Stray=1\n[Desktop Entry]\n Name = Kate \nExec=env A=B kate %F\n# a comment\n\
+                    [Desktop Action new]\nName=New Window\nExec=kate --new\n";
+        let keys: Vec<_> = entry_keys(text).collect();
+        assert_eq!(keys, [("Name", "Kate"), ("Exec", "env A=B kate %F")]);
+    }
 
     #[test]
     fn editors_are_shown_graphical_text_apps_by_name() {

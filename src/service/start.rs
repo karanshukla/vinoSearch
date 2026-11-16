@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use vinosearch_shared::dbus::{CONTROL_INTERFACE, CONTROL_PATH, names};
 use vinosearch_shared::sandbox;
+use vinosearch_shared::xdg::{cache_home, config_home, state_home};
 
 /// The systemd user unit installs before this one wrote and enabled.
 const OLD_UNIT: &str = "vinosearch.service";
@@ -39,20 +40,6 @@ const HEALTHY: Duration = Duration::from_secs(5 * 60);
 /// The log is moved to `.old` past this, when the runner (re)starts.
 const LOG_MAX: u64 = 1 << 20;
 
-pub fn config_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".config"),
-    })
-}
-
-pub fn data_home() -> Result<PathBuf> {
-    Ok(match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/share"),
-    })
-}
-
 /// The journal's entries for the runner, whichever unit systemd ran it in:
 /// one per D-Bus activation, one for the autostart entry.
 const JOURNAL: &str = "journalctl --user -u '*dev.vinosearch*'";
@@ -69,11 +56,7 @@ pub fn log_where() -> Result<String> {
 /// Where the runner's output goes when neither a terminal nor the journal
 /// has it.
 pub fn log_path() -> Result<PathBuf> {
-    let state = match std::env::var_os("XDG_STATE_HOME") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".local/state"),
-    };
-    Ok(state.join("vinosearch/service.log"))
+    Ok(state_home()?.join("vinosearch/service.log"))
 }
 
 pub fn autostart_path() -> Result<PathBuf> {
@@ -121,10 +104,7 @@ fn instance_lock_path() -> Result<PathBuf> {
             Some(app) => PathBuf::from(d).join("app").join(app),
             None => PathBuf::from(d),
         },
-        _ => match std::env::var_os("XDG_CACHE_HOME") {
-            Some(d) if !d.is_empty() => PathBuf::from(d),
-            _ => PathBuf::from(std::env::var_os("HOME").context("no HOME")?).join(".cache"),
-        },
+        _ => cache_home()?,
     };
     Ok(dir.join(format!("{}.lock", names().service)))
 }
