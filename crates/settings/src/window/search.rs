@@ -257,8 +257,11 @@ impl SearchWindow {
 
     /// Answers from the link thread.
     fn take_answers(&mut self) {
-        let mut shared = self.link.shared.lock().unwrap();
-        if let Some((n, answer)) = shared.results.take()
+        let (results, refused) = {
+            let mut shared = self.link.shared.lock().unwrap();
+            (shared.results.take(), shared.refused.take())
+        };
+        if let Some((n, answer)) = results
             && n == self.asked
         {
             self.searching = false;
@@ -277,9 +280,9 @@ impl SearchWindow {
                 }
             }
         }
-        if let Some(refused) = shared.refused.take() {
+        if let Some(refused) = refused {
             self.notice = Some(refused);
-        } else if let Some(done) = shared.done.take() {
+        } else if let Some(done) = self.link.shared.lock().unwrap().done.take() {
             self.notice = Some(done);
         }
     }

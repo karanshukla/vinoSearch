@@ -347,9 +347,8 @@ fn compile_reshaped(
     model
         .reshape(&[("input_ids", &tokens), ("attention_mask", &tokens)])
         .context("reshaping to static shapes")?;
-    Ok(core
-        .compile_model(&model, DeviceType::from(device))
-        .context("compiling")?)
+    core.compile_model(&model, DeviceType::from(device))
+        .context("compiling")
 }
 
 /// After work that started at `t0`, leave the device to other programs for

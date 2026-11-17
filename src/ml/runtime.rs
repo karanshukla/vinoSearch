@@ -337,7 +337,11 @@ mod tests {
             }),
             "NPU"
         );
-        assert_eq!(asked, ["NPU"], "the GPU isn't even asked about when there is an NPU");
+        assert_eq!(
+            asked,
+            ["NPU"],
+            "the GPU isn't even asked about when there is an NPU"
+        );
         assert_eq!(pick_device(|d| d == "GPU"), "GPU");
         assert_eq!(pick_device(|_| false), "CPU");
     }
