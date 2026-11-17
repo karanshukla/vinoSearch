@@ -34,15 +34,20 @@ pub struct Status {
     pub code_chunks: i64,
     pub session_files: i64,
     pub session_chunks: i64,
-    /// Sessions not read: a newer format, or broken (#143).
+    /// Sessions not read: a newer format, or broken.
     pub sessions_unread: i64,
-    /// Audio and video (#187), and whether the service has ffmpeg for them.
+    /// Audio and video, and whether the service has ffmpeg for them.
     pub media_files: i64,
     pub media_chunks: i64,
+    /// True when the service doesn't say, as one from before the key doesn't
+    /// (pinned by `tests::an_older_service_without_the_newer_keys_raises_no_warning`).
     pub ffmpeg: bool,
     pub roots: Vec<String>,
     pub model_present: bool,
-    /// What images and media each need besides the text model.
+    /// What images and media each need besides the text model. A service
+    /// from before the key reports the vision encoder in `model_present`
+    /// (pinned by `tests::an_older_service_without_the_newer_keys_raises_no_warning`
+    /// and `tests::a_service_that_sends_the_newer_keys_is_believed`).
     pub images_model_present: bool,
     pub media_model_present: bool,
     pub fetching: bool,
@@ -65,7 +70,7 @@ pub struct Status {
     pub partial: Vec<Partial>,
     /// Audio and video files waiting for a charger.
     pub media_waiting_for_ac: u64,
-    /// The index on disk is encrypted (#4).
+    /// The index on disk is encrypted.
     pub encrypted: bool,
     /// What its key is sealed with: a `dbus::seal` value, or empty.
     pub seal: String,
@@ -83,7 +88,7 @@ pub struct Status {
     pub new_seal: String,
 }
 
-/// A long document with only some of its parts indexed so far (#108).
+/// A long document with only some of its parts indexed so far.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Partial {
     pub path: String,
@@ -163,12 +168,9 @@ impl Status {
             sessions_unread: signed(status::SESSIONS_UNREAD),
             media_files: signed(status::MEDIA_FILES),
             media_chunks: signed(status::MEDIA_CHUNKS),
-            // A service from before the key says nothing: no warning then.
             ffmpeg: !matches!(get(status::FFMPEG), Some(Variant::Bool(false))),
             roots,
             model_present: flag(status::MODEL_PRESENT),
-            // A service from before the key reports the vision encoder in
-            // `model_present`, when images are on.
             images_model_present: match get(status::IMAGES_MODEL_PRESENT) {
                 Some(Variant::Bool(b)) => *b,
                 _ => flag(status::MODEL_PRESENT),
@@ -285,8 +287,8 @@ impl Link {
         (Link { requests, shared }, rx)
     }
 
+    /// Fails only once the thread has stopped, which it does with the window.
     pub fn send(&self, request: Request) {
-        // The thread only stops with the window.
         let _ = self.requests.send(request);
     }
 }
@@ -366,17 +368,25 @@ mod tests {
     use super::*;
     use zbus::Array;
 
-    #[test]
-    fn an_older_service_without_the_newer_keys_raises_no_warning() {
+    fn from_an_older_service() -> HashMap<String, OwnedVariant> {
         let mut map = HashMap::new();
         map.insert(
             status::MODEL_PRESENT.to_owned(),
             OwnedVariant::try_from(Variant::Bool(true)).unwrap(),
         );
-        let old = Status::parse(&map);
+        map
+    }
+
+    #[test]
+    fn an_older_service_without_the_newer_keys_raises_no_warning() {
+        let old = Status::parse(&from_an_older_service());
         assert!(old.images_model_present && old.ffmpeg);
         assert!(!old.media_model_present);
-        // A service that sends them is believed.
+    }
+
+    #[test]
+    fn a_service_that_sends_the_newer_keys_is_believed() {
+        let mut map = from_an_older_service();
         for key in [status::IMAGES_MODEL_PRESENT, status::FFMPEG] {
             map.insert(
                 key.to_owned(),

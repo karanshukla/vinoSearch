@@ -1,4 +1,4 @@
-//! What adding a folder will cost, shown before it is added (#112): how many
+//! What adding a folder will cost, shown before it is added: how many
 //! files, how long and how much index, and the subfolders taking longest, so
 //! one can be excluded first. `vinosearch estimate --json` does the walk,
 //! with the indexer's own rules, on a thread of its own: a home directory
@@ -17,6 +17,9 @@ use vino_ui::widgets::{self, Button};
 
 use super::{SettingsWindow, Target, tilde};
 use crate::integration;
+
+/// How often to look for the answer, which lands on another thread.
+const ANSWER_POLL: Duration = Duration::from_millis(100);
 
 /// One of the subfolders taking longest.
 #[derive(Clone, Debug, PartialEq)]
@@ -125,8 +128,7 @@ impl SettingsWindow {
             ui.label(RichText::new(format!("Add {name}?")).family(theme::semibold()));
             match &answer {
                 None => {
-                    // The answer lands on another thread; look for it.
-                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    ui.ctx().request_repaint_after(ANSWER_POLL);
                     widgets::small(ui, "Estimating…");
                 }
                 Some(Err(why)) => {
@@ -180,20 +182,23 @@ impl SettingsWindow {
         });
         if let Some(dir) = exclude {
             self.add(Target::Exclude, &dir);
-            // Again, without it: the config is saved, and the walk reads it.
             self.propose_root(&path);
         }
         if add {
             self.link
                 .send(crate::control::Request::Reindex(path.display().to_string()));
-            // As Status will list it: the service canonicalizes what it's sent.
-            let listed = std::fs::canonicalize(&path).unwrap_or(path);
-            self.joining.insert(listed.display().to_string());
+            self.joining
+                .insert(as_status_lists(path).display().to_string());
             self.adding = None;
         } else if cancel {
             self.adding = None;
         }
     }
+}
+
+/// The service canonicalizes the root it's sent.
+fn as_status_lists(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(test)]

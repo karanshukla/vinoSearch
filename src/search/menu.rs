@@ -171,7 +171,7 @@ fn rows(mut matches: Vec<Match>, home: Option<&str>) -> Vec<Row> {
                 .map(At::Line)
                 .or_else(|| number("page").map(At::Page))
                 .or_else(|| second(&props).map(At::Second));
-            // A transcript hit whose recording is indexed plays it (#188).
+            // A transcript hit whose recording is indexed plays it.
             let play = props
                 .get("play")
                 .and_then(|v| String::try_from(v.try_clone().ok()?).ok());
@@ -326,7 +326,6 @@ mod tests {
             "page".to_owned(),
             OwnedVariant::try_from(Variant::from(3u32)).unwrap(),
         );
-        // A media match's second can be 0, the start of the file.
         let mut clip = m("/d.mkv", "d.mkv", 0.35, "/, heard at 00:00");
         clip.5.insert(
             "second".to_owned(),
@@ -359,7 +358,6 @@ mod tests {
         let sh = |script: &str| vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()];
         assert_eq!(ask(&sh("exit 1"), &[]).unwrap(), None);
         assert_eq!(ask(&sh("true"), &[]).unwrap(), None);
-        // dmenu protocol: the choices arrive on stdin, the pick comes back.
         let picked = ask(&sh("sed -n 2p"), &["one".into(), "two".into()]).unwrap();
         assert_eq!(picked.as_deref(), Some("two"));
     }

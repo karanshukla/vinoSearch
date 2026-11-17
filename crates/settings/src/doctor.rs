@@ -78,14 +78,18 @@ fn parse(stdout: &str) -> Vec<(String, String)> {
                 "log" => "Service log",
                 other => other,
             };
-            let mut value = value.trim();
-            if key.trim() == "installed" {
-                // "OpenVINO 2026.4.1 (pypi/openvino/<wheel>)": the version says it.
-                value = value.split(" (").next().unwrap_or(value);
-            }
+            let value = match key.trim() {
+                "installed" => version_only(value.trim()),
+                _ => value.trim(),
+            };
             Some((format!("{label}:"), value.to_owned()))
         })
         .collect()
+}
+
+/// `OpenVINO 2026.4.1` of `OpenVINO 2026.4.1 (pypi/openvino/<wheel>)`.
+fn version_only(installed: &str) -> &str {
+    installed.split(" (").next().unwrap_or(installed)
 }
 
 #[cfg(test)]

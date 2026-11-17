@@ -1,4 +1,4 @@
-//! Opening a result where it matched (#105): a text file at its line in the
+//! Opening a result where it matched: a text file at its line in the
 //! editor, a PDF at its page in the viewer. KRunner, GNOME Shell and
 //! `vinosearch menu` all open through here.
 //!
@@ -9,11 +9,11 @@
 //! terminal app or a Flatpak included, gets `xdg-open` as before. Every
 //! command is an argv, never a shell line.
 //!
-//! A vinoWhisper session (#143) is a zip no editor opens: it goes to
+//! A vinoWhisper session is a zip no editor opens: it goes to
 //! vinoWhisper's settings window, or without vinoWhisper, the part that
 //! matched is copied out to a private file and that is opened.
 //!
-//! An audio or video file (#188) plays from the second that matched, in the
+//! An audio or video file plays from the second that matched, in the
 //! `player` setting or the default app when it is a known player.
 //!
 //! In the Flatpak all of it runs on the host, through `flatpak-spawn
@@ -355,7 +355,7 @@ fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
     app_argv(&default_entry(file, at)?, file, at)
 }
 
-/// A media player known to start a file at a time (#188), by how it takes it.
+/// A media player known to start a file at a time, by how it takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Player {
     /// `--start=S`
@@ -367,7 +367,7 @@ enum Player {
 }
 
 /// The player `program` (a name or path) is, by its file name. Haruna, Totem
-/// and Showtime (#188) aren't here because none takes a start time, read
+/// and Showtime aren't here because none takes a start time, read
 /// from their sources on 2026-11-11: Haruna's only option is
 /// `--ytdl-format-selection`, Showtime's is `--new-window`, and Totem
 /// declares a hidden `--seek` that nothing reads. They get the file alone.
@@ -400,8 +400,7 @@ fn decimal_seconds(seconds: f64) -> String {
 /// its program is unknown and may not take a decimal, and rounding down never
 /// skips past the matched words.
 fn whole_seconds(seconds: f64) -> String {
-    // Truncating is the floor here, as the value is never negative.
-    (clamped(seconds) as u64).to_string()
+    (clamped(seconds).floor() as u64).to_string()
 }
 
 /// The option that starts `player` at `seconds`.
@@ -450,7 +449,7 @@ fn player_argv(setting: &str, file: &Path, seconds: f64) -> Option<Vec<String>> 
     })
 }
 
-/// The command that plays the media `file` from `seconds` in (#188): the
+/// The command that plays the media `file` from `seconds` in: the
 /// `player` setting, else the default app for the file's type when it is a
 /// known player, else `xdg-open`, which can't seek. Looking up the default
 /// app runs `xdg-mime`, so call this off the bus.
@@ -534,6 +533,14 @@ fn manager_env() -> zbus::Result<Vec<(String, String)>> {
     })
 }
 
+/// In the Flatpak, whether the host lacks `program`. flatpak-spawn starts
+/// even then, so a missing one would open nothing rather than fail and fall
+/// back to xdg-open.
+fn missing_on_host(program: &str) -> bool {
+    vinosearch_shared::sandbox::flatpak_id().is_some()
+        && !vinosearch_shared::sandbox::host_has(program)
+}
+
 /// Start `argv` for the desktop, and reap it when it exits. Blocks on the bus
 /// in a unit, so call this off the runner's. In a process group of its own,
 /// so a signal to the runner's (Ctrl+C on a `vinosearch krunner` in a
@@ -549,12 +556,7 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     } else {
         Vec::new()
     };
-    // In the Flatpak, flatpak-spawn starts even when the host has no such
-    // program, so a missing one would open nothing rather than fail here
-    // and fall back to xdg-open.
-    if vinosearch_shared::sandbox::flatpak_id().is_some()
-        && !vinosearch_shared::sandbox::host_has(&argv[0])
-    {
+    if missing_on_host(&argv[0]) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "not found on the host",
@@ -578,12 +580,7 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
 /// the bus.
 pub fn open(file: &Path, at: Option<At>, editor: Option<&str>, player: Option<&str>) {
     if crate::extract::is_session(file) {
-        let (part, line) = match at {
-            Some(At::Session(part, line)) => (part, line),
-            // From `vinosearch menu` or the search window, which pass a line.
-            Some(At::Line(line)) => (Part::Transcript, line),
-            _ => (Part::Transcript, 0),
-        };
+        let (part, line) = session_place(at);
         if let Err(e) = open_session(file, part, line, editor) {
             eprintln!("opening {}: {e:#}", file.display());
         }
@@ -602,6 +599,16 @@ pub fn open(file: &Path, at: Option<At>, editor: Option<&str>, player: Option<&s
         }
     }
     xdg_open(file);
+}
+
+/// The part and line to open a session at. `vinosearch menu` and the search
+/// window pass a plain line, which is the transcript's.
+fn session_place(at: Option<At>) -> (Part, u32) {
+    match at {
+        Some(At::Session(part, line)) => (part, line),
+        Some(At::Line(line)) => (Part::Transcript, line),
+        _ => (Part::Transcript, 0),
+    }
 }
 
 pub fn xdg_open(target: &Path) {
@@ -648,14 +655,16 @@ fn vinowhisper_flatpak(home: &Path) -> Option<Vec<String>> {
     })
 }
 
+/// Where the host's `/` is, in the Flatpak.
+const HOST_ROOT: &str = "/run/host";
+
 /// A native install's window; KRunner's PATH may lack ~/.local/bin, where
 /// its setup puts it.
 fn native_vinowhisper_gui() -> Option<PathBuf> {
     const GUI: &str = "vinowhisper-gui";
     if vinosearch_shared::sandbox::flatpak_id().is_some() {
-        // The host's /usr, where a package would put it, is under /run/host.
         let usr = Path::new("/usr/bin").join(GUI);
-        if Path::new("/run/host")
+        if Path::new(HOST_ROOT)
             .join(usr.strip_prefix("/").unwrap())
             .is_file()
         {
@@ -670,7 +679,7 @@ fn native_vinowhisper_gui() -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
-/// What follows the bundle's path for vinoWhisper (vinoWhisper#123):
+/// What follows the bundle's path for vinoWhisper:
 /// `transcript`, `transcript@MM:SS` or `summary`.
 fn fragment(part: Part, stamp: Option<&str>) -> String {
     match (part, stamp) {
@@ -918,11 +927,13 @@ mod tests {
     }
 
     #[test]
-    fn anything_else_falls_back_to_xdg_open() {
-        // A viewer asked for a line, an editor for a page.
+    fn a_viewer_asked_for_a_line_or_an_editor_for_a_page_falls_back_to_xdg_open() {
         assert_eq!(argv(&entry("okular %U"), "/a.rs", At::Line(3)), None);
         assert_eq!(argv(&entry("kate %U"), "/a.pdf", At::Page(3)), None);
-        // Unknown apps, LibreOffice, Flatpaks and terminal apps.
+    }
+
+    #[test]
+    fn unknown_apps_libreoffice_flatpaks_and_terminal_apps_fall_back_to_xdg_open() {
         assert_eq!(argv(&entry("mupdf %f"), "/a.pdf", At::Page(3)), None);
         assert_eq!(
             argv(&entry("libreoffice --draw %U"), "/a.pdf", At::Page(3)),
@@ -933,7 +944,10 @@ mod tests {
         assert_eq!(argv(&entry(flatpak), "/a.pdf", At::Page(3)), None);
         let vim = "[Desktop Entry]\nExec=vim %F\nTerminal=true\n";
         assert_eq!(argv(vim, "/a.rs", At::Line(3)), None);
-        // A field code inside a word isn't filled in.
+    }
+
+    #[test]
+    fn a_field_code_inside_a_word_is_not_filled_in() {
         assert!(parse_entry(&entry("okular --file=%f")).is_none());
     }
 
@@ -1013,29 +1027,9 @@ mod tests {
 
     #[test]
     fn a_picked_editor_opens_at_the_line_when_it_can() {
-        let picked = |exec: &str| {
-            picked_argv(
-                &parse_entry(&entry(exec)).unwrap(),
-                Path::new("/a.rs"),
-                At::Line(9),
-            )
-        };
         assert_eq!(
             picked("kate -b %U").unwrap(),
             ["kate", "-b", "--line", "9", "/a.rs"]
-        );
-        // A Flatpak can't be told the line, but still opens the file.
-        assert_eq!(
-            picked("/usr/bin/flatpak run --command=kate org.kde.kate @@u %U @@").unwrap(),
-            [
-                "/usr/bin/flatpak",
-                "run",
-                "--command=kate",
-                "org.kde.kate",
-                "@@u",
-                "/a.rs",
-                "@@"
-            ]
         );
         let terminal = "[Desktop Entry]\nExec=nvim %F\nTerminal=true\n";
         assert_eq!(
@@ -1048,9 +1042,35 @@ mod tests {
         );
     }
 
+    fn picked(exec: &str) -> Option<Vec<String>> {
+        picked_argv(
+            &parse_entry(&entry(exec)).unwrap(),
+            Path::new("/a.rs"),
+            At::Line(9),
+        )
+    }
+
+    #[test]
+    fn a_picked_flatpak_editor_opens_the_file_without_the_line() {
+        assert_eq!(
+            picked("/usr/bin/flatpak run --command=kate org.kde.kate @@u %U @@").unwrap(),
+            [
+                "/usr/bin/flatpak",
+                "run",
+                "--command=kate",
+                "org.kde.kate",
+                "@@u",
+                "/a.rs",
+                "@@"
+            ]
+        );
+    }
+
+    const SPACED_SOURCE: &str = "/a b/c.rs";
+
     #[test]
     fn the_editor_setting() {
-        let f = Path::new("/a b/c.rs");
+        let f = Path::new(SPACED_SOURCE);
         assert_eq!(
             editor_argv("code", f, 9).unwrap(),
             ["code", "--goto", "/a b/c.rs:9"]
@@ -1059,20 +1079,29 @@ mod tests {
             editor_argv("/opt/idea/bin/idea.sh", f, 9).unwrap(),
             ["/opt/idea/bin/idea.sh", "--line", "9", "/a b/c.rs"]
         );
-        // A template: each word filled in on its own, so the path stays one argument.
+        assert_eq!(editor_argv("  ", f, 9), None);
+    }
+
+    #[test]
+    fn an_editor_template_fills_each_word_so_the_path_stays_one_argument() {
         assert_eq!(
-            editor_argv("foot -e nvim +{line} {file}", f, 9).unwrap(),
+            editor_argv("foot -e nvim +{line} {file}", Path::new(SPACED_SOURCE), 9).unwrap(),
             ["foot", "-e", "nvim", "+9", "/a b/c.rs"]
         );
-        // Unknown editor, no template: the file, without a line.
+    }
+
+    #[test]
+    fn an_unknown_editor_without_a_template_opens_the_file_without_a_line() {
         assert_eq!(
-            editor_argv("mousepad", f, 9).unwrap(),
+            editor_argv("mousepad", Path::new(SPACED_SOURCE), 9).unwrap(),
             ["mousepad", "/a b/c.rs"]
         );
-        assert_eq!(editor_argv("  ", f, 9), None);
-        // The setting wins over the default app, without asking xdg-mime.
+    }
+
+    #[test]
+    fn the_editor_setting_wins_over_the_default_app() {
         assert!(matches!(
-            argv_at(f, At::Line(9), Some("kate")).as_deref(),
+            argv_at(Path::new(SPACED_SOURCE), At::Line(9), Some("kate")).as_deref(),
             Some([k, ..]) if k == "kate"
         ));
     }
@@ -1087,7 +1116,6 @@ mod tests {
 
     #[test]
     fn known_players_start_at_the_time() {
-        // mpv's own desktop file ends its options with `--`.
         assert_eq!(
             play(
                 "mpv --player-operation-mode=pseudo-gui -- %U",
@@ -1101,7 +1129,8 @@ mod tests {
                 "--start=754",
                 "--",
                 "/v/a.mkv"
-            ]
+            ],
+            "mpv's own desktop file ends its options with `--`"
         );
         assert_eq!(
             play("/usr/bin/vlc --started-from-file %U", "/v/a.mkv", 754.0).unwrap(),
@@ -1146,23 +1175,27 @@ mod tests {
         assert_eq!(flag(f64::NAN), "--start=0");
     }
 
+    const ODD_FILM: &str = "/v/it's a \"film\".mkv";
+
     #[test]
-    fn the_player_setting() {
-        let f = Path::new("/v/it's a \"film\".mkv");
-        let name = f.display().to_string();
-        // A template: whole seconds, rounded down, and the path one argument.
+    fn a_player_template_takes_whole_seconds_rounded_down_and_the_path_as_one_argument() {
+        let f = Path::new(ODD_FILM);
         assert_eq!(
             player_argv("mpv --start={seconds} {file}", f, 754.9).unwrap(),
-            ["mpv", "--start=754", name.as_str()]
+            ["mpv", "--start=754", ODD_FILM]
         );
         assert_eq!(
             player_argv("ffplay -ss {seconds} -i {file}", f, 61.0).unwrap(),
-            ["ffplay", "-ss", "61", "-i", name.as_str()]
+            ["ffplay", "-ss", "61", "-i", ODD_FILM]
         );
-        // A known player without a template gets its own flag.
+    }
+
+    #[test]
+    fn a_known_player_without_a_template_gets_its_own_flag() {
+        let f = Path::new(ODD_FILM);
         assert_eq!(
             player_argv("vlc", f, 754.5).unwrap(),
-            ["vlc", "--start-time=754.5", name.as_str()]
+            ["vlc", "--start-time=754.5", ODD_FILM]
         );
         assert_eq!(
             player_argv("/usr/bin/celluloid --new-window", f, 3.0).unwrap(),
@@ -1170,26 +1203,36 @@ mod tests {
                 "/usr/bin/celluloid",
                 "--new-window",
                 "--mpv-start=3",
-                name.as_str()
+                ODD_FILM
             ]
         );
-        // Unknown player, no template: the file, without a time.
+    }
+
+    #[test]
+    fn an_unknown_player_without_a_template_opens_the_file_without_a_time() {
+        let f = Path::new(ODD_FILM);
         assert_eq!(
             player_argv("haruna", f, 754.0).unwrap(),
-            ["haruna", name.as_str()]
+            ["haruna", ODD_FILM]
         );
-        assert_eq!(player_argv("  ", f, 1.0), None);
-        // No start-time option to give: the file alone.
         for program in ["haruna", "totem", "showtime"] {
             assert_eq!(
                 player_argv(program, f, 9.0),
-                Some(vec![program.to_owned(), name.clone()])
+                Some(vec![program.to_owned(), ODD_FILM.to_owned()])
             );
         }
-        // The setting wins over the default app, without asking xdg-mime.
+    }
+
+    #[test]
+    fn a_blank_player_setting_is_none() {
+        assert_eq!(player_argv("  ", Path::new(ODD_FILM), 1.0), None);
+    }
+
+    #[test]
+    fn the_player_setting_wins_over_the_default_app() {
         assert_eq!(
-            play_argv(f, 2.0, Some("mpv")),
-            ["mpv", "--start=2", name.as_str()]
+            play_argv(Path::new(ODD_FILM), 2.0, Some("mpv")),
+            ["mpv", "--start=2", ODD_FILM]
         );
     }
 }

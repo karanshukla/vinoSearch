@@ -51,10 +51,29 @@ impl Build {
         })
     }
 
+    /// Check every CHECK_EVERY until the build changes, an uninstall
+    /// confirmed CONFIRM_AFTER later.
+    fn wait_for_change(&self) -> Change {
+        loop {
+            std::thread::sleep(CHECK_EVERY);
+            match self.check() {
+                Some(Change::Uninstalled) => {
+                    std::thread::sleep(CONFIRM_AFTER);
+                    if let Some(change) = self.check() {
+                        return change;
+                    }
+                }
+                Some(Change::Updated) => return Change::Updated,
+                None => {}
+            }
+        }
+    }
+
+    /// Asked in the C locale: flatpak's messages are translated, and "not
+    /// installed" is matched.
     fn check(&self) -> Option<Change> {
         let out = Command::new("flatpak-spawn")
             .current_dir("/")
-            // flatpak's messages are translated; "not installed" is matched.
             .args([
                 "--host",
                 "--env=LC_ALL=C",
@@ -99,19 +118,7 @@ pub fn spawn() -> Arc<OnceLock<Change>> {
     };
     let set = changed.clone();
     std::thread::spawn(move || {
-        let change = loop {
-            std::thread::sleep(CHECK_EVERY);
-            match build.check() {
-                Some(Change::Uninstalled) => {
-                    std::thread::sleep(CONFIRM_AFTER);
-                    if let Some(change) = build.check() {
-                        break change;
-                    }
-                }
-                Some(Change::Updated) => break Change::Updated,
-                None => {}
-            }
-        };
+        let change = build.wait_for_change();
         match change {
             Change::Uninstalled => eprintln!("this build was uninstalled; stopping"),
             Change::Updated => eprintln!("a newer build is installed; restarting on it"),
@@ -155,12 +162,13 @@ mod tests {
 
     #[test]
     fn an_unclear_answer_leaves_the_runner_alone() {
-        // flatpak-spawn without a portal, a signal, output that isn't a
-        // commit, another error.
-        assert_eq!(verdict(Some(1), "", "Portal call failed", RUNNING), None);
-        assert_eq!(verdict(None, "", "", RUNNING), None);
-        assert_eq!(verdict(Some(0), "", "", RUNNING), None);
-        assert_eq!(verdict(Some(0), "warning: x\n", "", RUNNING), None);
-        assert_eq!(verdict(Some(2), "", "not installed", RUNNING), None);
+        let no_portal = verdict(Some(1), "", "Portal call failed", RUNNING);
+        assert_eq!(no_portal, None, "flatpak-spawn without a portal");
+        assert_eq!(verdict(None, "", "", RUNNING), None, "a signal");
+        assert_eq!(verdict(Some(0), "", "", RUNNING), None, "no commit");
+        let warning = verdict(Some(0), "warning: x\n", "", RUNNING);
+        assert_eq!(warning, None, "output that isn't a commit");
+        let other = verdict(Some(2), "", "not installed", RUNNING);
+        assert_eq!(other, None, "another error");
     }
 }

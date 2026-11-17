@@ -784,284 +784,384 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
 fn run_with<E: Embed>(
     jobs: mpsc::Receiver<Job>,
     opts: Options,
-    mut load_model: impl FnMut(&str) -> Result<E>,
+    load_model: impl FnMut(&str) -> Result<E>,
 ) -> Result<()> {
-    let db = opts.db.clone();
-    let mut want = Want::of(&opts.file);
-    let mut conn = match index::open(&db) {
-        Err(e) if seal::is_unavailable(&e) => wait_for_key(&jobs, &opts.status, &db, &mut want)?,
-        conn => conn?,
-    };
-    let mut rules = Rules {
-        excludes: opts.excludes.clone(),
-        types: opts.types.clone(),
-    };
-    let mut device = opts.device.clone();
-    let mut idle = opts.idle;
-    let share = |file: &Config| {
-        config::index_share(
-            file.index_busy_percent
-                .unwrap_or(config::DEFAULT_INDEX_BUSY_PERCENT),
-        )
-    };
-    let mut pace = sched::Pace::new(share(&opts.file).unwrap_or_else(|e| {
-        eprintln!("{e:#}");
-        config::index_share(config::DEFAULT_INDEX_BUSY_PERCENT).unwrap()
-    }));
-    opts.status
-        .power
-        .set_index_on_battery(opts.file.index_on_battery());
-    let purged = index::purge(&conn, &rules.excludes)? + index::purge_types(&conn, &rules.types)?;
-    if purged > 0 {
-        eprintln!("removed {purged} excluded files from the index");
+    Worker::start(jobs, opts, load_model)?.run()
+}
+
+/// `index_busy_percent` from the config file, as a share.
+fn index_share(file: &Config) -> Result<f64> {
+    config::index_share(
+        file.index_busy_percent
+            .unwrap_or(config::DEFAULT_INDEX_BUSY_PERCENT),
+    )
+}
+
+/// The worker loop's state.
+struct Worker<E, L> {
+    jobs: mpsc::Receiver<Job>,
+    status: Arc<Status>,
+    db: PathBuf,
+    default_device: String,
+    pinned: Pinned,
+    load_model: L,
+    conn: rusqlite::Connection,
+    want: Want,
+    rules: Rules,
+    device: String,
+    idle: Option<Duration>,
+    pace: sched::Pace,
+    loaded: Option<Loaded<E>>,
+    /// False once the rest of long documents failed, until a Retry or a load
+    /// succeeds.
+    rest_ready: bool,
+    rest_failures: RestFailures,
+    /// False once media's models were missing, until a Retry (a fetch sends
+    /// one): not found out again by loading the model.
+    media_models: bool,
+    /// What indexing did since the worker last had nothing to do.
+    run: index::Stats,
+    did_work: bool,
+    last_job: Instant,
+    free_docs: Option<Instant>,
+    timed_out: bool,
+}
+
+/// What waiting for a job came to.
+enum Waited {
+    Job(Job),
+    TimedOut,
+    Closed,
+}
+
+impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
+    /// Opened (waiting for the key if need be), purged of what the settings
+    /// leave out, and following vinoWhisper's folder.
+    fn start(jobs: mpsc::Receiver<Job>, opts: Options, load_model: L) -> Result<Self> {
+        let mut want = Want::of(&opts.file);
+        let conn = match index::open(&opts.db) {
+            Err(e) if seal::is_unavailable(&e) => {
+                wait_for_key(&jobs, &opts.status, &opts.db, &mut want)?
+            }
+            conn => conn?,
+        };
+        let rules = Rules {
+            excludes: opts.excludes,
+            types: opts.types,
+        };
+        let pace = sched::Pace::new(index_share(&opts.file).unwrap_or_else(|e| {
+            eprintln!("{e:#}");
+            config::index_share(config::DEFAULT_INDEX_BUSY_PERCENT).unwrap()
+        }));
+        opts.status
+            .power
+            .set_index_on_battery(opts.file.index_on_battery());
+        let purged =
+            index::purge(&conn, &rules.excludes)? + index::purge_types(&conn, &rules.types)?;
+        if purged > 0 {
+            eprintln!("removed {purged} excluded files from the index");
+        }
+        follow_sessions(&conn, &opts.db, &rules.types, &opts.status.work);
+        Ok(Self {
+            jobs,
+            status: opts.status,
+            db: opts.db,
+            default_device: opts.default_device,
+            pinned: opts.pinned,
+            load_model,
+            conn,
+            want,
+            rules,
+            device: opts.device,
+            idle: opts.idle,
+            pace,
+            loaded: None,
+            rest_ready: true,
+            rest_failures: RestFailures::default(),
+            media_models: true,
+            run: index::Stats::default(),
+            did_work: false,
+            last_job: Instant::now(),
+            free_docs: None,
+            timed_out: false,
+        })
     }
-    follow_sessions(&conn, &db, &rules.types, &opts.status.work);
-    let mut load = |conn: &rusqlite::Connection, device: &str| -> Result<Loaded<E>> {
-        let emb = load_model(device)?;
-        let vectors = Vectors::load(conn)?;
+
+    /// Each turn applies what arrived first, so anything taken after it is
+    /// checked under it.
+    fn run(mut self) -> Result<()> {
+        loop {
+            if !std::mem::take(&mut self.timed_out) {
+                self.last_job = Instant::now();
+            }
+            let arrived = self.status.pending.take();
+            if let Some(file) = arrived.config {
+                self.apply_config(file)?;
+            }
+            for r in arrived.requests {
+                self.apply_request(r)?;
+            }
+            let item = next_item(&self.status, &self.conn, self.rest_ready, self.media_models);
+            let Some(item) = item else {
+                if std::mem::take(&mut self.did_work) {
+                    finish_run(&self.status, std::mem::take(&mut self.run));
+                }
+                match self.wait_for_job() {
+                    Waited::Job(job) => self.take_job(job),
+                    Waited::TimedOut => {}
+                    Waited::Closed => break,
+                }
+                continue;
+            };
+            self.work_on(item, arrived.generation);
+        }
+        Ok(())
+    }
+
+    /// The config file changed: apply what changed in it.
+    fn apply_config(&mut self, file: Config) -> Result<()> {
+        match file.excludes() {
+            Ok(ex) if ex != self.rules.excludes => {
+                let allowed = no_longer_excluded(&self.rules.excludes, &ex);
+                self.rules.excludes = ex;
+                match index::purge(&self.conn, &self.rules.excludes) {
+                    Ok(n) => eprintln!("exclusions changed, {n} files removed"),
+                    Err(e) => eprintln!("applying exclusions: {e:#}"),
+                }
+                self.status.work.found(allowed);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("exclusions not applied: {e:#}"),
+        }
+        match FileTypes::new(&file.formats) {
+            Ok(new) if new != self.rules.types => {
+                self.rules.types = new;
+                match index::purge_types(&self.conn, &self.rules.types) {
+                    Ok(n) => eprintln!("file types changed, {n} files removed"),
+                    Err(e) => eprintln!("applying file types: {e:#}"),
+                }
+                follow_sessions(&self.conn, &self.db, &self.rules.types, &self.status.work);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("file types not applied: {e:#}"),
+        }
+        if !self.pinned.device {
+            let new = file.device.as_deref().unwrap_or(&self.default_device);
+            if new != self.device {
+                eprintln!("device changed to {new}");
+                self.device = new.to_owned();
+                *self.status.device.lock().unwrap() = self.device.clone();
+                self.unload("device changed");
+            }
+        }
+        match index_share(&file) {
+            Ok(new) => self.pace.set(new),
+            Err(e) => eprintln!("index_busy_percent not applied: {e:#}"),
+        }
+        self.status
+            .power
+            .set_index_on_battery(file.index_on_battery());
+        if Want::of(&file) != self.want {
+            self.want = Want::of(&file);
+            self.reencrypt(false)?;
+        }
+        if !self.pinned.idle_unload {
+            let m = file
+                .idle_unload_minutes
+                .unwrap_or(config::DEFAULT_IDLE_UNLOAD_MINUTES);
+            match config::idle_unload(m) {
+                Ok(new) if new != self.idle => {
+                    eprintln!("idle unload changed to {m} minutes");
+                    self.idle = new;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("idle_unload_minutes not applied: {e:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_request(&mut self, r: Request) -> Result<()> {
+        match r {
+            Request::Forget(root) => forget_root(&self.conn, &self.db, &self.status.work, &root),
+            Request::Encryption(w) => {
+                self.want = w;
+                self.reencrypt(false)?;
+            }
+            Request::Rekey => self.reencrypt(true)?,
+            Request::Unload => self.unload("asked to"),
+            Request::DeleteModel => {
+                // Again: a FetchModel may have started while this waited.
+                if self.status.fetching.load(Ordering::SeqCst) {
+                    eprintln!("not deleting the model: a download started since it was asked");
+                    return Ok(());
+                }
+                self.unload("deleting the model");
+                match crate::ml::model::delete() {
+                    Ok(()) => eprintln!("model deleted"),
+                    Err(e) => eprintln!("deleting the model: {e:#}"),
+                }
+            }
+            Request::ClearCache => match clear_compiled_cache() {
+                Ok(()) => eprintln!("compiled-model cache cleared"),
+                Err(e) => eprintln!("clearing the cache: {e:#}"),
+            },
+        }
+        Ok(())
+    }
+
+    fn reencrypt(&mut self, rekey: bool) -> Result<()> {
+        reencrypt(
+            &self.status,
+            &self.db,
+            &mut self.conn,
+            &mut self.loaded,
+            self.want,
+            rekey,
+        )
+    }
+
+    fn load(&mut self) -> Result<()> {
+        let emb = (self.load_model)(&self.device)?;
+        let vectors = Vectors::load(&self.conn)?;
         eprintln!("serving {} chunks", vectors.len());
-        Ok(Loaded { emb, vectors })
-    };
-    let status = &opts.status;
-    let mut loaded: Option<Loaded<E>> = None;
-    let unload = |loaded: &mut Option<Loaded<E>>, why: &str| {
-        if loaded.take().is_some() {
-            status.loaded.store(false, Ordering::Relaxed);
+        self.loaded = Some(Loaded { emb, vectors });
+        self.status.loaded.store(true, Ordering::Relaxed);
+        self.rest_ready = true;
+        Ok(())
+    }
+
+    fn unload(&mut self, why: &str) {
+        if self.loaded.take().is_some() {
+            self.status.loaded.store(false, Ordering::Relaxed);
             eprintln!("model unloaded ({why})");
         }
-    };
-    // False once the rest of long documents failed, until a Retry or a load
-    // succeeds.
-    let mut rest_ready = true;
-    let mut rest_failures = RestFailures::default();
-    // False once media's models were missing, until a Retry (a fetch sends
-    // one): not found out again by loading the model.
-    let mut media_models = true;
-    // Since the worker last had nothing to do.
-    let mut run = index::Stats::default();
-    let mut did_work = false;
-    let mut last_job = Instant::now();
-    let mut free_docs: Option<Instant> = None;
-    let mut timed_out = false;
-    loop {
-        if !std::mem::take(&mut timed_out) {
-            last_job = Instant::now();
-        }
-        // The settings and requests first: anything taken below is checked
-        // under them.
-        let Arrived {
-            generation: applied,
-            config: file,
-            requests,
-        } = status.pending.take();
-        if let Some(file) = file {
-            match file.excludes() {
-                Ok(ex) if ex != rules.excludes => {
-                    let allowed = no_longer_excluded(&rules.excludes, &ex);
-                    rules.excludes = ex;
-                    match index::purge(&conn, &rules.excludes) {
-                        Ok(n) => eprintln!("exclusions changed, {n} files removed"),
-                        Err(e) => eprintln!("applying exclusions: {e:#}"),
-                    }
-                    status.work.found(allowed);
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("exclusions not applied: {e:#}"),
-            }
-            // What is newly wanted is the watcher's to find, root by root.
-            match FileTypes::new(&file.formats) {
-                Ok(new) if new != rules.types => {
-                    rules.types = new;
-                    match index::purge_types(&conn, &rules.types) {
-                        Ok(n) => eprintln!("file types changed, {n} files removed"),
-                        Err(e) => eprintln!("applying file types: {e:#}"),
-                    }
-                    follow_sessions(&conn, &db, &rules.types, &status.work);
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("file types not applied: {e:#}"),
-            }
-            if !opts.pinned.device {
-                let new = file.device.as_deref().unwrap_or(&opts.default_device);
-                if new != device {
-                    eprintln!("device changed to {new}");
-                    device = new.to_owned();
-                    *status.device.lock().unwrap() = device.clone();
-                    unload(&mut loaded, "device changed");
-                }
-            }
-            match share(&file) {
-                Ok(new) => pace.set(new),
-                Err(e) => eprintln!("index_busy_percent not applied: {e:#}"),
-            }
-            status.power.set_index_on_battery(file.index_on_battery());
-            if Want::of(&file) != want {
-                want = Want::of(&file);
-                reencrypt(status, &db, &mut conn, &mut loaded, want, false)?;
-            }
-            if !opts.pinned.idle_unload {
-                let m = file
-                    .idle_unload_minutes
-                    .unwrap_or(config::DEFAULT_IDLE_UNLOAD_MINUTES);
-                match config::idle_unload(m) {
-                    Ok(new) if new != idle => {
-                        eprintln!("idle unload changed to {m} minutes");
-                        idle = new;
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("idle_unload_minutes not applied: {e:#}"),
-                }
-            }
-        }
-        for r in requests {
-            match r {
-                Request::Forget(root) => forget_root(&conn, &db, &status.work, &root),
-                Request::Encryption(w) => {
-                    want = w;
-                    reencrypt(status, &db, &mut conn, &mut loaded, want, false)?;
-                }
-                Request::Rekey => reencrypt(status, &db, &mut conn, &mut loaded, want, true)?,
-                Request::Unload => unload(&mut loaded, "asked to"),
-                Request::DeleteModel => {
-                    // Again: a FetchModel may have started while this waited.
-                    if status.fetching.load(Ordering::SeqCst) {
-                        eprintln!("not deleting the model: a download started since it was asked");
-                        continue;
-                    }
-                    unload(&mut loaded, "deleting the model");
-                    match crate::ml::model::delete() {
-                        Ok(()) => eprintln!("model deleted"),
-                        Err(e) => eprintln!("deleting the model: {e:#}"),
-                    }
-                }
-                // Only the next load reads the cache.
-                Request::ClearCache => match clear_compiled_cache() {
-                    Ok(()) => eprintln!("compiled-model cache cleared"),
-                    Err(e) => eprintln!("clearing the cache: {e:#}"),
-                },
-            }
-        }
-        let item = next_item(status, &conn, rest_ready, media_models);
-        let Some(item) = item else {
-            if std::mem::take(&mut did_work) {
-                finish_run(status, std::mem::take(&mut run));
-            }
-            let unload_at = idle.filter(|_| loaded.is_some()).map(|d| last_job + d);
-            let free_at = free_docs.filter(|_| loaded.is_some());
-            let job = match unload_at.into_iter().chain(free_at).min() {
-                Some(at) => match jobs.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                    Ok(job) => job,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        timed_out = true;
-                        free_docs = None;
-                        if Some(at) == unload_at {
-                            let after = idle.unwrap_or_default().as_secs();
-                            unload(&mut loaded, &format!("idle for {after}s"));
-                        } else if let Some(l) = loaded.as_mut()
-                            && l.emb.release_documents()
-                        {
-                            eprintln!("document model freed");
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                },
-                None => match jobs.recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                },
-            };
-            match job {
-                Job::Match { query, k, reply } => {
-                    if loaded.is_none() {
-                        match load(&conn, &device) {
-                            Ok(l) => {
-                                loaded = Some(l);
-                                status.loaded.store(true, Ordering::Relaxed);
-                                status.waiting_model.store(false, Ordering::Relaxed);
-                                rest_ready = true;
-                            }
-                            Err(e) => {
-                                eprintln!("loading model: {e:#}");
-                                let _ = reply.send(Vec::new());
-                                continue;
-                            }
-                        }
-                    }
-                    let Loaded { emb, vectors } = loaded.as_mut().unwrap();
-                    let had_docs = emb.has_documents();
-                    if let Err(e) = vectors.refresh(&conn) {
-                        eprintln!("reloading vectors: {e:#}");
-                    }
-                    answer(&conn, emb, vectors, &query, k, reply);
-                    // A query too long for the query stage compiled the
-                    // document stage: free it as after indexing.
-                    if emb.has_documents() && !had_docs {
-                        free_docs = Some(Instant::now() + DOCS_HOLD);
-                    }
-                }
-                Job::Wake => {}
-                Job::Retry => {
-                    rest_ready = true;
-                    media_models = true;
-                    status.waiting_model.store(false, Ordering::Relaxed);
-                }
-            }
-            continue;
+    }
+
+    /// Nothing to do: wait for a job, or until the model has been idle long
+    /// enough to unload or the document stage to free.
+    fn wait_for_job(&mut self) -> Waited {
+        let unload_at = self
+            .idle
+            .filter(|_| self.loaded.is_some())
+            .map(|d| self.last_job + d);
+        let free_at = self.free_docs.filter(|_| self.loaded.is_some());
+        let Some(at) = unload_at.into_iter().chain(free_at).min() else {
+            return self.jobs.recv().map_or(Waited::Closed, Waited::Job);
         };
-        status.working.store(true, Ordering::Relaxed);
-        did_work = true;
+        match self
+            .jobs
+            .recv_timeout(at.saturating_duration_since(Instant::now()))
+        {
+            Ok(job) => Waited::Job(job),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.timed_out = true;
+                self.free_docs = None;
+                if Some(at) == unload_at {
+                    let after = self.idle.unwrap_or_default().as_secs();
+                    self.unload(&format!("idle for {after}s"));
+                } else if let Some(l) = self.loaded.as_mut()
+                    && l.emb.release_documents()
+                {
+                    eprintln!("document model freed");
+                }
+                Waited::TimedOut
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Waited::Closed,
+        }
+    }
+
+    /// A job that came while nothing was being indexed.
+    fn take_job(&mut self, job: Job) {
+        match job {
+            Job::Match { query, k, reply } => {
+                if self.loaded.is_none() {
+                    if let Err(e) = self.load() {
+                        eprintln!("loading model: {e:#}");
+                        let _ = reply.send(Vec::new());
+                        return;
+                    }
+                    self.status.waiting_model.store(false, Ordering::Relaxed);
+                }
+                let Loaded { emb, vectors } = self.loaded.as_mut().unwrap();
+                let had_docs = emb.has_documents();
+                if let Err(e) = vectors.refresh(&self.conn) {
+                    eprintln!("reloading vectors: {e:#}");
+                }
+                answer(&self.conn, emb, vectors, &query, k, reply);
+                // A query too long for the query stage compiled the document
+                // stage: free it as after indexing.
+                if emb.has_documents() && !had_docs {
+                    self.free_docs = Some(Instant::now() + DOCS_HOLD);
+                }
+            }
+            Job::Wake => {}
+            Job::Retry => {
+                self.rest_ready = true;
+                self.media_models = true;
+                self.status.waiting_model.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Register a root, or check a path or index a run of the rest under
+    /// the settings current to `applied`.
+    fn work_on(&mut self, item: Item, applied: u64) {
+        self.status.working.store(true, Ordering::Relaxed);
+        self.did_work = true;
         if let Item::Root(root) = item {
             let _idle = sched::Idle::enter();
-            match register_root(&conn, &db, &root, &rules) {
+            match register_root(&self.conn, &self.db, &root, &self.rules) {
                 Ok(paths) => {
                     eprintln!("{}: {} paths to check", root.display(), paths.len());
-                    status.work.found(paths);
+                    self.status.work.found(paths);
                 }
                 Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
             }
-            status.working.store(false, Ordering::Relaxed);
-            continue;
+            self.status.working.store(false, Ordering::Relaxed);
+            return;
         }
-        status
+        self.status
             .indexing_rest
             .store(matches!(item, Item::Rest), Ordering::Relaxed);
-        if loaded.is_none() {
-            match load(&conn, &device) {
-                Ok(l) => {
-                    loaded = Some(l);
-                    status.loaded.store(true, Ordering::Relaxed);
-                    rest_ready = true;
-                }
-                Err(e) => {
-                    eprintln!("loading model: {e:#}");
-                    status.waiting_model.store(true, Ordering::Relaxed);
-                    match item {
-                        Item::Check(path) => status.work.changed([path]),
-                        Item::Rest => rest_ready = false,
-                        Item::Root(_) => unreachable!("needs no model"),
-                    }
-                    status.indexing_rest.store(false, Ordering::Relaxed);
-                    status.working.store(false, Ordering::Relaxed);
-                    continue;
-                }
+        if self.loaded.is_none()
+            && let Err(e) = self.load()
+        {
+            eprintln!("loading model: {e:#}");
+            self.status.waiting_model.store(true, Ordering::Relaxed);
+            match item {
+                Item::Check(path) => self.status.work.changed([path]),
+                Item::Rest => self.rest_ready = false,
+                Item::Root(_) => unreachable!("needs no model"),
             }
+            self.status.indexing_rest.store(false, Ordering::Relaxed);
+            self.status.working.store(false, Ordering::Relaxed);
+            return;
         }
-        status.waiting_model.store(false, Ordering::Relaxed);
-        let Loaded { emb, vectors } = loaded.as_mut().unwrap();
+        self.status.waiting_model.store(false, Ordering::Relaxed);
+        self.index_item(item, applied);
+        self.status.indexing_rest.store(false, Ordering::Relaxed);
+        self.status.working.store(false, Ordering::Relaxed);
+    }
+
+    /// `item` with the model loaded, at idle priority. Stops between chunks
+    /// for a hold or for what arrived (the item goes back first in line).
+    fn index_item(&mut self, item: Item, applied: u64) {
+        let Loaded { emb, vectors } = self.loaded.as_mut().unwrap();
         // Compiled before dropping to idle priority: OpenVINO's threads
         // inherit the compiling thread's priority and would stay at idle.
         if let Err(e) = emb.prepare_documents() {
             eprintln!("compiling the document model: {e:#}");
         }
-        emb.set_document_share(pace.share());
-        // As `index_rest` does, or the next item would be Rest for nothing.
-        media_models = emb.can_embed_media();
+        emb.set_document_share(self.pace.share());
+        self.media_models = emb.can_embed_media();
         let idle = sched::Idle::enter();
         let mut retried = false;
-        // Stops for a hold or for what arrived (the item goes back first in
-        // line); answers queries at normal priority from the vectors as they
-        // were (a reload per file would cost more than the query).
+        let status = &self.status;
+        let pace = &mut self.pace;
+        let jobs = &self.jobs;
+        // Answers queries from the vectors as they were: a reload per file
+        // would cost more than the query.
         let mut between = |conn: &rusqlite::Connection, emb: &mut E| -> Result<()> {
             if status.held() || status.pending.generation() != applied {
                 return Err(Interrupted.into());
@@ -1078,15 +1178,16 @@ fn run_with<E: Embed>(
             }
             Ok(())
         };
+        let run = &mut self.run;
         let before = (run.files_embedded, run.removed, run.duplicates);
         match item {
             Item::Check(path) => {
                 let r = check(
-                    &mut conn,
+                    &mut self.conn,
                     emb,
                     &path,
-                    &rules,
-                    &mut run,
+                    &self.rules,
+                    run,
                     &status.work,
                     &mut between,
                 );
@@ -1097,7 +1198,7 @@ fn run_with<E: Embed>(
                 }
             }
             Item::Rest => {
-                let r = index::index_rest(&mut conn, emb, &rules.types, &mut between);
+                let r = index::index_rest(&mut self.conn, emb, &self.rules.types, &mut between);
                 match r {
                     Ok(Some(rest)) => {
                         match rest {
@@ -1109,16 +1210,15 @@ fn run_with<E: Embed>(
                             }
                             _ => {}
                         }
-                        rest_failures.succeeded();
+                        self.rest_failures.succeeded();
                         status.last_indexed.store(unix_now(), Ordering::Relaxed);
                     }
                     Ok(None) => {}
-                    // The next run goes on from where the index has it.
                     Err(_) if interrupted(&r) => {}
                     Err(e) => {
                         eprintln!("indexing the rest of a long document: {e:#}");
-                        if rest_failures.failed() {
-                            rest_ready = false;
+                        if self.rest_failures.failed() {
+                            self.rest_ready = false;
                         }
                     }
                 }
@@ -1127,8 +1227,8 @@ fn run_with<E: Embed>(
         }
         drop(idle);
         if retried {
-            rest_ready = true;
-            media_models = true;
+            self.rest_ready = true;
+            self.media_models = true;
         }
         if before != (run.files_embedded, run.removed, run.duplicates) {
             status.last_indexed.store(unix_now(), Ordering::Relaxed);
@@ -1137,12 +1237,9 @@ fn run_with<E: Embed>(
             .indexed_files
             .store(run.files_embedded as u64, Ordering::Relaxed);
         if emb.has_documents() {
-            free_docs = Some(Instant::now() + DOCS_HOLD);
+            self.free_docs = Some(Instant::now() + DOCS_HOLD);
         }
-        status.indexing_rest.store(false, Ordering::Relaxed);
-        status.working.store(false, Ordering::Relaxed);
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -39,8 +39,9 @@ pub fn index(
     Ok(true)
 }
 
-/// The index, encrypted or not as the config file asks (#4) before anything
-/// is written, and cleared of what another model or an older reader left.
+/// The index, encrypted or not as the config file asks before anything is
+/// written, and cleared of what another model or an older reader left. Held
+/// shared while indexing, so the runner doesn't convert the file underneath.
 fn open_as_configured(db: &Path, s: &Settings) -> Result<Connection> {
     let enc = encryption::apply(db, encryption::Want::of(&s.file), false, &Sealer::default());
     for msg in [&enc.broken, &enc.error] {
@@ -48,7 +49,6 @@ fn open_as_configured(db: &Path, s: &Settings) -> Result<Connection> {
             eprintln!("encryption: {msg}");
         }
     }
-    // Held while indexing, so the runner doesn't convert the file underneath.
     encryption::hold_shared(db)?;
     let conn = index::open(db)?;
     if let Some(why) = worker::model_changed(&index::purge_other_models(&conn)?) {
@@ -96,7 +96,7 @@ fn index_root(conn: &mut Connection, emb: &mut Embedder, root: &Path, s: &Settin
     Ok(())
 }
 
-/// What the first pass left of long documents (#108), which the service
+/// What the first pass left of long documents, which the service
 /// leaves until nothing else is waiting.
 fn index_rest_of_long_documents(
     conn: &mut Connection,
@@ -151,11 +151,10 @@ pub fn estimate(paths: &[PathBuf], json: bool, s: &Settings) -> Result<bool> {
 }
 
 /// What indexing each of `paths` would cost, leaving out files the index
-/// already has unchanged.
+/// already has unchanged. The index is opened read-only, and only when it
+/// exists: an estimate must not write to it or leave an empty one behind.
 fn estimates(paths: &[PathBuf], s: &Settings) -> Result<Vec<estimate::Estimate>> {
     let db = index::default_db()?;
-    // Read-only, and not created just to look: an estimate must not write
-    // to the index or leave an empty one behind.
     let conn = if db.exists() {
         Some(encryption::open_read_only(&db)?)
     } else {

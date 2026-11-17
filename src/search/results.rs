@@ -8,11 +8,23 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 use vinosearch_shared::dbus::results;
 
-/// One file as `Control1.Search` returns it: path, kind (`results::*`),
-/// score, snippet, unit ("line", "page", "slide", ... or empty), the match's
-/// number in that unit (0 for none), and mtime in Unix seconds. A media
-/// file's unit is "second", counted from 0.
-pub type Found = (String, String, f64, String, String, u32, i64);
+/// One file as `Control1.Search` returns it. The fields' order is the
+/// D-Bus struct the window reads (pinned by
+/// `tests::found_goes_over_d_bus_as_the_struct_ssdssux`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, zbus::zvariant::Type)]
+pub struct Found {
+    pub path: String,
+    /// One of `results::*`.
+    pub kind: String,
+    pub score: f64,
+    pub snippet: String,
+    /// "line", "page", "slide", "second" (media, counted from 0), ... or empty.
+    pub unit: String,
+    /// The match's number in `unit`; 0 for none.
+    pub at: u32,
+    /// Unix seconds.
+    pub mtime: i64,
+}
 
 /// The window's kind for a hit: text OCR read in an image is an image, as
 /// KRunner groups it.
@@ -105,7 +117,7 @@ pub fn found(h: Hit) -> Option<Found> {
         .map_or(0, |d| d.as_secs() as i64);
     let kind = kind(&h);
     let unit = match kind {
-        // An HTML page's lines are of its extracted text: no use to a reader.
+        // An HTML page's lines are of its extracted text, no use to a reader.
         results::TEXT if !crate::extract::is_html(path) => "line",
         results::CODE => "line",
         results::DOCUMENT => crate::extract::unit(path),
@@ -121,15 +133,15 @@ pub fn found(h: Hit) -> Option<Found> {
         Kind::Image | Kind::Media => String::new(),
         _ => crate::snippet(&h.text),
     };
-    Some((
-        h.path,
-        kind.to_owned(),
-        f64::from(h.score),
+    Some(Found {
+        path: h.path,
+        kind: kind.to_owned(),
+        score: f64::from(h.score),
         snippet,
-        unit.to_owned(),
+        unit: unit.to_owned(),
         at,
         mtime,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -208,38 +220,73 @@ mod tests {
         assert_eq!(kept[0].path, "/n/0.md");
     }
 
+    /// A file `name` in a temp dir of its own, removed when dropped.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("vinosearch-results-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            TempFile(path)
+        }
+
+        fn hit(&self, kind: Kind) -> Hit {
+            hit(kind, 0.8, self.0.to_str().unwrap())
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    fn kind_unit_at(f: &Found) -> (&str, &str, u32) {
+        (f.kind.as_str(), f.unit.as_str(), f.at)
+    }
+
     #[test]
-    fn found_names_the_unit_and_drops_missing_files() {
-        let dir = std::env::temp_dir().join(format!("vinosearch-results-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let note = dir.join("note.md");
-        std::fs::write(&note, "x").unwrap();
-        let photo = dir.join("photo.png");
-        std::fs::write(&photo, "x").unwrap();
+    fn found_names_a_text_files_line() {
+        let note = TempFile::new("note.md");
+        let f = found(note.hit(Kind::Text)).unwrap();
+        assert_eq!(f.path, note.0.to_str().unwrap());
+        assert_eq!(kind_unit_at(&f), ("text", "line", 3));
+        assert_eq!(f.snippet, "some matching text");
+        assert!(f.mtime > 0);
+    }
 
-        let (path, kind, _, snippet, unit, at, mtime) =
-            found(hit(Kind::Text, 0.8, note.to_str().unwrap())).unwrap();
-        assert_eq!(path, note.to_str().unwrap());
-        assert_eq!((kind.as_str(), unit.as_str(), at), ("text", "line", 3));
-        assert_eq!(snippet, "some matching text");
-        assert!(mtime > 0);
+    #[test]
+    fn text_read_in_a_photo_is_an_image_with_no_line_to_name() {
+        let photo = TempFile::new("photo.png");
+        let f = found(photo.hit(Kind::Document)).unwrap();
+        assert_eq!(kind_unit_at(&f), ("image", "", 0));
+        assert_eq!(f.snippet, "some matching text");
+    }
 
-        // Text read in a photo: an image, with no line to name.
-        let (_, kind, _, snippet, unit, at, _) =
-            found(hit(Kind::Document, 0.8, photo.to_str().unwrap())).unwrap();
-        assert_eq!((kind.as_str(), unit.as_str(), at), ("image", "", 0));
-        assert_eq!(snippet, "some matching text");
-
-        // A frame's number is past FRAME_LINES; the window gets its second.
-        let clip = dir.join("clip.mkv");
-        std::fs::write(&clip, "x").unwrap();
-        let mut seen = hit(Kind::Media, 0.8, clip.to_str().unwrap());
+    #[test]
+    fn a_frame_is_found_at_its_second() {
+        let clip = TempFile::new("clip.mkv");
+        let mut seen = clip.hit(Kind::Media);
         seen.line = crate::extract::media::FRAME_LINES as i64 + 754;
-        let (_, kind, _, snippet, unit, at, _) = found(seen).unwrap();
-        assert_eq!((kind.as_str(), unit.as_str(), at), ("media", "second", 754));
-        assert_eq!(snippet, "");
+        let f = found(seen).unwrap();
+        assert_eq!(kind_unit_at(&f), ("media", "second", 754));
+        assert_eq!(f.snippet, "");
+    }
 
+    #[test]
+    fn a_file_gone_since_it_was_indexed_is_not_found() {
         assert!(found(hit(Kind::Text, 0.8, "/nonexistent/gone.md")).is_none());
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The window reads the fields by position, as the tuple they were.
+    #[test]
+    fn found_goes_over_d_bus_as_the_struct_ssdssux() {
+        use zbus::zvariant::Type;
+        type AsTuple = (String, String, f64, String, String, u32, i64);
+        assert_eq!(Found::SIGNATURE.to_string(), "(ssdssux)");
+        assert_eq!(Found::SIGNATURE, AsTuple::SIGNATURE);
     }
 }

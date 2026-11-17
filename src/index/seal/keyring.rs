@@ -27,7 +27,8 @@ use zbus::{OwnedObjectPath, OwnedVariant, Variant};
 use zeroize::Zeroizing;
 
 /// What `index.key` starts with for a key in the keyring. Not base64 (the
-/// space), so never taken for a `systemd-creds` credential.
+/// space), so never taken for a `systemd-creds` credential (pinned by
+/// `tests::a_key_file_is_never_read_as_a_systemd_creds_credential`).
 pub const HEAD: &str = "secret-service 1 ";
 /// The item's `xdg:schema`, beside an `id` naming this key.
 const SCHEMA: &str = "dev.vinosearch.IndexKey";
@@ -98,9 +99,10 @@ impl Keyring {
     }
 
     /// The secret the item `blob` names. Every failure is `Unavailable`, an
-    /// item that isn't there too: unlike a cleared TPM, that may be another
-    /// keyring serving this session (another desktop), or one whose
-    /// collection isn't open yet.
+    /// item that isn't there too (pinned by
+    /// `tests::a_deleted_item_is_waited_out_never_a_lost_key`): unlike a
+    /// cleared TPM, that may be another keyring serving this session (another
+    /// desktop), or one whose collection isn't open yet.
     pub fn fetch(&self, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let id = id_of(blob).context("not a keyring key file")?;
         self.block(async |c: &Client| {
@@ -308,16 +310,7 @@ impl Client {
         let Some(wait) = self.prompt else {
             bail!(Unavailable("the keyring is locked".into()));
         };
-        let rule = zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .interface(PROMPT)
-            .member("Completed")
-            .path(prompt.as_str())
-            .build()?;
-        // Subscribed before the prompt shows, so its answer isn't missed.
-        let mut completed = zbus::MessageStream::for_match_rule(rule, &self.conn, None)
-            .await
-            .map_err(transient)?;
+        let mut completed = self.completion(prompt).await?;
         let () = self.call(prompt.as_str(), PROMPT, "Prompt", &("",)).await?;
         let answer = within(wait, async {
             match completed.next().await {
@@ -345,6 +338,20 @@ impl Client {
             }
         }
     }
+
+    /// `prompt`'s `Completed` signals. Subscribe before the prompt shows, so
+    /// its answer isn't missed.
+    async fn completion(&self, prompt: &OwnedObjectPath) -> Result<zbus::MessageStream> {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(PROMPT)
+            .member("Completed")
+            .path(prompt.as_str())
+            .build()?;
+        zbus::MessageStream::for_match_rule(rule, &self.conn, None)
+            .await
+            .map_err(transient)
+    }
 }
 
 #[cfg(test)]
@@ -367,54 +374,99 @@ mod tests {
     fn key_files_name_an_item_and_nothing_else() {
         assert_eq!(id_of(&blob(ID)), Some(ID));
         assert_eq!(id_of(b"secret-service 1 short\n"), None);
+    }
+
+    #[test]
+    fn a_systemd_creds_credential_is_never_read_as_a_key_file() {
         assert_eq!(id_of(b"VbntHThZTUOoMZ0uuzMqxiAAAAAB"), None);
-        // Never read as a systemd-creds credential, nor one as this.
+    }
+
+    #[test]
+    fn a_key_file_is_never_read_as_a_systemd_creds_credential() {
         assert_eq!(sealed_with(&blob(ID)), Some(Seal::Keyring));
         assert_eq!(sealed_with(b"secret-service 1 junk"), None);
     }
 
-    #[test]
-    fn stores_and_fetches_through_an_encrypted_session() {
-        let Some(m) = Mock::start("roundtrip") else {
+    /// A mock Secret Service named `tag` holding one stored key, and the
+    /// keyring file for it; None without a dbus-daemon.
+    fn stored(tag: &str, secret: [u8; 32]) -> Option<(Mock, Keyring, Vec<u8>)> {
+        let Some(m) = Mock::start(tag) else {
             eprintln!("no dbus-daemon: skipped");
-            return;
+            return None;
         };
         let k = m.keyring(Some(Duration::from_secs(5)));
-        let secret = [0x5a; 32];
         let b = k.store(&secret).unwrap();
-        // The file names the item, and holds nothing of the secret.
+        Some((m, k, b))
+    }
+
+    #[test]
+    fn stores_and_fetches_through_an_encrypted_session() {
+        let secret = [0x5a; 32];
+        let Some((m, k, b)) = stored("roundtrip", secret) else {
+            return;
+        };
         let id = id_of(&b).unwrap().to_owned();
-        assert!(!b.windows(4).any(|w| w == [0x5a; 4]));
         assert_eq!(m.state().items.len(), 1);
         assert_eq!(m.state().items[0].0, id);
         assert_eq!(*m.state().items[0].1, secret);
         assert_eq!(*k.fetch(&b).unwrap(), secret);
-        // Another key is another item.
+    }
+
+    #[test]
+    fn a_key_file_names_its_item_and_holds_nothing_of_the_secret() {
+        let Some((_m, _k, b)) = stored("nosecret", [0x5a; 32]) else {
+            return;
+        };
+        assert!(id_of(&b).is_some());
+        assert!(!b.windows(4).any(|w| w == [0x5a; 4]));
+    }
+
+    #[test]
+    fn another_key_is_another_item() {
+        let Some((m, k, b)) = stored("another", [0x5a; 32]) else {
+            return;
+        };
         let b2 = k.store(&[1; 32]).unwrap();
         assert_ne!(b, b2);
+        assert_eq!(m.state().items.len(), 2);
         assert_eq!(*k.fetch(&b2).unwrap(), [1; 32]);
+    }
+
+    #[test]
+    fn a_deleted_item_is_waited_out_never_a_lost_key() {
+        let Some((m, k, b)) = stored("deleted", [0x5a; 32]) else {
+            return;
+        };
         k.delete(&b).unwrap();
-        assert_eq!(m.state().items.len(), 1);
-        // Gone, or in another keyring: waited out, never a lost key.
+        assert_eq!(m.state().items.len(), 0);
         let e = k.fetch(&b).unwrap_err();
         assert!(is_unavailable(&e), "{e:#}");
         assert!(format!("{e:#}").contains("no item"), "{e:#}");
     }
 
+    /// A key stored, then its keyring locked.
+    fn locked(tag: &str) -> Option<(Mock, Keyring, Vec<u8>)> {
+        let (m, k, b) = stored(tag, [3; 32])?;
+        m.state().locked = true;
+        Some((m, k, b))
+    }
+
     #[test]
-    fn a_locked_keyring_prompts_once_and_only_when_allowed() {
-        let Some(m) = Mock::start("locked") else {
+    fn a_quiet_fetch_from_a_locked_keyring_is_unavailable_without_a_prompt() {
+        let Some((m, _, b)) = locked("lockedquiet") else {
             return;
         };
-        let k = m.keyring(Some(Duration::from_secs(5)));
-        let b = k.store(&[3; 32]).unwrap();
-        m.state().locked = true;
-        // Quiet: no prompt, and Unavailable.
         let e = m.keyring(None).fetch(&b).unwrap_err();
         assert!(is_unavailable(&e), "{e:#}");
         assert!(format!("{e:#}").contains("locked"), "{e:#}");
         assert_eq!(m.state().prompts, 0);
-        // Dismissed by the user: Unavailable, still locked.
+    }
+
+    #[test]
+    fn a_dismissed_prompt_is_unavailable_and_leaves_the_keyring_locked() {
+        let Some((m, k, b)) = locked("lockeddismiss") else {
+            return;
+        };
         m.state().answer = Answer::Dismiss;
         let e = k.fetch(&b).unwrap_err();
         assert!(
@@ -422,23 +474,35 @@ mod tests {
             "{e:#}"
         );
         assert!(m.state().locked);
-        // Unlocked at the prompt.
+        assert_eq!(m.state().prompts, 1);
+    }
+
+    #[test]
+    fn a_keyring_unlocked_at_its_prompt_gives_the_key() {
+        let Some((m, k, b)) = locked("lockedunlock") else {
+            return;
+        };
         m.state().answer = Answer::Unlock;
         assert_eq!(*k.fetch(&b).unwrap(), [3; 32]);
-        assert_eq!(m.state().prompts, 2);
+        assert_eq!(m.state().prompts, 1);
+    }
+
+    /// A key stored, then its keyring locked behind a prompt nobody answers.
+    fn locked_and_ignored(tag: &str) -> Option<(Mock, Vec<u8>)> {
+        let m = Mock::start(tag)?;
+        let b = m.keyring(None).store(&[4; 32]).unwrap();
+        let mut st = m.state();
+        st.locked = true;
+        st.answer = Answer::Ignore;
+        drop(st);
+        Some((m, b))
     }
 
     #[test]
     fn an_unanswered_prompt_is_dismissed_in_time() {
-        let Some(m) = Mock::start("ignored") else {
+        let Some((m, b)) = locked_and_ignored("ignored") else {
             return;
         };
-        let b = m.keyring(None).store(&[4; 32]).unwrap();
-        {
-            let mut st = m.state();
-            st.locked = true;
-            st.answer = Answer::Ignore;
-        }
         let t = Instant::now();
         let e = m
             .keyring(Some(Duration::from_millis(300)))
@@ -450,7 +514,13 @@ mod tests {
             "{e:#}"
         );
         assert!(m.state().dismissed);
-        // Storing into a locked keyring waits the same way.
+    }
+
+    #[test]
+    fn storing_into_a_locked_keyring_waits_out_its_prompt_the_same_way() {
+        let Some((m, _)) = locked_and_ignored("ignoredstore") else {
+            return;
+        };
         let e = m
             .keyring(Some(Duration::from_millis(300)))
             .store(&[5; 32])
@@ -461,11 +531,9 @@ mod tests {
 
     #[test]
     fn a_keyring_refusing_a_plain_session_is_unavailable() {
-        let Some(m) = Mock::start("noplain") else {
+        let Some((m, k, b)) = stored("noplain", [6; 32]) else {
             return;
         };
-        let k = m.keyring(Some(Duration::from_secs(5)));
-        let b = k.store(&[6; 32]).unwrap();
         m.state().refuse_plain = true;
         let e = k.fetch(&b).unwrap_err();
         assert!(is_unavailable(&e), "{e:#}");
@@ -489,7 +557,10 @@ mod tests {
         let _ = daemon.kill();
         let _ = daemon.wait();
         let _ = std::fs::remove_dir_all(dir);
-        // No bus at all.
+    }
+
+    #[test]
+    fn no_session_bus_is_unavailable() {
         let k = Keyring {
             address: Some("unix:path=/nonexistent/bus".into()),
             prompt: None,
@@ -501,7 +572,8 @@ mod tests {
     /// `VINOSEARCH_REAL_KEYRING=1`, inside a throwaway `dbus-run-session`
     /// with its own keyring daemon, never the desktop's. Writes the stored
     /// secret's id and hex to `$VINOSEARCH_REAL_KEYRING_OUT` for
-    /// `secret-tool` to check.
+    /// `secret-tool` to check, and reads back the item libsecret stored under
+    /// `$VINOSEARCH_REAL_KEYRING_ID`.
     #[test]
     fn real_secret_service() {
         if std::env::var_os("VINOSEARCH_REAL_KEYRING").is_none() {
@@ -523,7 +595,6 @@ mod tests {
         if let Some(out) = std::env::var_os("VINOSEARCH_REAL_KEYRING_OUT") {
             std::fs::write(out, format!("{} {hex}\n", id_of(&b).unwrap())).unwrap();
         }
-        // One stored by libsecret, read back here.
         if let Some(id) = std::env::var_os("VINOSEARCH_REAL_KEYRING_ID") {
             let theirs = k.fetch(&blob(id.to_str().unwrap())).unwrap();
             eprintln!("libsecret's: {}", String::from_utf8_lossy(&theirs));

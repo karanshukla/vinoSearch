@@ -42,15 +42,7 @@ pub fn run(tag: Option<String>) -> Result<bool> {
 fn update(tag: Option<String>) -> Result<()> {
     let app = sandbox::flatpak_id()
         .context("Not running in the Flatpak: a release install updates with vinosearch-upgrade")?;
-    let tag = tag
-        .or_else(|| std::env::var("VINO_UPDATE_TAG").ok())
-        .unwrap_or_default();
-    if !release_tag(&tag) {
-        bail!(
-            "Not a release tag: {:?}",
-            tag.chars().take(40).collect::<String>()
-        );
-    }
+    let tag = requested_tag(tag)?;
     let branch = sandbox::info_value("Instance", "branch").unwrap_or_default();
     if branch != sandbox::RELEASE_BRANCH {
         bail!(
@@ -61,25 +53,61 @@ fn update(tag: Option<String>) -> Result<()> {
         .context("/.flatpak-info doesn't say where the app is installed")?;
     let home = vinosearch_shared::xdg::home()?;
     let scope = installation(&app_path, app, &home)?;
+    let base = release_base(&tag);
+    let scratch = Scratch::new(scratch_dir(&home, app))?;
+    eprintln!("downloading {tag} from {base}");
+    let bundle = download_verified(&base, &scratch.0)?;
+    eprintln!("checksum verified");
 
-    // A mirror, or a test's fake release. The checksum is checked the same.
-    let base = match std::env::var("VINOSEARCH_RELEASE_BASE") {
+    let service = &names().service;
+    let was_running = start::owned(service) == Some(true);
+    install(scope, &bundle, &tag)?;
+    check_installed(scope, app, &tag)?;
+    if was_running {
+        restart(service, &tag);
+    }
+    Ok(())
+}
+
+/// `tag`, else `$VINO_UPDATE_TAG`, when it is a release tag.
+fn requested_tag(tag: Option<String>) -> Result<String> {
+    let tag = tag
+        .or_else(|| std::env::var("VINO_UPDATE_TAG").ok())
+        .unwrap_or_default();
+    if !release_tag(&tag) {
+        bail!(
+            "Not a release tag: {:?}",
+            tag.chars().take(40).collect::<String>()
+        );
+    }
+    Ok(tag)
+}
+
+/// Where release `tag`'s assets are: `$VINOSEARCH_RELEASE_BASE` (a mirror, or
+/// a test's fake release, whose checksum is checked the same), else GitHub.
+fn release_base(tag: &str) -> String {
+    match std::env::var("VINOSEARCH_RELEASE_BASE") {
         Ok(base) if !base.is_empty() => base.trim_end_matches('/').to_owned(),
         _ => format!("https://github.com/{REPO}/releases/download/{tag}"),
-    };
-    // The app's cache under ~/.var/app, not /tmp: the host's flatpak reads it.
-    let scratch = Scratch::new(
-        home.join(".var/app")
-            .join(app)
-            .join("cache/vinosearch-update"),
-    )?;
-    let bundle = scratch.0.join(BUNDLE);
+    }
+}
+
+/// The app's cache under ~/.var/app, not /tmp: the host's flatpak reads it.
+fn scratch_dir(home: &Path, app: &str) -> PathBuf {
+    home.join(".var/app")
+        .join(app)
+        .join("cache/vinosearch-update")
+}
+
+/// Download the bundle into `dir` and check it against the release's
+/// checksum file; its path.
+fn download_verified(base: &str, dir: &Path) -> Result<PathBuf> {
+    let bundle = dir.join(BUNDLE);
     let agent = agent();
-    eprintln!("downloading {tag} from {base}");
     let mut sums = Vec::new();
     fetch(
         &agent,
-        &base,
+        base,
         &format!("{BUNDLE}.sha256"),
         &mut sums,
         MAX_SUMS,
@@ -89,36 +117,35 @@ fn update(tag: Option<String>) -> Result<()> {
     let want = expected_sum(&String::from_utf8_lossy(&sums), BUNDLE).ok_or_else(checksum_failed)?;
     let mut file = fs::File::create(&bundle)
         .with_context(|| format!("Couldn't write {}", bundle.display()))?;
-    let got = fetch(&agent, &base, BUNDLE, &mut file, MAX_BUNDLE)?;
+    let got = fetch(&agent, base, BUNDLE, &mut file, MAX_BUNDLE)?;
     file.sync_all()?;
     drop(file);
     if got != want {
         return Err(checksum_failed());
     }
-    eprintln!("checksum verified");
+    Ok(bundle)
+}
 
-    let service = &names().service;
-    let was_running = start::owned(service) == Some(true);
-    install(scope, &bundle, &tag)?;
-    // Flatpak installs an older build over a newer one without a word, so
-    // the build now installed is asked what it is.
+/// Flatpak installs an older build over a newer one without a word, so the
+/// build now installed is asked what it is.
+fn check_installed(scope: Scope, app: &str, tag: &str) -> Result<()> {
     match installed_version(scope, app) {
-        Some(version) if same_version(&tag, &version) => {}
+        Some(version) if same_version(tag, &version) => Ok(()),
         Some(version) => bail!(
             "{tag}'s bundle is vinoSearch {version}, and that is installed now; \
              the service wasn't restarted"
         ),
         None => bail!("{tag} is installed but doesn't run; the service wasn't restarted"),
     }
-    // As install.sh does: the running service is restarted on the new
-    // build. A stopped one stays stopped and starts on it next time.
-    if was_running {
-        match start::stop_runner().and_then(|_| start::start(service)) {
-            Ok(()) => println!("restarted {service}"),
-            Err(e) => eprintln!("{service} runs {tag} from its next start: {e:#}"),
-        }
+}
+
+/// As install.sh does, the running service is restarted on the new build. A
+/// stopped one stays stopped and starts on it next time.
+fn restart(service: &str, tag: &str) {
+    match start::stop_runner().and_then(|_| start::start(service)) {
+        Ok(()) => println!("restarted {service}"),
+        Err(e) => eprintln!("{service} runs {tag} from its next start: {e:#}"),
     }
-    Ok(())
 }
 
 /// `v` and dot-separated numbers, as install.sh takes: the tag ends up in a
@@ -166,10 +193,9 @@ impl Scope {
 }
 
 /// `flatpak SUBCOMMAND --user|--system` on the host, for its arguments to
-/// follow.
+/// follow. Started in `/`: the host has no sandbox paths to start in.
 pub(crate) fn host_flatpak(subcommand: &str, scope: Scope) -> Command {
     let mut command = Command::new("flatpak-spawn");
-    // The host has no sandbox paths to start in.
     command
         .current_dir("/")
         .args(["--host", "flatpak", subcommand, scope.flag()])
@@ -211,7 +237,9 @@ pub(crate) fn installation(app_path: &str, app: &str, home: &Path) -> Result<Sco
 
 /// The hash `sums` (sha256sum's output) gives for `name`. Exactly one line
 /// must name it, as install.sh checks: `sha256sum -c` alone would pass
-/// whatever file it happened to list.
+/// whatever file it happened to list (pinned by
+/// `tests::the_checksum_line_names_the_bundle` and
+/// `tests::another_files_line_or_two_for_the_bundle_are_no_use`).
 fn expected_sum(sums: &str, name: &str) -> Option<String> {
     let mut hashes = sums.lines().filter_map(|line| {
         let (hash, rest) = line.split_at_checked(64)?;
@@ -266,10 +294,10 @@ fn fetch(
 }
 
 /// The host's flatpak installs `bundle` into `scope`. A system installation
-/// asks for an administrator's password through the desktop (polkit).
+/// asks for an administrator's password through the desktop (polkit). A
+/// newer build of the installed branch replaces it; an instance still running
+/// keeps the old one until it exits.
 fn install(scope: Scope, bundle: &Path, tag: &str) -> Result<()> {
-    // A newer build of the installed branch replaces it; an instance still
-    // running keeps the old one until it exits.
     let out = host_flatpak("install", scope)
         .args(["-y", "--bundle"])
         .arg(bundle)
@@ -338,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn the_checksum_must_name_exactly_the_bundle() {
+    fn the_checksum_line_names_the_bundle() {
         let h = "a".repeat(64);
         let one = format!("{h}  {BUNDLE}\n");
         assert_eq!(expected_sum(&one, BUNDLE), Some(h.clone()));
@@ -346,7 +374,12 @@ mod tests {
             expected_sum(&format!("{h} *{BUNDLE}\n"), BUNDLE),
             Some(h.clone())
         );
-        // Another file's line is no use, nor two for this one.
+    }
+
+    #[test]
+    fn another_files_line_or_two_for_the_bundle_are_no_use() {
+        let h = "a".repeat(64);
+        let one = format!("{h}  {BUNDLE}\n");
         assert_eq!(expected_sum(&format!("{h}  other.flatpak\n"), BUNDLE), None);
         assert_eq!(expected_sum(&format!("{h}  ./{BUNDLE}\n"), BUNDLE), None);
         assert_eq!(expected_sum(&format!("{one}{one}"), BUNDLE), None);

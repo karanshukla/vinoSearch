@@ -17,21 +17,27 @@ pub fn pick_folder(title: &str) -> Result<Option<PathBuf>> {
     zbus::block_on(pick(title))
 }
 
-async fn pick(title: &str) -> Result<Option<PathBuf>> {
-    let conn = Connection::session().await?;
-    // The portal answers on a Request object whose path it derives from our
-    // bus name and this token. Listening there before asking means a fast
-    // answer can't arrive ahead of the match rule.
-    let token = format!("vinosearch{}", std::process::id());
+/// Where the portal will answer: it derives the Request object's path from
+/// our bus name and the token, so listening there before asking means a fast
+/// answer can't arrive ahead of the match rule.
+fn request_path(conn: &Connection, token: &str) -> Result<String> {
     let sender = conn
         .unique_name()
         .context("no unique bus name")?
         .trim_start_matches(':')
         .replace('.', "_");
+    Ok(format!(
+        "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    ))
+}
+
+async fn pick(title: &str) -> Result<Option<PathBuf>> {
+    let conn = Connection::session().await?;
+    let token = format!("vinosearch{}", std::process::id());
     let request = Proxy::new(
         &conn,
         PORTAL,
-        format!("/org/freedesktop/portal/desktop/request/{sender}/{token}"),
+        request_path(&conn, &token)?,
         "org.freedesktop.portal.Request",
     )
     .await?;

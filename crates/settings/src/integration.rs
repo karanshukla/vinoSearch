@@ -1,6 +1,6 @@
 //! Turning each search place, and the service, on and off, by running what
 //! the CLI does: `vinosearch integrate kde|gnome [--off]`, and `vinosearch
-//! krunner --install` / `--uninstall` for the service with everything (#45).
+//! krunner --install` / `--uninstall` for the service with everything.
 //!
 //! In the Flatpak a place's files come with it, and its switch is the
 //! desktop's own setting for the place (the app menu's is an entry written
@@ -45,12 +45,9 @@ impl State {
         let n = names();
         if let Some(app) = sandbox::flatpak_id() {
             let autostart = sandbox::host_autostart_entry(app);
-            // Asking gsettings runs a command on the host: only where GNOME is.
-            let gnome = desktops().1
-                && sandbox::gnome_providers("enabled").is_some_and(|l| l.contains(&n.desktop_id));
             return State {
                 kde: sandbox::krunner_plugin_on(&n.krunner_plugin_id),
-                gnome,
+                gnome: gnome_provider_on_host(&n.desktop_id),
                 menu: sandbox::host_data_home().is_some_and(|d| d.join(&n.search_entry).exists()),
                 service: autostart.is_some_and(|p| p.exists()),
                 ..State::default()
@@ -91,6 +88,12 @@ pub fn first_run(state: &Arc<Mutex<State>>, ctx: &egui::Context) {
     if !asked.exists() {
         run(Arc::clone(state), ctx, Switch::Service, true);
     }
+}
+
+/// Asking gsettings runs a command on the host, so only where GNOME is.
+fn gnome_provider_on_host(desktop_id: &str) -> bool {
+    desktops().1
+        && sandbox::gnome_providers("enabled").is_some_and(|l| l.iter().any(|d| d == desktop_id))
 }
 
 /// Which desktops the session is, from XDG_CURRENT_DESKTOP: (Plasma, GNOME).

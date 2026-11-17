@@ -40,12 +40,16 @@ pub(super) fn count(n: i64) -> String {
     if n < 0 { format!("-{digits}") } else { digits }
 }
 
+/// Never so little room that nothing of either end is left (pinned by
+/// `tests::a_name_cut_in_too_little_room_still_keeps_twelve_letters`).
+const LEAST_ROOM: usize = 12;
+
 /// `name` in about `room` letters: the middle cut out, as the end of a file
 /// name (the track, the chapter, the extension) is what tells it from the
 /// next one.
 pub(super) fn middle_cut(name: &str, room: usize) -> String {
     let letters: Vec<char> = name.chars().collect();
-    let room = room.max(12);
+    let room = room.max(LEAST_ROOM);
     if letters.len() <= room {
         return name.to_owned();
     }
@@ -114,7 +118,10 @@ mod tests {
             cut.starts_with("Windwaker - ") && cut.ends_with("e of Mind.mp3"),
             "{cut}"
         );
-        // Never so little room that nothing of either end is left.
+    }
+
+    #[test]
+    fn a_name_cut_in_too_little_room_still_keeps_twelve_letters() {
         assert_eq!(
             middle_cut("a-very-long-file-name.txt", 0).chars().count(),
             12

@@ -47,7 +47,7 @@ pub(super) fn pdf(bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
 pub(super) const FURNITURE_LINES: usize = 3;
 
 /// Takes the running headers, footers and page numbers out of `pages` (numbered
-/// from 1) while their text is still in lines (#158). Once `pdf_pages` puts a page
+/// from 1) while their text is still in lines. Once `pdf_pages` puts a page
 /// on one line they can't be told from its first and last sentences, and reading
 /// aloud says "Annual Report 2025 3 Introduction The company grew...".
 ///
@@ -58,48 +58,12 @@ pub(super) const FURNITURE_LINES: usize = 3;
 /// PDF of one or two pages loses only its page numbers. Indexing reads a run of
 /// PARTS_AT_ONCE pages at a time, and counts within the run.
 pub(super) fn drop_furniture(pages: &mut [(usize, String)]) {
-    let slots: Vec<Vec<(usize, String)>> = pages
-        .iter()
-        .map(|(_, text)| {
-            let lines: Vec<(usize, &str)> = text
-                .lines()
-                .enumerate()
-                .filter(|(_, l)| !l.trim().is_empty())
-                .collect();
-            let head = FURNITURE_LINES.min(lines.len());
-            let tail = lines.len().saturating_sub(FURNITURE_LINES).max(head);
-            lines[..head]
-                .iter()
-                .chain(&lines[tail..])
-                .map(|&(i, l)| (i, blanked(l)))
-                .collect()
-        })
-        .collect();
-    // Pages with text, and how many of them each slot's text is on: even, odd.
-    let mut with_text = [0usize; 2];
-    let mut on: std::collections::HashMap<&str, [usize; 2]> = Default::default();
-    for ((n, _), slots) in pages.iter().zip(&slots) {
-        if slots.is_empty() {
-            continue;
-        }
-        with_text[n % 2] += 1;
-        let mut seen: Vec<&str> = slots.iter().map(|(_, s)| s.as_str()).collect();
-        seen.sort_unstable();
-        seen.dedup();
-        for s in seen {
-            on.entry(s).or_default()[n % 2] += 1;
-        }
-    }
-    let all = with_text[0] + with_text[1];
-    let repeated = |s: &str| {
-        on.get(s).is_some_and(|c| {
-            c[0] + c[1] >= 3 && ((c[0] + c[1]) * 2 > all || (0..2).any(|p| c[p] * 2 > with_text[p]))
-        })
-    };
+    let slots: Vec<Vec<(usize, String)>> = pages.iter().map(|(_, text)| slots_of(text)).collect();
+    let repeats = Repeats::count(pages, &slots);
     for ((_, text), slots) in pages.iter_mut().zip(&slots) {
         let gone: Vec<usize> = slots
             .iter()
-            .filter(|(_, s)| page_number(s) || repeated(s))
+            .filter(|(_, s)| page_number(s) || repeats.repeated(s))
             .map(|(i, _)| *i)
             .collect();
         if !gone.is_empty() {
@@ -111,6 +75,62 @@ pub(super) fn drop_furniture(pages: &mut [(usize, String)]) {
                 .collect::<Vec<_>>()
                 .join("\n");
         }
+    }
+}
+
+/// A page's slots: its first and last FURNITURE_LINES non-empty lines,
+/// `blanked`, by line index.
+fn slots_of(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .collect();
+    let head = FURNITURE_LINES.min(lines.len());
+    let tail = lines.len().saturating_sub(FURNITURE_LINES).max(head);
+    lines[..head]
+        .iter()
+        .chain(&lines[tail..])
+        .map(|&(i, l)| (i, blanked(l)))
+        .collect()
+}
+
+/// Pages with text, and how many of them each slot's text is on, each
+/// counted as [even, odd].
+struct Repeats<'a> {
+    with_text: [usize; 2],
+    on: std::collections::HashMap<&'a str, [usize; 2]>,
+}
+
+impl<'a> Repeats<'a> {
+    fn count(pages: &[(usize, String)], slots: &'a [Vec<(usize, String)>]) -> Self {
+        let mut repeats = Repeats {
+            with_text: [0; 2],
+            on: Default::default(),
+        };
+        for ((n, _), slots) in pages.iter().zip(slots) {
+            if slots.is_empty() {
+                continue;
+            }
+            repeats.with_text[n % 2] += 1;
+            let mut seen: Vec<&str> = slots.iter().map(|(_, s)| s.as_str()).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            for s in seen {
+                repeats.on.entry(s).or_default()[n % 2] += 1;
+            }
+        }
+        repeats
+    }
+
+    /// On 3 pages or more, and on more than half of them, or of the odd or
+    /// the even ones.
+    fn repeated(&self, s: &str) -> bool {
+        let all = self.with_text[0] + self.with_text[1];
+        self.on.get(s).is_some_and(|c| {
+            c[0] + c[1] >= 3
+                && ((c[0] + c[1]) * 2 > all || (0..2).any(|p| c[p] * 2 > self.with_text[p]))
+        })
     }
 }
 
@@ -153,37 +173,50 @@ pub(super) fn page_number(blanked: &str) -> bool {
     }
 }
 
+const NUMERALS: [(u32, &str); 13] = [
+    (1000, "m"),
+    (900, "cm"),
+    (500, "d"),
+    (400, "cd"),
+    (100, "c"),
+    (90, "xc"),
+    (50, "l"),
+    (40, "xl"),
+    (10, "x"),
+    (9, "ix"),
+    (5, "v"),
+    (4, "iv"),
+    (1, "i"),
+];
+
 /// Whether `s` is a roman numeral written the usual way, all in one case:
-/// "iv" and "XII", not "iiii", "Mix" or "dim".
+/// "iv" and "XII", not "iiii", "Mix" or "dim" (pinned by
+/// `extract::tests::page_numbers_are_told_from_text`).
 pub(super) fn roman(s: &str) -> bool {
-    const NUMERALS: [(u32, &str); 13] = [
-        (1000, "m"),
-        (900, "cm"),
-        (500, "d"),
-        (400, "cd"),
-        (100, "c"),
-        (90, "xc"),
-        (50, "l"),
-        (40, "xl"),
-        (10, "x"),
-        (9, "ix"),
-        (5, "v"),
-        (4, "iv"),
-        (1, "i"),
-    ];
     if s.is_empty() || s.len() > 15 || (s != s.to_lowercase() && s != s.to_uppercase()) {
         return false;
     }
     let s = s.to_lowercase();
-    // Read greedily, then written back the usual way: only that is a numeral.
+    let (value, rest) = read_roman_greedily(&s);
+    rest.is_empty() && write_roman(value) == s
+}
+
+/// The value of `s`'s leading numerals, taking the largest first, and what
+/// follows them.
+fn read_roman_greedily(s: &str) -> (u32, &str) {
     let mut value = 0;
-    let mut rest = s.as_str();
+    let mut rest = s;
     for (n, numeral) in NUMERALS {
         while let Some(r) = rest.strip_prefix(numeral) {
             rest = r;
             value += n;
         }
     }
+    (value, rest)
+}
+
+/// `value` in lowercase roman numerals, written the usual way.
+fn write_roman(mut value: u32) -> String {
     let mut usual = String::new();
     for (n, numeral) in NUMERALS {
         while value >= n {
@@ -191,13 +224,13 @@ pub(super) fn roman(s: &str) -> bool {
             value -= n;
         }
     }
-    rest.is_empty() && usual == s
+    usual
 }
 
 /// lopdf decodes by a font's /Encoding whenever it has one and reads /ToUnicode only
 /// without, the reverse of the spec's order. A Type 3 font always has an /Encoding, and
 /// Chromium's Print to PDF draws web fonts as Type 3 with made-up glyph names, so its
-/// pages came out as glyph codes (#92). With /Encoding gone, lopdf takes /ToUnicode.
+/// pages came out as glyph codes. With /Encoding gone, lopdf takes /ToUnicode.
 pub(super) fn prefer_to_unicode(doc: &mut lopdf::Document) {
     for object in doc.objects.values_mut() {
         if let Ok(font) = object.as_dict_mut()

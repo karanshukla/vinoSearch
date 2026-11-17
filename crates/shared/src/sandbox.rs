@@ -231,15 +231,23 @@ mod tests {
         assert!(plugin_on(rc, "x.y"));
         assert!(!plugin_on(rc, "baloosearch"));
         assert!(!plugin_on("[General]\nx.yEnabled=true\n", "x.y"));
-        // As KConfig writes it: the last of a repeated key or group wins, a
-        // nested group is not the group, and `[$i]` and `:` belong to keys.
-        let rc = "[Plugins]\nx.yEnabled=true\nx.yEnabled=false\n\n[Plugins][Favorites]\nx.yEnabled=true\n\n[General]\nhistory[$i]=a:b;c\n";
-        assert!(!plugin_on(rc, "x.y"));
-        assert!(plugin_on(
-            "[Plugins]\nx.yEnabled=false\n[Other]\na=b\n[Plugins]\nx.yEnabled=true\n",
-            "x.y"
-        ));
         assert!(!plugin_on("", "x.y"));
+    }
+
+    #[test]
+    fn a_krunner_plugin_is_read_as_kconfig_writes_it() {
+        let rc = "[Plugins]\nx.yEnabled=true\nx.yEnabled=false\n\n[Plugins][Favorites]\nx.yEnabled=true\n\n[General]\nhistory[$i]=a:b;c\n";
+        assert!(
+            !plugin_on(rc, "x.y"),
+            "the last repeated key wins, a nested group is not the group, `[$i]` is a key's"
+        );
+        assert!(
+            plugin_on(
+                "[Plugins]\nx.yEnabled=false\n[Other]\na=b\n[Plugins]\nx.yEnabled=true\n",
+                "x.y"
+            ),
+            "the last repeated group wins"
+        );
     }
 
     #[test]
@@ -274,7 +282,10 @@ mod tests {
             ini_value(info, "Instance", "app-path").as_deref(),
             Some("/x/app/a.b/files")
         );
-        // Flatpak's lists end in `;`, and a path may hold `:` or `#`.
+    }
+
+    #[test]
+    fn a_flatpak_list_keeps_its_semicolon_and_a_path_its_colon_and_hash() {
         let info = "[Context]\nfilesystems=home;host-os:ro;\n# a comment\n[Instance]\napp-path=/a:b #1/files\n";
         assert_eq!(
             ini_value(info, "Context", "filesystems").as_deref(),

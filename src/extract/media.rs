@@ -1,10 +1,10 @@
-//! Sound and picture out of audio and video files (#187, #192), streamed from
+//! Sound and picture out of audio and video files, streamed from
 //! ffmpeg so a two-hour film is never held in memory. Audio comes as 10 s
 //! windows of 16 kHz mono, frames as one per shot. Both start at a given
 //! second, so an interrupted file carries on where it stopped.
 //!
 //! The files come from anywhere, so ffmpeg and ffprobe run under limits, as
-//! poppler does for OCR (#106): address space and CPU per process, and a
+//! poppler does for OCR: address space and CPU per process, and a
 //! watchdog that kills one that stops producing output.
 
 use crate::ml::audio::{SAMPLE_RATE, WINDOW_SAMPLES};
@@ -13,7 +13,7 @@ use image::RgbImage;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ const PROBE_WALL: Duration = Duration::from_secs(30);
 /// status the settings window polls doesn't walk PATH every time.
 const LOOK_AGAIN: Duration = Duration::from_secs(30);
 
-/// A frame at each scene cut over this (#192).
+/// A frame at each scene cut over this.
 const SCENE: f64 = 0.3;
 /// At most one frame per this many seconds, however many cuts.
 const MIN_GAP: u32 = 5;
@@ -47,17 +47,17 @@ const MAX_GAP: u32 = 30;
 const FRAME_SIDE: u32 = 768;
 
 /// 100 ms frames, and a window is quiet when this share of them are under
-/// QUIET_DBFS (#192).
+/// QUIET_DBFS.
 const QUIET_DBFS: f32 = -50.0;
 const QUIET_SHARE: f32 = 0.95;
-/// Windows start every 5 s, so each moment is whole in one of them. Without
-/// the overlap the #187 spike's dog, bells and speech fell across windows
-/// and lost to others; with it audio is still ~1.2 NPU min an hour (#190).
+/// Windows start every 5 s, so each moment is whole in one of them: without
+/// the overlap sounds fall across windows and lose to others. Audio is still
+/// ~1.2 NPU min an hour (measured 2026-11).
 const HOP_SAMPLES: usize = 5 * SAMPLE_RATE;
 /// A file shorter than this has no window, and at the end a last hop
 /// shorter than this adds none. A last hop longer is a window ending at the
 /// end: a second of sound padded with nine of silence embeds as little but
-/// silence, and outscored every real window in the #187 spike.
+/// silence, and outscores real windows.
 const MIN_WINDOW_SAMPLES: usize = SAMPLE_RATE;
 
 /// A media file's frames are numbered from here up by their second; its
@@ -215,6 +215,13 @@ impl Window {
     }
 }
 
+/// Fills a late start or a gap with silence, which the raw output would
+/// otherwise close up: windows are timed by counting samples from `from`
+/// (pinned by `tests::sound_that_starts_late_is_timed_from_the_start_of_the_file`).
+const FILL_GAPS_WITH_SILENCE: &str = "aresample=async=1:first_pts=0";
+/// stderr lines kept for the error message when ffmpeg fails.
+const KEPT_LINES: usize = 5;
+
 /// The first audio stream from second `from`, in 10 s windows every 5 s.
 pub struct Audio {
     decoder: Decoder,
@@ -232,10 +239,7 @@ pub fn audio(path: &Path, from: u32, probe: &Probe) -> Result<Audio> {
         .arg("-i")
         .arg(input(path))
         .args(["-map", "0:a:0", "-vn"])
-        // Silence where the stream starts late or has a gap, which the raw
-        // output would otherwise close up: windows are timed by counting
-        // samples from `from`.
-        .args(["-af", "aresample=async=1:first_pts=0"])
+        .args(["-af", FILL_GAPS_WITH_SILENCE])
         .args(["-f", "f32le", "-ac", "1"])
         .args(["-ar", &SAMPLE_RATE.to_string(), "pipe:1"]);
     Ok(Audio {
@@ -263,6 +267,30 @@ impl Audio {
             .map(|b| f32::from_le_bytes(*b))
             .collect())
     }
+
+    /// A whole window, or what there is of a short file; false when that is
+    /// under MIN_WINDOW_SAMPLES.
+    fn first_window(&mut self) -> Result<bool> {
+        let samples = self.read(WINDOW_SAMPLES)?;
+        if samples.len() < MIN_WINDOW_SAMPLES {
+            return Ok(false);
+        }
+        self.window = samples;
+        Ok(true)
+    }
+
+    /// HOP_SAMPLES on, the rest of the window kept from the one before; false
+    /// at the end.
+    fn hop(&mut self) -> Result<bool> {
+        let new = self.read(HOP_SAMPLES)?;
+        if new.len() < MIN_WINDOW_SAMPLES || self.window.len() < WINDOW_SAMPLES {
+            return Ok(false);
+        }
+        self.window.drain(..new.len());
+        self.window.extend(new.iter());
+        self.at += new.len();
+        Ok(true)
+    }
 }
 
 impl Iterator for Audio {
@@ -272,33 +300,19 @@ impl Iterator for Audio {
         if self.done {
             return None;
         }
-        if self.window.is_empty() {
-            // The first: a whole window, or what there is of a short file.
-            let samples = match self.read(WINDOW_SAMPLES) {
-                Ok(s) => s,
-                Err(e) => return Some(Err(e)),
-            };
-            if samples.len() < MIN_WINDOW_SAMPLES {
-                return None;
-            }
-            self.window = samples;
+        let more = if self.window.is_empty() {
+            self.first_window()
         } else {
-            // Then HOP on, the last of them filled out from the one before.
-            let new = match self.read(HOP_SAMPLES) {
-                Ok(s) => s,
-                Err(e) => return Some(Err(e)),
-            };
-            if new.len() < MIN_WINDOW_SAMPLES || self.window.len() < WINDOW_SAMPLES {
-                return None;
-            }
-            self.window.drain(..new.len());
-            self.window.extend(new.iter());
-            self.at += new.len();
+            self.hop()
+        };
+        match more {
+            Ok(true) => Some(Ok(Window {
+                start: self.from + (self.at / SAMPLE_RATE) as u32,
+                samples: self.window.clone(),
+            })),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
         }
-        Some(Ok(Window {
-            start: self.from + (self.at / SAMPLE_RATE) as u32,
-            samples: self.window.clone(),
-        }))
     }
 }
 
@@ -318,6 +332,10 @@ pub struct Frames {
     done: bool,
 }
 
+/// Decoded to rgb24, as a 10-bit source (HEVC Main10, a phone's HDR video)
+/// would otherwise come as 16-bit PPM (pinned by
+/// `tests::ten_bit_video_gives_eight_bit_frames`). showinfo reports each kept
+/// frame's time at the info level.
 pub fn frames(path: &Path, from: u32, probe: &Probe) -> Result<Frames> {
     let select = format!(
         "select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{MAX_GAP})\
@@ -326,8 +344,6 @@ pub fn frames(path: &Path, from: u32, probe: &Probe) -> Result<Frames> {
          format=rgb24,showinfo"
     );
     let mut cmd = limited("ffmpeg", cpu_seconds(probe));
-    // rgb24, or a 10-bit source (HEVC Main10, a phone's HDR video) comes as
-    // 16-bit PPM. showinfo reports each kept frame's time at the info level.
     cmd.args(["-nostdin", "-hide_banner", "-nostats", "-v", "info"])
         .args(["-threads", "2", "-ss", &from.to_string()])
         .arg("-i")
@@ -497,7 +513,7 @@ impl Decoder {
     fn spawn(
         mut cmd: Command,
         stall: Duration,
-        mut on_line: impl FnMut(&str) -> Option<()> + Send + 'static,
+        on_line: impl FnMut(&str) -> Option<()> + Send + 'static,
     ) -> Result<Self> {
         let mut child = cmd
             .stdin(Stdio::null())
@@ -511,47 +527,15 @@ impl Decoder {
         let waiting = Arc::new(AtomicU64::new(IDLE));
         let stop = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
-        let stderr = std::thread::spawn(move || {
-            let mut kept: Vec<String> = Vec::new();
-            let mut stderr = BufReader::new(stderr);
-            let mut line = Vec::new();
-            // By bytes: ffmpeg prints a file's tags as they are, and one
-            // that isn't UTF-8 must not end the reading.
-            while stderr.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
-                let text = String::from_utf8_lossy(&line);
-                let text = text.trim_end_matches(['\n', '\r']);
-                if on_line(text).is_none() && !text.trim().is_empty() {
-                    kept.push(text.to_owned());
-                    if kept.len() > 5 {
-                        kept.remove(0);
-                    }
-                }
-                line.clear();
-            }
-            kept.join("\n")
-        });
-        let pid = child.id() as libc::pid_t;
-        let watchdog = {
-            let (waiting, stop, stalled) = (waiting.clone(), stop.clone(), stalled.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let since = waiting.load(Ordering::Relaxed);
-                    if since != IDLE
-                        && started
-                            .elapsed()
-                            .saturating_sub(Duration::from_millis(since))
-                            > stall
-                    {
-                        stalled.store(true, Ordering::Relaxed);
-                        // SAFETY: the child isn't reaped until this thread is
-                        // joined, so the pid is still the child's.
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                        return;
-                    }
-                }
-            })
-        };
+        let stderr = drain_stderr(stderr, on_line);
+        let watchdog = spawn_watchdog(
+            child.id() as libc::pid_t,
+            waiting.clone(),
+            stop.clone(),
+            stalled.clone(),
+            started,
+            stall,
+        );
         Ok(Self {
             child,
             stdout,
@@ -570,9 +554,7 @@ impl Decoder {
         let mut got = 0;
         let mut result = Ok(());
         while got < buf.len() {
-            // The stall clock starts with each read, and stops below.
-            self.waiting
-                .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            self.start_stall_clock();
             match self.stdout.read(&mut buf[got..]) {
                 Ok(0) => break,
                 Ok(n) => got += n,
@@ -583,9 +565,18 @@ impl Decoder {
                 }
             }
         }
-        self.waiting.store(IDLE, Ordering::Relaxed);
+        self.stop_stall_clock();
         result?;
         Ok(got)
+    }
+
+    fn start_stall_clock(&self) {
+        self.waiting
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn stop_stall_clock(&self) {
+        self.waiting.store(IDLE, Ordering::Relaxed);
     }
 
     /// At the end of stdout: Err unless ffmpeg exited cleanly.
@@ -615,6 +606,63 @@ impl Decoder {
             let _ = w.join();
         }
     }
+}
+
+/// The last KEPT_LINES of `stderr` that `on_line` returns None for. Read by
+/// bytes: ffmpeg prints a file's tags as they are, and one that isn't UTF-8
+/// must not end the reading (pinned by
+/// `tests::a_tag_that_isnt_utf8_doesnt_lose_the_frames`).
+fn drain_stderr(
+    stderr: ChildStderr,
+    mut on_line: impl FnMut(&str) -> Option<()> + Send + 'static,
+) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut kept: Vec<String> = Vec::new();
+        let mut stderr = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while stderr.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\n', '\r']);
+            if on_line(text).is_none() && !text.trim().is_empty() {
+                kept.push(text.to_owned());
+                if kept.len() > KEPT_LINES {
+                    kept.remove(0);
+                }
+            }
+            line.clear();
+        }
+        kept.join("\n")
+    })
+}
+
+/// Kills `pid` once a read has been `waiting` longer than `stall`, until
+/// `stop`; says so in `stalled`.
+fn spawn_watchdog(
+    pid: libc::pid_t,
+    waiting: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+    started: Instant,
+    stall: Duration,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+            let since = waiting.load(Ordering::Relaxed);
+            if since != IDLE
+                && started
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(since))
+                    > stall
+            {
+                stalled.store(true, Ordering::Relaxed);
+                // SAFETY: the child isn't reaped until this thread is
+                // joined, so the pid is still the child's.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return;
+            }
+        }
+    })
 }
 
 impl Drop for Decoder {
@@ -703,9 +751,12 @@ mod tests {
         let starts: Vec<u32> = windows.iter().map(|w| w.start).collect();
         assert_eq!(starts, [0, 5, 10, 15]);
         assert!(windows.iter().all(|w| w.samples.len() == WINDOW_SAMPLES));
-        // Only 10 to 20 s is all silence.
         let quiet: Vec<bool> = windows.iter().map(Window::quiet).collect();
-        assert_eq!(quiet, [false, false, true, false]);
+        assert_eq!(
+            quiet,
+            [false, false, true, false],
+            "only 10 to 20 s is all silence"
+        );
 
         let resumed: Vec<u32> = audio(&path, 10, &p)
             .unwrap()
@@ -799,14 +850,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_decoder_that_hangs_is_killed() {
-        // Not through sh: dash forks the sleep, which then holds the pipe
-        // open after sh is killed. ffmpeg doesn't fork.
+    /// `sleep` itself, not through sh: dash forks the sleep, which then holds
+    /// the pipe open after sh is killed. ffmpeg doesn't fork.
+    fn a_hanging_decoder() -> Command {
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
+        cmd
+    }
+
+    #[test]
+    fn a_decoder_that_hangs_is_killed() {
         let started = Instant::now();
-        let mut d = Decoder::spawn(cmd, Duration::from_secs(1), |_| None).unwrap();
+        let mut d = Decoder::spawn(a_hanging_decoder(), Duration::from_secs(1), |_| None).unwrap();
         assert_eq!(d.read_up_to(&mut [0u8; 16]).unwrap(), 0);
         let err = d.finish().unwrap_err().to_string();
         assert!(err.contains("gave nothing"), "{err}");
@@ -852,13 +907,13 @@ mod tests {
         if !ffmpeg() {
             return;
         }
-        // Latin-1 "Café", as an old tagger wrote it; ffmpeg prints it as is.
+        let latin1_title = std::ffi::OsStr::from_bytes(b"title=Caf\xe9 \xff\xfe");
         let path = scratch().join("latin1.mkv");
         let ok = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg("color=red:s=160x120:r=5:d=3")
             .arg("-metadata")
-            .arg(std::ffi::OsStr::from_bytes(b"title=Caf\xe9 \xff\xfe"))
+            .arg(latin1_title)
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
             .arg(&path)
             .status()
@@ -878,7 +933,6 @@ mod tests {
         if !ffmpeg() {
             return;
         }
-        // 20 s of picture, a tone from 12 s on.
         let path = scratch().join("late-sound.mkv");
         let ok = Command::new("ffmpeg")
             .args(["-v", "error", "-y"])
@@ -896,25 +950,32 @@ mod tests {
         let windows: Vec<Window> = audio(&path, 0, &p).unwrap().map(|w| w.unwrap()).collect();
         let starts: Vec<u32> = windows.iter().map(|w| w.start).collect();
         assert_eq!(starts, [0, 5, 10]);
-        // Nothing to hear until 12 s: the first window is the silence
-        // before it, not the tone moved up to 0.
         let quiet: Vec<bool> = windows.iter().map(Window::quiet).collect();
-        assert_eq!(quiet, [true, false, false]);
+        assert_eq!(
+            quiet,
+            [true, false, false],
+            "the tone starts at 12 s: the first window is the silence before it"
+        );
         let tenth = SAMPLE_RATE / 10;
         let loud = |w: &Window, second: usize| {
             w.samples[second * SAMPLE_RATE..][..tenth]
                 .iter()
                 .any(|x| x.abs() > 0.05)
         };
-        // The window from 5 s hears it from its seventh second on.
-        assert!(!loud(&windows[1], 6) && loud(&windows[1], 8));
+        assert!(
+            !loud(&windows[1], 6) && loud(&windows[1], 8),
+            "the window from 5 s hears it from its seventh second on"
+        );
 
-        // From a second past its start, nothing is padded.
         let resumed: Vec<bool> = audio(&path, 14, &p)
             .unwrap()
             .map(|w| w.unwrap().quiet())
             .collect();
-        assert_eq!(resumed, [false]);
+        assert_eq!(
+            resumed,
+            [false],
+            "from a second past its start, nothing is padded"
+        );
     }
 
     #[test]
@@ -923,8 +984,8 @@ mod tests {
             Decoder::spawn(Command::new("yes"), Duration::from_millis(600), |_| None).unwrap();
         let mut buf = [0u8; 16];
         assert_eq!(d.read_up_to(&mut buf).unwrap(), 16);
-        // The embedder busy with a window for longer than the stall.
-        std::thread::sleep(Duration::from_millis(1500));
+        let embedder_busy_past_the_stall = Duration::from_millis(1500);
+        std::thread::sleep(embedder_busy_past_the_stall);
         assert!(!d.stalled.load(Ordering::Relaxed));
         assert_eq!(d.read_up_to(&mut buf).unwrap(), 16);
         assert_eq!(&buf[..4], b"y\ny\n");
@@ -942,16 +1003,17 @@ mod tests {
             })
         };
         assert!(!get(0, false));
-        // Installed a moment later: not seen until LOOK_AGAIN has passed.
-        assert!(!get(10, true));
+        assert!(
+            !get(10, true),
+            "installed: not seen until LOOK_AGAIN has passed"
+        );
         assert!(get(31, true));
-        // Found: never looked for again.
-        assert!(get(32, false));
+        assert!(get(32, false), "found: never looked for again");
         assert!(get(3600, false));
         assert_eq!(looks, 2);
     }
 
-    /// The #187 spike's clip, seven segments with a cut between each
+    /// The A/V spike's clip, seven segments with a cut between each
     /// (bench/av_spike/make_clip.sh), which isn't checked in:
     /// `VINOSEARCH_AV_SPIKE=~/.cache/vinosearch/bench/av_spike cargo test -- --ignored spike`
     #[test]
@@ -974,10 +1036,9 @@ mod tests {
             .unwrap()
             .map(|w| w.unwrap().start)
             .collect();
-        // 91 s: every 5 s to 80, then the last 10 s.
         let mut want: Vec<u32> = (0..17).map(|i| i * 5).collect();
         want.push(81);
-        assert_eq!(windows, want);
+        assert_eq!(windows, want, "91 s: every 5 s to 80, then the last 10 s");
     }
 
     #[test]

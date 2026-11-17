@@ -1,7 +1,7 @@
 //! The embedding model: EmbeddingGemma 2's text model, rotary-fixed and INT8,
 //! for images its vision encoder with static shapes, and for audio its audio
-//! encoder, static and INT8 (#190); and the OCR model for the text in images
-//! and scans (#106). Each is pinned by Hugging Face commit and SHA-256.
+//! encoder, static and INT8; and the OCR model for the text in images
+//! and scans. Each is pinned by Hugging Face commit and SHA-256.
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -24,102 +24,115 @@ pub(crate) const AUDIO_TEXT_REVISION: &str = "1e53edbfc9581825c13a0e057e098418db
 const OCR_REPO: &str = "arankays/pp-ocrv6-small-onnx";
 pub(crate) const OCR_REVISION: &str = "5bc17817a3879e7e494cd71b43d66b7b608abfac";
 
-/// (path in the repo, sha256, size in bytes)
-const FILES: &[(&str, &str, u64)] = &[
-    // The text-only graph: OpenVINO's C API cannot build the zero-size media
-    // inputs model.onnx takes.
-    (
-        "onnx/model_text.onnx",
-        "cab66c5d0bf25beaadca4095c7c4cb2e06b05cb360059f5854d9e4b110b70af3",
-        713_515,
-    ),
-    (
-        "onnx/model.onnx_data",
-        "5fa7999279f92b8e97dd74dee5478b58b58c2c28bfdcfd343c7e4e4cb4103dd7",
-        273_296_384,
-    ),
-    // model_text.onnx with its inputs fixed at [1, 32] and [1, 256]
-    // (bench/static_shapes.py), so the runner can compile straight from the
-    // path and a cache hit never reads the weights.
-    (
-        "onnx/model_text_q32.onnx",
-        "8ecbd32473fce1d7805ab4ef8ab9be69d12b3b95639231001cd30054096245bc",
-        713_465,
-    ),
-    (
-        "onnx/model_text_d256.onnx",
-        "65e91c59827cfa791f090dab4b9091ff5a37e5393adb1fd77d6289ef89985049",
-        713_467,
-    ),
-    (
-        "tokenizer.json",
-        "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
-        32_170_510,
-    ),
-    // model_text.onnx taking the vision encoder's output, for images
-    // (bench/static_image_text.py). Small, so fetched whether or not images are on.
-    (
-        "onnx/model_image_140.onnx",
-        "e160498a7564bfa0f53b37bf648d0d72377206294acd0a4e48334fbea31cb144",
-        713_476,
-    ),
+/// A file of a repo, as fetched.
+struct Pinned<'a> {
+    /// Its path in the repo.
+    path: &'a str,
+    sha256: &'a str,
+    bytes: u64,
+}
+
+/// The text-only graph: OpenVINO's C API cannot build the zero-size media
+/// inputs model.onnx takes.
+const TEXT_ONLY_GRAPH: Pinned = Pinned {
+    path: "onnx/model_text.onnx",
+    sha256: "cab66c5d0bf25beaadca4095c7c4cb2e06b05cb360059f5854d9e4b110b70af3",
+    bytes: 713_515,
+};
+/// model_text.onnx with its inputs fixed at [1, 32] (bench/static_shapes.py),
+/// so the runner can compile straight from the path and a cache hit never
+/// reads the weights.
+const QUERY_GRAPH: Pinned = Pinned {
+    path: "onnx/model_text_q32.onnx",
+    sha256: "8ecbd32473fce1d7805ab4ef8ab9be69d12b3b95639231001cd30054096245bc",
+    bytes: 713_465,
+};
+/// QUERY_GRAPH's twin at [1, 256].
+const DOCUMENT_GRAPH: Pinned = Pinned {
+    path: "onnx/model_text_d256.onnx",
+    sha256: "65e91c59827cfa791f090dab4b9091ff5a37e5393adb1fd77d6289ef89985049",
+    bytes: 713_467,
+};
+/// model_text.onnx taking the vision encoder's output, for images
+/// (bench/static_image_text.py). Small, so fetched whether or not images are on.
+const IMAGE_TEXT_GRAPH: Pinned = Pinned {
+    path: "onnx/model_image_140.onnx",
+    sha256: "e160498a7564bfa0f53b37bf648d0d72377206294acd0a4e48334fbea31cb144",
+    bytes: 713_476,
+};
+
+const FILES: &[Pinned] = &[
+    TEXT_ONLY_GRAPH,
+    Pinned {
+        path: "onnx/model.onnx_data",
+        sha256: "5fa7999279f92b8e97dd74dee5478b58b58c2c28bfdcfd343c7e4e4cb4103dd7",
+        bytes: 273_296_384,
+    },
+    QUERY_GRAPH,
+    DOCUMENT_GRAPH,
+    Pinned {
+        path: "tokenizer.json",
+        sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+        bytes: 32_170_510,
+    },
+    IMAGE_TEXT_GRAPH,
 ];
 
 /// The vision encoder, fetched only while images are indexed.
-const VISION_FILES: &[(&str, &str, u64)] = &[
-    (
-        "onnx/vision_encoder_static_140.onnx",
-        "edfc29b9451ab3da75d8030b55285ec12006438b89d6aa8cd4f9729ffc35d813",
-        121_271,
-    ),
-    (
-        "onnx/vision_encoder.onnx_data",
-        "ca8d28c99feb8129618f141978a27adae25090e0dadb68a30c235e191c01e37e",
-        671_026_176,
-    ),
+const VISION_FILES: &[Pinned] = &[
+    Pinned {
+        path: "onnx/vision_encoder_static_140.onnx",
+        sha256: "edfc29b9451ab3da75d8030b55285ec12006438b89d6aa8cd4f9729ffc35d813",
+        bytes: 121_271,
+    },
+    Pinned {
+        path: "onnx/vision_encoder.onnx_data",
+        sha256: "ca8d28c99feb8129618f141978a27adae25090e0dadb68a30c235e191c01e37e",
+        bytes: 671_026_176,
+    },
 ];
 
 /// The audio encoder, fetched only while media is indexed.
-const AUDIO_FILES: &[(&str, &str, u64)] = &[
-    (
-        "onnx/audio_encoder_static_10s_int8.onnx",
-        "859067ce6112f3c56240cfb7e6d2db6031954ae5f342a3d1869ea5a06bed1e03",
-        240_579,
-    ),
-    (
-        "onnx/audio_encoder_static_10s_int8.onnx_data",
-        "b70b84ac5b467e84e265cc44e0a117d623cdd7f6310e141aa580d03dcccd492e",
-        295_154_176,
-    ),
+const AUDIO_FILES: &[Pinned] = &[
+    Pinned {
+        path: "onnx/audio_encoder_static_10s_int8.onnx",
+        sha256: "859067ce6112f3c56240cfb7e6d2db6031954ae5f342a3d1869ea5a06bed1e03",
+        bytes: 240_579,
+    },
+    Pinned {
+        path: "onnx/audio_encoder_static_10s_int8.onnx_data",
+        sha256: "b70b84ac5b467e84e265cc44e0a117d623cdd7f6310e141aa580d03dcccd492e",
+        bytes: 295_154_176,
+    },
 ];
 
 /// `model_text.onnx` taking the audio encoder's output, from the text repo
 /// at AUDIO_TEXT_REVISION, into the text model's directory: it reads
 /// `model.onnx_data` beside it.
-const AUDIO_TEXT_FILES: &[(&str, &str, u64)] = &[(
-    "onnx/model_audio_250.onnx",
-    "fe1196496d5e8db24d2621a2fdd090856a19984398e2d032ec46a38e2c6effb6",
-    713_476,
-)];
+const AUDIO_TEXT_FILES: &[Pinned] = &[Pinned {
+    path: "onnx/model_audio_250.onnx",
+    sha256: "fe1196496d5e8db24d2621a2fdd090856a19984398e2d032ec46a38e2c6effb6",
+    bytes: 713_476,
+}];
 
 /// PP-OCRv6 small, as RapidOCR 3.10.0 publishes it, and its dict. Small, so
 /// fetched whether or not images are on: scanned PDFs need it too.
-const OCR_FILES: &[(&str, &str, u64)] = &[
-    (
-        "onnx/PP-OCRv6_det_small.onnx",
-        "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f",
-        9_929_594,
-    ),
-    (
-        "onnx/PP-OCRv6_rec_small.onnx",
-        "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
-        21_234_383,
-    ),
-    (
-        "ppocrv6_dict.txt",
-        "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
-        74_947,
-    ),
+const OCR_FILES: &[Pinned] = &[
+    Pinned {
+        path: "onnx/PP-OCRv6_det_small.onnx",
+        sha256: "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f",
+        bytes: 9_929_594,
+    },
+    Pinned {
+        path: "onnx/PP-OCRv6_rec_small.onnx",
+        sha256: "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
+        bytes: 21_234_383,
+    },
+    Pinned {
+        path: "ppocrv6_dict.txt",
+        sha256: "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+        bytes: 74_947,
+    },
 ];
 
 /// The encoders the formats switched on need, besides the text model and OCR.
@@ -145,7 +158,7 @@ impl Wants {
 
 /// Bytes the model takes on disk once fetched, with what `wants` adds.
 pub fn total_bytes(wants: Wants) -> u64 {
-    let size = |files: &[(&str, &str, u64)]| files.iter().map(|(_, _, size)| size).sum::<u64>();
+    let size = |files: &[Pinned]| files.iter().map(|f| f.bytes).sum::<u64>();
     size(FILES)
         + size(OCR_FILES)
         + if wants.vision() {
@@ -187,39 +200,34 @@ pub fn bytes() -> Result<u64> {
 
 /// The audio encoder, in `audio_dir()`.
 pub fn audio_path(dir: &Path) -> PathBuf {
-    dir.join(AUDIO_FILES[0].0)
+    dir.join(AUDIO_FILES[0].path)
 }
 
 /// The text model taking audio features, in `default_dir()`.
 pub fn audio_text_path(dir: &Path) -> PathBuf {
-    dir.join(AUDIO_TEXT_FILES[0].0)
+    dir.join(AUDIO_TEXT_FILES[0].path)
 }
 
 /// What embedding sound needs, besides the text model, is present.
 pub fn audio_present(dir: &Path, audio_dir: &Path) -> bool {
-    audio_text_path(dir).is_file()
-        && AUDIO_FILES
-            .iter()
-            .all(|(name, _, _)| audio_dir.join(name).is_file())
+    audio_text_path(dir).is_file() && AUDIO_FILES.iter().all(|f| audio_dir.join(f.path).is_file())
 }
 
 pub fn ocr_det_path(dir: &Path) -> PathBuf {
-    dir.join(OCR_FILES[0].0)
+    dir.join(OCR_FILES[0].path)
 }
 
 pub fn ocr_rec_path(dir: &Path) -> PathBuf {
-    dir.join(OCR_FILES[1].0)
+    dir.join(OCR_FILES[1].path)
 }
 
 pub fn ocr_dict_path(dir: &Path) -> PathBuf {
-    dir.join(OCR_FILES[2].0)
+    dir.join(OCR_FILES[2].path)
 }
 
 /// Every file reading text from pixels needs is in `dir`.
 pub fn ocr_present(dir: &Path) -> bool {
-    OCR_FILES
-        .iter()
-        .all(|(name, _, _)| dir.join(name).is_file())
+    OCR_FILES.iter().all(|f| dir.join(f.path).is_file())
 }
 
 /// The vision encoder, in `vision_dir()`.
@@ -324,16 +332,23 @@ pub fn fetch(wants: Wants, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
     Ok(())
 }
 
-/// `files` from `source`, the URL their paths are under.
+/// `files` from `source`, the URL their paths are under. However a download
+/// stops (a dropped connection, a full disk), its part file is not left
+/// behind (pinned by `tests::a_dropped_download_leaves_no_part_file`).
 fn fetch_files(
     source: &str,
-    files: &[(&str, &str, u64)],
+    files: &[Pinned],
     dir: &Path,
     done: &mut u64,
     total: u64,
     progress: &mut dyn FnMut(&str, u64, u64),
 ) -> Result<()> {
-    for (name, want, size) in files {
+    for Pinned {
+        path: name,
+        sha256: want,
+        bytes: size,
+    } in files
+    {
         let dest = dir.join(name);
         if dest.is_file() && sha256_file(&dest)? == *want {
             *done += size;
@@ -349,8 +364,6 @@ fn fetch_files(
         });
         *done += size;
         if let Err(e) = got {
-            // However it stopped (a dropped connection, a full disk), a
-            // half-written file of up to the file's size is not left behind.
             let _ = fs::remove_file(&part);
             return Err(e);
         }
@@ -405,8 +418,8 @@ fn download(
 pub fn present(dir: &Path) -> bool {
     FILES
         .iter()
-        .filter(|(name, _, _)| !name.contains("model_text_") && !name.contains("model_image_"))
-        .all(|(name, _, _)| dir.join(name).is_file())
+        .filter(|f| !f.path.contains("model_text_") && !f.path.contains("model_image_"))
+        .all(|f| dir.join(f.path).is_file())
 }
 
 /// What embedding an image needs, besides the text model, is present.
@@ -414,7 +427,7 @@ pub fn vision_present(dir: &Path, vision_dir: &Path) -> bool {
     image_text_path(dir).is_file()
         && VISION_FILES
             .iter()
-            .all(|(name, _, _)| vision_dir.join(name).is_file())
+            .all(|f| vision_dir.join(f.path).is_file())
 }
 
 /// What indexing an image needs, besides the text model, is present: the
@@ -507,7 +520,11 @@ mod tests {
         let mut last = 0;
         fetch_files(
             url,
-            &[("onnx/m.onnx", want, size)],
+            &[Pinned {
+                path: "onnx/m.onnx",
+                sha256: want,
+                bytes: size,
+            }],
             dir,
             &mut done,
             size,
@@ -539,9 +556,12 @@ mod tests {
         assert_eq!(fetch_one(&url, &dir, &sha(BODY), size).unwrap(), size);
         assert_eq!(fs::read(dir.join("onnx/m.onnx")).unwrap(), BODY);
         assert_eq!(files(&dir), ["onnx/m.onnx"]);
-        // In place and matching: counted, not asked for.
         assert_eq!(fetch_one(&url, &dir, &sha(BODY), size).unwrap(), size);
-        assert_eq!(*asked.lock().unwrap(), ["/onnx/m.onnx"]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["/onnx/m.onnx"],
+            "in place and matching: counted, not asked for"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -551,10 +571,13 @@ mod tests {
         let dir = temp("corrupt");
         fs::create_dir_all(dir.join("onnx")).unwrap();
         fs::write(dir.join("onnx/m.onnx"), b"bit rot").unwrap();
-        // A stale part from an earlier try is overwritten, not appended to.
         fs::write(dir.join("onnx/m.part"), b"stale stale stale stale stale").unwrap();
         fetch_one(&url, &dir, &sha(BODY), BODY.len() as u64).unwrap();
-        assert_eq!(fs::read(dir.join("onnx/m.onnx")).unwrap(), BODY);
+        assert_eq!(
+            fs::read(dir.join("onnx/m.onnx")).unwrap(),
+            BODY,
+            "a stale part from an earlier try is overwritten, not appended to"
+        );
         assert_eq!(files(&dir), ["onnx/m.onnx"]);
         assert_eq!(asked.lock().unwrap().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
@@ -611,7 +634,12 @@ mod tests {
 
     #[test]
     fn pinned_files_have_hashes_and_sizes() {
-        for (name, sha, size) in FILES.iter().chain(VISION_FILES).chain(OCR_FILES) {
+        for Pinned {
+            path: name,
+            sha256: sha,
+            bytes: size,
+        } in FILES.iter().chain(VISION_FILES).chain(OCR_FILES)
+        {
             assert_eq!(sha.len(), 64, "{name}");
             assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
             assert!(*size > 0, "{name}");
@@ -634,7 +662,9 @@ mod tests {
             media: true,
         });
         assert!(none < images && images < media);
-        // Images and video's frames share the vision encoder.
-        assert_eq!(both, media);
+        assert_eq!(
+            both, media,
+            "images and video's frames share the vision encoder"
+        );
     }
 }

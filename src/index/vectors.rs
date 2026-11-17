@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 /// Every chunk's embedding, held as int8 with a per-vector scale: a quarter
 /// of the memory, and a quarter of the bytes each query reads, which is what
 /// bounds brute-force search. On a 113k-chunk index the top result scored at
-/// most 0.001 below f32's (mean 0.00001), and 97% of the top 40 matched.
+/// most 0.001 below f32's (mean 0.00001), and 97% of the top 40 matched
+/// (2026-10-18).
 pub struct Vectors {
     pub(super) ids: Vec<i64>,
     pub(super) data: Vec<i8>,
@@ -94,8 +95,9 @@ impl Vectors {
         self.kinds.truncate(last);
     }
 
+    /// Every chunk's vector, read in one transaction so the log position
+    /// matches the rows read. Blobs are borrowed, not copied, on the way in.
     pub fn load(conn: &Connection) -> Result<Self> {
-        // One read transaction, so the log position matches the rows read.
         let tx = conn.unchecked_transaction()?;
         let n: i64 = tx.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
         let n = n as usize;
@@ -111,7 +113,6 @@ impl Vectors {
         let mut stmt = tx.prepare("SELECT id, embedding, kind FROM chunks")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            // Borrowed, so no copy of each blob is made on the way in.
             if let rusqlite::types::ValueRef::Blob(blob) = row.get_ref(1)? {
                 out.push(row.get(0)?, blob, Kind::from_db(row.get(2)?));
             }
@@ -134,7 +135,11 @@ impl Vectors {
         Ok(())
     }
 
-    /// Ok(false) when a full reload is needed instead.
+    /// Ok(false) when a full reload is needed instead: the log was pruned
+    /// past these vectors, or the database is from before the log, or rebuilt
+    /// (pinned by `index::tests::refresh_reloads_in_full_once_the_log_is_pruned_past_it`),
+    /// or most of the index changed (pinned by
+    /// `index::tests::refresh_reloads_in_full_when_most_of_the_index_changed`).
     pub(super) fn catch_up(&mut self, conn: &Connection) -> Result<bool> {
         let tx = conn.unchecked_transaction()?;
         let end = log_end(&tx)?;
@@ -147,8 +152,8 @@ impl Vectors {
             [self.seq],
             |r| r.get(0),
         )?;
-        // Pruned past us (or a database from before the log, or rebuilt).
-        if end < self.seq || first != Some(self.seq + 1) {
+        let pruned_past_us = end < self.seq || first != Some(self.seq + 1);
+        if pruned_past_us {
             return Ok(false);
         }
         let touched: HashSet<i64> = {
@@ -159,24 +164,11 @@ impl Vectors {
         if touched.len() > self.ids.len() / 2 {
             return Ok(false);
         }
-        // Whatever happened to an id in between, its row now (or its
-        // absence) is what counts: drop the old vector, read the current one.
         for id in &touched {
             self.remove(*id);
         }
-        let mut stmt = tx.prepare("SELECT embedding, kind FROM chunks WHERE id = ?1")?;
-        let mut added = Vec::new();
-        for id in &touched {
-            let mut rows = stmt.query([id])?;
-            if let Some(row) = rows.next()? {
-                added.push((*id, row.get::<_, Vec<u8>>(0)?, Kind::from_db(row.get(1)?)));
-            }
-        }
-        // Exact, so a few new chunks do not double a 100 MB buffer.
-        self.ids.reserve_exact(added.len());
-        self.scales.reserve_exact(added.len());
-        self.kinds.reserve_exact(added.len());
-        self.data.reserve_exact(added.len() * DIM);
+        let added = current_rows(&tx, &touched)?;
+        self.reserve_exact(added.len());
         for (id, blob, kind) in &added {
             self.push(*id, blob, *kind);
         }
@@ -185,9 +177,33 @@ impl Vectors {
         Ok(true)
     }
 
+    /// Room for `n` more, exactly, so a few new chunks don't double a 100 MB
+    /// buffer.
+    fn reserve_exact(&mut self, n: usize) {
+        self.ids.reserve_exact(n);
+        self.scales.reserve_exact(n);
+        self.kinds.reserve_exact(n);
+        self.data.reserve_exact(n * DIM);
+    }
+
     pub fn len(&self) -> usize {
         self.ids.len()
     }
+}
+
+/// The rows of the chunks `touched` that are there now, whatever happened to
+/// them in between (pinned by
+/// `index::tests::refresh_applies_a_reused_id_with_its_new_vector`).
+fn current_rows(tx: &Connection, touched: &HashSet<i64>) -> Result<Vec<(i64, Vec<u8>, Kind)>> {
+    let mut stmt = tx.prepare("SELECT embedding, kind FROM chunks WHERE id = ?1")?;
+    let mut rows_now = Vec::new();
+    for id in touched {
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            rows_now.push((*id, row.get::<_, Vec<u8>>(0)?, Kind::from_db(row.get(1)?)));
+        }
+    }
+    Ok(rows_now)
 }
 
 /// Symmetric int8: `v ≈ q * scale`, with the largest component at ±127.

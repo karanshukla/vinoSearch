@@ -1,4 +1,4 @@
-//! Word 97-2003 `.doc` and PowerPoint 97-2003 `.ppt` (#97): both are compound
+//! Word 97-2003 `.doc` and PowerPoint 97-2003 `.ppt`: both are compound
 //! files (`cfb`) holding a binary stream we read the text out of ourselves.
 //! Only what the text needs is parsed: Word's piece table, and PowerPoint's
 //! text atoms per slide.
@@ -50,52 +50,108 @@ fn too_long(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The FIB's wIdent for Word 97 and later.
+const WORD_97: u16 = 0xA5EC;
+const WORD_95: u16 = 0xA5DC;
+/// The lowest nFib with a piece table like this: 0xC1 since Word 97.
+const MIN_NFIB: u16 = 0xC0;
+const F_ENCRYPTED: u16 = 0x0100;
+/// The table is in 1Table rather than 0Table.
+const F_WHICH_TBL_STM: u16 = 0x0200;
+/// fcClx and lcbClx are this pair of FibRgFcLcb97, from 0.
+const CLX_PAIR: usize = 33;
+/// The Clx's record types.
+const PRC: u8 = 1;
+const PCDT: u8 = 2;
+/// A piece's fc flag: 8-bit text, at half the offset.
+const FC_COMPRESSED: u32 = 0x4000_0000;
+
+/// What the text needs from the FIB ([MS-DOC] 2.5.1): a fixed base, then
+/// three arrays that each start with their length.
+struct Fib {
+    /// The main document's length in characters: footnotes, headers and the
+    /// rest follow it.
+    ccp_text: u32,
+    fc_clx: usize,
+    lcb_clx: usize,
+    table: &'static str,
+}
+
+impl Fib {
+    fn read(word: &[u8]) -> Result<Fib> {
+        match le16(word, 0) {
+            Some(WORD_97) => {}
+            Some(WORD_95) => bail!("Word 95 or older"),
+            _ => bail!("not a Word document"),
+        }
+        let short = || anyhow::anyhow!("FIB cut short");
+        if le16(word, 2).ok_or_else(short)? < MIN_NFIB {
+            bail!("Word 95 or older");
+        }
+        let flags = le16(word, 0x0A).ok_or_else(short)?;
+        if flags & F_ENCRYPTED != 0 {
+            bail!("encrypted");
+        }
+        let rg_lw = 34 + 2 * usize::from(le16(word, 32).ok_or_else(short)?);
+        let lw_count = usize::from(le16(word, rg_lw).ok_or_else(short)?);
+        let ccp_text = le32(word, rg_lw + 2 + 3 * 4).ok_or_else(short)?;
+        let clx_at = rg_lw + 2 + 4 * lw_count + 2 + CLX_PAIR * 8;
+        Ok(Fib {
+            ccp_text,
+            fc_clx: le32(word, clx_at).ok_or_else(short)? as usize,
+            lcb_clx: le32(word, clx_at + 4).ok_or_else(short)? as usize,
+            table: if flags & F_WHICH_TBL_STM != 0 {
+                "1Table"
+            } else {
+                "0Table"
+            },
+        })
+    }
+}
+
 /// A `.doc`'s main text, a line per paragraph. Headers, footnotes and
 /// comments are left out, as they are for a `.docx`.
 pub fn doc(bytes: &[u8]) -> Result<String> {
     let mut file = open(bytes)?;
     let word = stream(&mut file, "WordDocument")?;
-    // The FIB ([MS-DOC] 2.5.1): a fixed base, then three arrays that each
-    // start with their length.
-    match le16(&word, 0) {
-        Some(0xA5EC) => {}
-        Some(0xA5DC) => bail!("Word 95 or older"),
-        _ => bail!("not a Word document"),
-    }
-    let short = || anyhow::anyhow!("FIB cut short");
-    // 0xC1 since Word 97; Word 6 and 95 files have no piece table like this.
-    if le16(&word, 2).ok_or_else(short)? < 0xC0 {
-        bail!("Word 95 or older");
-    }
-    let flags = le16(&word, 0x0A).ok_or_else(short)?;
-    if flags & 0x0100 != 0 {
-        bail!("encrypted");
-    }
-    let rg_lw = 34 + 2 * usize::from(le16(&word, 32).ok_or_else(short)?);
-    let lw_count = usize::from(le16(&word, rg_lw).ok_or_else(short)?);
-    let ccp_text = le32(&word, rg_lw + 2 + 3 * 4).ok_or_else(short)?;
-    // fcClx and lcbClx, the 34th pair of FibRgFcLcb97.
-    let clx_at = rg_lw + 2 + 4 * lw_count + 2 + 33 * 8;
-    let fc_clx = le32(&word, clx_at).ok_or_else(short)? as usize;
-    let lcb_clx = le32(&word, clx_at + 4).ok_or_else(short)? as usize;
-    let table = stream(
-        &mut file,
-        if flags & 0x0200 != 0 {
-            "1Table"
-        } else {
-            "0Table"
-        },
-    )?;
-    let clx = fc_clx
-        .checked_add(lcb_clx)
-        .and_then(|end| table.get(fc_clx..end))
+    let fib = Fib::read(&word)?;
+    let table = stream(&mut file, fib.table)?;
+    let clx = fib
+        .fc_clx
+        .checked_add(fib.lcb_clx)
+        .and_then(|end| table.get(fib.fc_clx..end))
         .context("piece table out of range")?;
-    // Formatting (Prc) first, then the piece table (Pcdt).
+    let plc = piece_table(clx)?;
+    let pieces = (plc.len() - 4) / 12;
+    let mut raw = String::new();
+    for i in 0..pieces {
+        let (Some(start), Some(end), Some(fc)) = (
+            le32(plc, 4 * i),
+            le32(plc, 4 * (i + 1)),
+            le32(plc, 4 * (pieces + 1) + 8 * i + 2),
+        ) else {
+            break;
+        };
+        let main_chars = end.min(fib.ccp_text).saturating_sub(start) as usize;
+        if main_chars == 0 {
+            continue;
+        }
+        let Some(text) = piece(&word, fc, main_chars) else {
+            continue;
+        };
+        raw.push_str(&text);
+        too_long(&raw)?;
+    }
+    Ok(word_text(&raw))
+}
+
+/// The Pcdt's PlcPcd in `clx`, past the formatting (Prc) before it.
+fn piece_table(clx: &[u8]) -> Result<&[u8]> {
     let mut at = 0;
-    while clx.get(at) == Some(&1) {
+    while clx.get(at) == Some(&PRC) {
         at += 3 + usize::from(le16(clx, at + 1).context("Clx cut short")?);
     }
-    if clx.get(at) != Some(&2) {
+    if clx.get(at) != Some(&PCDT) {
         bail!("no piece table");
     }
     let len = le32(clx, at + 1).context("Clx cut short")? as usize;
@@ -106,78 +162,66 @@ pub fn doc(bytes: &[u8]) -> Result<String> {
     if len < 4 || !(len - 4).is_multiple_of(12) {
         bail!("piece table of {len} bytes");
     }
-    let pieces = (len - 4) / 12;
-    let mut raw = String::new();
-    for i in 0..pieces {
-        let (Some(start), Some(end), Some(fc)) = (
-            le32(plc, 4 * i),
-            le32(plc, 4 * (i + 1)),
-            le32(plc, 4 * (pieces + 1) + 8 * i + 2),
-        ) else {
-            break;
-        };
-        // Only the main document's characters: footnotes, headers and the
-        // rest follow it.
-        let chars = end.min(ccp_text).saturating_sub(start) as usize;
-        if chars == 0 {
-            continue;
-        }
-        let compressed = fc & 0x4000_0000 != 0;
-        let fc = (fc & 0x3FFF_FFFF) as usize;
-        let (from, size) = if compressed {
-            (fc / 2, chars)
-        } else {
-            (fc, chars * 2)
-        };
-        let Some(bytes) = word.get(from..).map(|b| &b[..size.min(b.len())]) else {
-            continue;
-        };
-        if compressed {
-            // [MS-DOC] 2.9.73's mapping is Windows-1252's.
-            raw.push_str(
-                &encoding_rs::WINDOWS_1252
-                    .decode_without_bom_handling(bytes)
-                    .0,
-            );
-        } else {
-            raw.push_str(&utf16(bytes));
-        }
-        too_long(&raw)?;
-    }
-    Ok(word_text(&raw))
+    Ok(plc)
 }
+
+/// `chars` characters of the piece at `fc` in `word`, cut short at its end.
+/// A compressed piece is 8-bit, [MS-DOC] 2.9.73's mapping being
+/// Windows-1252's; the rest are UTF-16.
+fn piece(word: &[u8], fc: u32, chars: usize) -> Option<String> {
+    let compressed = fc & FC_COMPRESSED != 0;
+    let fc = (fc & 0x3FFF_FFFF) as usize;
+    let (from, size) = if compressed {
+        (fc / 2, chars)
+    } else {
+        (fc, chars * 2)
+    };
+    let bytes = word.get(from..).map(|b| &b[..size.min(b.len())])?;
+    Some(if compressed {
+        encoding_rs::WINDOWS_1252
+            .decode_without_bom_handling(bytes)
+            .0
+            .into_owned()
+    } else {
+        utf16(bytes)
+    })
+}
+
+const FIELD_BEGIN: char = '\u{13}';
+const FIELD_SEPARATOR: char = '\u{14}';
+const FIELD_END: char = '\u{15}';
+const NON_BREAKING_HYPHEN: char = '\u{1e}';
 
 /// Word's special characters out of the text: a paragraph or line break as a
 /// newline, a table cell's end as a tab. A field (a page number, a link, a
-/// table of contents) shows its result; its code is left out.
+/// table of contents) shows its result; its code is left out. Other control
+/// characters (pictures, footnote marks, an optional hyphen) are dropped
+/// (pinned by `extract::tests::doc_reads_the_piece_table`).
 fn word_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    // Per open field, whether it's still in its code.
-    let mut fields: Vec<bool> = Vec::new();
+    let mut open_fields_in_code: Vec<bool> = Vec::new();
     let mut in_code = 0usize;
     for c in raw.chars() {
         match c {
-            '\u{13}' => {
-                fields.push(true);
+            FIELD_BEGIN => {
+                open_fields_in_code.push(true);
                 in_code += 1;
             }
-            '\u{14}' => {
-                if let Some(code) = fields.last_mut().filter(|code| **code) {
+            FIELD_SEPARATOR => {
+                if let Some(code) = open_fields_in_code.last_mut().filter(|code| **code) {
                     *code = false;
                     in_code -= 1;
                 }
             }
-            '\u{15}' => {
-                if fields.pop() == Some(true) {
+            FIELD_END => {
+                if open_fields_in_code.pop() == Some(true) {
                     in_code -= 1;
                 }
             }
             _ if in_code > 0 => {}
             '\r' | '\u{b}' | '\u{c}' => out.push('\n'),
             '\u{7}' | '\t' => out.push('\t'),
-            // A non-breaking hyphen.
-            '\u{1e}' => out.push('-'),
-            // Pictures, footnote marks, an optional hyphen.
+            NON_BREAKING_HYPHEN => out.push('-'),
             c if c < ' ' => {}
             c => out.push(c),
         }
@@ -190,10 +234,22 @@ const DOCUMENT: u16 = 0x03E8;
 const SLIDE: u16 = 0x03EE;
 const SLIDE_PERSIST: u16 = 0x03F3;
 const TEXT_CHARS: u16 = 0x0FA0;
+/// A text atom of UTF-16's low bytes, so Latin-1.
 const TEXT_BYTES: u16 = 0x0FA8;
 const SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 const USER_EDIT: u16 = 0x0FF5;
 const PERSIST_DIRECTORY: u16 = 0x1772;
+
+/// Where the Current User stream holds its header token, and the offset of
+/// the last edit.
+const HEADER_TOKEN_AT: usize = 12;
+const LAST_EDIT_AT: usize = 16;
+const ENCRYPTED_TOKEN: u32 = 0xF3D1_C4DF;
+/// A UserEditAtom this long has an encryptSessionPersistIdRef, the field only
+/// an encrypted file has.
+const ENCRYPTED_EDIT_LEN: usize = 32;
+/// A slide number's or date's placeholder text.
+const NUMBER_OR_DATE_PLACEHOLDER: &str = "*";
 
 struct Record<'a> {
     kind: u16,
@@ -248,7 +304,6 @@ fn texts(data: &[u8], depth: u32, out: &mut Vec<String>) {
 fn atom_text(rec: &Record, out: &mut Vec<String>) {
     match rec.kind {
         TEXT_CHARS => out.push(utf16(rec.body)),
-        // The low bytes of UTF-16, so Latin-1.
         TEXT_BYTES => out.push(rec.body.iter().map(|&b| char::from(b)).collect()),
         _ => {}
     }
@@ -260,43 +315,14 @@ pub fn ppt(bytes: &[u8]) -> Result<Vec<String>> {
     let mut file = open(bytes)?;
     let doc = stream(&mut file, "PowerPoint Document")?;
     let user = stream(&mut file, "Current User").unwrap_or_default();
-    // The current user's header token says so, or the last edit has an
-    // encryptSessionPersistIdRef, the field only an encrypted file has.
-    let last_edit = le32(&user, 16).and_then(|at| record_at(&doc, at as usize));
-    if le32(&user, 12) == Some(0xF3D1_C4DF)
-        || last_edit.is_some_and(|r| r.kind == USER_EDIT && r.body.len() >= 32)
-    {
+    if encrypted(&doc, &user) {
         bail!("encrypted");
     }
-    // Without a usable edit history: every slide in the stream, in the order
-    // they're stored. After a fast save that can include old versions.
-    let slides = persisted_slides(&doc, &user).unwrap_or_else(|_| {
-        records(&doc)
-            .filter(|r| r.kind == SLIDE)
-            .map(|r| {
-                let mut t = Vec::new();
-                texts(r.body, 0, &mut t);
-                t
-            })
-            .collect()
-    });
+    let slides = persisted_slides(&doc, &user).unwrap_or_else(|_| stored_slides(&doc));
     let mut total = 0;
     let slides = slides
         .into_iter()
-        .map(|texts| {
-            let mut slide = String::new();
-            // A slide number's or date's placeholder is a lone `*`.
-            for t in texts.into_iter().filter(|t| t != "*") {
-                for c in t.chars() {
-                    slide.push(match c {
-                        '\r' | '\u{b}' => '\n',
-                        c => c,
-                    });
-                }
-                slide.push('\n');
-            }
-            slide
-        })
+        .map(slide_text)
         .inspect(|s| total += s.len())
         .collect();
     if total as u64 > MAX_TEXT_BYTES {
@@ -305,43 +331,57 @@ pub fn ppt(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(slides)
 }
 
+/// The current user's header token says so, or the last edit is long enough
+/// to have the encrypted file's field (pinned by
+/// `extract::tests::encrypted_ppt_is_an_error`).
+fn encrypted(doc: &[u8], user: &[u8]) -> bool {
+    let last_edit = le32(user, LAST_EDIT_AT).and_then(|at| record_at(doc, at as usize));
+    le32(user, HEADER_TOKEN_AT) == Some(ENCRYPTED_TOKEN)
+        || last_edit.is_some_and(|r| r.kind == USER_EDIT && r.body.len() >= ENCRYPTED_EDIT_LEN)
+}
+
+/// Every slide in the stream, in the order stored: all there is without a
+/// usable edit history. After a fast save that includes old versions
+/// (pinned by `extract::tests::ppt_without_an_edit_history_reads_every_slide`).
+fn stored_slides(doc: &[u8]) -> Vec<Vec<String>> {
+    records(doc)
+        .filter(|r| r.kind == SLIDE)
+        .map(|r| {
+            let mut t = Vec::new();
+            texts(r.body, 0, &mut t);
+            t
+        })
+        .collect()
+}
+
+/// A slide's text blocks, a line each, without the number's or date's
+/// placeholder.
+fn slide_text(texts: Vec<String>) -> String {
+    let mut slide = String::new();
+    for t in texts
+        .into_iter()
+        .filter(|t| t != NUMBER_OR_DATE_PLACEHOLDER)
+    {
+        for c in t.chars() {
+            slide.push(match c {
+                '\r' | '\u{b}' => '\n',
+                c => c,
+            });
+        }
+        slide.push('\n');
+    }
+    slide
+}
+
 /// Each slide's text blocks, found the way PowerPoint does: the current
 /// edit's persist directory gives where each object is, the document's
 /// slide list which slides are shown and in what order ([MS-PPT] 2.1.2).
 /// Placeholder text sits in the slide list, a text box's in the slide.
 fn persisted_slides(doc: &[u8], user: &[u8]) -> Result<Vec<Vec<String>>> {
-    // CurrentUserAtom: the offset of the last edit.
-    let mut edit = le32(user, 16).context("no current user")? as usize;
-    let mut persist: HashMap<u32, usize> = HashMap::new();
-    let mut doc_ref = None;
-    let mut seen = HashSet::new();
-    // Newest edit first; an object's latest offset is the one that counts.
-    while seen.insert(edit) {
-        let rec = record_at(doc, edit).filter(|r| r.kind == USER_EDIT);
-        let body = rec.context("no edit record")?.body;
-        doc_ref.get_or_insert(le32(body, 16).context("edit cut short")?);
-        let dir_at = le32(body, 12).context("edit cut short")? as usize;
-        let dir = record_at(doc, dir_at)
-            .filter(|r| r.kind == PERSIST_DIRECTORY)
-            .context("no persist directory")?
-            .body;
-        let mut at = 0;
-        while let Some(entry) = le32(dir, at) {
-            let (first, count) = (entry & 0xF_FFFF, entry >> 20);
-            at += 4;
-            for id in first..first + count {
-                let Some(offset) = le32(dir, at) else { break };
-                persist.entry(id).or_insert(offset as usize);
-                at += 4;
-            }
-        }
-        match le32(body, 8) {
-            Some(0) | None => break,
-            Some(last) => edit = last as usize,
-        }
-    }
-    let at = doc_ref
-        .and_then(|r| persist.get(&r))
+    let persisted = Persisted::read(doc, user)?;
+    let at = persisted
+        .offsets
+        .get(&persisted.document)
         .context("no document")?;
     let document = record_at(doc, *at)
         .filter(|r| r.kind == DOCUMENT)
@@ -358,29 +398,82 @@ fn persisted_slides(doc: &[u8], user: &[u8]) -> Result<Vec<Vec<String>>> {
             atom_text(&rec, t);
         }
     }
-    // A slide listed twice is read once: a crafted list could name one big
-    // slide for every few bytes.
-    let mut read = HashSet::new();
-    Ok(slides
-        .into_iter()
-        .map(|(id, mut listed)| {
-            let mut own = Vec::new();
-            if let Some(slide) = persist
-                .get(&id)
-                .filter(|_| read.insert(id))
-                .and_then(|&at| record_at(doc, at))
-                .filter(|r| r.kind == SLIDE)
-            {
-                texts(slide.body, 0, &mut own);
-            }
-            // Newer PowerPoints keep placeholder text in both places.
-            let mut have: HashSet<String> = listed.iter().cloned().collect();
-            for t in own {
-                if have.insert(t.clone()) {
-                    listed.push(t);
+    Ok(persisted.slides(doc, slides))
+}
+
+/// The edits' persist directories, merged.
+struct Persisted {
+    /// Each object's latest offset in the stream, by persist id.
+    offsets: HashMap<u32, usize>,
+    /// The persist id of the document record.
+    document: u32,
+}
+
+impl Persisted {
+    /// Walks the edits newest first, so an object's latest offset is the one
+    /// kept.
+    fn read(doc: &[u8], user: &[u8]) -> Result<Persisted> {
+        let mut edit = le32(user, LAST_EDIT_AT).context("no current user")? as usize;
+        let mut offsets: HashMap<u32, usize> = HashMap::new();
+        let mut document = None;
+        let mut seen = HashSet::new();
+        while seen.insert(edit) {
+            let rec = record_at(doc, edit).filter(|r| r.kind == USER_EDIT);
+            let body = rec.context("no edit record")?.body;
+            document.get_or_insert(le32(body, 16).context("edit cut short")?);
+            let dir_at = le32(body, 12).context("edit cut short")? as usize;
+            let dir = record_at(doc, dir_at)
+                .filter(|r| r.kind == PERSIST_DIRECTORY)
+                .context("no persist directory")?
+                .body;
+            let mut at = 0;
+            while let Some(entry) = le32(dir, at) {
+                let (first, count) = (entry & 0xF_FFFF, entry >> 20);
+                at += 4;
+                for id in first..first + count {
+                    let Some(offset) = le32(dir, at) else { break };
+                    offsets.entry(id).or_insert(offset as usize);
+                    at += 4;
                 }
             }
-            listed
+            match le32(body, 8) {
+                Some(0) | None => break,
+                Some(last) => edit = last as usize,
+            }
+        }
+        Ok(Persisted {
+            offsets,
+            document: document.context("no document")?,
         })
-        .collect())
+    }
+
+    /// Each listed slide's placeholder text, then the slide's own text that
+    /// isn't among it: newer PowerPoints keep placeholder text in both places
+    /// (pinned by `extract::tests::ppt_slides_follow_the_slide_list`). A slide
+    /// listed twice is read once: a crafted list could name one big slide for
+    /// every few bytes.
+    fn slides(&self, doc: &[u8], list: Vec<(u32, Vec<String>)>) -> Vec<Vec<String>> {
+        let mut read = HashSet::new();
+        list.into_iter()
+            .map(|(id, mut listed)| {
+                let mut own = Vec::new();
+                if let Some(slide) = self
+                    .offsets
+                    .get(&id)
+                    .filter(|_| read.insert(id))
+                    .and_then(|&at| record_at(doc, at))
+                    .filter(|r| r.kind == SLIDE)
+                {
+                    texts(slide.body, 0, &mut own);
+                }
+                let mut have: HashSet<String> = listed.iter().cloned().collect();
+                for t in own {
+                    if have.insert(t.clone()) {
+                        listed.push(t);
+                    }
+                }
+                listed
+            })
+            .collect()
+    }
 }

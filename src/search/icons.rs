@@ -10,14 +10,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// What vinoWhisper registers for its sessions' type, so a result looks as
+/// the file does in a file manager.
 const SESSION_ICON: &str = "io.github.karanshukla.vinowhisper";
+
+/// Extensions of sound files, each one media indexing takes (pinned by
+/// `tests::every_sound_extension_is_one_media_indexing_takes`).
+const SOUND: &[&str] = &[
+    "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "wma",
+];
 
 /// Whether `path` is a sound file by its extension; an `ogg` can hold video,
 /// and is nearly always sound.
 fn sound_only(path: &Path) -> bool {
-    const SOUND: &[&str] = &[
-        "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "wma",
-    ];
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| SOUND.contains(&e.to_ascii_lowercase().as_str()))
@@ -33,8 +38,6 @@ pub fn for_path(path: &Path, kind: Kind) -> (&'static str, &'static str) {
         Kind::Code => "text-x-script",
         Kind::Media if sound_only(path) => "audio-x-generic",
         Kind::Media => "video-x-generic",
-        // What vinoWhisper registers for the type (vinoWhisper#123), so a
-        // result looks as the file does in a file manager.
         Kind::Session => return (SESSION_ICON, "text-x-generic"),
     };
     let specific = path
@@ -82,19 +85,23 @@ fn load() -> HashMap<String, String> {
     )
 }
 
+/// Directory levels above `mimetypes`: the theme's, and the size's.
+const THEME_AND_SIZE: usize = 2;
+
+fn in_mimetypes(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "mimetypes")
+}
+
 /// Names of the mimetype icons under an icons directory (`<theme>/mimetypes/<size>/`,
 /// `<theme>/<size>/mimetypes/`).
 fn theme_icons(icons: &Path, out: &mut HashSet<String>) {
     let walk = walkdir::WalkDir::new(icons)
         .max_depth(4)
         .into_iter()
-        // Past the theme and size levels, only into mimetypes directories.
-        .filter_entry(|e| {
-            e.depth() <= 2 || e.path().components().any(|c| c.as_os_str() == "mimetypes")
-        });
+        .filter_entry(|e| e.depth() <= THEME_AND_SIZE || in_mimetypes(e.path()));
     for e in walk.flatten() {
         if e.file_type().is_file()
-            && e.path().components().any(|c| c.as_os_str() == "mimetypes")
+            && in_mimetypes(e.path())
             && let Some(stem) = e.path().file_stem().and_then(|s| s.to_str())
         {
             out.insert(stem.to_owned());
@@ -158,11 +165,12 @@ mod tests {
         assert!(sound_only(Path::new("/m/talk.MP3")));
         assert!(!sound_only(Path::new("/m/talk.mkv")));
         assert!(!sound_only(Path::new("/m/talk")));
-        // Every sound extension is one media indexing takes.
-        for e in [
-            "mp3", "m4a", "aac", "flac", "ogg", "oga", "opus", "wav", "wma",
-        ] {
-            assert!(crate::config::MEDIA_EXTENSIONS.contains(&e), "{e}");
+    }
+
+    #[test]
+    fn every_sound_extension_is_one_media_indexing_takes() {
+        for e in SOUND {
+            assert!(crate::config::MEDIA_EXTENSIONS.contains(e), "{e}");
         }
     }
 
@@ -190,8 +198,10 @@ mod tests {
         assert_eq!(got["rs"], "text-rust");
         assert_eq!(got["png"], "image-png");
         assert_eq!(got["wrd"], "text-x-generic-template");
-        // No installed icon: left to the generic fallback.
-        assert!(!got.contains_key("c"));
+        assert!(
+            !got.contains_key("c"),
+            "no installed icon: left to the generic fallback"
+        );
         assert_eq!(got.len(), 4);
     }
 

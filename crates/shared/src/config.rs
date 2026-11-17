@@ -50,18 +50,16 @@ pub const DEFAULT_DEVICE: &str = "NPU";
 pub const DEFAULT_IDLE_UNLOAD_MINUTES: f64 = 5.0;
 pub const DEFAULT_INDEX_BUSY_PERCENT: u8 = 50;
 /// Big trees of downloaded or installed files that live in the home folder
-/// under names too common to skip everywhere (`pkg`, `sdk`, `Games`).
+/// under names too common to skip everywhere (`pkg`, `sdk`, `Games`): Snap's
+/// packages, Go's module cache and SDKs, Android's SDK, per-user R and Perl
+/// libraries, and the games Heroic, Lutris and others install.
 pub const DEFAULT_EXCLUDE: &[&str] = &[
-    // Snap packages' data and revisions
     "~/snap",
-    // Go's module and build cache, and the Go SDKs `go install` fetches
     "~/go/pkg",
     "~/sdk",
     "~/Android/Sdk",
-    // R and Perl libraries installed per user
     "~/R",
     "~/perl5",
-    // Heroic, Lutris and others install games here
     "~/Games",
 ];
 
@@ -70,7 +68,7 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
 /// higher: at 0.66 the evals' paraphrases fall from 0.909 recall@1 to
 /// 0.873, as some right answers score 0.65 to 0.66.
 pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
-/// Code results (queries starting `code:`, #110) scoring below this are
+/// Code results (queries starting `code:`) scoring below this are
 /// left out. The code retrieval prompt scores higher than the search one:
 /// on ovfetch's source (251 chunks), the right function for 12 queries
 /// scored 0.76 to 0.92 and the best match for 4 unrelated ones 0.64 to 0.70.
@@ -82,18 +80,18 @@ pub const DEFAULT_CODE_MIN_SCORE: f32 = 0.72;
 /// words ("valorant", "Pokemon") put photos at up to 0.677 and right
 /// matches scored 0.73 to 0.89.
 pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.68;
-/// The #187 spike's right windows scored 0.67 to 0.75 and its wrong ones up
+/// The A/V search spike's right windows scored 0.67 to 0.75 and its wrong ones up
 /// to 0.05 less. On a home folder of 36 videos (2026-11-13), off-topic
 /// single words put most at up to 0.66 (two at 0.69 and 0.70), and videos
 /// named for the query scored 0.68 to 0.82.
 pub const DEFAULT_MEDIA_MIN_SCORE: f32 = 0.68;
 pub const DEFAULT_MEDIA_MAX_HOURS: f32 = 3.0;
-/// Audio and video files, by extension (#187). Not `ts`: TypeScript has it.
+/// Audio and video files, by extension. Not `ts`: TypeScript has it.
 pub const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "wmv", "mp3", "m4a", "aac", "flac",
     "ogg", "oga", "opus", "wav", "wma",
 ];
-/// HEIC, HEIF and AVIF need libheif's heif-convert installed (#79); without
+/// HEIC, HEIF and AVIF need libheif's heif-convert installed; without
 /// it they are counted and skipped.
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif",
@@ -135,25 +133,25 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_busy_percent: Option<u8>,
     /// Index while on battery; false holds indexing until a charger is
-    /// plugged in (#109) [default: true].
+    /// plugged in [default: true].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_on_battery: Option<bool>,
-    /// What opens a text result at its line (#105): an app's desktop entry
+    /// What opens a text result at its line: an app's desktop entry
     /// id (`org.kde.kate.desktop`, as the settings app's picker saves it), a
     /// known editor (`code`, `kate`, `zed`, a JetBrains IDE...), or any
     /// command with `{file}` and `{line}` in it, split on spaces and run
     /// without a shell [default: the default app for the file's type].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
-    /// What plays a media result at its time (#188): an app's desktop entry
+    /// What plays a media result at its time: an app's desktop entry
     /// id, a known player (`mpv`, `vlc`, `celluloid`), or any command with
     /// `{file}` and `{seconds}` (whole seconds) in it, split on spaces and
     /// run without a shell [default: the default app for the file's type].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<String>,
-    /// What kinds of file are indexed, and how close a result must be (#73).
+    /// What kinds of file are indexed, and how close a result must be.
     pub formats: Formats,
-    /// Encrypting the index at rest (#4).
+    /// Encrypting the index at rest.
     pub encryption: Encryption,
 }
 
@@ -205,7 +203,7 @@ pub struct TextFormat {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImageFormat {
-    /// Index images, by what's in them and the text OCR reads in them (#106).
+    /// Index images, by what's in them and the text OCR reads in them.
     /// Needs the vision encoder, a 671 MB download [default: false].
     pub enabled: Option<bool>,
     /// File extensions taken for images [default: DEFAULT_IMAGE_EXTENSIONS].
@@ -214,19 +212,19 @@ pub struct ImageFormat {
     pub min_score: Option<f32>,
 }
 
-/// PDF, Office and OpenDocument files, spreadsheets, CSV (#55), EPUB,
-/// subtitles, `.doc`, `.ppt` and RTF (#97). Searched
+/// PDF, Office and OpenDocument files, spreadsheets, CSV, EPUB,
+/// subtitles, `.doc`, `.ppt` and RTF. Searched
 /// with text, so they share its `min_score`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DocumentFormat {
     /// Index documents' text. Off by default: statements, tax forms and
     /// exports end up in the index, which is plaintext unless `encryption`
-    /// is on (#4) [default: false].
+    /// is on [default: false].
     pub enabled: Option<bool>,
 }
 
-/// Source code (#110), searched apart from everything else: only queries
+/// Source code, searched apart from everything else: only queries
 /// starting `code:` find it, and they find nothing else. Files git ignores,
 /// vendored and generated code, and code holding a key or token are left out.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -239,7 +237,7 @@ pub struct CodeFormat {
     pub min_score: Option<f32>,
 }
 
-/// vinoWhisper sessions (#143): `.vwsession` bundles, each a transcript and
+/// vinoWhisper sessions: `.vwsession` bundles, each a transcript and
 /// its summary, searched with text. Read from vinoWhisper's own folder as
 /// well as the folders indexed.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -251,7 +249,7 @@ pub struct SessionFormat {
     pub enabled: Option<bool>,
 }
 
-/// Audio and video files (#187), by their sound and picture: 10 s windows
+/// Audio and video files, by their sound and picture: 10 s windows
 /// of sound and a frame per shot, so "a dog barking" or "a whiteboard"
 /// finds the moment. Needs ffmpeg, and the vision and audio encoders.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -396,15 +394,9 @@ impl Config {
             exclude.set_trailing_comma(true);
             exclude.set_trailing("\n");
         }
-        match doc.get_mut("exclude").and_then(|i| i.as_value_mut()) {
-            // Assigning the value alone keeps the comments around the key.
-            Some(v) => {
-                let decor = v.decor().clone();
-                *v = exclude.into();
-                *v.decor_mut() = decor;
-            }
-            // Left unwritten while it is the defaults, so a later release's defaults reach it.
-            None if self.exclude == Config::default().exclude => {}
+        match doc.get_mut("exclude").filter(|i| i.is_value()) {
+            Some(old) => replace_keeping_comments(old, toml_edit::value(exclude)),
+            None if self.exclude_is_the_default() => {}
             None => doc["exclude"] = toml_edit::value(exclude),
         }
         match &self.device {
@@ -412,11 +404,7 @@ impl Config {
             None => drop(doc.remove("device")),
         }
         match self.idle_unload_minutes {
-            // Whole minutes stay integers, as people write them.
-            Some(m) if m.fract() == 0.0 && m.abs() < i64::MAX as f64 => {
-                doc["idle_unload_minutes"] = toml_edit::value(m as i64)
-            }
-            Some(m) => doc["idle_unload_minutes"] = toml_edit::value(m),
+            Some(m) => doc["idle_unload_minutes"] = minutes_as_written(m),
             None => drop(doc.remove("idle_unload_minutes")),
         }
         match self.index_busy_percent {
@@ -436,9 +424,12 @@ impl Config {
             _ => drop(doc.remove("player")),
         }
         let f = &self.formats;
-        // Through its shortest decimal, so 0.7 is written as 0.7, not 0.699999988.
-        let score = |s: f32| toml_edit::value(s.to_string().parse::<f64>().unwrap_or(f64::from(s)));
-        set(&mut doc, "text", "min_score", f.text.min_score.map(score));
+        set(
+            &mut doc,
+            "text",
+            "min_score",
+            f.text.min_score.map(shortest_decimal),
+        );
         set(
             &mut doc,
             "images",
@@ -457,7 +448,7 @@ impl Config {
             &mut doc,
             "images",
             "min_score",
-            f.images.min_score.map(score),
+            f.images.min_score.map(shortest_decimal),
         );
         set(
             &mut doc,
@@ -471,7 +462,12 @@ impl Config {
             "enabled",
             f.code.enabled.map(toml_edit::value),
         );
-        set(&mut doc, "code", "min_score", f.code.min_score.map(score));
+        set(
+            &mut doc,
+            "code",
+            "min_score",
+            f.code.min_score.map(shortest_decimal),
+        );
         set(
             &mut doc,
             "sessions",
@@ -484,8 +480,18 @@ impl Config {
             "enabled",
             f.media.enabled.map(toml_edit::value),
         );
-        set(&mut doc, "media", "min_score", f.media.min_score.map(score));
-        set(&mut doc, "media", "max_hours", f.media.max_hours.map(score));
+        set(
+            &mut doc,
+            "media",
+            "min_score",
+            f.media.min_score.map(shortest_decimal),
+        );
+        set(
+            &mut doc,
+            "media",
+            "max_hours",
+            f.media.max_hours.map(shortest_decimal),
+        );
         let e = &self.encryption;
         set_table(
             &mut doc,
@@ -501,19 +507,21 @@ impl Config {
         );
         let dir = path.parent().context("config path has no directory")?;
         fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-        // A name of its own per save: two settings windows saving at once
-        // shared `config.toml.tmp`, and the second rename found it gone.
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
+        let tmp = tmp_path_of_this_save(path);
         let saved = fs::write(&tmp, doc.to_string())
             .with_context(|| tmp.display().to_string())
             .and_then(|()| fs::rename(&tmp, path).with_context(|| path.display().to_string()));
         if saved.is_err() {
-            // Each save has its own name, so nothing else would clear it.
             let _ = fs::remove_file(&tmp);
         }
         saved
+    }
+
+    /// An `exclude` left unwritten while it is the defaults takes a later
+    /// release's defaults (pinned by
+    /// `tests::a_missing_exclude_is_the_default_list_until_changed`).
+    fn exclude_is_the_default(&self) -> bool {
+        self.exclude == Config::default().exclude
     }
 
     pub fn excludes(&self) -> Result<Excludes> {
@@ -528,6 +536,40 @@ impl Config {
     pub fn index_on_battery(&self) -> bool {
         self.index_on_battery.unwrap_or(true)
     }
+}
+
+/// A name of its own per save, so two windows saving at once don't rename
+/// each other's file away (pinned by
+/// `tests::saves_at_once_dont_trip_over_each_other`).
+fn tmp_path_of_this_save(path: &Path) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("toml.{}-{n}.tmp", std::process::id()))
+}
+
+/// Whole minutes stay integers, as people write them (pinned by
+/// `tests::whole_idle_minutes_are_saved_as_an_integer` and
+/// `tests::part_minutes_are_saved_as_a_float`).
+fn minutes_as_written(m: f64) -> toml_edit::Item {
+    if m.fract() == 0.0 && m.abs() < i64::MAX as f64 {
+        toml_edit::value(m as i64)
+    } else {
+        toml_edit::value(m)
+    }
+}
+
+/// `0.7` saved as `0.7`, not `0.699999988` (pinned by
+/// `tests::saving_formats_keeps_comments_and_drops_empty_tables`).
+fn shortest_decimal(s: f32) -> toml_edit::Item {
+    toml_edit::value(s.to_string().parse::<f64>().unwrap_or(f64::from(s)))
+}
+
+/// Assigning the value alone keeps the comments around its key (pinned by
+/// `tests::saving_keeps_comments_and_round_trips`).
+fn replace_keeping_comments(old: &mut toml_edit::Item, new: toml_edit::Item) {
+    let decor = old.as_value().unwrap().decor().clone();
+    *old = new;
+    *old.as_value_mut().unwrap().decor_mut() = decor;
 }
 
 /// Set or remove `<table>.<key>`, dropping the table once it is empty.
@@ -551,13 +593,8 @@ fn set_table(
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_like_mut()
         .expect("a table");
-    // A whole value, keeping any comment beside it.
     match t.get_mut(key) {
-        Some(old) if old.is_value() => {
-            let decor = old.as_value().unwrap().decor().clone();
-            *old = value;
-            *old.as_value_mut().unwrap().decor_mut() = decor;
-        }
+        Some(old) if old.is_value() => replace_keeping_comments(old, value),
         _ => {
             t.insert(key, value);
         }
@@ -590,17 +627,12 @@ fn set(doc: &mut toml_edit::DocumentMut, format: &str, key: &str, value: Option<
         .expect("formats is a table")
         .entry(format)
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    // A whole value, keeping any comment beside it.
     match t
         .as_table_like_mut()
         .expect("a format is a table")
         .get_mut(key)
     {
-        Some(old) if old.is_value() => {
-            let decor = old.as_value().unwrap().decor().clone();
-            *old = value;
-            *old.as_value_mut().unwrap().decor_mut() = decor;
-        }
+        Some(old) if old.is_value() => replace_keeping_comments(old, value),
         _ => {
             t.as_table_like_mut().unwrap().insert(key, value);
         }
@@ -716,9 +748,12 @@ mod tests {
         let link = dir.join("home");
         std::os::unix::fs::symlink(dir.join("var/home"), &link).unwrap();
         let real = fs::canonicalize(&real).unwrap();
-        // Written before Documents/tax exists, through the symlink.
         let ex = resolve("~/Documents/tax", &link.join("u")).unwrap();
-        assert_eq!(ex, real.join("Documents/tax"));
+        assert_eq!(
+            ex,
+            real.join("Documents/tax"),
+            "written through the symlink before Documents/tax exists"
+        );
         fs::create_dir_all(real.join("Documents/tax")).unwrap();
         let indexed = fs::canonicalize(link.join("u/Documents/tax")).unwrap();
         assert!(Excludes(vec![ex]).contains(&indexed.join("2025.md")));
@@ -788,6 +823,35 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn saved_text(c: &Config, name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("vinosearch-{name}-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        c.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        text
+    }
+
+    #[test]
+    fn whole_idle_minutes_are_saved_as_an_integer() {
+        let c = Config {
+            idle_unload_minutes: Some(3.0),
+            ..Config::default()
+        };
+        let text = saved_text(&c, "whole-minutes");
+        assert!(text.contains("idle_unload_minutes = 3\n"), "{text}");
+    }
+
+    #[test]
+    fn part_minutes_are_saved_as_a_float() {
+        let c = Config {
+            idle_unload_minutes: Some(2.5),
+            ..Config::default()
+        };
+        let text = saved_text(&c, "part-minutes");
+        assert!(text.contains("idle_unload_minutes = 2.5\n"), "{text}");
+    }
+
     #[test]
     fn saving_creates_the_file() {
         let dir = std::env::temp_dir().join(format!("vinosearch-new-{}", std::process::id()));
@@ -841,9 +905,15 @@ mod tests {
         assert!(c.formats.image_extensions().is_err());
         let c: Config = toml::from_str("[formats.text]\nmin_score = 2\n").unwrap();
         assert!(c.formats.text_min_score().is_err());
-        // Text can't be turned off yet.
+    }
+
+    #[test]
+    fn text_cant_be_turned_off() {
         assert!(toml::from_str::<Config>("[formats.text]\nenabled = false\n").is_err());
-        // Code is opt-in (#110).
+    }
+
+    #[test]
+    fn code_is_opt_in() {
         assert!(!Config::default().formats.code_enabled());
         assert_eq!(
             Config::default().formats.code_min_score().unwrap(),
@@ -855,11 +925,17 @@ mod tests {
         assert_eq!(c.formats.code_min_score().unwrap(), 0.7);
         let c: Config = toml::from_str("[formats.code]\nmin_score = -2\n").unwrap();
         assert!(c.formats.code_min_score().is_err());
-        // Sessions are opt-in (#143).
+    }
+
+    #[test]
+    fn sessions_are_opt_in() {
         assert!(!Config::default().formats.sessions_enabled());
         let c: Config = toml::from_str("[formats.sessions]\nenabled = true\n").unwrap();
         assert!(c.formats.sessions_enabled());
-        // Media too (#187), held to 3 h unless set.
+    }
+
+    #[test]
+    fn media_is_opt_in_and_held_to_three_hours_unless_set() {
         let d = Config::default().formats;
         assert!(!d.media_enabled());
         assert_eq!(d.media_max_seconds().unwrap(), 3.0 * 3600.0);
