@@ -9,4 +9,5 @@ pub mod limits;
 pub mod models;
 pub mod numbers;
 pub mod sandbox;
+pub mod version;
 pub mod xdg;

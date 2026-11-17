@@ -21,7 +21,7 @@ use vinosearch_shared::config;
 
 /// Semantic file search, run on the NPU.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = vinosearch_shared::version::VERSION)]
 struct Cli {
     /// ovfetch prefix holding the OpenVINO runtime [default: ~/.local/lib/vinosearch/openvino]
     #[arg(long, global = true, env = "VINOSEARCH_OPENVINO_DIR")]
