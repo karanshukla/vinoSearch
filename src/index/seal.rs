@@ -15,11 +15,10 @@
 //! allow PCRs of our choosing, but `/dev/tpmrm0` is for the `tss` group only.
 //!
 //! The Flatpak runs the host's `systemd-creds` through `flatpak-spawn
-//! --host` (its `--talk-name=org.freedesktop.Flatpak`), the key on a pipe the
-//! host's process reads itself, so what it seals is the same credential a
-//! native install seals, and either unseals the other's. Not reaching the
-//! host (no session helper, the permission taken away, no answer) is
-//! `Unavailable`: waited out, never taken for a lost key.
+//! --host` (`--talk-name=org.freedesktop.Flatpak`), the key on a pipe the host's
+//! process reads itself, so native and Flatpak installs seal and unseal the same
+//! credential. Not reaching the host (no session helper, permission taken away,
+//! no answer) is `Unavailable`: waited out, never taken for a lost key.
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -32,29 +31,20 @@ use zeroize::{Zeroize, Zeroizing};
 pub(crate) mod keyring;
 pub use keyring::Keyring;
 
-/// How long a keyring unlock prompt waits for the user before it is
-/// dismissed.
 pub const PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Root-owned places systemd's tools live, so PATH never picks the binary:
-/// merged /usr, split /usr, NixOS.
+/// Root-owned dirs, so PATH never picks the binary: merged /usr, split /usr, NixOS.
 const SYSTEM_BIN_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/run/current-system/sw/bin"];
 
-/// The runtime's, which runs a command on the host.
 const FLATPAK_SPAWN: &str = "/usr/bin/flatpak-spawn";
-/// Where the Flatpak sees the host's /usr, /bin and /etc, read-only
-/// (`--filesystem=host-os:ro`).
+/// The Flatpak's read-only view of the host's /usr, /bin and /etc (`--filesystem=host-os:ro`).
 const HOST_ROOT: &str = "/run/host";
-/// A tool on the host that hasn't answered in this long is given up on for
-/// now, as if the host couldn't be reached.
+/// A host tool silent this long is given up on, as if the host were unreachable.
 const HOST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One of systemd's tools: this system's, or from the Flatpak the host's.
 #[derive(Clone, Debug)]
 struct Tool {
-    /// As the system it runs on sees it.
     path: PathBuf,
-    /// Run on the host through flatpak-spawn.
     host: Option<Spawn>,
 }
 
@@ -64,7 +54,6 @@ struct Spawn {
     timeout: Duration,
 }
 
-/// `name` from the root-owned places; None when it isn't there.
 fn system_tool(name: &str) -> Option<Tool> {
     if vinosearch_shared::sandbox::flatpak_id().is_none() {
         let path = SYSTEM_BIN_DIRS
@@ -82,8 +71,7 @@ fn system_tool(name: &str) -> Option<Tool> {
     })
 }
 
-/// The host's `name`, looked for under `root`, where the sandbox sees the
-/// host's /usr and /bin (pinned by
+/// The host's `name` under `root` (pinned by
 /// `tests::host_tools_are_found_under_the_hosts_root_owned_dirs`). NixOS's /run
 /// isn't shared, so there it is assumed (pinned by
 /// `tests::on_a_nixos_host_its_run_tools_are_taken_on_trust`).
@@ -98,12 +86,10 @@ fn host_tool(root: &Path, name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Sealed into the credential: one sealed under another name doesn't unseal
-/// as this one.
+/// Sealed into the credential: one sealed under another name won't unseal as this.
 const NAME: &str = "vinosearch-index";
 pub const KEY_BYTES: usize = 32;
 
-/// An SQLCipher key: 32 random bytes, zeroed when dropped.
 pub struct Key(Zeroizing<[u8; KEY_BYTES]>);
 
 impl Key {
@@ -135,7 +121,6 @@ impl Key {
     }
 }
 
-/// Fill `buf` from the kernel's CSPRNG.
 fn random(buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -154,9 +139,8 @@ fn random(buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// The key can't be had right now (the keyring is locked, its prompt was
-/// dismissed or not answered, there is no Secret Service): wait and try
-/// again, never take it for a lost key.
+/// The key can't be had right now (locked keyring, prompt dismissed, no Secret
+/// Service): wait and retry, never take it for a lost key.
 #[derive(Debug)]
 pub struct Unavailable(pub String);
 
@@ -172,28 +156,20 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<Unavailable>().is_some())
 }
 
-/// Never the bytes.
 impl std::fmt::Debug for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str("Key(..)")
     }
 }
 
-/// What a sealed key needs to unseal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seal {
-    /// This machine's TPM (and systemd's host key with it).
     Tpm,
-    /// systemd's host key alone, `/var/lib/systemd/credential.secret`,
-    /// readable by root.
     Host,
-    /// The desktop keyring, unlocked at login and readable by this user's
-    /// session; no TPM.
     Keyring,
 }
 
 impl Seal {
-    /// `Status`'s `seal` values.
     pub fn name(self) -> &'static str {
         match self {
             Seal::Tpm => vinosearch_shared::dbus::seal::TPM,
@@ -203,8 +179,7 @@ impl Seal {
     }
 }
 
-/// Key ids from systemd's creds-util.h: what a credential is sealed with,
-/// its first 16 bytes.
+/// Key ids from systemd's creds-util.h: a credential's first 16 bytes.
 const BY_HOST_SCOPED: [u8; 16] = id("55b9ed1d38594d43a8319d2ebb332ac6");
 const BY_HOST_AND_TPM2_SCOPED: [u8; 16] = id("ef4ac13679a9480ea7db68897f9f165d");
 const BY_HOST_AND_TPM2_PK_SCOPED: [u8; 16] = id("adbc4ca3efb64201ba881b6f2e4095ea");
@@ -231,9 +206,9 @@ const fn nibble(c: u8) -> u8 {
     }
 }
 
-/// What an `index.key` is sealed with: the keyring's item reference, or a
-/// credential from `systemd-creds encrypt` (base64, as it writes them); None
-/// for anything else, a system-scoped credential included (pinned by
+/// What an `index.key` is sealed with: the keyring's item reference or a base64
+/// `systemd-creds encrypt` credential; None for anything else, a system-scoped
+/// credential included (pinned by
 /// `tests::a_system_scoped_credential_is_not_ours`).
 pub fn sealed_with(credential: &[u8]) -> Option<Seal> {
     if credential.starts_with(keyring::HEAD.as_bytes()) {
@@ -250,7 +225,6 @@ pub fn sealed_with(credential: &[u8]) -> Option<Seal> {
     }
 }
 
-/// The first `n` bytes of standard base64, ignoring whitespace.
 fn base64_prefix(text: &[u8], n: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(n + 2);
     let (mut acc, mut bits) = (0u32, 0);
@@ -277,31 +251,24 @@ fn base64_prefix(text: &[u8], n: usize) -> Option<Vec<u8>> {
     None
 }
 
-/// Whether systemd will seal with the TPM: one is there and the firmware
-/// reports it. Without that, the host key alone.
+/// Whether systemd will seal with the TPM; otherwise the host key alone.
 pub fn tpm_available() -> bool {
     system_tool("systemd-analyze").is_some_and(|t| run(&t, &["has-tpm2", "--quiet"], &[]).is_ok())
 }
 
-/// Why turning encryption on was refused without a TPM.
 pub const NO_TPM: &str = "This machine has no TPM that systemd can use, so the index key can't be \
      sealed to it. Allow the host key (weaker) or leave encryption off.";
 
-/// `systemd-creds` (or a stand-in for tests), and the keyring for where it
-/// can't be used.
 #[derive(Clone)]
 pub struct Sealer {
-    /// None for none at all.
     creds: Option<Creds>,
     keyring: Keyring,
-    /// The user asked for this now (ApplyEncryption, the config file), so
-    /// turning encryption off while the key can't be had starts over.
+    /// Asked for now, so turning encryption off while the key can't be had starts over.
     start_over: bool,
 }
 
 #[derive(Clone)]
 enum Creds {
-    /// The system's (from the Flatpak, the host's), where it can be used.
     System,
     #[cfg(test)]
     At(Tool),
@@ -320,12 +287,10 @@ impl Default for Sealer {
     }
 }
 
-/// The first systemd with `systemd-creds --user`.
 const FIRST_USER_CREDS_SYSTEMD: u32 = 256;
 
-/// systemd runs this machine and is new enough for `systemd-creds --user`:
-/// not so on a distribution without systemd, or in a container. From the
-/// Flatpak, the host's; `Unavailable` while it can't be reached.
+/// systemd runs here and is new enough for `systemd-creds --user`; from the
+/// Flatpak, the host's (`Unavailable` while unreachable).
 fn creds_usable(creds: &Tool) -> Result<bool> {
     if !systemd_booted(creds)? {
         return Ok(false);
@@ -336,7 +301,6 @@ fn creds_usable(creds: &Tool) -> Result<bool> {
     Ok(has_user_creds(&out))
 }
 
-/// Whether systemd runs the system `creds` runs on: this one, or the host.
 fn systemd_booted(creds: &Tool) -> Result<bool> {
     if creds.host.is_none() {
         return Ok(Path::new("/run/systemd/system").is_dir());
@@ -347,8 +311,7 @@ fn systemd_booted(creds: &Tool) -> Result<bool> {
     }
 }
 
-/// Whether `systemd-creds --version`, as in `systemd 259 (259.1-1.fc45)`,
-/// names a systemd with `--user` (pinned by
+/// Whether `systemd-creds --version` names a systemd with `--user` (pinned by
 /// `tests::systemd_256_has_user_credentials`,
 /// `tests::systemd_255_has_no_user_credentials`).
 fn has_user_creds(version: &[u8]) -> bool {
@@ -359,8 +322,7 @@ fn has_user_creds(version: &[u8]) -> bool {
         .is_some_and(|v| v >= FIRST_USER_CREDS_SYSTEMD)
 }
 
-/// A tool's output, None when it failed; Err only when it couldn't be run
-/// for now (`Unavailable`).
+/// A tool's output, None when it failed; Err only when it couldn't run for now.
 fn succeeded(r: Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
     match r {
         Ok(out) => Ok(Some(out)),
@@ -382,7 +344,6 @@ impl Sealer {
         }
     }
 
-    /// `program` on the "host", through `spawn`, a stand-in for flatpak-spawn.
     #[cfg(test)]
     pub fn on_host(spawn: &Path, program: &Path, timeout: Duration) -> Self {
         Sealer {
@@ -398,7 +359,6 @@ impl Sealer {
         }
     }
 
-    /// No `systemd-creds`: the Secret Service `keyring` points at.
     #[cfg(test)]
     pub fn keyring_only(keyring: Keyring) -> Self {
         Sealer {
@@ -408,10 +368,9 @@ impl Sealer {
         }
     }
 
-    /// `systemd-creds`, if it can seal a new key here; None for the keyring.
-    /// Looked at once per process, and only for a new key: not on the way to
-    /// unsealing one. From the Flatpak, a host that can't be reached is
-    /// `Unavailable`, never the keyring, and looked at again next time.
+    /// `systemd-creds`, if it can seal a new key here; None for the keyring. Looked
+    /// at once per process, and only for a new key. From the Flatpak an unreachable
+    /// host is `Unavailable`, never the keyring.
     fn sealing(&self) -> Result<Option<Tool>> {
         static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         match self.creds.as_ref() {
@@ -434,7 +393,6 @@ impl Sealer {
         }
     }
 
-    /// `systemd-creds`, to unseal what it sealed.
     fn unsealing(&self) -> Option<Tool> {
         match self.creds.as_ref()? {
             Creds::System => system_tool("systemd-creds"),
@@ -443,12 +401,10 @@ impl Sealer {
         }
     }
 
-    /// Whether turning encryption off without the key may rebuild the index.
     pub fn starts_over(&self) -> bool {
         self.start_over
     }
 
-    /// The same, for a change the user asked for now: see `start_over`.
     pub fn asked(&self) -> Self {
         Sealer {
             start_over: true,
@@ -456,8 +412,7 @@ impl Sealer {
         }
     }
 
-    /// The same, but a locked keyring is `Unavailable` at once rather than
-    /// prompting: for tries nobody asked for.
+    /// A locked keyring is `Unavailable` at once rather than prompting: for tries nobody asked for.
     pub fn quiet(&self) -> Self {
         Sealer {
             keyring: Keyring {
@@ -468,9 +423,9 @@ impl Sealer {
         }
     }
 
-    /// What a new key is sealed with here: the TPM or the host key (`tpm`
-    /// says which) while `systemd-creds` works, else the keyring. A host out
-    /// of reach for now still counts as `systemd-creds` (pinned by
+    /// What a new key is sealed with: the TPM or host key (`tpm` says which) while
+    /// `systemd-creds` works, else the keyring. An unreachable host still counts as
+    /// `systemd-creds` (pinned by
     /// `tests::in_the_flatpak_without_the_host_the_key_is_waited_for`).
     pub fn new_seal(&self, tpm: bool) -> Seal {
         match (self.sealing(), tpm) {
@@ -480,10 +435,9 @@ impl Sealer {
         }
     }
 
-    /// Seal `key` for this user, with `systemd-creds` wherever it works: a
-    /// key sealed with the host key alone is refused unless `allow_host` says
-    /// otherwise, never weaker than asked, and never put in the keyring
-    /// instead. Only where `systemd-creds` can't be used at all, the keyring.
+    /// Seal `key` with `systemd-creds` wherever it works; a host-key-only seal is
+    /// refused unless `allow_host`, never weaker than asked, never put in the
+    /// keyring instead.
     pub fn seal(&self, key: &Key, allow_host: bool) -> Result<(Vec<u8>, Seal)> {
         let Some(tool) = self.sealing().context("systemd-creds")? else {
             let blob = self
@@ -511,10 +465,9 @@ impl Sealer {
         }
     }
 
-    /// The key in `credential`, from whatever sealed it. Any failure is an
-    /// error and nothing else: the caller must not fall back to anything.
-    /// An `Unavailable` one is to be waited out, never taken for a lost key
-    /// (which rebuilds the index): a missing `systemd-creds` is one.
+    /// The key in `credential`, from whatever sealed it. Any failure is an error and
+    /// nothing else: the caller must not fall back. `Unavailable` is waited out,
+    /// never taken for a lost key (which rebuilds the index).
     pub fn unseal(&self, credential: &[u8]) -> Result<Key> {
         if sealed_with(credential) == Some(Seal::Keyring) {
             return self.keyring_key(credential);
@@ -533,8 +486,6 @@ impl Sealer {
         Key::from_slice(&out)
     }
 
-    /// The key the keyring keeps for `credential`. An item that isn't a key
-    /// is the keyring's oddity, `Unavailable` like the rest.
     fn keyring_key(&self, credential: &[u8]) -> Result<Key> {
         let out = self
             .keyring
@@ -543,9 +494,7 @@ impl Sealer {
         Key::from_slice(&out).map_err(|e| Unavailable(format!("{e:#}")).into())
     }
 
-    /// Once `credential` is replaced, drop what it keeps outside its file:
-    /// the keyring's item. Nothing for `systemd-creds`, whose credential is
-    /// the file.
+    /// Drop what `credential` keeps outside its file (the keyring's item).
     pub fn forget(&self, credential: &[u8]) {
         if sealed_with(credential) == Some(Seal::Keyring)
             && let Err(e) = self.keyring.delete(credential)
@@ -555,13 +504,12 @@ impl Sealer {
     }
 }
 
-/// flatpak-spawn's arguments before the tool's path. `-v` is for its word on
-/// how the tool exited (`host_exit`).
+/// flatpak-spawn's arguments before the tool's path; `-v` reports how the tool exited
+/// (`host_exit`).
 const FLATPAK_SPAWN_ARGS: [&str; 4] = ["-v", "--clear-env", "--directory=/", "--host"];
 
-/// `tool`'s stdout for `args` and `input`. A failed exit is reported before a
-/// failed write: a child that exits early breaks the pipe, and its stderr says
-/// why.
+/// `tool`'s stdout. A failed exit is reported before a failed write: a child
+/// that exits early breaks the pipe, and its stderr says why.
 fn run(tool: &Tool, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     let mut child = start(tool, args)?;
     let writer = write_in_background(child.stdin.take().expect("stdin is piped"), input);
@@ -597,10 +545,9 @@ fn run(tool: &Tool, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(std::mem::take(&mut *stdout))
 }
 
-/// `tool` started on piped stdio, with no environment of ours (pinned by
-/// `tests::creds_gets_no_environment_of_ours`): it talks to systemd over its
-/// socket. Through flatpak-spawn, which gets only the session bus, its way to
-/// the host (pinned by
+/// `tool` on piped stdio, with no environment of ours (pinned by
+/// `tests::creds_gets_no_environment_of_ours`). Through flatpak-spawn, which
+/// gets only the session bus (pinned by
 /// `tests::on_the_host_flatpak_spawn_gets_the_bus_and_nothing_else`), the
 /// tool's stdin and stdout are these pipes, passed on: the key never passes
 /// through flatpak-spawn or the session helper.
@@ -635,8 +582,6 @@ fn start(tool: &Tool, args: &[&str]) -> Result<Child> {
     }
 }
 
-/// Writes `input` to `stdin` from a thread, so a full stdout pipe can't
-/// deadlock the reader, and zeroes its copy.
 fn write_in_background(
     mut stdin: std::process::ChildStdin,
     input: &[u8],
@@ -649,11 +594,10 @@ fn write_in_background(
     })
 }
 
-/// flatpak-spawn -v's stderr: the exit code of what it ran on the host, if
-/// it says it ran and exited (`F: child exit code PID: CODE`), and the rest,
-/// which is that tool's stderr or why flatpak-spawn failed. Its own exit
-/// code can't tell those apart: 1 for both. No code means the tool never ran
-/// or never finished: the host's fault, not the key's (pinned by
+/// flatpak-spawn -v's stderr split into the exit code of what it ran on the host
+/// (`F: child exit code PID: CODE`) and the rest. Its own exit code can't tell
+/// those apart. No code means the tool never ran or finished: the host's fault,
+/// not the key's (pinned by
 /// `tests::on_the_host_a_tool_that_never_ran_is_unavailable`).
 fn host_exit(stderr: &str) -> (Option<i32>, String) {
     let mut pid = None;
@@ -676,9 +620,8 @@ fn host_exit(stderr: &str) -> (Option<i32>, String) {
     (code, rest.join("\n").trim().to_owned())
 }
 
-/// `child`'s output, or why there is none after `timeout`: then it is sent
-/// SIGTERM, which flatpak-spawn passes on to what it runs on the host, and
-/// SIGKILL if that isn't enough.
+/// `child`'s output, or why there is none after `timeout`: SIGTERM (flatpak-spawn
+/// passes it to the host tool), then SIGKILL.
 fn output_within(child: Child, timeout: Duration) -> std::result::Result<Output, String> {
     // SAFETY: a pid of ours, not yet waited for.
     let pidfd = unsafe {
@@ -733,10 +676,8 @@ pub(crate) mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A stand-in for `systemd-creds`: records its argv (one per line) and
-    /// its environment beside itself, then runs `body`. It "seals" by
-    /// prefixing a key id, in base64 as systemd writes them, and "unseals"
-    /// by stripping it.
+    /// A stand-in for `systemd-creds`: records its argv and environment, then runs
+    /// `body`; "seals" by prefixing a base64 key id.
     pub struct Fake {
         pub dir: PathBuf,
     }
@@ -773,8 +714,6 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
             )
         }
 
-        /// An executable `name` holding `text`, renamed into place so no fork
-        /// elsewhere holds it open for writing.
         fn script(&self, name: &str, text: &str) -> PathBuf {
             let path = self.dir.join(name);
             let tmp = self.dir.join(format!("{name}.tmp"));
@@ -852,8 +791,6 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
         ));
     }
 
-    /// Fails unless every variable in the environment `file` recorded is
-    /// one of `allowed`, or one sh sets itself.
     fn assert_env_only(file: &Path, allowed: &[&str]) {
         let env = fs::read_to_string(file).unwrap();
         for line in env.lines() {
@@ -938,9 +875,8 @@ if [ "$mode" = e ]; then printf '%s' '{head}'; base64 -w0; echo; else tail -c +2
         assert!(s.unseal(b"blob").is_err());
     }
 
-    /// A stand-in for flatpak-spawn: records its argv and environment, then
-    /// does what `body` says. `HOST` runs the "host" tool (the rest of argv
-    /// after `--host`) and reports as `flatpak-spawn -v` does.
+    /// A stand-in for flatpak-spawn: records argv and environment, then does what
+    /// `body` says; `HOST` runs the "host" tool after `--host`.
     pub fn spawner(fake: &Fake, body: &str) -> PathBuf {
         fake.script(
             "flatpak-spawn",
@@ -997,7 +933,6 @@ exit $c"#;
 
     const HOST_WAIT: Duration = Duration::from_secs(10);
 
-    /// A `systemd-creds` that refuses to unseal.
     fn refusing_creds(fake: &Fake) -> PathBuf {
         fake.tool("echo 'Failed to unseal secret using TPM2' >&2; exit 1")
     }
@@ -1153,9 +1088,7 @@ exit $c"#;
         );
     }
 
-    /// In the Flatpak with its permission to reach the host taken away
-    /// (`flatpak run --no-talk-name=org.freedesktop.Flatpak`): waited for,
-    /// and never the keyring instead.
+    /// In the Flatpak with host access removed: waited for, never the keyring.
     #[test]
     #[ignore = "needs the Flatpak sandbox, without org.freedesktop.Flatpak"]
     fn in_the_flatpak_without_the_host_the_key_is_waited_for() {

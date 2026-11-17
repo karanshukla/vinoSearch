@@ -2,12 +2,10 @@
 //! editor, a PDF at its page in the viewer. KRunner, GNOME Shell and
 //! `vinosearch menu` all open through here.
 //!
-//! The app is the `editor` setting for text (a command, or an app's desktop
-//! entry id as the settings app's picker saves it), else the default app for
-//! the file's type (`xdg-mime query default`), whose desktop file says what
-//! to run. Only apps known to take a line or page get one; anything else, a
-//! terminal app or a Flatpak included, gets `xdg-open` as before. Every
-//! command is an argv, never a shell line.
+//! The app is the `editor` setting for text (a command, or a desktop entry id),
+//! else the default app for the file's type (`xdg-mime query default`). Only apps
+//! known to take a line or page get one; anything else (a terminal app, a
+//! Flatpak) gets `xdg-open`. Every command is an argv, never a shell line.
 //!
 //! A vinoWhisper session is a zip no editor opens: it goes to
 //! vinoWhisper's settings window, or without vinoWhisper, the part that
@@ -29,25 +27,19 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Where in its file a result matched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum At {
-    /// A text file's line, from 1.
     Line(u32),
-    /// A PDF's page, counted from 1 in document order (an index, not a
-    /// printed page label).
+    /// A PDF's page from 1, in document order (an index, not a printed page label).
     Page(u32),
-    /// A vinoWhisper session's part, at a line of it (0 for the top).
     Session(Part, u32),
-    /// An audio or video file's second, from 0.
     Second(u32),
 }
 
 impl At {
-    /// Where a hit on `path` at chunk number `line` is, if an app can be told.
-    /// An HTML page's lines are of its extracted text, and a document's
-    /// numbers other than a PDF's page are slides, rows or chapters, which
-    /// no common app takes from the command line.
+    /// Where a hit on `path` at chunk `line` is, if an app can be told. HTML lines are
+    /// of its extracted text and non-PDF document numbers are slides, rows or
+    /// chapters, which no common app takes.
     pub fn of(kind: Kind, path: &Path, line: i64) -> Option<At> {
         if kind == Kind::Session {
             let (part, n) = Part::of(line);
@@ -67,7 +59,6 @@ impl At {
     }
 }
 
-/// How an app takes a line or page.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Style {
     /// `--page N FILE`
@@ -105,7 +96,6 @@ const JETBRAINS: &[&str] = &[
     "aqua",
 ];
 
-/// The style of the program `program` (a name or path), by its file name.
 fn style(program: &str) -> Option<Style> {
     let name = Path::new(program).file_name()?.to_str()?;
     let name = name.strip_suffix(".sh").unwrap_or(name);
@@ -123,8 +113,6 @@ fn style(program: &str) -> Option<Style> {
     })
 }
 
-/// The arguments after the program that open `file` at `at`, if `style`
-/// takes that kind of place.
 fn args(style: Style, file: &Path, at: At) -> Option<Vec<String>> {
     let f = file.display().to_string();
     Some(match (style, at) {
@@ -140,11 +128,10 @@ fn args(style: Style, file: &Path, at: At) -> Option<Vec<String>> {
     })
 }
 
-/// The command for a setting like `editor` or `player`: a template when it
-/// has `{file}` (each word on its own, every `fields` placeholder replaced
-/// too), else the command with what `place` gives for its program, else the
-/// command with the file alone. Words are split on whitespace, never through
-/// a shell, so a path with spaces or quotes stays one argument.
+/// The command for a setting like `editor` or `player`: a template when it has
+/// `{file}` (each word on its own, `fields` replaced too), else the command plus
+/// what `place` gives, else plus the file alone. Split on whitespace, never
+/// through a shell, so a path with spaces or quotes stays one argument.
 fn setting_argv(
     setting: &str,
     file: &Path,
@@ -168,23 +155,18 @@ fn setting_argv(
     Some(argv)
 }
 
-/// The command for the `editor` setting: a template with `{file}` and
-/// `{line}`, else a known editor with its line flag, else the command with
-/// the file and no line.
 fn editor_argv(editor: &str, file: &Path, line: u32) -> Option<Vec<String>> {
     setting_argv(editor, file, &[("{line}", line.to_string())], |program| {
         args(style(program)?, file, At::Line(line))
     })
 }
 
-/// A desktop file's `Exec` and `Terminal`.
 #[derive(Debug, PartialEq)]
 struct Entry {
     exec: Vec<String>,
     terminal: bool,
 }
 
-/// `Exec` and `Terminal` from the `[Desktop Entry]` group of `text`.
 fn parse_entry(text: &str) -> Option<Entry> {
     let (mut exec, mut terminal) = (None, false);
     for (key, value) in vinosearch_shared::apps::entry_keys(text) {
@@ -200,7 +182,6 @@ fn parse_entry(text: &str) -> Option<Entry> {
     })
 }
 
-/// A desktop file string's escapes (`\s`, `\n`, `\t`, `\r`, `\\`).
 fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
@@ -264,10 +245,9 @@ fn exec_words(exec: &str) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// The command a default app's desktop entry gives for `file` at `at`: its
-/// `Exec` without field codes, then the app's own arguments. None for a
-/// terminal app or one not known to take this kind of place (a Flatpak's
-/// `Exec` is `flatpak run ...`, so it is one of those).
+/// The command a default app's entry gives: its `Exec` without field codes, then
+/// the app's own arguments. None for a terminal app or one not known to take this
+/// place (a Flatpak's `Exec` is `flatpak run ...`).
 fn app_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
     if entry.terminal {
         return None;
@@ -276,7 +256,6 @@ fn app_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
     Some(entry.exec.iter().cloned().chain(a).collect())
 }
 
-/// The desktop entry with id `id` (`org.kde.okular.desktop`), first found.
 fn find_entry(id: &str) -> Option<Entry> {
     if id.contains('/') || !id.ends_with(".desktop") {
         return None;
@@ -287,7 +266,6 @@ fn find_entry(id: &str) -> Option<Entry> {
     })
 }
 
-/// One line of `xdg-mime`'s output, if it ran and printed one.
 fn xdg_mime(args: &[&std::ffi::OsStr]) -> Option<String> {
     let out = host_command("xdg-mime")
         .args(args)
@@ -299,7 +277,6 @@ fn xdg_mime(args: &[&std::ffi::OsStr]) -> Option<String> {
     (out.status.success() && !line.is_empty() && !line.contains('\n')).then_some(line)
 }
 
-/// The default app's desktop entry for `file` at `at`.
 fn default_entry(file: &Path, at: At) -> Option<Entry> {
     let mime = match at {
         At::Page(_) => "application/pdf".to_owned(),
@@ -321,9 +298,7 @@ fn default_app(mime: &str) -> Option<Entry> {
     find_entry(&id)
 }
 
-/// The command a picked editor's entry gives: at the line when it is an app
-/// known to take one, else the file alone, as the app's own `Exec`. None for
-/// a terminal app.
+/// At the line when the app is known to take one, else the file alone. None for a terminal app.
 fn picked_argv(entry: &Entry, file: &Path, at: At) -> Option<Vec<String>> {
     if entry.terminal {
         return None;
@@ -344,7 +319,6 @@ fn exec_with_file(entry: &Entry, file: &Path) -> Vec<String> {
     argv
 }
 
-/// The command that opens `file` at `at`, if anything known can.
 fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
     if let (At::Line(l), Some(e)) = (at, editor.filter(|e| !e.trim().is_empty())) {
         if vinosearch_shared::apps::is_entry_id(e) {
@@ -355,10 +329,8 @@ fn argv_at(file: &Path, at: At, editor: Option<&str>) -> Option<Vec<String>> {
     app_argv(&default_entry(file, at)?, file, at)
 }
 
-/// A media player known to start a file at a time, by how it takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Player {
-    /// `--start=S`
     Mpv,
     /// `--start-time=S`, parsed with `us_atof`, so a decimal point in any locale.
     Vlc,
@@ -366,11 +338,10 @@ enum Player {
     Celluloid,
 }
 
-/// The player `program` (a name or path) is, by its file name. Haruna, Totem
-/// and Showtime aren't here because none takes a start time, read
-/// from their sources on 2026-11-11: Haruna's only option is
-/// `--ytdl-format-selection`, Showtime's is `--new-window`, and Totem
-/// declares a hidden `--seek` that nothing reads. They get the file alone.
+/// The player `program` is, by file name. Haruna, Totem and Showtime take no start
+/// time (read from their sources 2026-11-11: Haruna's only option is
+/// `--ytdl-format-selection`, Showtime's `--new-window`, Totem's a hidden `--seek`
+/// nothing reads), so they get the file alone.
 fn player(program: &str) -> Option<Player> {
     Some(match Path::new(program).file_name()?.to_str()? {
         "mpv" => Player::Mpv,
@@ -380,7 +351,6 @@ fn player(program: &str) -> Option<Player> {
     })
 }
 
-/// `seconds`, 0 when negative or not a number.
 fn clamped(seconds: f64) -> f64 {
     if seconds.is_finite() {
         seconds.max(0.0)
@@ -389,21 +359,18 @@ fn clamped(seconds: f64) -> f64 {
     }
 }
 
-/// `seconds` to the millisecond, without trailing zeros (`754`, `754.5`). All
-/// three known players take a decimal, and a window can start mid-second.
+/// `seconds` to the millisecond without trailing zeros (`754.5`); a window can start mid-second.
 fn decimal_seconds(seconds: f64) -> String {
     let s = format!("{:.3}", clamped(seconds));
     s.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-/// `seconds` rounded down to a whole second, for a template's `{seconds}`:
-/// its program is unknown and may not take a decimal, and rounding down never
-/// skips past the matched words.
+/// `seconds` rounded down for a template's `{seconds}`: its program is unknown
+/// and may not take a decimal, and rounding down never skips past the matched words.
 fn whole_seconds(seconds: f64) -> String {
     (clamped(seconds).floor() as u64).to_string()
 }
 
-/// The option that starts `player` at `seconds`.
 fn start_flag(player: Player, seconds: f64) -> String {
     let s = decimal_seconds(seconds);
     match player {
@@ -413,10 +380,9 @@ fn start_flag(player: Player, seconds: f64) -> String {
     }
 }
 
-/// The command a player's desktop entry gives for `file` at `seconds`, if it
-/// is a known player that isn't a terminal app (a Flatpak's `Exec` is
-/// `flatpak run ...`, so it isn't one). The start flag goes before a `--`,
-/// as mpv's desktop file has, after which it would be taken for a file.
+/// The command a player's entry gives for `file` at `seconds`, if it is a known
+/// player and not a terminal app. The start flag goes before a `--`, as mpv's
+/// desktop file has, after which it would be a file.
 fn entry_play_argv(entry: &Entry, file: &Path, seconds: f64) -> Option<Vec<String>> {
     if entry.terminal {
         return None;
@@ -429,10 +395,9 @@ fn entry_play_argv(entry: &Entry, file: &Path, seconds: f64) -> Option<Vec<Strin
     Some(argv)
 }
 
-/// The command for the `player` setting: an app's desktop entry id, a
-/// template with `{file}` and `{seconds}` (whole seconds), a known player
-/// with its start flag, or any other command with the file and no time.
-/// None when blank, or for a desktop entry id not found or run in a terminal.
+/// The command for the `player` setting: a desktop entry id, a template with
+/// `{file}` and `{seconds}`, a known player's start flag, or the command and file
+/// alone. None when blank or an entry id not found or run in a terminal.
 fn player_argv(setting: &str, file: &Path, seconds: f64) -> Option<Vec<String>> {
     if vinosearch_shared::apps::is_entry_id(setting) {
         let entry = find_entry(setting.trim())?;
@@ -449,10 +414,9 @@ fn player_argv(setting: &str, file: &Path, seconds: f64) -> Option<Vec<String>> 
     })
 }
 
-/// The command that plays the media `file` from `seconds` in: the
-/// `player` setting, else the default app for the file's type when it is a
-/// known player, else `xdg-open`, which can't seek. Looking up the default
-/// app runs `xdg-mime`, so call this off the bus.
+/// The command that plays `file` from `seconds`: the `player` setting, else the
+/// default app when a known player, else `xdg-open`, which can't seek. Runs
+/// `xdg-mime`: call off the bus.
 pub fn play_argv(file: &Path, seconds: f64, player: Option<&str>) -> Vec<String> {
     player
         .filter(|p| !p.trim().is_empty())
@@ -484,7 +448,6 @@ fn detached(argv: Vec<String>, in_unit: bool) -> Vec<String> {
     .collect()
 }
 
-/// `program`, on the host when this runs in the Flatpak.
 fn host_command(program: &str) -> Command {
     let argv = host_argv(vec![program.to_owned()]);
     let mut c = Command::new(&argv[0]);
@@ -513,7 +476,6 @@ fn in_unit() -> bool {
     std::env::var_os("INVOCATION_ID").is_some() && crate::search::menu::on_path("systemd-run")
 }
 
-/// `KEY=value` entries as pairs, skipping any without a `=`.
 fn env_pairs(entries: Vec<String>) -> Vec<(String, String)> {
     entries
         .iter()
@@ -533,19 +495,17 @@ fn manager_env() -> zbus::Result<Vec<(String, String)>> {
     })
 }
 
-/// In the Flatpak, whether the host lacks `program`. flatpak-spawn starts
-/// even then, so a missing one would open nothing rather than fail and fall
-/// back to xdg-open.
+/// In the Flatpak, whether the host lacks `program`: flatpak-spawn starts even
+/// then, so a missing one would open nothing rather than fall back to xdg-open.
 fn missing_on_host(program: &str) -> bool {
     vinosearch_shared::sandbox::flatpak_id().is_some()
         && !vinosearch_shared::sandbox::host_has(program)
 }
 
-/// Start `argv` for the desktop, and reap it when it exits. Blocks on the bus
-/// in a unit, so call this off the runner's. In a process group of its own,
-/// so a signal to the runner's (Ctrl+C on a `vinosearch krunner` in a
-/// terminal) leaves it, and its output out of the runner's log; outside a
-/// unit nothing else ties it to the runner, which can exit or crash under it.
+/// Start `argv` for the desktop and reap it. Blocks on the bus in a unit: call off
+/// the runner's. In a process group of its own so Ctrl+C to the runner leaves it
+/// and its output stays out of the runner's log; outside a unit nothing else ties
+/// it to the runner, which can exit under it.
 pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     let in_unit = in_unit();
     let env = if in_unit {
@@ -575,9 +535,8 @@ pub fn spawn(argv: Vec<String>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Open `file` at `at` in the editor, player or default app, else with
-/// `xdg-open`. Looking up the default app runs `xdg-mime`, so call this off
-/// the bus.
+/// Open `file` at `at` in the editor, player or default app, else `xdg-open`.
+/// Runs `xdg-mime`: call off the bus.
 pub fn open(file: &Path, at: Option<At>, editor: Option<&str>, player: Option<&str>) {
     if crate::extract::is_session(file) {
         let (part, line) = session_place(at);
@@ -601,8 +560,7 @@ pub fn open(file: &Path, at: Option<At>, editor: Option<&str>, player: Option<&s
     xdg_open(file);
 }
 
-/// The part and line to open a session at. `vinosearch menu` and the search
-/// window pass a plain line, which is the transcript's.
+/// The part and line to open a session at; a plain line is the transcript's.
 fn session_place(at: Option<At>) -> (Part, u32) {
     match at {
         Some(At::Session(part, line)) => (part, line),
@@ -617,9 +575,9 @@ pub fn xdg_open(target: &Path) {
     }
 }
 
-/// The command for vinoWhisper's settings window, which opens a session's
-/// part (and the transcript at a `[MM:SS]`): its Flatpak's for a session the
-/// Flatpak saved, or where there is no native install; else the native one.
+/// The command for vinoWhisper's settings window, which opens a session's part:
+/// its Flatpak's for a session the Flatpak saved or with no native install, else
+/// the native one.
 fn vinowhisper_gui(file: &Path) -> Option<Vec<String>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let flatpak = home.as_deref().and_then(vinowhisper_flatpak);
@@ -634,8 +592,8 @@ fn vinowhisper_gui(file: &Path) -> Option<Vec<String>> {
     }
 }
 
-/// `flatpak run` for vinoWhisper's window, when its Flatpak is installed
-/// for this user or system-wide: Flatpak exports its launcher entry there.
+/// `flatpak run` for vinoWhisper's window when its Flatpak is installed for this user or
+/// system-wide.
 fn vinowhisper_flatpak(home: &Path) -> Option<Vec<String>> {
     let app = crate::index::VINOWHISPER_FLATPAK;
     let entry = format!("exports/share/applications/{app}.desktop");
@@ -655,7 +613,6 @@ fn vinowhisper_flatpak(home: &Path) -> Option<Vec<String>> {
     })
 }
 
-/// Where the host's `/` is, in the Flatpak.
 const HOST_ROOT: &str = "/run/host";
 
 /// A native install's window; KRunner's PATH may lack ~/.local/bin, where
@@ -717,10 +674,9 @@ fn open_session(file: &Path, part: Part, line: u32, editor: Option<&str>) -> Res
 }
 
 /// `text`, `file`'s `part`, in a file only this user can read, under
-/// $XDG_RUNTIME_DIR (memory, gone at logout), never /tmp. Copies from
-/// before are deleted first: each open leaves at most one behind. In the
-/// Flatpak, under its `app/<id>` directory there, which the host sees at the
-/// same path.
+/// $XDG_RUNTIME_DIR (memory, gone at logout), never /tmp. Earlier copies are
+/// deleted first: each open leaves at most one. In the Flatpak, under its
+/// `app/<id>` directory, which the host sees at the same path.
 fn copy_out(file: &Path, part: Part, text: &str) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let mut runtime =

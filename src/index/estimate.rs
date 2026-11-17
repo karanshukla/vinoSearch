@@ -44,12 +44,10 @@ const SECS_PER_MEDIA_CHUNK: f64 = 0.7;
 /// transcript, plain text about a third its size zipped.
 const SESSION_TEXT_SHARE: f64 = 2.0;
 
-/// The share of a document's file that comes out as text. Guesses, not
-/// measured, set high so the estimate errs long: a PDF is mostly fonts,
-/// images and compressed streams; zipped Office and EPUB files deflate
-/// their XML about as much as the markup inflates it, and Word 97,
-/// PowerPoint 97 and RTF carry about as much formatting; the plain formats
-/// are nearly all text.
+/// The share of a document's file that comes out as text. Guesses, set high so the estimate errs
+/// long: a PDF is mostly fonts, images and compressed streams; zipped Office and EPUB files deflate
+/// their XML about as much as markup inflates it; Word 97, PowerPoint 97 and RTF carry about as
+/// much formatting; plain formats are nearly all text.
 fn document_text_share(path: &Path) -> f64 {
     let ext = path
         .extension()
@@ -64,7 +62,6 @@ fn document_text_share(path: &Path) -> f64 {
     }
 }
 
-/// The chunks a file of `bytes` is expected to make.
 fn chunks_of(kind: Kind, path: &Path, bytes: u64) -> u64 {
     let text = match kind {
         Kind::Image => return 1,
@@ -92,7 +89,6 @@ fn worth_excluding(ms: u64, total_ms: u64) -> bool {
     ms * 50 >= total_ms
 }
 
-/// Seconds to embed `chunks` of `kind`.
 fn secs_of(kind: Kind, chunks: u64) -> f64 {
     match kind {
         Kind::Image => chunks as f64 * SECS_PER_IMAGE,
@@ -101,7 +97,6 @@ fn secs_of(kind: Kind, chunks: u64) -> f64 {
     }
 }
 
-/// Files of one kind still to index.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Tally {
     pub files: u64,
@@ -114,9 +109,7 @@ pub struct Estimate {
     pub root: PathBuf,
     /// In `Kind::ALL`'s order: text, documents, images, code, sessions, media.
     pub kinds: [Tally; 6],
-    /// Files already indexed and unchanged since, which cost nothing.
     pub up_to_date: u64,
-    /// The subfolders taking longest, longest first: (folder, seconds, files).
     pub folders: Vec<(PathBuf, f64, u64)>,
 }
 
@@ -137,7 +130,6 @@ impl Estimate {
         self.kinds.iter().map(|t| t.chunks).sum::<u64>() * INDEX_BYTES_PER_CHUNK
     }
 
-    /// "~4,200 files, ~35 min, ~180 MB".
     pub fn summary(&self) -> String {
         if self.files() == 0 {
             return if self.up_to_date > 0 {
@@ -164,7 +156,6 @@ impl Estimate {
         )
     }
 
-    /// `device` is the one indexing will run on, for `rates_note`.
     pub fn to_json(&self, device: &str) -> serde_json::Value {
         let kinds: serde_json::Map<_, _> = Kind::ALL
             .iter()
@@ -217,20 +208,17 @@ pub fn rates_note(device: &str) -> Option<String> {
     }
 }
 
-/// "~12 min, 1,300 files", for one of the biggest subfolders.
 pub fn folder_summary(secs: f64, files: u64) -> String {
     format!("{}, {}", duration(secs), self::files(files))
 }
 
-/// "1 file", "1,300 files".
 fn files(n: u64) -> String {
     format!("{} file{}", thousands(n), if n == 1 { "" } else { "s" })
 }
 
-/// Walk `root` as indexing it would, counting what is still to index:
-/// files `known` (path to recorded mtime and size, from the index) records
-/// unchanged are left out. `limit` subfolders are named as the biggest.
-/// Copies of a file are counted in full, though indexing embeds one.
+/// Walk `root` as indexing it would, counting what is still to index: files `known` (path to mtime
+/// and size) records unchanged are left out. `limit` subfolders are named as the biggest. Copies
+/// are counted in full, though indexing embeds one.
 pub fn estimate(
     root: &Path,
     ex: &Excludes,
@@ -283,8 +271,7 @@ pub fn estimate(
     Ok(est)
 }
 
-/// `n` to two significant figures past 1,000, since it is an estimate:
-/// 4,213 reads ~4,200.
+/// `n` to two significant figures past 1,000: 4,213 reads ~4,200.
 fn about(n: u64) -> String {
     if n < 1000 {
         return thousands(n);
@@ -293,7 +280,6 @@ fn about(n: u64) -> String {
     format!("~{}", thousands((n + step / 2) / step * step))
 }
 
-/// "under a minute", "~35 min", "~1.5 h", "~12 h".
 pub fn duration(secs: f64) -> String {
     let min = (secs / 60.0).round();
     if secs < 60.0 {
@@ -307,7 +293,6 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
-/// "~180 MB", "~1.2 GB", "under 1 MB".
 fn size(bytes: u64) -> String {
     let mb = bytes as f64 / 1e6;
     if mb < 1.0 {

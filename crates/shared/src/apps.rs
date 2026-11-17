@@ -60,7 +60,8 @@ pub fn is_entry_id(editor: &str) -> bool {
 }
 
 /// Every app that says it opens text/plain or is a text editor (VS Code
-/// claims only its workspace files), by name, from `dirs`' `applications`. An id in an earlier directory hides the same id later, as
+/// claims only its workspace files), by name, from `dirs`' `applications`. An id in an earlier
+/// directory hides the same id later, as
 /// in the menu; hidden entries and terminal apps (which need a terminal to
 /// run in) are left out.
 pub fn editors_in(dirs: &[PathBuf]) -> Vec<App> {

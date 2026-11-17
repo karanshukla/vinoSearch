@@ -17,16 +17,13 @@ const VISION_REPO: &str = "arankays/embeddinggemma-2-vision-static-onnx";
 pub(crate) const VISION_REVISION: &str = "16414206c27ee4bc435a7c03467155063fee1d9f";
 const AUDIO_REPO: &str = "arankays/embeddinggemma-2-audio-static-onnx";
 pub(crate) const AUDIO_REVISION: &str = "c6d60dee133087e72c58a9ac802ad7ef430e30cf";
-/// The text repo's commit adding `model_audio_250.onnx`. Its other files are
-/// REVISION's byte for byte, so REVISION stays the pin for them, and the
-/// vectors of every other kind stay valid.
+/// The text repo's commit adding `model_audio_250.onnx`; its other files are REVISION's byte for
+/// byte, so REVISION stays their pin and other kinds' vectors stay valid.
 pub(crate) const AUDIO_TEXT_REVISION: &str = "1e53edbfc9581825c13a0e057e098418dbab5196";
 const OCR_REPO: &str = "arankays/pp-ocrv6-small-onnx";
 pub(crate) const OCR_REVISION: &str = "5bc17817a3879e7e494cd71b43d66b7b608abfac";
 
-/// A file of a repo, as fetched.
 struct Pinned<'a> {
-    /// Its path in the repo.
     path: &'a str,
     sha256: &'a str,
     bytes: u64,
@@ -39,15 +36,13 @@ const TEXT_ONLY_GRAPH: Pinned = Pinned {
     sha256: "cab66c5d0bf25beaadca4095c7c4cb2e06b05cb360059f5854d9e4b110b70af3",
     bytes: 713_515,
 };
-/// model_text.onnx with its inputs fixed at [1, 32] (bench/static_shapes.py),
-/// so the runner can compile straight from the path and a cache hit never
+/// model_text.onnx with inputs fixed at [1, 32] (bench/static_shapes.py), so a cache hit never
 /// reads the weights.
 const QUERY_GRAPH: Pinned = Pinned {
     path: "onnx/model_text_q32.onnx",
     sha256: "8ecbd32473fce1d7805ab4ef8ab9be69d12b3b95639231001cd30054096245bc",
     bytes: 713_465,
 };
-/// QUERY_GRAPH's twin at [1, 256].
 const DOCUMENT_GRAPH: Pinned = Pinned {
     path: "onnx/model_text_d256.onnx",
     sha256: "65e91c59827cfa791f090dab4b9091ff5a37e5393adb1fd77d6289ef89985049",
@@ -78,7 +73,6 @@ const FILES: &[Pinned] = &[
     IMAGE_TEXT_GRAPH,
 ];
 
-/// The vision encoder, fetched only while images are indexed.
 const VISION_FILES: &[Pinned] = &[
     Pinned {
         path: "onnx/vision_encoder_static_140.onnx",
@@ -92,7 +86,6 @@ const VISION_FILES: &[Pinned] = &[
     },
 ];
 
-/// The audio encoder, fetched only while media is indexed.
 const AUDIO_FILES: &[Pinned] = &[
     Pinned {
         path: "onnx/audio_encoder_static_10s_int8.onnx",
@@ -106,9 +99,8 @@ const AUDIO_FILES: &[Pinned] = &[
     },
 ];
 
-/// `model_text.onnx` taking the audio encoder's output, from the text repo
-/// at AUDIO_TEXT_REVISION, into the text model's directory: it reads
-/// `model.onnx_data` beside it.
+/// `model_text.onnx` taking the audio encoder's output, from the text repo at AUDIO_TEXT_REVISION,
+/// into the text model's directory (it reads `model.onnx_data` beside it).
 const AUDIO_TEXT_FILES: &[Pinned] = &[Pinned {
     path: "onnx/model_audio_250.onnx",
     sha256: "fe1196496d5e8db24d2621a2fdd090856a19984398e2d032ec46a38e2c6effb6",
@@ -135,7 +127,6 @@ const OCR_FILES: &[Pinned] = &[
     },
 ];
 
-/// The encoders the formats switched on need, besides the text model and OCR.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Wants {
     pub images: bool,
@@ -150,13 +141,11 @@ impl Wants {
         }
     }
 
-    /// Images, and video's frames.
     fn vision(self) -> bool {
         self.images || self.media
     }
 }
 
-/// Bytes the model takes on disk once fetched, with what `wants` adds.
 pub fn total_bytes(wants: Wants) -> u64 {
     let size = |files: &[Pinned]| files.iter().map(|f| f.bytes).sum::<u64>();
     size(FILES)
@@ -193,22 +182,18 @@ pub fn audio_dir() -> Result<PathBuf> {
     Ok(models_dir()?.join(models::AUDIO))
 }
 
-/// Bytes of every model on disk, a partial download's included.
 pub fn bytes() -> Result<u64> {
     Ok(models::bytes(&models_dir()?))
 }
 
-/// The audio encoder, in `audio_dir()`.
 pub fn audio_path(dir: &Path) -> PathBuf {
     dir.join(AUDIO_FILES[0].path)
 }
 
-/// The text model taking audio features, in `default_dir()`.
 pub fn audio_text_path(dir: &Path) -> PathBuf {
     dir.join(AUDIO_TEXT_FILES[0].path)
 }
 
-/// What embedding sound needs, besides the text model, is present.
 pub fn audio_present(dir: &Path, audio_dir: &Path) -> bool {
     audio_text_path(dir).is_file() && AUDIO_FILES.iter().all(|f| audio_dir.join(f.path).is_file())
 }
@@ -225,17 +210,14 @@ pub fn ocr_dict_path(dir: &Path) -> PathBuf {
     dir.join(OCR_FILES[2].path)
 }
 
-/// Every file reading text from pixels needs is in `dir`.
 pub fn ocr_present(dir: &Path) -> bool {
     OCR_FILES.iter().all(|f| dir.join(f.path).is_file())
 }
 
-/// The vision encoder, in `vision_dir()`.
 pub fn vision_path(dir: &Path) -> PathBuf {
     dir.join("onnx/vision_encoder_static_140.onnx")
 }
 
-/// The text model taking image features, in `default_dir()`.
 pub fn image_text_path(dir: &Path) -> PathBuf {
     dir.join("onnx/model_image_140.onnx")
 }
@@ -244,7 +226,6 @@ pub fn onnx_path(dir: &Path) -> PathBuf {
     dir.join("onnx/model_text.onnx")
 }
 
-/// The graph with inputs fixed at `[1, len]`, if one was published for `len`.
 pub fn static_path(dir: &Path, len: usize) -> Option<PathBuf> {
     let tag = match len {
         32 => "q32",
@@ -272,16 +253,13 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Where Hugging Face serves `repo`'s files at `revision`.
 fn hub(repo: &str, revision: &str) -> String {
     format!("{HUB}/{repo}/resolve/{revision}")
 }
 
-/// Download whatever is missing or does not match its pinned hash, with
-/// what `wants` adds. Files are hashed as they stream and only renamed
-/// into place once they match; one larger than its pinned size is abandoned
-/// as it streams. `progress` gets (bytes done, bytes in total) across all
-/// files, files already in place included.
+/// Download whatever is missing or does not match its pinned hash, with what `wants` adds. Files
+/// are hashed as they stream and renamed into place only once they match; one over its pinned size
+/// is abandoned. `progress` gets (bytes done, bytes in total) across all files.
 pub fn fetch(wants: Wants, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<()> {
     let total = total_bytes(wants);
     let mut done = 0;
@@ -332,9 +310,8 @@ pub fn fetch(wants: Wants, progress: &mut dyn FnMut(&str, u64, u64)) -> Result<(
     Ok(())
 }
 
-/// `files` from `source`, the URL their paths are under. However a download
-/// stops (a dropped connection, a full disk), its part file is not left
-/// behind (pinned by `tests::a_dropped_download_leaves_no_part_file`).
+/// `files` from `source`. However a download stops, its part file is not left behind (pinned by
+/// `tests::a_dropped_download_leaves_no_part_file`).
 fn fetch_files(
     source: &str,
     files: &[Pinned],
@@ -372,8 +349,6 @@ fn fetch_files(
     Ok(())
 }
 
-/// `url` into `part`, hashed as it streams; Err if it runs past `size`
-/// bytes or doesn't hash to `want`. `progress` gets the bytes so far.
 fn download(
     url: &str,
     part: &Path,
@@ -411,10 +386,9 @@ fn download(
     Ok(())
 }
 
-/// The files a text load needs are present. Hashes are checked by `fetch`,
-/// not on every load. The static-shape graphs are optional: a model fetched
-/// before they were published loads through the reshape path instead. So is
-/// the image graph, which only images need.
+/// The files a text load needs are present; hashes are checked by `fetch`. The static-shape graphs
+/// are optional: a model fetched before they were published loads through the reshape path, as does
+/// the image graph (only images need it).
 pub fn present(dir: &Path) -> bool {
     FILES
         .iter()
@@ -422,7 +396,6 @@ pub fn present(dir: &Path) -> bool {
         .all(|f| dir.join(f.path).is_file())
 }
 
-/// What embedding an image needs, besides the text model, is present.
 pub fn vision_present(dir: &Path, vision_dir: &Path) -> bool {
     image_text_path(dir).is_file()
         && VISION_FILES
@@ -430,14 +403,10 @@ pub fn vision_present(dir: &Path, vision_dir: &Path) -> bool {
             .all(|f| vision_dir.join(f.path).is_file())
 }
 
-/// What indexing an image needs, besides the text model, is present: the
-/// vision encoder, and the OCR model for its text.
 pub fn images_present(dir: &Path, vision_dir: &Path, ocr_dir: &Path) -> bool {
     vision_present(dir, vision_dir) && ocr_present(ocr_dir)
 }
 
-/// Remove the model's files, the vision, audio and OCR models' included. The
-/// caller makes sure nothing has them loaded.
 pub fn delete() -> Result<()> {
     models::delete(&models_dir()?)
 }
@@ -449,8 +418,6 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    /// What the test server sends for a path: a Content-Length, and a body
-    /// that may be shorter (a dropped connection) or longer.
     struct Reply {
         length: usize,
         body: Vec<u8>,
@@ -465,8 +432,6 @@ mod tests {
         }
     }
 
-    /// An HTTP server on localhost serving `replies` by path, 404 for any
-    /// other. Returns its URL and the paths asked for.
     fn serve(replies: Vec<(&'static str, Reply)>) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -514,7 +479,6 @@ mod tests {
         dir
     }
 
-    /// `fetch_files` for one file pinned to `want` and `size`, from `url`.
     fn fetch_one(url: &str, dir: &Path, want: &str, size: u64) -> Result<u64> {
         let mut done = 0;
         let mut last = 0;
@@ -534,7 +498,6 @@ mod tests {
         Ok(done)
     }
 
-    /// Every file under `dir`, relative to it.
     fn files(dir: &Path) -> Vec<String> {
         let mut out: Vec<String> = walkdir::WalkDir::new(dir)
             .into_iter()

@@ -32,9 +32,7 @@ use vinosearch_shared::dbus::{
     CONTROL_PATH as CONTROL, GNOME_PATH as GNOME, RUNNER_PATH as OBJECT, names, recent, results,
     status as key,
 };
-/// Files of each kind shown.
 pub(crate) const RESULTS: usize = 5;
-/// QueryMatch::CategoryRelevance::Moderate
 const RELEVANCE_MODERATE: i32 = 50;
 
 type Match = (
@@ -46,8 +44,8 @@ type Match = (
     HashMap<String, OwnedVariant>,
 );
 
-/// One connection for the handlers that read the index; queries are short.
-/// Closed and opened again under it when encryption changes (#4).
+/// One connection for the handlers that read the index; closed and reopened when encryption
+/// changes.
 type Db = Arc<crate::index::encryption::Live>;
 
 struct Runner {
@@ -55,11 +53,9 @@ struct Runner {
     db: Db,
     config: PathBuf,
     places: Places,
-    /// The last search's query, for Show all results.
     query: Mutex<String>,
 }
 
-/// How close a result must be, per kind (`formats.*.min_score`).
 #[derive(Clone, Copy)]
 pub(crate) struct Floors {
     text: f32,
@@ -69,13 +65,11 @@ pub(crate) struct Floors {
 }
 
 impl Floors {
-    /// From the config file as it is now, so a change in the settings window
-    /// shows from the next keystroke; the defaults if it doesn't parse.
+    /// From the config file as it is now, so a settings change shows from the next keystroke.
     fn load(config: &Path) -> Self {
         Self::of_formats(&Config::load(config).map(|c| c.formats).unwrap_or_default())
     }
 
-    /// `formats`' floors, the defaults where they are unset or out of range.
     pub(crate) fn of_formats(formats: &crate::config::Formats) -> Self {
         Self {
             text: formats
@@ -93,8 +87,7 @@ impl Floors {
         }
     }
 
-    /// `h`'s floor: its kind's, or the image floor for text read in an
-    /// image (results::picture).
+    /// `h`'s floor: its kind's, or the image floor for text read in an image.
     pub(crate) fn of(&self, h: &Hit) -> f32 {
         match h.kind {
             _ if crate::search::results::picture(h) => self.image,
@@ -107,14 +100,11 @@ impl Floors {
 }
 
 /// The best chunk of each of the best files for `query`, text first, then
-/// documents, then images, as KRunner and GNOME Shell both show them; code
-/// alone for a query starting `code:` (#110). Empty if the worker has
-/// stopped.
+/// documents, then images; code alone for `code:`. Empty if the worker has stopped.
 async fn search(jobs: &Mutex<mpsc::Sender<Job>>, floors: Floors, query: String) -> Vec<Hit> {
     per_file(chunks(jobs, query, RESULTS * 8).await, floors)
 }
 
-/// The best `k` chunks of each kind for `query`; empty if the worker has stopped.
 async fn chunks(jobs: &Mutex<mpsc::Sender<Job>>, query: String, k: usize) -> Vec<Hit> {
     // KRunner counts `code:` towards its three letters.
     if index::scope(&query).0.chars().count() < MIN_QUERY_CHARS {
@@ -132,7 +122,6 @@ async fn chunks(jobs: &Mutex<mpsc::Sender<Job>>, query: String, k: usize) -> Vec
     rx.await.unwrap_or_default()
 }
 
-/// `path`'s file name, and its directory with the hit's line and a snippet.
 fn describe(h: &Hit) -> (String, String) {
     let path = Path::new(&h.path);
     let name = path
@@ -189,9 +178,8 @@ fn describe(h: &Hit) -> (String, String) {
     (name, description)
 }
 
-/// Which part of a session matched, and when it was (#143): "Transcript at
-/// 01:12 · 2026-10-27 14:05, 43 min", "Summary, AI-generated · ...". None
-/// for a bundle that no longer reads.
+/// Which part of a session matched and when: "Transcript at 01:12 · 2026-10-27
+/// 14:05, 43 min", "Summary, AI-generated · ...". None for a bundle that no longer reads.
 fn session_place(h: &Hit) -> Option<String> {
     let bytes = session::load(Path::new(&h.path)).ok()?;
     let about = session::about(&bytes).ok()?;
@@ -209,7 +197,6 @@ fn session_place(h: &Hit) -> Option<String> {
     Some(format!("{part} · {}", about.when()))
 }
 
-/// The actions a match offers: the other part of a session (#143) as well.
 fn match_actions(h: &Hit, plays: bool) -> Vec<&'static str> {
     let mut out = vec![OPEN_FOLDER, SHOW_ALL];
     if h.kind == Kind::Session {
@@ -229,12 +216,10 @@ fn match_actions(h: &Hit, plays: bool) -> Vec<&'static str> {
     out
 }
 
-/// A recording, and the second in it a transcript hit is at.
 type Play = (PathBuf, u32);
 
-/// The indexed recording the session `id` was transcribed from (#188), by
-/// the SHA-256 its attestation gives. None for a live session, or while the
-/// recording isn't indexed (media is off, or the file is outside the roots).
+/// The indexed recording a session was transcribed from, by the SHA-256 its
+/// attestation gives; None for a live session or an unindexed recording.
 fn session_recording(db: &Db, id: &str) -> Option<PathBuf> {
     let bytes = session::load(Path::new(id)).ok()?;
     let sha = session::about(&bytes).ok()?.source_sha256?;
@@ -246,8 +231,6 @@ fn session_recording(db: &Db, id: &str) -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
-/// What a hit at `line` of the session `id`'s transcript plays: its
-/// recording, from the stamp of the paragraph that matched.
 fn recording_at(db: &Db, id: &str, line: u32) -> Option<Play> {
     let bytes = session::load(Path::new(id)).ok()?;
     let text = session::text(&bytes, Part::Transcript).ok()?;
@@ -255,7 +238,6 @@ fn recording_at(db: &Db, id: &str, line: u32) -> Option<Play> {
     Some((session_recording(db, id)?, session::seconds(&stamp)?))
 }
 
-/// What `h` plays, if it is a transcript hit with a recording to play.
 fn recording(db: &Db, h: &Hit) -> Option<Play> {
     match at(h) {
         Some(At::Session(Part::Transcript, line)) => recording_at(db, &h.path, line),
@@ -267,8 +249,8 @@ fn owned(v: Variant<'_>) -> OwnedVariant {
     v.try_into().expect("string values have no fds")
 }
 
-/// Text OCR read in an image: scored as a document, but with no page or
-/// slide to name, and listed with the images.
+/// Text OCR read in an image: scored as a document, with no page or slide to name, listed with the
+/// images.
 fn read_in_an_image(h: &Hit) -> bool {
     h.kind == Kind::Document && !crate::extract::is_document(Path::new(&h.path))
 }
@@ -321,20 +303,17 @@ fn to_match(h: Hit, floors: Floors, play: Option<&Play>) -> Match {
     )
 }
 
-/// How far above its kind's floor `h` scores, 0 to 1: what KRunner orders
-/// matches by.
+/// How far above its kind's floor `h` scores, 0 to 1: what KRunner orders by.
 pub(crate) fn relevance(h: &Hit, floors: Floors) -> f64 {
     let floor = floors.of(h);
     f64::from(((h.score - floor) / (1.0 - floor)).clamp(0.0, 1.0))
 }
 
-/// `path` as a file:// URL, percent-encoded so `#`, `%`, `?` and spaces
-/// survive (RFC 8089; `/` stays as the separator).
+/// `path` as a percent-encoded file:// URL (RFC 8089) so `#`, `%`, `?` and spaces survive.
 fn file_url(path: &str) -> String {
     format!("file://{}", utf8_percent_encode(path, FILE_URL_ESCAPED))
 }
 
-/// Everything but RFC 3986's unreserved characters and the `/` separator.
 const FILE_URL_ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b'-')
@@ -358,8 +337,7 @@ fn indexed(db: &Db, id: &str, doing: &str) -> bool {
     }
 }
 
-/// Open the indexed file `id` at `at`, or its folder, on a thread of its
-/// own: finding the default app runs `xdg-mime`.
+/// Opens on a thread of its own: finding the default app runs `xdg-mime`.
 fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     if !indexed(db, id, "opening") {
         return;
@@ -377,8 +355,7 @@ fn open(db: &Db, config: &Path, id: &str, at: Option<At>, folder: bool) {
     });
 }
 
-/// The default action on the indexed file `id` at `at`: a transcript hit
-/// whose recording is indexed plays the recording from its stamp (#188);
+/// A transcript hit whose recording is indexed plays it from its stamp;
 /// anything else opens as `open` does.
 fn open_or_play(db: &Db, config: &Path, id: &str, at: Option<At>) {
     if let Some(At::Session(Part::Transcript, line)) = at
@@ -391,7 +368,6 @@ fn open_or_play(db: &Db, config: &Path, id: &str, at: Option<At>) {
     open(db, config, id, at, false);
 }
 
-/// The last search's places, by result id, for opening a result there.
 type Places = Mutex<HashMap<String, Option<At>>>;
 
 fn remember(places: &Places, hits: &[Hit]) {
@@ -402,10 +378,9 @@ fn at(h: &Hit) -> Option<At> {
     At::of(h.kind, Path::new(&h.path), h.line)
 }
 
-/// The text of the indexed file `id`, for Control1.FileText: a text file's
-/// contents (an HTML page's without its tags), a document's text from the
-/// extractor child (seconds for a big PDF), or a session's transcript. Err for anything else, an image
-/// included.
+/// The text of the indexed file `id` for Control1.FileText: a text file's
+/// contents (HTML without tags), a document's from the extractor child (seconds for
+/// a big PDF), or a session's transcript. Err otherwise, images included.
 fn file_text(db: &Db, id: &str) -> Result<String> {
     if !index::is_indexed(&*db.lock()?, id)? {
         bail!("{id} is not an indexed file");
@@ -478,8 +453,7 @@ impl Runner {
             .collect()
     }
 
-    /// At the match's line or page when it is from the last search; at the
-    /// top otherwise.
+    /// At the match's line or page when from the last search; at the top otherwise.
     #[zbus(name = "Run")]
     fn run(&self, match_id: String, action_id: String) {
         if action_id == SHOW_ALL {
@@ -515,8 +489,8 @@ impl Runner {
     fn teardown(&self) {}
 }
 
-/// GNOME Shell asks for result ids first, then for how to show them, so the
-/// last search's hits are kept to describe them without searching again.
+/// GNOME Shell asks for result ids first, then how to show them: the last hits are kept to describe
+/// them.
 struct Gnome {
     jobs: Mutex<mpsc::Sender<Job>>,
     db: Db,
@@ -548,8 +522,7 @@ impl Gnome {
         self.results(terms).await
     }
 
-    /// A semantic match does not narrow as the query grows, so this searches
-    /// afresh rather than filtering `previous`.
+    /// A semantic match does not narrow as the query grows: search afresh, don't filter `previous`.
     #[zbus(name = "GetSubsearchResultSet")]
     async fn subsearch(&self, _previous: Vec<String>, terms: Vec<String>) -> Vec<String> {
         self.results(terms).await
@@ -591,23 +564,19 @@ impl Gnome {
         open_or_play(&self.db, &self.config, &id, at);
     }
 
-    /// Clicking the provider's icon: the search window with the query
-    /// (#111), when vinosearch-settings is installed beside us.
+    /// The provider's icon opens the search window with the query, when vinosearch-settings is
+    /// installed.
     #[zbus(name = "LaunchSearch")]
     fn launch(&self, terms: Vec<String>, _timestamp: u32) {
         launch_settings(&["--search", &terms.join(" ")]);
     }
 }
 
-/// KRunner's action for opening the query in the search window.
 const SHOW_ALL: &str = "show-all";
 const OPEN_FOLDER: &str = "open-folder";
-/// A session's other part (#143).
 const OPEN_SUMMARY: &str = "open-summary";
 const OPEN_TRANSCRIPT: &str = "open-transcript";
 
-/// Start vinosearch-settings with `args` on a thread of its own, when it is
-/// installed beside us.
 fn launch_settings(args: &[&str]) {
     let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
     match settings {
@@ -624,10 +593,9 @@ fn launch_settings(args: &[&str]) {
     }
 }
 
-/// The command that opens vinosearch-settings with `args`. In the Flatpak
-/// `open::spawn` runs commands on the host, so there it is the host's
-/// `flatpak run`, as the app menu's entry is: a sandbox of its own, which
-/// one started in the runner's wouldn't outlive. Natively, `program`.
+/// The command that opens vinosearch-settings. In the Flatpak `open::spawn` runs on
+/// the host, so it is the host's `flatpak run` (a sandbox of its own, which one
+/// started in the runner's wouldn't outlive); natively, `program`.
 fn settings_argv(flatpak: Option<&str>, program: &str, args: &[&str]) -> Vec<String> {
     let command: Vec<&str> = match flatpak {
         Some(app) => vec!["flatpak", "run", "--command=vinosearch-settings", app],
@@ -645,17 +613,13 @@ struct Control {
     status: Arc<Status>,
     db: Db,
     config: PathBuf,
-    /// Taken by Quit, which `serve` waits on beside the worker.
     quit: Mutex<Option<oneshot::Sender<()>>>,
-    /// What Status last counted from the index, and the index files' stamp
-    /// it was counted at.
     counted: Mutex<Option<(Stamp, Counted)>>,
 }
 
-/// What Status counts from the index. Each is a scan of it, and with an
-/// encrypted index that is all of it read and decrypted: 53 MB and a
-/// quarter of a second for 11,600 chunks, once a second while the settings
-/// window is open, on the thread that answers searches.
+/// What Status counts from the index. Each is a scan, and with an encrypted index
+/// that is all of it decrypted: 53 MB and a quarter of a second for 11,600 chunks,
+/// once a second while the settings window is open.
 #[derive(Clone, Default)]
 struct Counted {
     files: i64,
@@ -668,8 +632,7 @@ struct Counted {
     media_partial: i64,
 }
 
-/// Length and modification time of the index and its write-ahead log: any
-/// commit, by this process or `vinosearch index`, changes one of them.
+/// Length and mtime of the index and its WAL: any commit changes one.
 type Stamp = [Option<(u64, std::time::SystemTime)>; 2];
 
 fn stamp(db: &Path) -> Stamp {
@@ -704,8 +667,7 @@ fn failed(e: impl std::fmt::Display) -> zbus::fdo::Error {
 }
 
 impl Control {
-    /// The index's counts: counted again only when the index has changed
-    /// since the last time. Nothing while its key can't be had (`db` None).
+    /// The index's counts, recounted only when it changed; nothing while its key can't be had.
     fn counted(&self, db: Option<&rusqlite::Connection>) -> zbus::fdo::Result<Counted> {
         let Some(conn) = db else {
             return Ok(Counted::default());
@@ -722,8 +684,6 @@ impl Control {
         }
     }
 
-    /// What the formats on in the config file as it is now need; nothing
-    /// extra if it doesn't parse.
     fn model_wants(&self) -> model::Wants {
         Config::load(&self.config)
             .map(|c| model::Wants::of(&c.formats))
@@ -738,7 +698,6 @@ impl Control {
             .map_err(|_| failed("the worker has stopped"))
     }
 
-    /// For the worker's next step.
     fn request(&self, r: Request) -> zbus::fdo::Result<()> {
         self.status.pending.request(r);
         self.send(Job::Wake)
@@ -752,7 +711,6 @@ impl Control {
         }
     }
 
-    /// An existing directory, canonical, not excluded.
     fn root(&self, path: &str) -> zbus::fdo::Result<PathBuf> {
         let p = fs::canonicalize(path).map_err(|e| failed(format!("{path}: {e}")))?;
         if !p.is_dir() {
@@ -770,8 +728,7 @@ impl Control {
 
 #[interface(name = "dev.vinosearch.Control1")]
 impl Control {
-    /// State, storage and progress; keys in vinosearch_shared::dbus::status,
-    /// described in docs/dbus.md.
+    /// State, storage and progress; keys in `vinosearch_shared::dbus::status`, see docs/dbus.md.
     fn status(&self) -> zbus::fdo::Result<HashMap<String, OwnedVariant>> {
         // Answered while the key can't be had yet, counts empty.
         let db = match self.db.lock() {
@@ -948,21 +905,18 @@ impl Control {
         Ok(out)
     }
 
-    /// Index a directory and watch it from now on. Returns once queued.
     fn reindex(&self, path: String) -> zbus::fdo::Result<()> {
         let root = self.root(&path)?;
         self.status.work.root(root);
         self.send(Job::Wake)
     }
 
-    /// Stop indexing a root and drop what was indexed under it.
     fn forget(&self, path: String) -> zbus::fdo::Result<()> {
         let root = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
         self.request(Request::Forget(root))
     }
 
-    /// The folders holding most of the index, biggest first, with their
-    /// chunk counts: at most `limit`, none inside another (index::largest_folders).
+    /// The biggest folders by chunk count, at most `limit`, none inside another.
     fn largest_folders(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, u64)>> {
         let db = self.db.lock().map_err(failed)?;
         Ok(index::largest_folders(&db, limit as usize)
@@ -972,30 +926,26 @@ impl Control {
             .collect())
     }
 
-    /// Compare every root with the index now, as the watcher does hourly,
-    /// and index what differs. Waits for any indexing job to finish first.
+    /// Compare every root with the index now and index what differs; waits for any indexing job
+    /// first.
     fn check_now(&self) -> zbus::fdo::Result<()> {
         self.status.check_now.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Stop indexing within a chunk and hold new indexing until
-    /// ResumeIndexing. Files already indexed stay; queries still work.
+    /// Stop indexing within a chunk and hold new indexing until ResumeIndexing; queries still work.
     fn pause_indexing(&self) -> zbus::fdo::Result<()> {
         self.status.paused.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Run the indexing held since PauseIndexing. Unchanged files are
-    /// skipped, so it carries on where it stopped.
     fn resume_indexing(&self) -> zbus::fdo::Result<()> {
         self.status.paused.store(false, Ordering::Relaxed);
         self.send(Job::Retry)
     }
 
-    /// Indexed text files and documents, newest first by modification
-    /// time, as (path, kind, unix seconds): at most `limit`, capped at
-    /// recent::MAX. Files gone since they were indexed are left out.
+    /// Indexed text files and documents, newest first, as (path, kind, unix seconds):
+    /// at most `limit`, capped at recent::MAX; files gone since are left out.
     fn recent_files(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, String, i64)>> {
         let db = self.db.lock().map_err(failed)?;
         let files = index::recent_files(&db, limit.min(recent::MAX) as usize, Path::exists)
@@ -1012,9 +962,8 @@ impl Control {
             .collect())
     }
 
-    /// The whole text of an indexed text file or document, for reading
-    /// aloud. A document is parsed on a thread of its own, so the bus is not
-    /// held while a big PDF is.
+    /// The whole text of an indexed text file or document, for reading aloud; a
+    /// document is parsed on its own thread so the bus is not held.
     async fn file_text(&self, path: String) -> zbus::fdo::Result<String> {
         let db = self.db.clone();
         let (tx, rx) = oneshot::channel();
@@ -1026,9 +975,8 @@ impl Control {
             .map_err(|e| failed(format!("{e:#}")))
     }
 
-    /// Every file `query` finds, for the search window (#111): the best
-    /// chunk of each, at or above its kind's min_score, at most `limit`
-    /// (capped at results::MAX) of each kind. See crate::search::results::Found.
+    /// Every file `query` finds, for the search window: the best chunk of each at or
+    /// above its kind's min_score, at most `limit` (capped at results::MAX) per kind.
     async fn search(
         &self,
         query: String,
@@ -1053,8 +1001,7 @@ impl Control {
         )
     }
 
-    /// Open an indexed file at `line`, a number from Search's results, as
-    /// KRunner's Run opens a match.
+    /// Open an indexed file at `line`, as KRunner's Run does.
     #[zbus(name = "Open")]
     fn open_file(&self, path: String, line: u32) -> zbus::fdo::Result<()> {
         self.is_indexed(&path)?;
@@ -1064,8 +1011,8 @@ impl Control {
         Ok(())
     }
 
-    /// Play an indexed audio or video file from `second`, or the recording
-    /// an indexed session was transcribed from (#188).
+    /// Play an indexed audio or video file from `second`, or the recording a session was
+    /// transcribed from.
     fn play(&self, path: String, second: u32) -> zbus::fdo::Result<()> {
         self.is_indexed(&path)?;
         let file = if crate::extract::is_session(Path::new(&path)) {
@@ -1088,21 +1035,18 @@ impl Control {
         Ok(())
     }
 
-    /// Open the folder an indexed file is in.
     fn open_folder(&self, path: String) -> zbus::fdo::Result<()> {
         self.is_indexed(&path)?;
         open(&self.db, &self.config, &path, None, true);
         Ok(())
     }
 
-    /// Free the model now.
     fn unload(&self) -> zbus::fdo::Result<()> {
         self.request(Request::Unload)
     }
 
-    /// Download the model (or whatever of it is missing or corrupt) in the
-    /// background. Progress is in Status: fetching, fetch_done, fetch_total,
-    /// fetch_error.
+    /// Download the model, or what of it is missing or corrupt, in the background; progress is in
+    /// Status.
     fn fetch_model(&self) -> zbus::fdo::Result<()> {
         if self.status.fetching.swap(true, Ordering::SeqCst) {
             return Err(failed("a download is already running"));
@@ -1133,7 +1077,6 @@ impl Control {
         Ok(())
     }
 
-    /// Unload and delete the model's files.
     fn delete_model(&self) -> zbus::fdo::Result<()> {
         if self.status.fetching.load(Ordering::SeqCst) {
             return Err(failed("a download is running"));
@@ -1141,22 +1084,19 @@ impl Control {
         self.request(Request::DeleteModel)
     }
 
-    /// Delete the compiled-model cache; the next model load recompiles (seconds).
     fn clear_cache(&self) -> zbus::fdo::Result<()> {
         self.request(Request::ClearCache)
     }
 
-    /// Exit, releasing the bus name; `krunner` doesn't start it again. For
-    /// installs and uninstalls, in place of a service manager's stop.
+    /// Exit, releasing the bus name; `krunner` doesn't restart it. For installs and uninstalls.
     fn quit(&self) {
         if let Some(quit) = self.quit.lock().unwrap().take() {
             let _ = quit.send(());
         }
     }
 
-    /// Encrypt or decrypt the index as the config file's `encryption` says,
-    /// now rather than at the next read of it; again after a refusal. Queued:
-    /// `encrypted`, `seal` and `encryption_error` in Status say how it went.
+    /// Encrypt or decrypt the index as the config's `encryption` says, now; again
+    /// after a refusal. Queued: Status says how it went.
     fn apply_encryption(&self) -> zbus::fdo::Result<()> {
         let file = Config::load(&self.config).map_err(|e| failed(format!("{e:#}")))?;
         // The watcher too, or it would take its next read for unchanged.
@@ -1166,8 +1106,7 @@ impl Control {
         )))
     }
 
-    /// Encrypt the index again under a new key, sealed afresh. Fails while
-    /// it isn't encrypted.
+    /// Encrypt again under a new key; fails while not encrypted.
     fn rekey(&self) -> zbus::fdo::Result<()> {
         if !self.status.encryption.lock().unwrap().encrypted {
             return Err(failed("the index isn't encrypted"));
@@ -1176,7 +1115,6 @@ impl Control {
     }
 }
 
-/// Bytes under `path`, a file or a directory; 0 if it is missing.
 fn disk_bytes(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .into_iter()
@@ -1187,12 +1125,10 @@ fn disk_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-/// Best chunk per file, files at or above their kind's floor, best RESULTS
-/// of each kind: text, then documents, then vinoWhisper sessions, then
-/// audio and video, then images, less audio, video and images too far below
-/// the best of the others (results::far_below), then code (only ever on its
-/// own, for `code:`).
-/// Near-duplicate images are one result (#78).
+/// Best chunk per file, files at or above their kind's floor, best RESULTS of each
+/// kind: text, documents, sessions, audio and video, then images (less those too far
+/// below the best of the others, results::far_below), then code (only on its own,
+/// for `code:`). Near-duplicate images are one result.
 pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     const IMAGES: usize = 4;
     let mut seen = HashSet::new();
@@ -1221,8 +1157,8 @@ pub(crate) fn per_file(hits: Vec<Hit>, floors: Floors) -> Vec<Hit> {
     kept
 }
 
-/// A runner that stopped before it owned the bus name, which exits with
-/// start::NOT_STARTED so `krunner` doesn't start it again.
+/// A runner that stopped before owning the bus name exits with start::NOT_STARTED so `krunner`
+/// doesn't restart it.
 #[derive(Debug)]
 pub struct NotStarted(pub(crate) anyhow::Error);
 
@@ -1234,9 +1170,8 @@ impl std::fmt::Display for NotStarted {
 
 impl std::error::Error for NotStarted {}
 
-/// `vinosearch krunner`: this same command line with `--worker`, the
-/// runner, kept running by service::start. False when it stopped on an
-/// error.
+/// `vinosearch krunner`: this command line with `--worker`, kept running by
+/// service::start. False when it stopped on an error.
 pub fn supervise() -> Result<bool> {
     let mut worker = std::process::Command::new(std::env::current_exe()?);
     worker.args(std::env::args_os().skip(1)).arg("--worker");
@@ -1333,9 +1268,8 @@ pub fn serve(opts: Options) -> Result<()> {
     })
 }
 
-/// Delete the models: through the runner while it runs, so it unloads them
-/// first and refuses during a download; from disk otherwise. True when the
-/// runner was asked, which deletes them once its worker takes the request.
+/// Delete the models through the runner while it runs (it unloads first and
+/// refuses during a download), else from disk. True when the runner was asked.
 pub fn delete_models() -> Result<bool> {
     // Without a session bus no runner can be running. A bus that doesn't
     // answer is an error: deleting under a runner mid-download would leave
@@ -1365,7 +1299,6 @@ pub fn delete_models() -> Result<bool> {
     Ok(true)
 }
 
-/// Whether something owns the runner's bus name; None without a session bus.
 fn runner_owned() -> Result<Option<bool>> {
     zbus::block_on(async {
         let Ok(conn) = zbus::Connection::session().await else {

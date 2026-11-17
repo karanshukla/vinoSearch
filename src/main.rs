@@ -177,7 +177,6 @@ enum Command {
     FlatpakUpdate { tag: Option<String> },
 }
 
-/// OpenVINO's compiled-model cache.
 pub(crate) fn cache_dir() -> Result<PathBuf> {
     Ok(vinosearch_shared::xdg::cache_home()?.join("vinosearch/ov-cache"))
 }
@@ -209,13 +208,10 @@ pub(crate) fn embedder(openvino_dir: Option<PathBuf>, device: &str) -> Result<em
     Ok(emb)
 }
 
-/// Flags over the config file over defaults.
 struct Settings {
     path: PathBuf,
     file: config::Config,
     device: String,
-    /// What a config file with no device means: the best device found, for
-    /// commands that load a model.
     default_device: String,
     idle_unload_minutes: f64,
     excludes: config::Excludes,

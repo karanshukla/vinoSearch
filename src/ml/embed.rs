@@ -29,13 +29,10 @@ const IN_FLIGHT: usize = 1;
 const WAIT_MS: i64 = 120_000;
 
 const QUERY_PREFIX: &str = "task: search result | query: ";
-/// EmbeddingGemma's prompt for finding code from a description, for
-/// `code:` queries.
 const CODE_QUERY_PREFIX: &str = "task: code retrieval | query: ";
 /// An image's prompt, `<bos> <|image> <|image|> x tokens <image|> <eos>`,
 /// padded to this: SOFT_TOKENS + 4 rounded up to 16, model_image_140's shape.
 const IMAGE_LEN: usize = 144;
-/// Tokens `model_audio_250.onnx` takes: 250 audio tokens and four around them.
 const AUDIO_LEN: usize = 256;
 
 pub fn document_text(title: &str, text: &str) -> String {
@@ -46,38 +43,32 @@ struct Stage {
     len: usize,
     _compiled: CompiledModel,
     requests: Vec<InferRequest>,
-    /// Compiled now rather than loaded from the cache.
     fresh: bool,
     cache: PathBuf,
 }
 
-/// The vision encoder and the text model taking its output.
 struct ImageStage {
     _vision: CompiledModel,
     vision: InferRequest,
     _text: CompiledModel,
     text: InferRequest,
-    /// `<bos>`, `<|image>`, `<|image|>`, `<image|>`, `<eos>`.
     ids: [i64; 5],
     fresh: bool,
     cache: PathBuf,
 }
 
-/// The audio encoder and the text model taking its output.
 struct AudioStage {
     _audio: CompiledModel,
     audio: InferRequest,
     _text: CompiledModel,
     text: InferRequest,
-    /// `<bos>`, `<|audio>`, `<|audio|>`, `<audio|>`, `<eos>`.
     ids: [i64; 5],
     fresh: bool,
     cache: PathBuf,
 }
 
-/// Query stage up front; the document and image stages compile on first
-/// use, so a process that only answers queries never holds a second copy of
-/// the model.
+/// Query stage up front; document and image stages compile on first use, so a query-only process
+/// never holds a second copy.
 pub struct Embedder {
     core: Core,
     model_dir: PathBuf,
@@ -94,7 +85,6 @@ pub struct Embedder {
     docs_share: f64,
 }
 
-/// Whether `text` fits in `len` tokens with the special tokens added.
 fn fits(tok: &Tokenizer, text: &str, len: usize) -> Result<bool> {
     let n = tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.len();
     let added = tok
@@ -103,9 +93,8 @@ fn fits(tok: &Tokenizer, text: &str, len: usize) -> Result<bool> {
     Ok(n + added <= len)
 }
 
-/// Token ids and attention mask, exactly `len` long: truncated before the
-/// special tokens are added so they survive (as `TokenizerImpl::post_process`
-/// does with truncation set), then padded with mask 0.
+/// Token ids and attention mask, exactly `len` long: truncated before the special tokens are added
+/// so they survive, then padded with mask 0.
 fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Vec<i64>)> {
     let mut enc = tok.encode(text, false).map_err(|e| anyhow!("{e}"))?;
     let added = tok
@@ -131,11 +120,9 @@ fn encode_fixed(tok: &Tokenizer, text: &str, len: usize) -> Result<(Vec<i64>, Ve
     Ok((ids, mask))
 }
 
-/// Compiled blobs for one stage live in their own directory, named for what
-/// decides their contents, so blobs for an old model revision or shape are
-/// recognisably stale. OpenVINO names blobs by an opaque hash, and nothing
-/// evicts them: one day of changing shapes left 1.4 GB, five ~280 MB blobs,
-/// for two in use.
+/// Compiled blobs for one stage live in a directory named for what decides their contents, so old
+/// revisions or shapes are recognisably stale. OpenVINO names blobs by opaque hash and nothing
+/// evicts them: one day of changing shapes left 1.4 GB, five ~280 MB blobs, for two in use.
 fn cache_key(device: &str, len: usize) -> String {
     stage_key(crate::ml::model::REVISION, device, &len.to_string())
 }
@@ -148,7 +135,6 @@ pub(crate) fn stage_key(revision: &str, device: &str, stage: &str) -> String {
     format!("{}-{dev}-{stage}", &revision[..12])
 }
 
-/// The stages this build compiles, as (model revision, stage).
 fn stages() -> Vec<(&'static str, String)> {
     let tokens = crate::ml::vision::SOFT_TOKENS;
     let mut out = vec![
@@ -170,9 +156,8 @@ fn stages() -> Vec<(&'static str, String)> {
     out
 }
 
-/// Drop everything under `root` but this build's stage directories (for
-/// any device, so a one-off run on another device does not cost the NPU a
-/// recompile).
+/// Drop everything under `root` but this build's stage directories (for any device, so a one-off
+/// run elsewhere doesn't cost the NPU a recompile).
 fn prune_cache(root: &Path) -> Result<()> {
     let stages = stages();
     for e in std::fs::read_dir(root)?.flatten() {
@@ -207,8 +192,6 @@ fn blobs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Compile with this stage's cache directory, then drop the blobs a cache
-/// miss left stale. True when it was a miss.
 pub(crate) fn compile_cached(
     core: &mut Core,
     device: &str,
@@ -227,9 +210,8 @@ pub(crate) fn compile_cached(
     Ok((compiled, drop_stale_blobs(cache, before)))
 }
 
-/// Whether compiling wrote a new blob into `cache`. One means a cache miss
-/// (a new OpenVINO, say), so the blobs from `before` are for a build that
-/// no longer loads them, and go.
+/// Whether compiling wrote a new blob into `cache`: a cache miss (a new OpenVINO, say), so
+/// `before`'s blobs are for a build that no longer loads them, and go.
 fn drop_stale_blobs(cache: &Path, before: Vec<PathBuf>) -> bool {
     let fresh = blobs(cache).iter().any(|b| !before.contains(b));
     if fresh {
@@ -294,7 +276,6 @@ impl Stage {
         Ok(())
     }
 
-    /// One request's `sentence_embedding`, L2-normalised.
     fn read(req: &InferRequest) -> Result<Vec<f32>> {
         let out = req.get_tensor("sentence_embedding")?;
         let v = out.get_data::<f32>()?;
@@ -311,8 +292,8 @@ impl Stage {
         Ok(v.iter().map(|x| x / norm).collect())
     }
 
-    /// `share` of the device's time, in (0, 1]: after each request, wait
-    /// `busy * (1 - share) / share`, leaving the device to other programs.
+    /// `share` of the device's time, in (0, 1]: after each request, wait `busy * (1 - share) /
+    /// share`.
     fn run(&mut self, tok: &Tokenizer, texts: &[String], share: f64) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for window in texts.chunks(self.requests.len()) {
@@ -331,8 +312,6 @@ impl Stage {
     }
 }
 
-/// For a model fetched before the static graphs were published: the dynamic
-/// one, reshaped to `len` tokens.
 fn compile_reshaped(
     core: &mut Core,
     model_dir: &Path,
@@ -351,8 +330,6 @@ fn compile_reshaped(
         .context("compiling")
 }
 
-/// After work that started at `t0`, leave the device to other programs for
-/// long enough that this work takes `share` of its time.
 pub(crate) fn yield_device(t0: Instant, share: f64) {
     if share < 1.0 {
         std::thread::sleep(t0.elapsed().mul_f64((1.0 - share) / share));
@@ -373,11 +350,9 @@ fn bool_tensor(dims: &[i64], data: &[bool]) -> Result<Tensor> {
     Ok(t)
 }
 
-/// The text model's ids and mask around `tokens` media tokens:
-/// `[bos, begin, media, ..., end, eos]`, then padded to `len` with id 0 and
-/// mask 0. The text model merges the encoder's first `tokens` rows and
-/// ignores the rest. Padding with more media tokens instead would not be
-/// neutral: they are attended even when masked (pinned by
+/// The text model's ids and mask around `tokens` media tokens, `[bos, begin,
+/// media, ..., end, eos]`, padded to `len` with id 0 and mask 0. Padding with more
+/// media tokens would not be neutral: they are attended even when masked (pinned by
 /// `tests::a_media_prompt_is_padded_at_the_end_with_id_0_and_mask_0`).
 fn media_prompt(specials: [i64; 5], tokens: usize, len: usize) -> (Vec<i64>, Vec<i64>) {
     let [bos, begin, media, end, eos] = specials;
@@ -476,7 +451,6 @@ impl ImageStage {
     }
 }
 
-/// A token's id, or an error naming it.
 fn token_id(tok: &Tokenizer, t: &str) -> Result<i64> {
     tok.token_to_id(t)
         .map(i64::from)
@@ -554,7 +528,6 @@ impl AudioStage {
     }
 }
 
-/// A compiled stage, as `checked` sees it.
 trait Compiled {
     fn fresh(&self) -> bool;
     fn cache(&self) -> &Path;
@@ -587,9 +560,8 @@ impl Compiled for AudioStage {
     }
 }
 
-/// `build` the stage on `device`, then hold it to the CPU's answer for the same
-/// input: checked when compiled fresh or never checked under this OpenVINO,
-/// otherwise the recorded cosine stands. Below `parity::MIN_COSINE`, it's built on the CPU instead.
+/// `build` the stage on `device`, then hold it to the CPU's answer for the same input when compiled
+/// fresh or never checked under this OpenVINO; below `parity::MIN_COSINE` it's built on the CPU.
 fn checked<S: Compiled>(
     name: &str,
     device: &str,
@@ -620,8 +592,6 @@ fn checked<S: Compiled>(
     build("CPU")
 }
 
-/// What each stage's last check on `device` found, as doctor reports it: None for not
-/// checked yet.
 pub fn parity(cache_root: &Path, device: &str) -> Vec<(&'static str, Option<f32>)> {
     let tokens = crate::ml::vision::SOFT_TOKENS;
     let dirs = [
@@ -685,7 +655,6 @@ impl Embedder {
         })
     }
 
-    /// A query for `kinds`: code alone gets the code retrieval prompt.
     pub fn query_for(&mut self, text: &str, kinds: &[crate::index::Kind]) -> Result<Vec<f32>> {
         let prefix = match kinds {
             [crate::index::Kind::Code] => CODE_QUERY_PREFIX,
@@ -704,14 +673,12 @@ impl Embedder {
         Ok(v.remove(0))
     }
 
-    /// Too long for the query shape: the document shape takes 256 tokens, and
-    /// is compiled already whenever the runner has indexed.
+    /// Too long for the query shape: the document shape takes 256 tokens.
     fn run_long_query(&mut self, text: String) -> Result<Vec<Vec<f32>>> {
         self.prepare_documents()?;
         self.docs.as_mut().unwrap().run(&self.tok, &[text], 1.0)
     }
 
-    /// Compile the document stage now, if it is not already.
     pub fn prepare_documents(&mut self) -> Result<()> {
         if self.docs.is_none() {
             let (core, tok) = (&mut self.core, &self.tok);
@@ -740,14 +707,12 @@ impl Embedder {
         Ok(())
     }
 
-    /// Cap document and image embedding at `share` of the device's time, in
-    /// (0, 1]. Queries always run at full speed.
+    /// Cap document and image embedding at `share` of the device's time; queries run at full speed.
     pub fn set_document_share(&mut self, share: f64) {
         self.docs_share = share.clamp(0.01, 1.0);
     }
 
-    /// Free the document and image stages; the next document (or long
-    /// query) or image compiles them again, from the cache.
+    /// Free the document and image stages; the next use compiles them again from the cache.
     pub fn release_documents(&mut self) -> bool {
         let images = self.images.take().is_some();
         let audio = self.audio.take().is_some();
@@ -755,17 +720,14 @@ impl Embedder {
         self.docs.take().is_some() || images || audio || ocr
     }
 
-    /// The document or image stage is compiled.
     pub fn has_documents(&self) -> bool {
         self.docs.is_some() || self.images.is_some() || self.audio.is_some() || self.ocr.is_some()
     }
 
-    /// The OCR model's files are fetched.
     pub fn can_read_text(&self) -> bool {
         crate::ml::model::ocr_present(&self.ocr_dir)
     }
 
-    /// The lines of text in `img`, at the document share of the device.
     pub fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>> {
         if self.ocr.is_none() {
             self.ocr = Some(crate::ml::ocr::Ocr::new(
@@ -778,7 +740,6 @@ impl Embedder {
         self.ocr.as_mut().unwrap().read(img, self.docs_share)
     }
 
-    /// Embed an image, prepared by [`crate::ml::vision::prepare`].
     pub fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>> {
         if self.images.is_none() {
             let (core, tok) = (&mut self.core, &self.tok);
@@ -804,16 +765,13 @@ impl Embedder {
         Ok(v)
     }
 
-    /// The audio and vision models are fetched: what audio and video need
-    /// besides the text model.
     pub fn can_embed_media(&self) -> bool {
         crate::ml::model::vision_present(&self.model_dir, &self.vision_dir)
             && crate::ml::model::audio_dir()
                 .is_ok_and(|dir| crate::ml::model::audio_present(&self.model_dir, &dir))
     }
 
-    /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
-    /// Not held to a CPU reference yet: there is none checked in for audio.
+    /// Not held to a CPU reference yet: none is checked in for audio.
     pub fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>> {
         if self.audio.is_none() {
             self.audio = Some(AudioStage::new(
@@ -830,7 +788,6 @@ impl Embedder {
         Ok(v)
     }
 
-    /// Embed documents already formatted with [`document_text`].
     pub fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.prepare_documents()?;
         let share = self.docs_share;
@@ -838,30 +795,18 @@ impl Embedder {
     }
 }
 
-/// What indexing and the worker ask of the model. `Embedder` on the
-/// device; tests index through a stand-in, with no OpenVINO.
+/// What indexing and the worker ask of the model: `Embedder`, or a stand-in in tests.
 pub trait Embed {
-    /// Embed documents already formatted with [`document_text`].
     fn documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-    /// Embed an image, prepared by [`crate::ml::vision::prepare`].
     fn image(&mut self, px: &crate::ml::vision::Pixels) -> Result<Vec<f32>>;
-    /// Embed up to 10 s of sound, as [`crate::ml::audio::log_mel`] gives it.
     fn audio(&mut self, f: &crate::ml::audio::Features) -> Result<Vec<f32>>;
-    /// The models audio and video need are fetched.
     fn can_embed_media(&self) -> bool;
-    /// The OCR model's files are fetched.
     fn can_read_text(&self) -> bool;
-    /// The lines of text in `img`.
     fn read_text(&mut self, img: &image::RgbImage) -> Result<Vec<String>>;
-    /// A query for `kinds`: code alone gets the code retrieval prompt.
     fn query_for(&mut self, text: &str, kinds: &[crate::index::Kind]) -> Result<Vec<f32>>;
-    /// Compile the document stage now, if it is not already.
     fn prepare_documents(&mut self) -> Result<()>;
-    /// Cap document and image embedding at `share` of the device's time.
     fn set_document_share(&mut self, share: f64);
-    /// Free the document and image stages; true if any was compiled.
     fn release_documents(&mut self) -> bool;
-    /// The document or image stage is compiled.
     fn has_documents(&self) -> bool;
 }
 
@@ -911,20 +856,16 @@ impl Embed for Embedder {
     }
 }
 
-/// A stand-in model for tests: each word of the text (the title included)
-/// adds to one of DIM buckets by its hash, normalised, so texts sharing words
-/// score above texts that share none. Counts what it was asked to embed, and
-/// calls `on_document` with each document's text before embedding it, for
-/// tests of what happens mid-file.
+/// A stand-in model for tests: each word adds to one of DIM buckets by its hash,
+/// so texts sharing words score above texts that share none. Counts what it embeds and calls
+/// `on_document` before each.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FakeEmbed {
     pub documents: usize,
     pub images: usize,
     pub audio: usize,
-    /// As if the audio or vision model were not fetched.
     pub no_media_models: bool,
-    /// Sound embeds fail, as on a device that is down.
     pub audio_fails: bool,
     pub on_document: Option<OnDocument>,
 }

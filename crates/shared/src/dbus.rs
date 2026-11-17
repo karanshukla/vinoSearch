@@ -1,33 +1,28 @@
 //! Names on the session bus. See `docs/dbus.md` for the methods.
 
-/// The names vinoSearch goes by on the bus and in the desktop's files. A
-/// native install's are fixed; the Flatpak's start with its app id, as
-/// Flatpak exports only such files and lets an app own only such names.
+/// The names vinoSearch goes by on the bus and in the desktop's files. The Flatpak's start with its
+/// app id, as Flatpak exports only such files and lets an app own only such names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Names {
-    /// Well-known name the runner owns; D-Bus activation starts it on first
-    /// use.
+    /// Well-known name the runner owns; D-Bus activation starts it.
     pub service: String,
-    /// The desktop entry GNOME Shell shows the provider's results under. It
-    /// also launches the settings window, whose Wayland app id is `app_id`,
-    /// so the window gets the entry's icon.
+    /// The desktop entry GNOME Shell shows results under; it also launches the settings window,
+    /// whose Wayland app id is `app_id`, so the window gets the icon.
     pub desktop_id: String,
     pub app_id: String,
     /// Icon name, installed under hicolor/scalable/apps.
     pub icon: String,
-    /// KRunner's plugin file, under the XDG data directory. Its presence is
-    /// the KDE search place being on.
+    /// KRunner's plugin file under the XDG data directory; its presence is the KDE search place
+    /// being on.
     pub krunner_plugin: String,
     /// The plugin's id in KRunner's settings.
     pub krunner_plugin_id: String,
-    /// GNOME Shell's search provider file, under the XDG data directory. A
-    /// native install's is in a directory of ours that environment.d adds to
-    /// XDG_DATA_DIRS, and its presence is the GNOME search place being on.
+    /// GNOME Shell's search provider file under the XDG data directory (a native install's is in a
+    /// directory environment.d adds to XDG_DATA_DIRS); its presence is the GNOME place being on.
     pub gnome_provider: String,
-    /// The app menu entry for the search window, under the XDG data
-    /// directory: the host's in the Flatpak (`sandbox::host_data_home`),
-    /// which exports no entry it could turn off. Its presence is the menu
-    /// place being on; off by default.
+    /// The app menu entry for the search window under the XDG data directory: the host's in the
+    /// Flatpak (`sandbox::host_data_home`). Its presence is the menu place being on; off by
+    /// default.
     pub search_entry: String,
     /// The D-Bus activation file, under the XDG data directory: the service
     /// is installed while it exists.
@@ -101,16 +96,14 @@ pub mod status {
     /// Source code.
     pub const CODE_FILES: &str = "code_files";
     pub const CODE_CHUNKS: &str = "code_chunks";
-    /// vinoWhisper sessions, and those not read: in a format this
-    /// build doesn't know, or broken.
+    /// vinoWhisper sessions, and those not read (unknown format or broken).
     pub const SESSION_FILES: &str = "session_files";
     pub const SESSION_CHUNKS: &str = "session_chunks";
     pub const SESSIONS_UNREAD: &str = "sessions_unread";
     /// Audio and video files, and their sound windows and frames.
     pub const MEDIA_FILES: &str = "media_files";
     pub const MEDIA_CHUNKS: &str = "media_chunks";
-    /// What images (the vision encoder and OCR) and media (the vision and
-    /// audio encoders) need is downloaded, whether or not they're on.
+    /// Whether what images and media need is downloaded, whether or not they're on.
     pub const IMAGES_MODEL_PRESENT: &str = "images_model_present";
     pub const MEDIA_MODEL_PRESENT: &str = "media_model_present";
     /// ffmpeg and ffprobe are on the service's PATH; media needs both.
@@ -120,13 +113,11 @@ pub mod status {
     pub const INDEXED_FILES: &str = "indexed_files";
     /// The indexing job is the rest of a long document.
     pub const INDEXING_REST: &str = "indexing_rest";
-    /// Documents indexed in part so far, next in line first, at most
-    /// PARTIAL_MAX: `a(sstt)` of (path, unit, parts in, parts in all), the
-    /// unit "page", "slide", "chapter" or "part".
+    /// Documents indexed in part, next first, at most PARTIAL_MAX: `a(sstt)` of (path, unit, parts
+    /// in, parts in all); unit is "page", "slide", "chapter" or "part".
     pub const PARTIAL: &str = "partial";
     pub const PARTIAL_MAX: usize = 100;
-    /// Audio and video files waiting for a charger to be embedded:
-    /// the media rows in `partial` while on battery, else 0.
+    /// Audio and video waiting for a charger: the media rows in `partial` on battery, else 0.
     pub const MEDIA_WAITING_FOR_AC: &str = "media_waiting_for_ac";
     /// PauseIndexing was called and ResumeIndexing not since.
     pub const PAUSED: &str = "paused";
@@ -137,38 +128,33 @@ pub mod status {
     pub const FETCH_DONE: &str = "fetch_done";
     pub const FETCH_TOTAL: &str = "fetch_total";
     pub const FETCH_ERROR: &str = "fetch_error";
-    /// Bytes on disk: the index database, every model (text, vision, OCR and
-    /// audio), the compiled-model cache.
+    /// Bytes on disk: index, every model, the compiled-model cache.
     pub const INDEX_BYTES: &str = "index_bytes";
     pub const MODEL_BYTES: &str = "model_bytes";
     pub const CACHE_BYTES: &str = "cache_bytes";
-    /// Unix seconds: the last check of every root against the index, and the
-    /// last indexing job that changed it. 0 for not since the runner started.
+    /// Unix seconds of the last check of every root and the last indexing that changed it; 0 since
+    /// the runner started.
     pub const LAST_CHECKED: &str = "last_checked";
     pub const LAST_INDEXED: &str = "last_indexed";
-    /// Why files are being indexed again after a start: a model changed
-    ///. Empty otherwise, and once that indexing is done.
+    /// Why files are being indexed again after a start (a model changed); empty otherwise and once
+    /// done.
     pub const MODEL_CHANGED: &str = "model_changed";
     /// Photos (HEIC, AVIF) skipped because no HEIF decoder is installed.
     pub const NO_DECODER: &str = "no_decoder";
     /// The index on disk is encrypted.
     pub const ENCRYPTED: &str = "encrypted";
-    /// What its key is sealed with: a `seal` value, empty while it isn't
-    /// encrypted.
+    /// What its key is sealed with, a `seal` value; empty while not encrypted.
     pub const SEAL: &str = "seal";
     /// systemd can seal a key to this machine's TPM.
     pub const TPM: &str = "tpm";
-    /// Why the last change to encryption was refused or failed; empty
-    /// otherwise.
+    /// Why the last change to encryption was refused or failed; empty otherwise.
     pub const ENCRYPTION_ERROR: &str = "encryption_error";
-    /// Why this start found the index's key unusable and rebuilt the index
-    /// from the files; empty otherwise.
+    /// Why this start found the index's key unusable and rebuilt it from the files; empty
+    /// otherwise.
     pub const SEAL_BROKEN: &str = "seal_broken";
-    /// Why the index's key can't be had yet (the keyring is locked, its
-    /// unlock prompt was dismissed or went unanswered, no Secret Service);
-    /// empty otherwise. The index is kept, searches find nothing meanwhile,
-    /// and the runner looks again every 30 s, or with a prompt on
-    /// `ApplyEncryption`.
+    /// Why the index's key can't be had yet (locked keyring, dismissed or unanswered prompt, no
+    /// Secret Service); empty otherwise. The index is kept and searches find nothing meanwhile; the
+    /// runner looks again every 30 s, or with a prompt on `ApplyEncryption`.
     pub const SEAL_WAITING: &str = "seal_waiting";
     /// What a new key is sealed with here, a `seal` value: `tpm` or `host`
     /// while `systemd-creds` works, else `keyring`.
@@ -181,11 +167,9 @@ pub mod seal {
     pub const TPM: &str = "tpm";
     /// systemd's host key alone (`/var/lib/systemd/credential.secret`).
     pub const HOST: &str = "host";
-    /// The desktop keyring (Secret Service), where `systemd-creds` can't be
-    /// used: unlocked at login, readable by the user's session, no TPM.
+    /// The desktop keyring (Secret Service), where `systemd-creds` can't be used: no TPM.
     pub const KEYRING: &str = "keyring";
-    /// Nothing could seal it: a key held in memory only, so the index is
-    /// rebuilt at the next start.
+    /// Nothing could seal it: held in memory only, so the index is rebuilt at the next start.
     pub const MEMORY: &str = "memory";
 }
 
