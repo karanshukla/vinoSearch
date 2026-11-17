@@ -96,7 +96,6 @@ const TITLE: &str = "vinoSearch settings";
 
 const DEVICES: [&str; 3] = ["NPU", "GPU", "CPU"];
 
-/// What the Index page says while indexing is held for power.
 fn power_hold(key: &str) -> Option<&'static str> {
     match key {
         hold::CHARGER => Some("Waiting for a charger"),
@@ -105,43 +104,34 @@ fn power_hold(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Folders listed under Largest folders.
 const LARGEST: u32 = 8;
 
-/// What a folder from the chooser is for.
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Root,
     Exclude,
 }
 
-/// What the chooser answered: None when it was cancelled.
 type Picked = (Target, Result<Option<PathBuf>, String>);
 
-/// What the Editor dropdown shows picked.
 #[derive(Clone, PartialEq)]
 enum Pick {
     Default,
-    /// A desktop entry id.
     App(String),
     Custom,
 }
 
-/// One "which app opens these" setting's rows.
 struct AppPicker<'a> {
     label: &'a str,
     help: &'a str,
     command_help: &'a str,
-    /// The custom command's placeholder.
     hint: &'a str,
     apps: &'a [App],
 }
 
-/// A dropdown of the default app, the installed `apps` and a custom command,
-/// with the command's field under it when that is picked. `setting` is the
-/// config value, `draft` the command as typed until Enter or leaving the
-/// field, and `custom` keeps the field showing while it is empty. Whether
-/// `setting` changed.
+/// A dropdown of the default app, installed `apps` and a custom command, with the command's field
+/// under it when picked. `draft` is the command as typed until Enter or leaving the field; `custom`
+/// keeps the field showing while empty. Whether `setting` changed.
 fn app_picker(
     ui: &mut egui::Ui,
     picker: &AppPicker,
@@ -215,7 +205,6 @@ fn app_picker(
     changed
 }
 
-/// A destructive action waiting for a second click.
 #[derive(Clone, PartialEq)]
 enum Confirm {
     Forget(String),
@@ -228,64 +217,47 @@ struct SettingsWindow {
     link: Link,
     config_path: PathBuf,
     config: Config,
-    /// Set when the file doesn't parse: saving would replace what the user wrote.
     config_broken: Option<String>,
     idle_dirty: bool,
     new_root: String,
     new_exclude: String,
-    /// The image extensions as typed, until Enter or leaving the field.
     image_extensions: Option<String>,
-    /// The editor as typed, until Enter or leaving the field.
     editor: Option<String>,
-    /// Custom command picked, so its field shows while still empty.
     custom_editor: bool,
-    /// The apps the editor can be, read when the Search page first shows.
     editors: Option<Vec<App>>,
-    /// The same three for the `player` setting.
     player: Option<String>,
     custom_player: bool,
     players: Option<Vec<App>>,
     picked: Arc<Mutex<Option<Picked>>>,
     picking: bool,
     confirm: Option<Confirm>,
-    /// Move focus to Cancel when a confirmation replaces the button that asked for it, so a
-    /// keyboard user isn't left focused on nothing.
+    /// Move focus to Cancel when a confirmation replaces the button that asked, so a keyboard user
+    /// isn't left on nothing.
     focus_cancel: bool,
-    /// `last_checked` when Check now was pressed, until a newer check lands.
     check_asked: Option<u64>,
-    /// Roots asked to be forgotten that Status still lists, hidden meanwhile.
     forgetting: HashSet<String>,
-    /// Folders added that Status doesn't list yet, shown meanwhile: the
-    /// service registers one only once its worker takes it, behind whatever
-    /// changed under the other roots.
+    /// Folders added that Status doesn't list yet: the service registers one only once its worker
+    /// takes it, behind changes under the other roots.
     joining: HashSet<String>,
     notice: Option<String>,
     integration: Arc<Mutex<integration::State>>,
     doctor: Arc<Mutex<doctor::State>>,
-    /// The chunk count Largest folders was last asked for at, to ask again
-    /// once the index changes.
     largest_for: Option<i64>,
-    /// A folder chosen to add, shown with its estimate until confirmed.
     adding: Option<estimate::Pending>,
     estimator: estimate::Estimator,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
-    /// The window's buttons and edges are drawn here, not by the desktop
-    /// (vino-ui's `window`).
     app_title_bar: bool,
-    /// The desktop's text scale as last applied. Only a change is applied again, so a Ctrl +
-    /// zoom isn't undone every time the window gets focus.
+    /// The desktop's text scale as last applied; only a change is reapplied so a Ctrl+ zoom isn't
+    /// undone on focus.
     text_scale: f32,
-    /// The About page's Updates row.
     updater: vino_ui::update::Updater,
-    /// Where the models are downloaded, to delete them while the runner can't be asked.
     models_dir: Option<PathBuf>,
 }
 
-/// The release installer leaves itself as `~/.local/bin/vinosearch-upgrade`; with it,
-/// About's Update button installs a release. A release's Flatpak bundle installs the next one
-/// with `vinosearch flatpak-update`. A build from source has neither, and links to the release
-/// instead.
+/// The release installer leaves `~/.local/bin/vinosearch-upgrade`: About's Update button installs a
+/// release with it. A release's Flatpak bundle installs the next with `vinosearch flatpak-update`.
+/// A build from source has neither and links to the release.
 fn updater() -> vino_ui::update::Updater {
     let updater =
         vino_ui::update::Updater::new(vino_ui::App::Search, vinosearch_shared::version::VERSION);
@@ -416,7 +388,6 @@ impl SettingsWindow {
         }
     }
 
-    /// A typed path: `~/` expanded, then it must be absolute.
     fn add_typed(&mut self, target: Target) {
         let typed = match target {
             Target::Root => std::mem::take(&mut self.new_root),
@@ -436,7 +407,6 @@ impl SettingsWindow {
     }
 }
 
-/// A folder in a list: its icon and path, the path in full on hover.
 fn path_label(ui: &mut egui::Ui, icon: Icon, path: &str, alarmed: bool) {
     let p = theme::palette(ui.ctx());
     ui.horizontal(|ui| {
@@ -446,8 +416,6 @@ fn path_label(ui: &mut egui::Ui, icon: Icon, path: &str, alarmed: bool) {
     });
 }
 
-/// How far a model download has got: wherever a Download button was
-/// pressed, so the press is seen to have done something.
 fn fetch_progress(ui: &mut egui::Ui, s: &Status) {
     let fraction = s.fetch_done as f32 / s.fetch_total.max(1) as f32;
     widgets::small(
@@ -457,13 +425,11 @@ fn fetch_progress(ui: &mut egui::Ui, s: &Status) {
     widgets::progress(ui, fraction, 120.0);
 }
 
-/// A legend entry's swatch and the gap after it, before its text.
 const LEGEND_SWATCH: f32 = 8.0 + 6.0;
 
-/// The share bar's colours, in Status's order: the palette's four, then
-/// sessions (teal) and media (amber), which vino-user-interface's
-/// palette has no colour for yet. Shades as dark against the light theme's
-/// card, and as light against the dark one's, as the palette's own.
+/// The share bar's colours, in Status's order: the palette's four, then sessions (teal) and media
+/// (amber), which the palette has no colour for yet, shaded dark against the light theme's card and
+/// light against the dark one's.
 fn kind_colors(p: &theme::Palette, dark: bool) -> [egui::Color32; 6] {
     let [text, documents, images, code] = p.kinds;
     let (sessions, media) = if dark {
@@ -480,20 +446,17 @@ fn kind_colors(p: &theme::Palette, dark: bool) -> [egui::Color32; 6] {
     [text, documents, images, code, sessions, media]
 }
 
-/// Switching to a custom command keeps the one set until another is typed;
-/// an app's entry id isn't a command.
+/// Switching to a custom command keeps the one set until another is typed; an app's entry id isn't
+/// a command.
 fn command_kept(current: Option<&String>) -> Option<String> {
     current.filter(|e| !apps::is_entry_id(e)).cloned()
 }
 
-/// A minimum score as a slider, strict on the left and loose on the right,
-/// with a way back to the default. Some(new value) when it changed, None
-/// meaning the default.
+/// A minimum score as a slider, strict on the left and loose on the right, with a way back to the
+/// default. Some(new value) when it changed, None meaning the default.
 ///
-/// Left to right as the number rises, so dragging, the number and the end
-/// labels all agree: further right, closer matches only. Laid out right to
-/// left: Default, the number, Closer, the bar, Looser. Default keeps its
-/// space when hidden, so every row's bar lines up.
+/// Laid out right to left: Default, the number, Closer, the bar, Looser. Default keeps its space
+/// when hidden, so every row's bar lines up.
 fn score_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -547,10 +510,9 @@ fn stored_score(v: f32, default: f32) -> Option<f32> {
     ((v - default).abs() > 0.001).then_some(v)
 }
 
-/// A slider and its number box, both named by the row's label, the box on
-/// the right. egui's Slider draws the box
-/// itself but leaves it unnamed, and while the box has focus the response it returns is the
-/// box's, so naming that response would name the slider only some of the time.
+/// A slider and its number box, both named by the row's label. egui's Slider leaves its box
+/// unnamed, and while the box has focus the response returned is the box's, so naming that response
+/// would name the slider only some of the time.
 fn slider<N: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     named: &dyn Fn(egui::Response) -> egui::Response,
@@ -638,8 +600,7 @@ impl SettingsWindow {
         self.save_once_numbers_settle(ctx);
     }
 
-    /// A refusal doesn't say which request it was, so every folder still
-    /// joining is dropped: an add refused would show forever.
+    /// A refusal doesn't say which request it was, so every folder still joining is dropped.
     fn show_refusal(&mut self, refused: String) {
         self.joining.clear();
         self.notice = Some(refused);
@@ -722,7 +683,6 @@ impl SettingsWindow {
             });
     }
 
-    /// Wrapped rather than clipped at the narrowest widths.
     fn page_tabs(&mut self, ui: &mut egui::Ui, header: theme::Header) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(18.0, 0.0);
@@ -735,9 +695,8 @@ impl SettingsWindow {
         });
     }
 
-    /// With the app's title bar, a wide window's page title moves up out of
-    /// the scroll area into a bar of its own, with the window buttons at its
-    /// end: that bar is what the window is dragged by.
+    /// With the app's title bar a wide window's page title moves out of the scroll area into a bar
+    /// of its own, which the window is dragged by.
     fn page_title_bar(
         &self,
         root: &mut egui::Ui,
@@ -797,8 +756,7 @@ impl SettingsWindow {
         });
     }
 
-    /// Typing or dragging a number changes it every frame, so the file is
-    /// written once it settles.
+    /// Typing or dragging a number changes it every frame: the file is written once it settles.
     fn save_once_numbers_settle(&mut self, ctx: &egui::Context) {
         if self.idle_dirty && ctx.dragged_id().is_none() && !ctx.egui_wants_keyboard_input() {
             self.idle_dirty = false;
@@ -806,9 +764,8 @@ impl SettingsWindow {
         }
     }
 
-    /// Back from the background: the desktop's light/dark switch or text
-    /// size may have changed, and the config file or the KRunner
-    /// registration under us.
+    /// Back from the background: the desktop theme or text size, the config file or the KRunner
+    /// registration may have changed.
     fn catch_up_on_focus(&mut self, ctx: &egui::Context) {
         theme::follow_desktop(ctx);
         self.kde_header = theme::kde_header();
@@ -826,7 +783,6 @@ impl SettingsWindow {
         }
     }
 
-    /// The folder chooser's answer, once it has one.
     fn take_picked_folder(&mut self) {
         let picked = self.picked.lock().unwrap().take();
         if let Some((target, answer)) = picked {
@@ -883,14 +839,11 @@ fn without_vsync() -> eframe::egui_glow::GlowConfiguration {
     }
 }
 
-/// The title bar is the compositor's, so the accessibility tree's window
-/// gets the same name.
 fn name_like_the_title_bar(ctx: &egui::Context) {
     ctx.accesskit_node_builder(egui::accesskit_root_id(), |node| node.set_label(TITLE));
 }
 
-/// vino-ui's brand, which the window bar's row is centred on: the logo on
-/// the nav items' icon column.
+/// vino-ui's brand, which the window bar's row is centred on.
 fn brand(ui: &mut egui::Ui) -> egui::Rect {
     ui.scope(|ui| {
         ui.style_mut().interaction.selectable_labels = false;
@@ -900,7 +853,6 @@ fn brand(ui: &mut egui::Ui) -> egui::Rect {
     .rect
 }
 
-/// Added after the brand, so its name drags the window.
 fn drag_by_brand(ui: &mut egui::Ui, brand: egui::Rect) {
     let clip = ui.clip_rect();
     vino_ui::window::drag(

@@ -20,43 +20,34 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Generous for ffmpeg's decoders and its threads' stacks; `-threads 2` keeps
-/// the count down.
+/// Generous for ffmpeg's decoders and its threads' stacks; `-threads 2` keeps the count down.
 const ADDRESS_SPACE: u64 = 2 << 30;
-/// CPU seconds per second of media, on top of a minute. 4K HEVC decoded in
-/// software runs near real time on a small laptop.
+/// CPU seconds per second of media, on top of a minute: 4K HEVC in software runs near real time on
+/// a small laptop.
 const CPU_PER_SECOND: f64 = 2.0;
-/// The longest duration the CPU limit allows for, whatever a file claims.
 const MAX_SECONDS: f64 = 12.0 * 3600.0;
 /// No output for this long and the decoder is killed: a hang, or a FIFO
 /// that never fills.
 const STALL: Duration = Duration::from_secs(120);
 const PROBE_WALL: Duration = Duration::from_secs(30);
-/// While ffmpeg is missing it is looked for again this often at most, so the
-/// status the settings window polls doesn't walk PATH every time.
+/// Looked for again at most this often while ffmpeg is missing, so polled status doesn't walk PATH
+/// each time.
 const LOOK_AGAIN: Duration = Duration::from_secs(30);
 
-/// A frame at each scene cut over this.
 const SCENE: f64 = 0.3;
-/// At most one frame per this many seconds, however many cuts.
 const MIN_GAP: u32 = 5;
-/// At least one frame per this many seconds, in a long shot.
 const MAX_GAP: u32 = 30;
-/// Frames bigger than this square are shrunk to fit; `vision::prepare`
-/// resizes them again for the encoder.
+/// Frames bigger than this square are shrunk to fit; `vision::prepare` resizes them again.
 const FRAME_SIDE: u32 = 768;
 
-/// 100 ms frames, and a window is quiet when this share of them are under
-/// QUIET_DBFS.
+/// 100 ms frames; a window is quiet when this share of them are under QUIET_DBFS.
 const QUIET_DBFS: f32 = -50.0;
 const QUIET_SHARE: f32 = 0.95;
-/// Windows start every 5 s, so each moment is whole in one of them: without
-/// the overlap sounds fall across windows and lose to others. Audio is still
-/// ~1.2 NPU min an hour (measured 2026-11).
+/// Windows start every 5 s so each moment is whole in one: without the overlap, sounds fall across
+/// windows and lose to others. Audio is ~1.2 NPU min an hour (measured 2026-11).
 const HOP_SAMPLES: usize = 5 * SAMPLE_RATE;
-/// A file shorter than this has no window, and at the end a last hop
-/// shorter than this adds none. A last hop longer is a window ending at the
-/// end: a second of sound padded with nine of silence embeds as little but
+/// A file shorter than this has no window; a last hop shorter adds none, and a longer one is a
+/// window ending at the end: a second of sound padded with nine of silence embeds as little but
 /// silence, and outscores real windows.
 const MIN_WINDOW_SAMPLES: usize = SAMPLE_RATE;
 
@@ -71,7 +62,6 @@ pub enum Track {
 }
 
 impl Track {
-    /// The track a chunk numbered `n` came from, and its second in it.
     pub fn of(n: i64) -> (Track, i64) {
         if n >= FRAME_LINES as i64 {
             (Track::Picture, n - FRAME_LINES as i64)
@@ -81,7 +71,6 @@ impl Track {
     }
 }
 
-/// `seconds` as a player shows it: 04:05, or 1:02:03 past an hour.
 pub fn stamp(seconds: i64) -> String {
     let s = seconds.max(0);
     let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
@@ -92,9 +81,8 @@ pub fn stamp(seconds: i64) -> String {
     }
 }
 
-/// ffmpeg and ffprobe, if both are on PATH. Found, they are taken to stay.
-/// Missing, they are looked for again every LOOK_AGAIN, so installing them
-/// shows without a restart.
+/// ffmpeg and ffprobe, if both are on PATH. Found, kept; missing, looked for again every LOOK_AGAIN
+/// so installing shows without a restart.
 pub fn ffmpeg() -> bool {
     static FOUND: Lookup = Lookup::new();
     FOUND.get(Instant::now(), || {
@@ -102,7 +90,6 @@ pub fn ffmpeg() -> bool {
     })
 }
 
-/// Whether something was found: a yes kept for good, a no for LOOK_AGAIN.
 struct Lookup {
     found: AtomicBool,
     looked: Mutex<Option<Instant>>,
@@ -138,8 +125,7 @@ pub struct Probe {
     pub video: bool,
 }
 
-/// What `path` holds. A cover image in an audio file is an attached picture,
-/// not video.
+/// A cover image in an audio file is an attached picture, not video.
 pub fn probe(path: &Path) -> Result<Probe> {
     let mut cmd = limited("ffprobe", PROBE_WALL.as_secs());
     cmd.args(["-v", "error", "-of", "json", "-show_entries"])
@@ -191,14 +177,12 @@ fn parse_probe(json: &[u8]) -> Result<Probe> {
     })
 }
 
-/// A run of audio: `samples` from second `start`.
 pub struct Window {
     pub start: u32,
     pub samples: Vec<f32>,
 }
 
 impl Window {
-    /// Mostly silence, so not worth an encoder run.
     pub fn quiet(&self) -> bool {
         let tenth = SAMPLE_RATE / 10;
         let frames = self.samples.len() / tenth;
@@ -215,18 +199,14 @@ impl Window {
     }
 }
 
-/// Fills a late start or a gap with silence, which the raw output would
-/// otherwise close up: windows are timed by counting samples from `from`
+/// Fills a late start or a gap with silence, which raw output would close up: windows are timed by counting samples from `from`
 /// (pinned by `tests::sound_that_starts_late_is_timed_from_the_start_of_the_file`).
 const FILL_GAPS_WITH_SILENCE: &str = "aresample=async=1:first_pts=0";
-/// stderr lines kept for the error message when ffmpeg fails.
 const KEPT_LINES: usize = 5;
 
-/// The first audio stream from second `from`, in 10 s windows every 5 s.
 pub struct Audio {
     decoder: Decoder,
     from: u32,
-    /// The last window given, and where it started, in samples from `from`.
     window: Vec<f32>,
     at: usize,
     done: bool,
@@ -252,7 +232,6 @@ pub fn audio(path: &Path, from: u32, probe: &Probe) -> Result<Audio> {
 }
 
 impl Audio {
-    /// Up to `n` samples; fewer only at the end, when ffmpeg is checked.
     fn read(&mut self, n: usize) -> Result<Vec<f32>> {
         let mut bytes = vec![0u8; n * 4];
         let got = self.decoder.read_up_to(&mut bytes)?;
@@ -268,8 +247,6 @@ impl Audio {
             .collect())
     }
 
-    /// A whole window, or what there is of a short file; false when that is
-    /// under MIN_WINDOW_SAMPLES.
     fn first_window(&mut self) -> Result<bool> {
         let samples = self.read(WINDOW_SAMPLES)?;
         if samples.len() < MIN_WINDOW_SAMPLES {
@@ -279,8 +256,6 @@ impl Audio {
         Ok(true)
     }
 
-    /// HOP_SAMPLES on, the rest of the window kept from the one before; false
-    /// at the end.
     fn hop(&mut self) -> Result<bool> {
         let new = self.read(HOP_SAMPLES)?;
         if new.len() < MIN_WINDOW_SAMPLES || self.window.len() < WINDOW_SAMPLES {
@@ -316,15 +291,13 @@ impl Iterator for Audio {
     }
 }
 
-/// A frame of video at `second`.
 pub struct Frame {
     pub second: f64,
     pub image: RgbImage,
 }
 
-/// One frame per shot from second `from`: the first, then one at each cut
-/// at least MIN_GAP s after the last kept, and one every MAX_GAP s in a
-/// long shot. One decode pass, as in bench/media_chunks.py.
+/// One frame per shot from second `from`: the first, then one at each cut at least MIN_GAP s after
+/// the last kept, and one every MAX_GAP s in a long shot.
 pub struct Frames {
     decoder: Decoder,
     times: mpsc::Receiver<f64>,
@@ -332,9 +305,8 @@ pub struct Frames {
     done: bool,
 }
 
-/// Decoded to rgb24, as a 10-bit source (HEVC Main10, a phone's HDR video)
-/// would otherwise come as 16-bit PPM (pinned by
-/// `tests::ten_bit_video_gives_eight_bit_frames`). showinfo reports each kept
+/// Decoded to rgb24, as a 10-bit source (HEVC Main10, phone HDR) would otherwise
+/// come as 16-bit PPM (pinned by `tests::ten_bit_video_gives_eight_bit_frames`).
 /// frame's time at the info level.
 pub fn frames(path: &Path, from: u32, probe: &Probe) -> Result<Frames> {
     let select = format!(
@@ -438,7 +410,6 @@ fn ppm_header(decoder: &mut Decoder) -> Result<Option<(u32, u32)>> {
     Ok(Some((number(&fields[1])?, number(&fields[2])?)))
 }
 
-/// `pts_time:12.5` in a showinfo line.
 fn showinfo_time(line: &str) -> Option<f64> {
     if !line.contains("Parsed_showinfo") {
         return None;
@@ -460,7 +431,6 @@ fn cpu_seconds(probe: &Probe) -> u64 {
     60 + (probe.seconds.clamp(0.0, MAX_SECONDS) * CPU_PER_SECOND) as u64
 }
 
-/// `tool` with the address space and CPU limits, reading only files.
 fn limited(tool: &str, cpu_seconds: u64) -> Command {
     let mut cmd = Command::new(tool);
     cmd.args(["-protocol_whitelist", "file"]);
@@ -485,17 +455,14 @@ fn limited(tool: &str, cpu_seconds: u64) -> Command {
     cmd
 }
 
-/// A running ffmpeg: its stdout read as needed, its stderr drained on a
-/// thread, and a watchdog that kills it when a read has waited `stall` for
-/// it. Time nobody is reading doesn't count: the embedder may take minutes
-/// over a window, and ffmpeg only waits on the full pipe meanwhile. Dropping
-/// it kills the child.
+/// A running ffmpeg: stdout read as needed, stderr drained on a thread, and a watchdog that kills
+/// it when a read has waited `stall`. Time nobody is reading doesn't count: the embedder may take
+/// minutes over a window while ffmpeg waits on the full pipe. Dropping it kills the child.
 struct Decoder {
     child: Child,
     stdout: ChildStdout,
     stderr: Option<JoinHandle<String>>,
-    /// Since when a read has been waiting, in ms from `started`; IDLE while
-    /// none is.
+    /// Since when a read has been waiting, in ms from `started`; IDLE while none is.
     waiting: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     stalled: Arc<AtomicBool>,
@@ -504,12 +471,9 @@ struct Decoder {
     started: Instant,
 }
 
-/// `Decoder::waiting` while no read is.
 const IDLE: u64 = u64::MAX;
 
 impl Decoder {
-    /// `on_line` sees each stderr line; lines it returns None for are kept
-    /// for the error message.
     fn spawn(
         mut cmd: Command,
         stall: Duration,
@@ -549,7 +513,6 @@ impl Decoder {
         })
     }
 
-    /// Fill `buf` unless the stream ends first; how much was read.
     fn read_up_to(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut got = 0;
         let mut result = Ok(());
@@ -579,7 +542,6 @@ impl Decoder {
         self.waiting.store(IDLE, Ordering::Relaxed);
     }
 
-    /// At the end of stdout: Err unless ffmpeg exited cleanly.
     fn finish(&mut self) -> Result<()> {
         self.stop_watchdog();
         let status = self.child.wait()?;
@@ -635,8 +597,6 @@ fn drain_stderr(
     })
 }
 
-/// Kills `pid` once a read has been `waiting` longer than `stall`, until
-/// `stop`; says so in `stalled`.
 fn spawn_watchdog(
     pid: libc::pid_t,
     waiting: Arc<AtomicU64>,
@@ -677,8 +637,6 @@ impl Drop for Decoder {
 mod tests {
     use super::*;
 
-    /// 25 s from ffmpeg's own sources: red for 12 s then blue, a 440 Hz tone
-    /// with silence from 10 to 20 s. None if ffmpeg isn't installed.
     fn clip(name: &str, video: bool, audio: bool) -> Option<std::path::PathBuf> {
         if !ffmpeg() {
             eprintln!("no ffmpeg; skipped");
@@ -868,7 +826,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
-    /// A scratch directory for clips made by one test.
     fn scratch() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("vinosearch-media-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

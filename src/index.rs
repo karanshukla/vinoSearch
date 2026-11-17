@@ -3,7 +3,7 @@
 //!
 //! Embeddings can be partly inverted back to their text, so the index is as
 //! sensitive as the files it covers: encrypted at rest when `encryption` is
-//! on (encryption.rs, #4), plaintext readable only by the user otherwise.
+//! on, plaintext readable only by the user otherwise.
 
 pub mod code;
 pub mod encryption;
@@ -35,21 +35,16 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
-/// About 250 tokens of English, inside the 256-token document shape.
 pub(crate) const CHUNK_CHARS: usize = 900;
 pub(crate) const MAX_FILE_BYTES: u64 = 1 << 20;
-/// A document's text, or a prose file's, all its parts together (#108):
-/// about 5,000 printed pages, ~18,000 chunks.
+/// A document's or prose file's text, all parts together: ~5,000 pages.
 pub(crate) const MAX_TEXT_BYTES: u64 = 16 << 20;
-/// Text files that may be books, held to MAX_TEXT_BYTES instead of
-/// MAX_FILE_BYTES.
 const PROSE: &[&str] = &["txt", "md", "rst", "org", "tex"];
 /// Prose and markup; code is `code::EXTENSIONS`. No config formats: they
 /// are where credentials live (pinned by `tests::config_files_are_not_indexed`).
 pub(crate) const TEXT_EXTENSIONS: &[&str] = &["md", "txt", "rst", "org", "tex", "html", "htm"];
-/// Directories that are always build output, caches, generated reports or
-/// vendored dependencies (`obj` is .NET's). Generic names a person might use
-/// for their own files (`bin`, `out`, `lib`) are left out (pinned by
+/// Always build output, caches, reports or vendored code. Generic names
+/// (`bin`, `out`, `lib`) are left out (pinned by
 /// `tests::generated_trees_and_files_are_skipped`).
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -73,37 +68,26 @@ const SKIP_DIRS: &[&str] = &[
     "coverage",
     "htmlcov",
 ];
-/// Directory name prefixes with the same meaning (`cmake-build-debug`, ...).
 const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
-/// `Kind::max_bytes` for media, which `formats.media.max_hours` holds by
-/// duration instead, and which is never read whole.
+/// `Kind::max_bytes` for media, which `formats.media.max_hours` limits by duration.
 const HELD_BY_DURATION: u64 = u64::MAX;
 
 use vinosearch_shared::limits::MAX_IMAGE_BYTES;
 use vinosearch_shared::xdg;
-/// Documents are parsed whole in memory too, once for each run of parts.
-/// Their extracted text is held to MAX_TEXT_BYTES.
+/// Documents are parsed whole in memory; their text is held to MAX_TEXT_BYTES.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 32 << 20;
 
-/// What a chunk was embedded from, stored in `chunks.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Text = 0,
     Image = 1,
-    /// Text extracted from a PDF, Office file or spreadsheet (#55), or read
-    /// from an image or scanned page by OCR (#106). Scored like text, but
-    /// searched apart so neither crowds the other out.
+    /// PDF, Office or spreadsheet text, or OCR of an image; searched apart from text.
     Document = 2,
-    /// Source code (#110): on only when asked for, and searched only by
-    /// queries starting `code:`.
+    /// Source code: on only when asked for, searched only by `code:` queries.
     Code = 3,
-    /// A vinoWhisper session's transcript and summary (#143), chunks of one
-    /// `.vwsession` file; `extract::session::Part::of` says which.
     Session = 4,
-    /// An audio or video file's sound, 10 s windows numbered by their first
-    /// second, and its frames, from `extract::media::FRAME_LINES` up
-    /// (#187); `extract::media::Track::of` says which. Embedded after
-    /// everything else, from `index_rest`.
+    /// Audio and video: sound in 10 s windows numbered by first second, then
+    /// frames from `extract::media::FRAME_LINES` up. Embedded last, from `index_rest`.
     Media = 5,
 }
 
@@ -128,7 +112,6 @@ impl Kind {
         }
     }
 
-    /// The largest `path` of this kind that is indexed.
     fn max_bytes(self, path: &Path) -> u64 {
         match self {
             Kind::Text if is_prose(path) => MAX_TEXT_BYTES,
@@ -139,10 +122,9 @@ impl Kind {
         }
     }
 
-    /// What made this kind's vectors, as `meta` records it: the models'
-    /// revisions, and whatever else changes the vectors or what a hit points
-    /// at. Vectors with another tag score against this build's queries
-    /// without erroring, just wrongly, so they are dropped.
+    /// What made this kind's vectors: model revisions and anything else that
+    /// changes them or what a hit points at. Vectors with another tag score
+    /// wrongly without erroring, so they are dropped.
     pub fn model_tag(self) -> String {
         match self {
             Kind::Text | Kind::Document | Kind::Code => crate::ml::model::REVISION.to_owned(),
@@ -179,26 +161,19 @@ impl Kind {
     }
 }
 
-/// The file types indexed: text always, images by extension, documents,
-/// code and vinoWhisper sessions while they are on (#73, #55, #110, #143).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileTypes {
     images: Vec<String>,
     documents: bool,
     code: bool,
     sessions: bool,
-    /// vinoWhisper's own folders of sessions, where nothing else is taken:
-    /// a native install's, and its Flatpak's.
     sessions_dirs: Vec<PathBuf>,
-    /// Audio and video, while on and ffmpeg is installed (#187).
     media: bool,
-    /// The longest media file indexed, in seconds.
     max_media_seconds: f64,
     ignores: SharedIgnores,
 }
 
-/// The ignore files read, shared by a `FileTypes` and its clones; no part
-/// of what makes two equal.
+/// Ignore files read, shared by clones; not part of equality.
 #[derive(Debug, Clone, Default)]
 struct SharedIgnores(std::sync::Arc<crate::index::code::Ignores>);
 
@@ -236,15 +211,12 @@ impl FileTypes {
         self
     }
 
-    /// vinoWhisper's folders of sessions, and whether sessions are on. While
-    /// they are each is a root of its own: the walk of a home folder skips
-    /// hidden directories.
+    /// vinoWhisper's session folders, and whether sessions are on; each is its
+    /// own root since the walk of a home folder skips hidden directories.
     pub fn sessions_dirs(&self) -> (&[PathBuf], bool) {
         (&self.sessions_dirs, self.sessions)
     }
 
-    /// The kind `path` is indexed as, by its name (and for code, the ignore
-    /// files above it); None if it is not.
     pub fn kind(&self, path: &Path) -> Option<Kind> {
         let session = crate::extract::is_session(path);
         if !session && self.in_sessions_dir(path) {
@@ -278,13 +250,10 @@ impl FileTypes {
     }
 }
 
-/// vinoWhisper's Flatpak, which keeps its data under `~/.var/app`.
 pub const VINOWHISPER_FLATPAK: &str = "io.github.karanshukla.vinowhisper";
 
-/// Where vinoWhisper keeps its sessions (karanshukla/vinoWhisper#123),
-/// canonical as roots are: a native install's data, and its Flatpak's. In
-/// our own Flatpak XDG_DATA_HOME is ours, so a native vinoWhisper's is the
-/// real home's.
+/// vinoWhisper's session folders, canonical: native data and its Flatpak's.
+/// In our Flatpak XDG_DATA_HOME is ours, so a native one's is the real home's.
 fn sessions_dirs() -> Vec<PathBuf> {
     let native = match vinosearch_shared::sandbox::flatpak_id() {
         Some(_) => vinosearch_shared::sandbox::host_data_home(),
@@ -310,7 +279,6 @@ pub fn default_db() -> Result<PathBuf> {
     Ok(xdg::data_home()?.join("vinosearch/index.sqlite"))
 }
 
-/// Whether `path` is indexed, as `types` takes it.
 pub(crate) fn wanted(path: &Path, types: &FileTypes) -> bool {
     types.kind(path).is_some()
 }
@@ -333,9 +301,8 @@ pub(crate) fn skipped_dir(name: &str) -> bool {
         || SKIP_DIR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Line-aligned chunks of up to CHUNK_CHARS, with the line each starts on.
-/// A single longer line is split between words, or failing that on char
-/// boundaries.
+/// Line-aligned chunks of up to CHUNK_CHARS; a longer line is split between
+/// words, else on char boundaries.
 pub fn chunk(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -399,9 +366,7 @@ pub struct Stats {
     pub files_embedded: usize,
     pub chunks: usize,
     pub removed: usize,
-    /// Files whose content was already indexed, so nothing was embedded.
     pub duplicates: usize,
-    /// Images skipped for want of a decoder this build lacks (HEIF, #79).
     pub no_decoder: usize,
 }
 
@@ -424,9 +389,7 @@ pub fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Everything under `root` that indexing looks at, skipping hidden and build
-/// directories and anything excluded. Follows no links, `root` included
-/// (pinned by `tests::walk_does_not_follow_symlinks`,
+/// Follows no links, `root` included (pinned by `tests::walk_does_not_follow_symlinks`,
 /// `tests::a_link_given_as_the_root_is_not_followed`).
 pub fn walk<'a>(root: &Path, ex: &'a Excludes) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
     WalkDir::new(root)
@@ -450,7 +413,6 @@ fn like_under(dir: &str) -> String {
     )
 }
 
-/// Drop `path` and, if it was a directory, everything under it. Returns files removed.
 pub fn remove(conn: &Connection, path: &Path) -> Result<usize> {
     let p = path.to_string_lossy();
     let n = conn.execute(
@@ -463,23 +425,17 @@ pub fn remove(conn: &Connection, path: &Path) -> Result<usize> {
 pub enum Outcome {
     Embedded(usize),
     Unchanged,
-    /// Same content as a file already indexed, whose chunks it shares.
     Duplicate,
-    /// Recorded with no chunks: an image that doesn't decode, so it isn't
-    /// tried again until it changes. `no_decoder` when a decoder this build
-    /// lacks would have read it (#79).
+    /// An image that doesn't decode: kept with no chunks so it isn't retried.
     Unreadable {
         no_decoder: bool,
     },
-    /// Not a wanted file (type, size, encoding); any old entry for it is dropped.
     Skipped,
 }
 
-/// Index one file if it is wanted and changed since it was last indexed.
-/// A long file gets its first PARTS_AT_ONCE parts (pages, say) now and the
-/// rest from `index_rest` once everything else is in (#108). `between` runs
-/// after each chunk is embedded, so a waiting query is not held for the
-/// whole run. An error from it stops the file unwritten.
+/// A long file gets its first PARTS_AT_ONCE parts now, the rest from
+/// `index_rest`. `between` runs after each chunk so a waiting query isn't held;
+/// an error from it stops the file unwritten.
 pub fn index_file<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -551,8 +507,6 @@ pub fn index_file<E: Embed>(
     write_file(conn, &seen, &content.hash, &chunked)
 }
 
-/// The file's row, its chunks and, for a long one, what is left for
-/// `index_rest`, in one transaction.
 fn write_file(
     conn: &mut Connection,
     seen: &Seen,
@@ -577,7 +531,6 @@ fn write_file(
     Ok(Outcome::Embedded(first.chunks.len()))
 }
 
-/// A `partial` row for `index_rest` when `parts` is more than the first run.
 fn leave_rest_for_later(tx: &Connection, file_id: i64, parts: usize) -> Result<()> {
     let total = parts.min(MAX_PARTS);
     if total > PARTS_AT_ONCE {
@@ -589,7 +542,6 @@ fn leave_rest_for_later(tx: &Connection, file_id: i64, parts: usize) -> Result<(
     Ok(())
 }
 
-/// A file as the walk found it: its path and what the filesystem says of it.
 struct Seen<'a> {
     path: &'a Path,
     key: &'a str,
@@ -599,7 +551,6 @@ struct Seen<'a> {
 }
 
 impl Seen<'_> {
-    /// A row with no chunks of its own, replacing any earlier one.
     fn record(&self, conn: &mut Connection, hash: &[u8]) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM files WHERE path = ?1", [self.key])?;
@@ -611,7 +562,6 @@ impl Seen<'_> {
     }
 }
 
-/// The row an earlier run left for a path.
 struct Known {
     id: i64,
     mtime: i64,
@@ -664,8 +614,7 @@ fn settle_known(
     backfill_hash(conn, known, hash, has_holder).map(Some)
 }
 
-/// A row indexed before content hashes gets its hash, and gives its chunks
-/// up if another file already holds the same ones (pinned by
+/// Hashes a row indexed before hashes; gives its chunks up to an older copy (pinned by
 /// `index::pipeline_tests::a_file_indexed_before_hashes_gets_its_hash_and_is_not_embedded_again`,
 /// `index::pipeline_tests::a_file_indexed_before_hashes_gives_up_its_chunks_to_an_older_copy`).
 fn backfill_hash(
@@ -684,9 +633,8 @@ fn backfill_hash(
     Ok(Outcome::Unchanged)
 }
 
-/// Media is probed before it is hashed, so a film over the longest indexed is
-/// never read whole: it keeps a row with no hash, and that row stands while
-/// the file and the limit do.
+/// Media is probed before hashing so a film over the limit is never read
+/// whole: it keeps a hashless row while the file and limit stand.
 fn probe_media(
     conn: &mut Connection,
     path: &Path,
@@ -710,15 +658,13 @@ fn probe_media(
     })
 }
 
-/// What a file held when it was read, and its sha256.
 struct Content {
     bytes: Vec<u8>,
     hash: Vec<u8>,
 }
 
-/// None if the file can't be read now. Media is hashed as it streams, and
-/// its bytes are left empty; an Err is `between` stopping that, which
-/// leaves the file as it was.
+/// None if the file can't be read now. Media is hashed as it streams, its
+/// bytes left empty; an Err is `between` stopping that.
 fn read_and_hash<E: Embed>(
     conn: &Connection,
     emb: &mut E,
@@ -744,8 +690,6 @@ fn read_and_hash<E: Embed>(
     Ok(Some(Content { bytes, hash }))
 }
 
-/// A file's first parts as chunks, each with its vector and the kind it is
-/// stored as.
 struct Chunked {
     first: Extract,
     vectors: Vec<Vec<f32>>,
@@ -793,9 +737,8 @@ fn text_chunks<E: Embed>(
     )))
 }
 
-/// A document that can't be read, or has no text OCR can read, keeps a row
-/// with no chunks, so it isn't parsed again until it changes. So does a
-/// session in a format this build doesn't read (pinned by
+/// A document that can't be read, or a session in an unread format, keeps a row with no chunks so
+/// it isn't parsed again (pinned by
 /// `tests::a_document_that_does_not_parse_has_no_chunks`,
 /// `index::pipeline_tests::a_session_that_does_not_parse_keeps_a_row_and_is_not_parsed_again`,
 /// `index::pipeline_tests::a_session_of_an_unknown_format_is_kept_unread_and_counted`).
@@ -831,9 +774,8 @@ fn document_chunks<E: Embed>(
     )))
 }
 
-/// A chunk with no text and line 0 from the pixels, then the text OCR reads
-/// in them as document chunks. One that doesn't decode keeps a row with no
-/// chunks, so it isn't decoded again at every check (pinned by
+/// A chunk from the pixels, then OCR'd text as document chunks. One that doesn't decode keeps a row
+/// with no chunks (pinned by
 /// `index::pipeline_tests::an_image_is_one_chunk_of_its_own_with_no_text`,
 /// `index::pipeline_tests::an_image_that_does_not_decode_is_kept_as_a_row_with_no_chunks`).
 fn image_chunks<E: Embed>(
@@ -903,8 +845,6 @@ fn insert_chunks(
     Ok(())
 }
 
-/// Each of `chunks` embedded as a document titled `title`, letting `between`
-/// run after each.
 fn embed_chunks<E: Embed>(
     conn: &Connection,
     emb: &mut E,
@@ -920,19 +860,15 @@ fn embed_chunks<E: Embed>(
     Ok(vectors)
 }
 
-/// A document with no text layer that OCR can read: a PDF, with poppler there
-/// to render its pages.
 fn is_scannable(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
         && crate::ml::ocr::poppler()
 }
 
-/// A scanned PDF's pages as OCR reads them, a chunk a page numbered by page,
-/// up to `ocr::MAX_SCAN_PAGES` and never left in part. `ocr::SCAN_WALL`
-/// bounds poppler's rendering only: OCR and embedding are paced by
-/// `between`. The first page that won't render ends the scan with the pages
-/// read so far: a file that stalls one page likely stalls them all.
+/// A scanned PDF's pages OCR'd, a chunk each, up to `ocr::MAX_SCAN_PAGES`,
+/// never left in part. `ocr::SCAN_WALL` bounds poppler's rendering only. The
+/// first page that won't render ends the scan: a file that stalls one likely stalls all.
 fn scan_chunks<E: Embed>(
     conn: &Connection,
     emb: &mut E,
@@ -976,14 +912,12 @@ fn scan_chunks<E: Embed>(
     Ok(out)
 }
 
-/// The name a file's chunks are embedded under.
 fn title_of(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// Parts `from..from + count` of a text file's chunks.
 fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
     let chunks = if crate::extract::is_html(path) {
         chunk(&crate::extract::html(text))
@@ -995,9 +929,8 @@ fn text_parts(path: &Path, text: &str, from: usize, count: usize) -> Extract {
     crate::extract::select(chunks, false, from, count)
 }
 
-/// Documents are parsed in a child with limits. A session is plain text in
-/// a zip, nothing in it needs a parser that could crash or hang, and each
-/// part it unzips is held to 1 MiB, so it's read here.
+/// A session is plain text in a zip with 1 MiB parts, so it is read here;
+/// documents are parsed in a child with limits.
 fn parser(kind: Kind) -> Parser {
     match kind {
         Kind::Session => crate::extract::parts,
@@ -1018,23 +951,19 @@ fn document_parts(path: &Path, bytes: &[u8], from: usize, parse: Parser) -> Resu
     Ok(run)
 }
 
-/// What `index_rest` does next.
 #[derive(Debug, PartialEq)]
 enum Next {
-    /// The parts of file `id` after the first `from`, of `total`.
     Parts {
         id: i64,
         path: String,
         from: usize,
         total: usize,
     },
-    /// The file changed or went since its first run: index it afresh.
     Again(String),
 }
 
-/// The long document indexed in part longest ago, and what to do with it:
-/// documents before media, which is taken only if `media`, and a file the
-/// model failed on after those it hasn't.
+/// The long document indexed in part longest ago: documents before media
+/// (only if `media`), and a file the model failed on after those it hasn't.
 fn next_rest(conn: &Connection, media: bool) -> Result<Option<Next>> {
     let row = conn
         .query_row(
@@ -1073,7 +1002,6 @@ fn next_rest(conn: &Connection, media: bool) -> Result<Option<Next>> {
     }))
 }
 
-/// A `partial` row and the stamp its file had when it was recorded.
 struct Waiting {
     id: i64,
     path: String,
@@ -1082,8 +1010,6 @@ struct Waiting {
     total: i64,
 }
 
-/// Store the chunks of parts `from..done` of file `id`, and move its partial
-/// row on to `done`, or drop it once that is all `total`.
 fn store_rest(
     conn: &mut Connection,
     id: i64,
@@ -1106,27 +1032,21 @@ fn store_rest(
     Ok(tx.commit()?)
 }
 
-/// What one `index_rest` call did.
 #[derive(Debug)]
 pub enum Rest {
-    /// `path` has `done` of its `total` parts in now, `chunks` of them just
-    /// embedded. Stopped short when a run would not parse: `done` stays.
+    /// Stopped short when a run would not parse: `done` stays.
     Parts {
         path: String,
         done: usize,
         total: usize,
         chunks: usize,
     },
-    /// The file had changed or gone, and was indexed afresh (its first run)
-    /// or dropped.
     Again(String),
 }
 
-/// The next run of parts of the long document indexed in part longest ago
-/// (#108), or None when every document is in whole. The parser's limits
-/// apply to the run, as in `index_file`, and `between` after each chunk.
-/// Media is left waiting, as if there were none, while the models it needs
-/// are not fetched: every slice would be decoded only to fail.
+/// The next run of parts of the document indexed in part longest ago, or
+/// None. Parser limits and `between` apply as in `index_file`. Media waits
+/// while its models aren't fetched: every slice would be decoded only to fail.
 pub fn index_rest<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -1211,7 +1131,6 @@ pub fn index_rest<E: Embed>(
     }))
 }
 
-/// `path` indexed afresh, as changed whatever its stamp says.
 fn index_again<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -1224,7 +1143,6 @@ fn index_again<E: Embed>(
     Ok(Rest::Again(path))
 }
 
-/// Trim `chunks` to MAX_TEXT_BYTES with `have` already in; true if some went.
 fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
     let mut total = have;
     let fits = chunks
@@ -1239,9 +1157,8 @@ fn text_budget(chunks: &mut Vec<(usize, String)>, have: u64) -> bool {
     cut
 }
 
-/// Whether any document is indexed in part only, or any media file if
-/// `media`. `index_rest` takes media last, so with documents waiting it
-/// takes those whatever this says.
+/// Whether any document, or media if `media`, is indexed in part.
+/// `index_rest` takes media last, whatever this says.
 pub fn has_partial(conn: &Connection, media: bool) -> Result<bool> {
     Ok(conn
         .query_row(
@@ -1253,7 +1170,6 @@ pub fn has_partial(conn: &Connection, media: bool) -> Result<bool> {
         .is_some())
 }
 
-/// Audio and video files registered but not fully embedded yet.
 pub fn media_partial(conn: &Connection) -> Result<i64> {
     Ok(
         conn.query_row("SELECT count(*) FROM partial WHERE media = 1", [], |r| {
@@ -1262,8 +1178,6 @@ pub fn media_partial(conn: &Connection) -> Result<i64> {
     )
 }
 
-/// Documents indexed in part so far (#108), the next in line first: (path,
-/// parts in, parts in all). At most `limit`.
 pub fn partial(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT f.path, p.done, p.total FROM partial p JOIN files f ON f.id = p.file_id
@@ -1273,9 +1187,9 @@ pub fn partial(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, i64)
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Another file with content `hash` that holds its chunks, if there is one,
-/// or that waits in `partial` to: a media file has no chunks until
-/// `index_rest` gets to it, and a copy found meanwhile is still a copy.
+/// Another file with this content that holds its chunks or waits in
+/// `partial` to: a media file has none until `index_rest`, and a copy found
+/// meanwhile is still a copy.
 fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
@@ -1288,13 +1202,11 @@ fn holder_of(conn: &Connection, hash: &[u8], except: &str) -> Result<Option<i64>
         .optional()?)
 }
 
-/// (mtime, size) as the index records them.
 pub(crate) fn stamp_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
     Some((mtime.as_secs() as i64, meta.len() as i64))
 }
 
-/// The (mtime, size) recorded for every indexed file under `root`, by path.
 pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i64, i64)>> {
     let mut stmt =
         conn.prepare("SELECT path, mtime, size FROM files WHERE path LIKE ?1 ESCAPE '\\'")?;
@@ -1304,17 +1216,14 @@ pub fn stamps_under(conn: &Connection, root: &Path) -> Result<HashMap<String, (i
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// What a file `walk` found is indexed as, with its metadata, or None. Reads no contents.
 pub fn indexable(entry: &walkdir::DirEntry, types: &FileTypes) -> Option<(Kind, fs::Metadata)> {
     let kind = types.kind(entry.path())?;
     let meta = entry.metadata().ok()?;
     (meta.len() <= kind.max_bytes(entry.path())).then_some((kind, meta))
 }
 
-/// Paths under `root` the index is behind on: wanted files that are new or
-/// changed (by mtime and size), and indexed files that are gone, excluded,
-/// skipped or no longer wanted. Needs no model, so a runner can check at
-/// start whether it has anything to do (pinned by
+/// Paths under `root` the index is behind on: new, changed, gone, excluded or
+/// no longer wanted. Needs no model (pinned by
 /// `tests::stale_finds_new_changed_and_gone_files`).
 pub fn stale(
     conn: &Connection,
@@ -1343,9 +1252,8 @@ pub fn stale(
 }
 
 /// Hand freed space back once over a quarter of the file is free pages.
-/// SQLite otherwise keeps a purged index's full size: excluding 80% of a
-/// 113k-chunk index left the file at 470 MB until a VACUUM took it to 92 MB
-/// (0.6 s).
+/// SQLite otherwise keeps a purged index's size: excluding 80% of a 113k-chunk
+/// index left 470 MB until a VACUUM took it to 92 MB.
 pub fn compact(conn: &Connection) -> Result<()> {
     let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
@@ -1355,7 +1263,6 @@ pub fn compact(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// `root` as `index` walks it: canonical, and an error if it is excluded.
 pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
     let root = fs::canonicalize(root).with_context(|| root.display().to_string())?;
     if ex.contains(&root) {
@@ -1368,11 +1275,9 @@ pub fn resolve_root(root: &Path, ex: &Excludes) -> Result<PathBuf> {
 }
 
 /// Called after each file `index` looks at, with the connection and model
-/// lent back: for progress, and for the runner to answer queries mid-index.
-/// An error from it stops indexing; every file finished so far is kept.
+/// lent back, for progress and mid-index queries. An error stops indexing.
 pub type AfterFile<'a, E = Embedder> = dyn FnMut(&Stats, &Connection, &mut E) -> Result<()> + 'a;
 
-/// Remember `root` (canonical, from `resolve_root`) as a root to watch.
 pub fn add_root(conn: &Connection, root: &Path) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO roots (path) VALUES (?1)",
@@ -1381,9 +1286,6 @@ pub fn add_root(conn: &Connection, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Index everything wanted under `root` and remember it as a root to watch.
-/// Unchanged files (same mtime and size) are skipped; files under `root`
-/// that are gone are removed.
 pub fn index<E: Embed>(
     conn: &mut Connection,
     emb: &mut E,
@@ -1436,7 +1338,6 @@ impl Stats {
     }
 }
 
-/// Drop the indexed files under `root` that the walk didn't see; how many.
 fn remove_unseen_under(conn: &Connection, root: &Path, seen: &HashSet<String>) -> Result<usize> {
     let gone: Vec<String> = conn
         .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")?
@@ -1453,8 +1354,7 @@ fn remove_unseen_under(conn: &Connection, root: &Path, seen: &HashSet<String>) -
     Ok(gone.len())
 }
 
-/// Stop treating `root` as a root and drop what was indexed under it, except
-/// files another root still walks. Returns files removed (pinned by
+/// Drop `root` and what was indexed under it, except what another root walks (pinned by
 /// `tests::forgetting_an_inner_root_keeps_what_the_outer_one_walks`,
 /// `tests::forgetting_the_outer_root_keeps_the_roots_inside_it`,
 /// `tests::forgetting_a_root_under_a_hidden_directory_drops_all_of_it`).
@@ -1585,7 +1485,6 @@ mod tests {
         ));
     }
 
-    /// `chunks` as (kind, line) on a new file at `path`.
     pub(super) fn file_with(conn: &Connection, path: &str, chunks: &[(Kind, i64)]) {
         conn.execute(
             "INSERT INTO files (path, mtime, size, sha256) VALUES (?1, 0, 0, ?1)",
@@ -1692,8 +1591,6 @@ mod tests {
         assert!(!is_indexed(&conn, "/c.md").unwrap());
     }
 
-    /// `/a/x.md` holding one chunk, `/b/x.md` its copy and `/c/y.md` other
-    /// content: (holder id, copy id, the chunk's vector).
     fn a_file_and_its_copy(conn: &Connection) -> (i64, i64, Vec<f32>) {
         let file = |path: &str, hash: &[u8]| {
             conn.execute(
@@ -1767,7 +1664,6 @@ mod tests {
         assert_eq!(counts(&conn).unwrap(), (1, 0));
     }
 
-    /// An index from before content hashes and kinds: `/old.md`, one chunk.
     fn old_index(dir: &Path) -> PathBuf {
         let db = dir.join("i.sqlite");
         Connection::open(&db)
@@ -1817,7 +1713,6 @@ mod tests {
         assert_eq!(matching(&open(&db).unwrap(), "x"), [1]);
     }
 
-    /// Roots `/dev`, `/dev/proj` and `/dev/.hidden/p2`, a file in each.
     fn nested_roots(dir: &Scratch) -> Connection {
         let conn = dir.db();
         for r in ["/dev", "/dev/proj", "/dev/.hidden/p2"] {
@@ -1935,7 +1830,6 @@ mod tests {
         assert!(text_file(Path::new("notes.md")));
     }
 
-    /// `root/real/a.md`, and `root/link` to a directory outside `root`.
     fn a_tree_with_a_link_out(name: &str) -> Scratch {
         let dir = Scratch::new(name);
         fs::create_dir_all(dir.join("root/real")).unwrap();
@@ -1964,7 +1858,6 @@ mod tests {
         assert!(is_real_dir(&dir.join("root/real")));
     }
 
-    /// As the watcher walks a created path.
     #[test]
     fn a_link_given_as_the_root_is_not_followed() {
         let dir = a_tree_with_a_link_out("link-root");
@@ -2230,8 +2123,6 @@ mod tests {
         );
     }
 
-    /// `path` indexed as it is on disk now, with `chunks` chunks and the
-    /// first `done` of `total` parts in.
     fn add_partial(conn: &Connection, path: &Path, done: i64, total: i64) -> i64 {
         let (mtime, size) = stamp_of(&fs::metadata(path).unwrap()).unwrap();
         conn.execute(
@@ -2500,7 +2391,6 @@ mod tests {
         assert_eq!(image_vector(&conn, "/p/missing.jpg").unwrap(), None);
     }
 
-    /// A unit vector along `axis`, as an embedding blob.
     pub(super) fn axis(axis: usize) -> Vec<u8> {
         let mut v = vec![0f32; DIM];
         v[axis] = 1.0;
@@ -2526,7 +2416,6 @@ mod tests {
             .collect()
     }
 
-    /// What refresh produced, compared with a fresh load: (id, best axis) pairs.
     fn contents(v: &Vectors) -> Vec<(i64, usize)> {
         let mut out: Vec<_> = v
             .ids
@@ -2538,7 +2427,6 @@ mod tests {
         out
     }
 
-    /// Chunk ids whose name or text hold `query`'s words, in id order.
     fn matching(conn: &Connection, query: &str) -> Vec<i64> {
         let terms = expression(query).unwrap().terms;
         let mut ids: Vec<i64> = conn
@@ -2624,9 +2512,6 @@ mod tests {
         }
     }
 
-    /// Three invoice notes: along the query's axis 0, "invoices in general"
-    /// leads, then the march one; the one with the number is far off it.
-    /// The numbered chunk's id comes back.
     fn invoices(conn: &Connection) -> i64 {
         let general = add_file(conn, "/inv/general.md", &[0])[0];
         let near = add_file(conn, "/inv/near.md", &[0])[0];
@@ -2646,7 +2531,6 @@ mod tests {
         numbered
     }
 
-    /// The top `k` text hits along axis 0, boosted by `words`.
     fn along_axis_0(conn: &Connection, words: &str, k: usize) -> Vec<String> {
         let vectors = Vectors::load(conn).unwrap();
         let words = (!words.is_empty()).then(|| Words::find(conn, words).unwrap());
@@ -2693,7 +2577,6 @@ mod tests {
         }
     }
 
-    /// An image has no text but its name.
     #[test]
     fn file_names_count_as_words() {
         let dir = Scratch::new("hybrid-name");
@@ -2743,9 +2626,6 @@ mod tests {
         assert!(matching(&conn, "zebra").is_empty());
     }
 
-    /// A reader's vectors, loaded, and a second connection that writes as
-    /// `vinosearch index` or the watcher would: `/base.md` with 20 chunks,
-    /// `/a.md` with 3.
     fn reader_and_writer(dir: &Scratch) -> (Connection, Connection, Vectors) {
         let conn = dir.db();
         let writer = dir.db();
@@ -2756,7 +2636,6 @@ mod tests {
         (conn, writer, v)
     }
 
-    /// Caught up incrementally, to what loading from scratch gives.
     fn assert_caught_up(conn: &Connection, v: &mut Vectors) {
         assert!(v.catch_up(conn).unwrap(), "fell back to a full reload");
         assert_eq!(contents(v), contents(&Vectors::load(conn).unwrap()));

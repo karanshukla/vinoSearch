@@ -2,12 +2,10 @@
 //! files are code, which of those are left out, and chunks that
 //! follow the code's own definitions.
 //!
-//! Left out by path: files git ignores (`.gitignore`, `.ignore`,
-//! `.git/info/exclude` and the global excludes file, inside a git work
-//! tree), vendored directories, generated files by their names, and files
-//! named for secrets. Left out by content, once read: generated files by
-//! their header, minified ones, and anything holding a private key or an
-//! API token.
+//! Left out by path: files git ignores (`.gitignore`, `.ignore`, `.git/info/exclude`, the global
+//! excludes file, inside a git work tree), vendored directories, generated files by name, and files
+//! named for secrets. Left out by content: generated files by header, minified ones, and anything
+//! holding a private key or API token.
 
 use crate::index::CHUNK_CHARS;
 use ignore::Match;
@@ -17,8 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Code, by extension. Prose and markup (`md`, `txt`, `rst`, `org`, `tex`,
-/// `html`) are text, in `index::TEXT_EXTENSIONS`.
+/// Code by extension; prose and markup are text, in `index::TEXT_EXTENSIONS`.
 pub const EXTENSIONS: &[&str] = &[
     "rs", "py", "pyi", "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "svelte", "go",
     "c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx", "m", "mm", "java", "kt", "kts", "scala",
@@ -26,9 +23,8 @@ pub const EXTENSIONS: &[&str] = &[
     "hs", "ml", "mli", "clj", "r", "jl", "sh", "bash", "zsh", "fish", "ps1", "css", "scss", "sass",
     "less", "sql", "qml", "cmake", "gd", "glsl", "wgsl", "proto",
 ];
-/// Directories of other people's code checked into a repository, inside a
-/// git work tree. `vendor` and `node_modules` are skipped for every kind
-/// (`index::SKIP_DIRS`).
+/// Directories of other people's code checked in, inside a git work tree. `vendor` and
+/// `node_modules` are skipped for every kind (`index::SKIP_DIRS`).
 const VENDORED_DIRS: &[&str] = &[
     "third_party",
     "third-party",
@@ -36,7 +32,6 @@ const VENDORED_DIRS: &[&str] = &[
     "3rdparty",
     "vendored",
 ];
-/// Generated files, by how their names end.
 const GENERATED_SUFFIXES: &[&str] = &[
     ".pb.go",
     ".pb.cc",
@@ -54,27 +49,23 @@ const GENERATED_SUFFIXES: &[&str] = &[
     ".bundle.js",
     ".d.ts",
 ];
-/// Parts of a file name that say what's inside is a secret.
 const SECRET_NAMES: &[&str] = &["secret", "credential", "password", "passwd"];
-/// How long the ignore files read stay trusted before they're read again.
 const IGNORES_TTL: Duration = Duration::from_secs(60);
 
-/// Whether `path` is code, by its extension.
 pub fn is_code(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-/// A query for code only: what follows a leading `code:`, or None.
 pub fn code_query(query: &str) -> Option<&str> {
     let q = query.trim_start();
     let head = q.get(..5)?;
     head.eq_ignore_ascii_case("code:").then(|| q[5..].trim())
 }
 
-/// The `.gitignore` and `.ignore` files of the directories looked at, read
-/// once a minute at most. Shared by the clones of a `FileTypes`.
+/// The ignore files of the directories looked at, read once a minute at most; shared by clones of a
+/// `FileTypes`.
 #[derive(Default)]
 pub struct Ignores {
     cache: Mutex<Cache>,
@@ -83,11 +74,8 @@ pub struct Ignores {
 #[derive(Default)]
 struct Cache {
     read: Option<Instant>,
-    /// The git work tree each directory is in, if any.
     repos: HashMap<PathBuf, Option<PathBuf>>,
-    /// Each directory's own ignore files, `.ignore` first (it wins).
     dirs: HashMap<PathBuf, Arc<Vec<Gitignore>>>,
-    /// Each work tree's `.git/info/exclude` and the global excludes file.
     repo_wide: HashMap<PathBuf, Arc<Vec<Gitignore>>>,
 }
 
@@ -98,9 +86,6 @@ impl std::fmt::Debug for Ignores {
 }
 
 impl Ignores {
-    /// Whether code at `path` is left out by its path: git ignores it, it is
-    /// in a vendored directory of its work tree, or its name says it is
-    /// generated or a secret.
     pub fn left_out(&self, path: &Path) -> bool {
         left_out_by_name(path) || self.ignored(path)
     }
@@ -139,8 +124,7 @@ impl Ignores {
     }
 }
 
-/// `dir` and its ancestors up to `repo`, deepest first, so a nearer ignore
-/// file's rules win over a further one's (pinned by
+/// `dir` and its ancestors up to `repo`, deepest first, so a nearer ignore file wins (pinned by
 /// `tests::a_nearer_ignore_files_rule_wins`).
 fn deepest_first<'a>(dir: &'a Path, repo: &Path) -> Vec<&'a Path> {
     let mut levels: Vec<&Path> = dir
@@ -151,8 +135,6 @@ fn deepest_first<'a>(dir: &'a Path, repo: &Path) -> Vec<&'a Path> {
     levels
 }
 
-/// Whether the first of `rules` to name `rel` ignores it; None when none
-/// does.
 fn verdict(rules: &[Gitignore], rel: &Path) -> Option<bool> {
     rules
         .iter()
@@ -164,8 +146,7 @@ fn verdict(rules: &[Gitignore], rel: &Path) -> Option<bool> {
 }
 
 impl Cache {
-    /// The work tree `dir` is in: the nearest directory holding `.git` (a
-    /// directory, or a file for a worktree or submodule).
+    /// The nearest directory holding `.git` (a directory, or a file for a worktree or submodule).
     fn repo_of(&mut self, dir: &Path) -> Option<PathBuf> {
         if let Some(r) = self.repos.get(dir) {
             return r.clone();
@@ -222,7 +203,6 @@ impl Cache {
     }
 }
 
-/// Generated or secret by its name alone.
 fn left_out_by_name(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -234,7 +214,6 @@ fn left_out_by_name(path: &Path) -> bool {
         || SECRET_NAMES.iter().any(|s| name.contains(s))
 }
 
-/// Why code with this content is left out, or None to index it.
 pub fn unwanted(text: &str) -> Option<&'static str> {
     if generated(text) {
         Some("generated")
@@ -249,8 +228,8 @@ pub fn unwanted(text: &str) -> Option<&'static str> {
     }
 }
 
-/// A "do not edit" header near the top: Go's `// Code generated ... DO NOT
-/// EDIT.`, `@generated`, protoc's and most other generators'.
+/// A "do not edit" header near the top: Go's `// Code generated ... DO NOT EDIT.`, `@generated`,
+/// protoc's and most generators'.
 fn generated(text: &str) -> bool {
     text.lines().take(12).any(|l| {
         let l = l.to_ascii_lowercase();
@@ -262,7 +241,6 @@ fn generated(text: &str) -> bool {
     })
 }
 
-/// A few enormous lines: a bundle or minified file without `.min` in its name.
 fn minified(text: &str) -> bool {
     text.len() > 4096 && text.lines().count() * 400 < text.len()
 }
@@ -274,8 +252,6 @@ fn private_key(text: &str) -> bool {
     })
 }
 
-/// Token formats that can't be mistaken for anything else: AWS access key
-/// ids, GitHub, GitLab, Slack, Stripe, OpenAI and Google API keys.
 fn token(text: &str) -> bool {
     const PREFIXES: &[(&str, usize)] = &[
         ("AKIA", 16),
@@ -307,14 +283,13 @@ fn token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
-/// Whether byte `i` of `text` isn't in the middle of a longer word (pinned by
+/// Whether byte `i` of `text` isn't mid-word (pinned by
 /// `tests::a_token_on_its_own_is_a_token`,
 /// `tests::a_token_inside_a_longer_word_is_not_a_token`).
 fn starts_a_word(text: &str, i: usize) -> bool {
     text[..i].chars().next_back().is_none_or(|c| !token_char(c))
 }
 
-/// Leading whitespace, a tab as four.
 fn indent(line: &str) -> usize {
     line.chars()
         .take_while(|c| c.is_whitespace())
@@ -322,9 +297,8 @@ fn indent(line: &str) -> usize {
         .sum()
 }
 
-/// A line that starts a definition in most languages: `fn`, `def`,
-/// `class`, `func`, `function` and the like, after any modifiers, which may
-/// take arguments as `pub(crate)` and `extern "C"` do (pinned by
+/// A line that starts a definition in most languages (`fn`, `def`, `class`, `func`...), after any
+/// modifiers, which may take arguments as `pub(crate)` and `extern "C"` do (pinned by
 /// `tests::a_definition_after_modifiers_with_arguments_starts_one`,
 /// `tests::a_statement_is_not_a_definition`).
 fn starts_definition(line: &str) -> bool {
@@ -392,8 +366,6 @@ fn starts_definition(line: &str) -> bool {
     false
 }
 
-/// A line that belongs to the definition after it: a comment, a doc
-/// comment, an attribute or a decorator.
 fn leads_in(line: &str) -> bool {
     let t = line.trim_start();
     ["//", "#", "/*", "*", "@", "--", ";", "\"\"\"", "'''"]
@@ -401,9 +373,6 @@ fn leads_in(line: &str) -> bool {
         .any(|p| t.starts_with(p))
 }
 
-/// Where `lines` splits into units at indentation `base`: a line there
-/// after a blank one, or one that starts a definition (with the comments
-/// and attributes right above it).
 fn breaks(lines: &[&str], base: usize) -> Vec<usize> {
     let mut out = vec![0];
     for i in 1..lines.len() {
@@ -425,8 +394,6 @@ fn breaks(lines: &[&str], base: usize) -> Vec<usize> {
     out
 }
 
-/// Where the definition on line `i` starts: at the comments and attributes
-/// right above it, at indentation `base`.
 fn with_lead_in(lines: &[&str], i: usize, base: usize) -> usize {
     let mut start = i;
     while start > 0
@@ -439,8 +406,6 @@ fn with_lead_in(lines: &[&str], i: usize, base: usize) -> usize {
     start
 }
 
-/// A run of lines that belongs together, and the definition line it's
-/// inside of when that isn't in it (both counted from 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Span {
     line: usize,
@@ -448,12 +413,10 @@ struct Span {
     inside: Option<usize>,
 }
 
-/// `lines` (from line `first`, counted from 1) as units no longer than
-/// CHUNK_CHARS where the code allows: whole definitions, or a definition
-/// that's too long split at its own inner definitions or paragraphs, its
-/// first line kept with the first of them. Inside a definition indented
-/// `header`, the units are at the least indentation deeper than it, so
-/// a closing brace back at `header` stays with the last of them.
+/// `lines` as units no longer than CHUNK_CHARS where the code allows: whole definitions, or a long
+/// one split at its inner definitions or paragraphs, its first line kept with the first of them.
+/// Inside a definition indented `header`, units sit at the least indentation deeper, so a closing
+/// brace back at `header` stays with the last.
 fn units(lines: &[&str], first: usize, header: Option<usize>, out: &mut Vec<Span>) {
     let size = |r: &[&str]| r.iter().map(|l| l.len() + 1).sum::<usize>();
     let indents = lines
@@ -487,9 +450,6 @@ fn units(lines: &[&str], first: usize, header: Option<usize>, out: &mut Vec<Span
     }
 }
 
-/// `unit`, from line `line`, too long for a chunk: split below its first
-/// line into units of its own, the first line kept with the first of them,
-/// the rest inside its definition. None when it doesn't split.
 fn split_below_first_line(unit: &[&str], line: usize) -> Option<Vec<Span>> {
     let mut inner = Vec::new();
     units(&unit[1..], line + 1, Some(indent(unit[0])), &mut inner);
@@ -505,25 +465,18 @@ fn split_below_first_line(unit: &[&str], line: usize) -> Option<Vec<Span>> {
     Some(inner)
 }
 
-/// Where the definition itself is in `unit`, past the comments and
-/// attributes above it.
 fn definition_line(unit: &[&str]) -> Option<usize> {
     unit.iter()
         .position(|l| !l.trim().is_empty() && !leads_in(l))
 }
 
-/// A chunk being filled.
 struct Pending {
     text: String,
-    /// Its first line.
     start: usize,
-    /// The bytes of the definition line it starts with, if it does.
     lead: usize,
 }
 
 impl Pending {
-    /// Moves the chunk into `out`, from its first line with anything on it
-    /// past the lead, and starts afresh.
     fn flush(&mut self, out: &mut Vec<(usize, String)>) {
         let (head, body) = self.text.split_at(self.lead);
         let skipped = body.lines().take_while(|l| l.trim().is_empty()).count();
@@ -536,13 +489,10 @@ impl Pending {
     }
 }
 
-/// Code as chunks of whole definitions, up to CHUNK_CHARS each, with the
-/// line each starts on: neighbouring short ones share a chunk, a long one
-/// is split at its inner definitions (methods of a class or impl) or its
-/// paragraphs, and only a run of lines with no break in it is cut by
-/// length, as `index::chunk` cuts text. A chunk from inside a definition
-/// whose first line it doesn't have starts with that line, so the part of
-/// a long function says which function it's from.
+/// Code as chunks of whole definitions up to CHUNK_CHARS: short neighbours share a chunk, a long
+/// one is split at its inner definitions or paragraphs, and only a run with no break is cut by
+/// length, as `index::chunk` does. A chunk from inside a definition starts with that definition's
+/// first line, so the part of a long function says which function it's from.
 pub fn chunk(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut spans = Vec::new();
@@ -687,7 +637,6 @@ mod tests {
         }
     }
 
-    /// The chunks' lines, each chunk's first line number and line count.
     fn spans(text: &str) -> Vec<(usize, usize)> {
         chunk(text)
             .iter()
@@ -695,8 +644,6 @@ mod tests {
             .collect()
     }
 
-    /// A documented function of about 400 bytes: two fit in a chunk, three
-    /// don't.
     fn function_of_400_bytes(name: &str) -> String {
         format!(
             "/// Does {name}.\nfn {name}() {{\n{}}}\n",
@@ -727,7 +674,6 @@ mod tests {
         assert_eq!(spans(&text), [(1, 14), (15, 14)]);
     }
 
-    /// A method of about 600 bytes: one to a chunk.
     fn method_of_600_bytes(name: &str) -> String {
         format!(
             "    def {name}(self):\n{}\n",
@@ -789,7 +735,6 @@ mod tests {
         assert!(chunk("\n\n   \n").is_empty());
     }
 
-    /// A git work tree under the temp dir, removed when dropped.
     struct Repo(PathBuf);
 
     impl Repo {

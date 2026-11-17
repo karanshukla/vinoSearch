@@ -10,11 +10,10 @@
 //! RapidOCR's dynamic pipeline on the CPU read 86-94% in 1.7-2.9 s
 //! (bench/ocr_static.py).
 //!
-//! Lines are boxed as the connected regions of the detector's map, each
-//! turned to its own axis (the principal axis of its pixels) and grown by
-//! DB's unclip distance. Upright boxes read a page scanned 0.8 degrees off at
-//! 0.79 of its characters, turned ones at 1.00, as RapidOCR's polygons do;
-//! the moments get there without contour or polygon code.
+//! Lines are boxed as the connected regions of the detector's map, each turned
+//! to its own axis and grown by DB's unclip distance. Upright boxes read a page
+//! scanned 0.8 degrees off at 0.79 of its characters, turned ones at 1.00, as
+//! RapidOCR's polygons do.
 
 use anyhow::{Context, Result, ensure};
 use image::{RgbImage, imageops::FilterType};
@@ -22,51 +21,40 @@ use openvino::{CompiledModel, Core, DeviceType, InferRequest};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// What this build keeps of what the model reads, in the image model tag:
-/// raised when it changes, so images are read again. 2 drops texture read
-/// as a letter or two; 3, images with under `MIN_IMAGE_TEXT` in all.
+/// Raised when what this build keeps of an image's text changes, so images are
+/// read again (2 drops texture read as a letter or two; 3, images with under
+/// `MIN_IMAGE_TEXT` in all).
 pub const READING: u32 = 3;
-/// An image's lines are indexed only when they hold this many letters or
-/// digits between them. A dog photo read as five short "words" (14) matched
-/// "girl" at 0.657, over the text floor: a few characters embed close to a
-/// one-word query whatever they say. Screenshots and pages hold hundreds;
-/// a picture under this is still found by what it looks like.
+/// An image's lines are indexed only when they hold this many letters or digits.
+/// A dog photo read as five short "words" (14) matched "girl" at 0.657, over the
+/// text floor. Screenshots and pages hold hundreds; a picture under this is still
+/// found by what it looks like.
 pub const MIN_IMAGE_TEXT: usize = 20;
 
 /// The detector's shapes, as (height, width): landscape, then portrait.
 /// 1088x1920 holds a 1080p screenshot unscaled; 64 ms on the NPU.
 pub const DET_SHAPES: [(usize, usize); 2] = [(1088, 1920), (1920, 1088)];
 const REC_HEIGHT: usize = 48;
-/// The recogniser's widths, 3 to 11 ms a line. A line wider than the last
-/// is squeezed into it.
+/// The recogniser's widths, 3 to 11 ms a line; a wider line is squeezed into the last.
 pub const REC_WIDTHS: [usize; 3] = [320, 640, 1280];
-/// A small image is scaled up to the detector's size, but no further than
-/// this: an icon blown up 17 times reads as noise.
+/// A small image is scaled up, but no more than this: an icon blown up 17 times reads as noise.
 const MAX_UPSCALE: f32 = 4.0;
-/// DB postprocessing, as RapidOCR runs PP-OCRv6: a pixel is text above
-/// `THRESH`, a region is kept when its mean is `BOX_THRESH` or more, and grows
-/// by `area * UNCLIP / perimeter` on every side.
+/// DB postprocessing as RapidOCR runs PP-OCRv6: a pixel is text above `THRESH`, a
+/// region is kept at mean `BOX_THRESH`, and grows by `area * UNCLIP / perimeter`.
 const THRESH: f32 = 0.3;
 const BOX_THRESH: f32 = 0.5;
 const UNCLIP: f32 = 1.6;
-/// Regions narrower than this, in the detector's pixels, are dropped.
 const MIN_SIDE: usize = 3;
-/// Lines whose characters average a lower probability are dropped.
 const MIN_SCORE: f32 = 0.5;
 /// A line needs this many letters or digits, and under `SHORT` of them this
-/// probability, to be text rather than texture. Photos with no text read as
-/// one- and two-character lines at 0.3-0.8, and a chunk of one character
-/// matches any query a little; real lines in the same images had 5 or more
-/// at 0.87 or above.
+/// probability, to be text rather than texture: photos with no text read as 1-2
+/// character lines at 0.3-0.8; real lines in the same images had 5 or more at 0.87+.
 const MIN_ALNUM: usize = 3;
 const SHORT: usize = 6;
 const SHORT_SCORE: f32 = 0.8;
-/// A region turns to its principal axis only when that axis is this many
-/// times its other's spread: a word is, a lone glyph's angle means nothing.
+/// A region turns to its principal axis only when elongated 2x: a lone glyph's angle means nothing.
 const MIN_ELONGATION: f32 = 2.0;
 
-/// A line's box in the image's own pixels: its centre, its length along
-/// `(cos, sin)` and its height across it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub cx: f32,
@@ -78,7 +66,6 @@ pub struct Rect {
 }
 
 impl Rect {
-    /// The upright bounds' top and left.
     fn top(&self) -> f32 {
         self.cy - (self.w * self.sin.abs() + self.h * self.cos.abs()) / 2.0
     }
@@ -88,8 +75,6 @@ impl Rect {
     }
 }
 
-/// Running sums over a region's pixels: count, probability, and the first
-/// and second moments of their centres.
 #[derive(Default)]
 struct Moments {
     n: f64,
@@ -113,8 +98,6 @@ impl Moments {
         self.xy += x * y;
     }
 
-    /// The direction of the principal axis, pointing right (or down, when
-    /// it stands upright); along x unless the region is elongated.
     fn axis(&self) -> (f64, f64) {
         let (mx, my) = (self.x / self.n, self.y / self.n);
         let sxx = self.xx / self.n - mx * mx;
@@ -134,27 +117,22 @@ impl Moments {
     }
 }
 
-/// The spread along the major and minor axes: the eigenvalues of the
-/// covariance `[[sxx, sxy], [sxy, syy]]`.
 fn spread(sxx: f64, syy: f64, sxy: f64) -> (f64, f64) {
     let mid = (sxx + syy) / 2.0;
     let gap = (((sxx - syy) / 2.0).powi(2) + sxy * sxy).sqrt();
     (mid + gap, (mid - gap).max(0.0))
 }
 
-/// Black, normalised as the detector's input is.
 const BLACK: f32 = -1.0;
 
-/// An image as the detector's input.
 struct Letterbox {
     input: Vec<f32>,
     scale: f32,
-    /// The scaled image's (height, width), in the input's top left.
     scaled: (usize, usize),
 }
 
-/// `img` scaled into a detector shape `(h, w)` and padded with black, as the
-/// detector's input: BGR, `(x / 255 - 0.5) / 0.5`, channels first.
+/// `img` scaled into a detector shape and padded with black: BGR, `(x / 255 - 0.5) / 0.5`, channels
+/// first.
 fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> Letterbox {
     let (ih, iw) = (img.height() as f32, img.width() as f32);
     let scale = (h as f32 / ih).min(w as f32 / iw).min(MAX_UPSCALE);
@@ -182,9 +160,8 @@ fn letterbox(img: &RgbImage, (h, w): (usize, usize)) -> Letterbox {
     }
 }
 
-/// The detector's map `prob` (`w` wide), over the scaled image's `(nh, nw)`,
-/// to line boxes in the image's pixels. Each 8-connected region above
-/// `THRESH`, after a 2x2 dilation, is a line.
+/// The detector's map to line boxes in the image's pixels: each 8-connected region above `THRESH`,
+/// after a 2x2 dilation, is a line.
 fn boxes(prob: &[f32], w: usize, (nh, nw): (usize, usize), scale: f32) -> Vec<Rect> {
     let mask = dilated(prob, w, (nh, nw));
     let mut seen = vec![false; nh * nw];
@@ -225,9 +202,8 @@ fn boxes(prob: &[f32], w: usize, (nh, nw): (usize, usize), scale: f32) -> Vec<Re
     reading_order(out)
 }
 
-/// The map over `THRESH` dilated by a 2x2 kernel anchored at its centre, as
-/// cv2.dilate does: a pixel is set when it or its left, upper or upper-left
-/// neighbour is (pinned by `tests::regions_become_boxes_grown_by_the_unclip_distance`).
+/// The map over `THRESH` dilated by a 2x2 kernel anchored at its centre, as cv2.dilate does
+/// (pinned by `tests::regions_become_boxes_grown_by_the_unclip_distance`).
 fn dilated(prob: &[f32], w: usize, (nh, nw): (usize, usize)) -> Vec<bool> {
     let on = |x: usize, y: usize| prob[y * w + x] > THRESH;
     let mut mask = vec![false; nh * nw];
@@ -242,9 +218,7 @@ fn dilated(prob: &[f32], w: usize, (nh, nw): (usize, usize)) -> Vec<bool> {
     mask
 }
 
-/// The box around `region` (indices into a map `nw` wide) along its axis,
-/// each pixel taken as its whole square, grown by UNCLIP and scaled back to
-/// the image's pixels; None if it is thinner than MIN_SIDE.
+/// The box around `region` along its axis, grown by UNCLIP; None if thinner than MIN_SIDE.
 fn line_box(region: &[usize], m: &Moments, nw: usize, scale: f32) -> Option<Rect> {
     let (cos, sin) = m.axis();
     let (mx, my) = (m.x / m.n, m.y / m.n);
@@ -272,8 +246,7 @@ fn line_box(region: &[usize], m: &Moments, nw: usize, scale: f32) -> Option<Rect
     })
 }
 
-/// Top to bottom, then left to right among boxes on the same row: within
-/// half the shorter one's height of each other.
+/// Top to bottom, then left to right among boxes within half the shorter one's height.
 fn reading_order(mut rects: Vec<Rect>) -> Vec<Rect> {
     rects.sort_by(|a, b| {
         a.top()
@@ -296,9 +269,8 @@ fn reading_order(mut rects: Vec<Rect>) -> Vec<Rect> {
     out
 }
 
-/// The line `r` sampled out of `img` along its own axes, bilinear, the
-/// image's edge repeated past it (as RapidOCR's warp does); turned a quarter
-/// left when it stands 1.5 times taller than wide, for vertical text.
+/// The line `r` sampled out of `img` along its own axes, bilinear, edge repeated (as RapidOCR's
+/// warp does); turned a quarter left when 1.5 times taller than wide.
 fn crop(img: &RgbImage, r: Rect) -> Option<RgbImage> {
     let (w, h) = (r.w.round() as u32, r.h.round() as u32);
     if w < 2 || h < 2 || u64::from(w) * u64::from(h) > 1 << 26 {
@@ -328,8 +300,6 @@ fn crop(img: &RgbImage, r: Rect) -> Option<RgbImage> {
     })
 }
 
-/// Where the line's pixel `(i, j)` samples `img`, in pixel indices: a
-/// pixel's centre is at +0.5 from its index.
 fn source_point(r: &Rect, i: u32, j: u32) -> (f32, f32) {
     let (u, v) = (i as f32 + 0.5 - r.w / 2.0, j as f32 + 0.5 - r.h / 2.0);
     (
@@ -338,9 +308,8 @@ fn source_point(r: &Rect, i: u32, j: u32) -> (f32, f32) {
     )
 }
 
-/// A line as the recogniser's input: scaled to its height, aspect kept up to
-/// the widest shape, normalised as the detector's, padded with 0 on the
-/// right. Returns the width picked and the input.
+/// A line as the recogniser's input: scaled to its height, normalised as the detector's, padded
+/// with 0 on the right.
 fn rec_input(line: &RgbImage) -> (usize, Vec<f32>) {
     let aspect = line.width() as f32 / line.height() as f32;
     let fit = ((REC_HEIGHT as f32 * aspect).round() as usize).max(1);
@@ -352,7 +321,6 @@ fn rec_input(line: &RgbImage) -> (usize, Vec<f32>) {
     (width, rec_fill(line, fit.min(width), width))
 }
 
-/// `line` scaled to `nw` by the recogniser's height, then padded to `width`.
 fn rec_fill(line: &RgbImage, nw: usize, width: usize) -> Vec<f32> {
     let scaled = image::imageops::resize(line, nw as u32, REC_HEIGHT as u32, FilterType::Triangle);
     let mut x = vec![0f32; 3 * REC_HEIGHT * width];
@@ -366,10 +334,8 @@ fn rec_fill(line: &RgbImage, nw: usize, width: usize) -> Vec<f32> {
     x
 }
 
-/// Greedy CTC over the recogniser's `[steps, classes]` probabilities: the
-/// likeliest class per step, repeats collapsed and blanks (0) dropped.
-/// Class `i` is `chars[i - 1]`; the one past the dict is a space. Returns
-/// the text and its characters' mean probability.
+/// Greedy CTC: the likeliest class per step, repeats collapsed and blanks (0) dropped. Class `i` is
+/// `chars[i - 1]`; the one past the dict is a space.
 fn ctc(probs: &[f32], classes: usize, chars: &[String]) -> (String, f32) {
     let mut text = String::new();
     let (mut sum, mut n) = (0f32, 0usize);
@@ -394,15 +360,13 @@ fn ctc(probs: &[f32], classes: usize, chars: &[String]) -> (String, f32) {
 /// Pages past this in a scanned PDF are left unread: at ~0.5 s a page, a
 /// 100-page scan takes under a minute.
 pub const MAX_SCAN_PAGES: usize = 100;
-/// pdfinfo and pdftoppm get what the document parser does: memory and
-/// CPU seconds a run, and one deadline for the whole scan, so a crafted PDF
-/// that stalls every page holds indexing minutes, not a minute a page.
+/// pdfinfo and pdftoppm get the document parser's limits, and one deadline for the whole scan, so a
+/// crafted PDF that stalls every page holds indexing minutes, not a minute a page.
 const POPPLER_ADDRESS_SPACE: u64 = 1 << 30;
 const POPPLER_CPU_SECONDS: u64 = 30;
 pub const SCAN_WALL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Poppler's pdfinfo and pdftoppm, if both are on PATH (poppler-utils, or
-/// poppler on Arch). Looked up once.
+/// Poppler's pdfinfo and pdftoppm, if both are on PATH. Looked up once.
 pub fn poppler() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
@@ -410,7 +374,6 @@ pub fn poppler() -> bool {
     })
 }
 
-/// `tool` reading the PDF on stdin, under POPPLER's limits.
 fn poppler_command(tool: &str) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(tool);
@@ -435,7 +398,6 @@ fn poppler_command(tool: &str) -> std::process::Command {
     cmd
 }
 
-/// The time left before `deadline`, or an error once it has passed.
 fn left(deadline: Instant) -> Result<std::time::Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     ensure!(
@@ -446,7 +408,6 @@ fn left(deadline: Instant) -> Result<std::time::Duration> {
     Ok(left)
 }
 
-/// The page count of the PDF `bytes`, by `deadline`.
 pub fn pdf_pages(bytes: &[u8], deadline: Instant) -> Result<usize> {
     let mut cmd = poppler_command("pdfinfo");
     cmd.arg("-");
@@ -457,8 +418,6 @@ pub fn pdf_pages(bytes: &[u8], deadline: Instant) -> Result<usize> {
         .context("pdfinfo gave no page count")
 }
 
-/// Page `page` (from 1) of the PDF `bytes`, rendered with its longer side at
-/// the detector's (no more pixels than it reads), by `deadline`.
 pub fn render_page(bytes: &[u8], page: usize, deadline: Instant) -> Result<RgbImage> {
     let longest = DET_SHAPES[0].1.to_string();
     let page = page.to_string();
@@ -472,7 +431,6 @@ pub fn render_page(bytes: &[u8], page: usize, deadline: Instant) -> Result<RgbIm
     )
 }
 
-/// Letters and digits in `lines`, CJK counting double, as `is_text` counts.
 pub fn text_size(lines: &[String]) -> usize {
     lines.iter().map(|l| alnum(l)).sum()
 }
@@ -485,14 +443,12 @@ fn alnum(line: &str) -> usize {
         .sum()
 }
 
-/// Whether a recognised line, with its mean probability, is worth indexing.
-/// Two CJK characters make a word, so they count double.
+/// Whether a recognised line is worth indexing; two CJK characters make a word.
 fn is_text(line: &str, score: f32) -> bool {
     let n = alnum(line);
     score >= MIN_SCORE && n >= MIN_ALNUM && (n >= SHORT || score >= SHORT_SCORE)
 }
 
-/// The recogniser's characters, one a line.
 pub fn read_dict(path: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
     let chars: Vec<String> = text.lines().map(str::to_owned).collect();
@@ -532,9 +488,7 @@ impl Graph {
         })
     }
 
-    /// Run on `input`, the graph's whole input, and hand its output to `read`.
-    /// Copied into the request's own input, rather than a new 25 MB tensor for
-    /// every image.
+    /// Copied into the request's own input rather than a new 25 MB tensor for every image.
     fn run<T>(&mut self, input: &[f32], read: impl FnOnce(&[f32]) -> T) -> Result<T> {
         let mut t = self.request.get_input_tensor()?;
         let data = t.get_data_mut::<f32>()?;
@@ -550,14 +504,11 @@ impl Graph {
     }
 }
 
-/// The detector at each of `DET_SHAPES` and the recogniser at each of
-/// `REC_WIDTHS`, compiled on one device.
 pub struct Ocr {
     det: Vec<Graph>,
     rec: Vec<Graph>,
     chars: Vec<String>,
     classes: usize,
-    /// Where the parity check is recorded.
     cache: PathBuf,
     pub device: String,
 }
@@ -570,8 +521,7 @@ fn rec_shape(w: usize) -> [i64; 4] {
     [1, 3, REC_HEIGHT as i64, w as i64]
 }
 
-/// Cosine of two outputs, summed in f64: over millions of values, f32 sums
-/// drift past 1.
+/// Cosine in f64: over millions of values, f32 sums drift past 1.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
     for (&x, &y) in a.iter().zip(b) {
@@ -583,8 +533,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (ab / (aa.sqrt() * bb.sqrt())) as f32
 }
 
-/// Each graph's cache directory under `root`: its own, since a cache miss
-/// drops the older blobs in its directory.
+/// Each graph's own cache directory under `root`: a cache miss drops the older blobs in its
+/// directory.
 pub fn stages() -> Vec<String> {
     let det = DET_SHAPES.iter().map(|(h, w)| format!("ocrdet{h}x{w}"));
     let rec = REC_WIDTHS.iter().map(|w| format!("ocrrec{w}"));
@@ -639,10 +589,9 @@ impl Ocr {
         })
     }
 
-    /// Compile on `device`; on another than the CPU, check it against the
-    /// CPU on a fixed input, as the embedding stages are, whenever it
-    /// compiled fresh or wasn't checked under this OpenVINO. Off the CPU's
-    /// answer, it runs on the CPU instead.
+    /// Compile on `device`; off the CPU, check it against the CPU on a fixed input whenever it
+    /// compiled fresh or wasn't checked under this OpenVINO. Off the CPU's answer, it runs on the
+    /// CPU.
     pub fn new(core: &mut Core, dir: &Path, device: &str, cache_root: &Path) -> Result<Self> {
         ensure!(
             crate::ml::model::ocr_present(dir),
@@ -674,8 +623,8 @@ impl Ocr {
         Ok(ocr)
     }
 
-    /// Every graph's output for a fixed input: dark bars on white, like lines
-    /// of text, so the detector's map isn't all zero.
+    /// Every graph's output for a fixed input: dark bars on white, so the detector's map isn't all
+    /// zero.
     fn probe(&mut self) -> Result<Vec<f32>> {
         let page = RgbImage::from_fn(960, 540, |x, y| {
             let bar = (y / 18) % 3 == 1 && (x / 9) % 7 != 0 && x > 40 && x < 900;
@@ -692,8 +641,6 @@ impl Ocr {
         Ok(out)
     }
 
-    /// The lines of text in `img`, in reading order. `share` of the device's
-    /// time, as document embedding takes it.
     pub fn read(&mut self, img: &RgbImage, share: f64) -> Result<Vec<String>> {
         if img.width() < 2 || img.height() < 2 {
             return Ok(Vec::new());

@@ -49,10 +49,9 @@ use std::time::Duration;
 pub const DEFAULT_DEVICE: &str = "NPU";
 pub const DEFAULT_IDLE_UNLOAD_MINUTES: f64 = 5.0;
 pub const DEFAULT_INDEX_BUSY_PERCENT: u8 = 50;
-/// Big trees of downloaded or installed files that live in the home folder
-/// under names too common to skip everywhere (`pkg`, `sdk`, `Games`): Snap's
-/// packages, Go's module cache and SDKs, Android's SDK, per-user R and Perl
-/// libraries, and the games Heroic, Lutris and others install.
+/// Big trees of downloaded or installed files in the home folder under names
+/// too common to skip everywhere (`pkg`, `sdk`, `Games`): Snap, Go, Android SDK,
+/// R and Perl libraries, game launchers.
 pub const DEFAULT_EXCLUDE: &[&str] = &[
     "~/snap",
     "~/go/pkg",
@@ -63,27 +62,22 @@ pub const DEFAULT_EXCLUDE: &[&str] = &[
     "~/Games",
 ];
 
-/// Text results scoring below this are left out. An off-topic query against a
-/// code index topped out at 0.60; real matches scored 0.72 to 0.83. Not
-/// higher: at 0.66 the evals' paraphrases fall from 0.909 recall@1 to
-/// 0.873, as some right answers score 0.65 to 0.66.
+/// Text results below this are left out. An off-topic query against a code
+/// index topped out at 0.60, real matches 0.72 to 0.83. Not higher: at 0.66 the
+/// evals' paraphrases fall from 0.909 recall@1 to 0.873.
 pub const DEFAULT_TEXT_MIN_SCORE: f32 = 0.65;
-/// Code results (queries starting `code:`) scoring below this are
-/// left out. The code retrieval prompt scores higher than the search one:
-/// on ovfetch's source (251 chunks), the right function for 12 queries
-/// scored 0.76 to 0.92 and the best match for 4 unrelated ones 0.64 to 0.70.
+/// Code results (`code:`) below this are left out. On ovfetch's source (251
+/// chunks), the right function for 12 queries scored 0.76 to 0.92, the best match
+/// for 4 unrelated ones 0.64 to 0.70.
 pub const DEFAULT_CODE_MIN_SCORE: f32 = 0.72;
-/// Images score lower against a text query than text does. On Flickr30k's 1k
-/// test images, 0.60 showed images for 85% of off-topic queries ("bills",
-/// "tax return") and 0.63 for 38%, while 99.8% of captions still found their
-/// own image. On a home folder of 153 images (2026-11-13), off-topic single
-/// words ("valorant", "Pokemon") put photos at up to 0.677 and right
-/// matches scored 0.73 to 0.89.
+/// Images score lower against a text query. On Flickr30k's 1k test images, 0.60
+/// showed images for 85% of off-topic queries and 0.63 for 38%, while 99.8% of
+/// captions still found their image. On 153 home-folder images (2026-11-13),
+/// off-topic words put photos at up to 0.677, right matches at 0.73 to 0.89.
 pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.68;
-/// The A/V search spike's right windows scored 0.67 to 0.75 and its wrong ones up
-/// to 0.05 less. On a home folder of 36 videos (2026-11-13), off-topic
-/// single words put most at up to 0.66 (two at 0.69 and 0.70), and videos
-/// named for the query scored 0.68 to 0.82.
+/// On the A/V spike, right windows scored 0.67 to 0.75, wrong ones up to 0.05
+/// less. On 36 home-folder videos (2026-11-13), off-topic words put most at up to
+/// 0.66 (two at 0.69, 0.70), videos named for the query at 0.68 to 0.82.
 pub const DEFAULT_MEDIA_MIN_SCORE: f32 = 0.68;
 pub const DEFAULT_MEDIA_MAX_HOURS: f32 = 3.0;
 /// Audio and video files, by extension. Not `ts`: TypeScript has it.
@@ -96,11 +90,9 @@ pub const MEDIA_EXTENSIONS: &[&str] = &[
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif", "avif",
 ];
-/// Where heif-convert comes from, for the messages that say to install it.
 pub const HEIF_CONVERT_PACKAGES: &str =
     "libheif-tools on Fedora, libheif-examples on Debian and Ubuntu, libheif on Arch";
 
-/// `index_busy_percent` as a share of the device's time, in (0, 1].
 pub fn index_share(percent: u8) -> Result<f64> {
     if !(1..=100).contains(&percent) {
         bail!("index_busy_percent must be 1 to 100");
@@ -108,7 +100,6 @@ pub fn index_share(percent: u8) -> Result<f64> {
     Ok(f64::from(percent) / 100.0)
 }
 
-/// How long the model may sit idle before it is freed; None keeps it loaded.
 pub fn idle_unload(minutes: f64) -> Result<Option<Duration>> {
     if !(minutes >= 0.0 && minutes.is_finite()) {
         bail!("idle_unload_minutes must be 0 or more");
@@ -149,15 +140,12 @@ pub struct Config {
     /// run without a shell [default: the default app for the file's type].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<String>,
-    /// What kinds of file are indexed, and how close a result must be.
     pub formats: Formats,
-    /// Encrypting the index at rest.
     pub encryption: Encryption,
 }
 
-/// The index encrypted with SQLCipher, its key sealed by `systemd-creds` to
-/// this machine's TPM and this user, or kept in the desktop keyring where
-/// `systemd-creds` can't be used.
+/// SQLCipher encryption, the key sealed by `systemd-creds` to this TPM and user,
+/// else kept in the desktop keyring.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Encryption {
@@ -192,7 +180,6 @@ pub struct Formats {
     pub media: MediaFormat,
 }
 
-/// Text is always indexed for now.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextFormat {
@@ -212,9 +199,8 @@ pub struct ImageFormat {
     pub min_score: Option<f32>,
 }
 
-/// PDF, Office and OpenDocument files, spreadsheets, CSV, EPUB,
-/// subtitles, `.doc`, `.ppt` and RTF. Searched
-/// with text, so they share its `min_score`.
+/// PDF, Office, OpenDocument, spreadsheets, CSV, EPUB, subtitles, `.doc`,
+/// `.ppt` and RTF, searched with text so sharing its `min_score`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DocumentFormat {
@@ -237,9 +223,8 @@ pub struct CodeFormat {
     pub min_score: Option<f32>,
 }
 
-/// vinoWhisper sessions: `.vwsession` bundles, each a transcript and
-/// its summary, searched with text. Read from vinoWhisper's own folder as
-/// well as the folders indexed.
+/// vinoWhisper sessions: `.vwsession` bundles (transcript and summary),
+/// searched with text; also read from vinoWhisper's own folder.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionFormat {
@@ -281,7 +266,6 @@ impl Default for Config {
     }
 }
 
-/// A `min_score`, checked: a cosine, so -1 to 1.
 pub fn min_score(score: Option<f32>, default: f32) -> Result<f32> {
     let s = score.unwrap_or(default);
     if !(-1.0..=1.0).contains(&s) {
@@ -315,7 +299,6 @@ impl Formats {
         min_score(self.media.min_score, DEFAULT_MEDIA_MIN_SCORE)
     }
 
-    /// The longest file indexed, in seconds.
     pub fn media_max_seconds(&self) -> Result<f64> {
         let h = self.media.max_hours.unwrap_or(DEFAULT_MEDIA_MAX_HOURS);
         if !(h > 0.0 && h <= 24.0) {
@@ -336,8 +319,7 @@ impl Formats {
         min_score(self.images.min_score, DEFAULT_IMAGE_MIN_SCORE)
     }
 
-    /// The extensions images are indexed by, lower case and without a dot;
-    /// empty while images are off.
+    /// Image extensions, lower case without a dot; empty while images are off.
     pub fn image_extensions(&self) -> Result<Vec<String>> {
         if !self.images_enabled() {
             return Ok(Vec::new());
@@ -375,9 +357,8 @@ impl Config {
         toml::from_str(&text).with_context(|| path.display().to_string())
     }
 
-    /// Write these settings to `path`, keeping the comments and layout of what
-    /// is already there. Written whole and renamed into place, so a runner
-    /// re-reading the file never sees half of it.
+    /// Write these settings to `path`, keeping comments and layout. Written whole
+    /// and renamed into place, so a runner re-reading never sees half.
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
@@ -538,9 +519,8 @@ impl Config {
     }
 }
 
-/// A name of its own per save, so two windows saving at once don't rename
-/// each other's file away (pinned by
-/// `tests::saves_at_once_dont_trip_over_each_other`).
+/// A name of its own per save, so two saves at once don't rename each other's
+/// file away (pinned by
 fn tmp_path_of_this_save(path: &Path) -> PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -572,7 +552,6 @@ fn replace_keeping_comments(old: &mut toml_edit::Item, new: toml_edit::Item) {
     *old.as_value_mut().unwrap().decor_mut() = decor;
 }
 
-/// Set or remove `<table>.<key>`, dropping the table once it is empty.
 fn set_table(
     doc: &mut toml_edit::DocumentMut,
     table: &str,
@@ -601,7 +580,6 @@ fn set_table(
     }
 }
 
-/// Set or remove `formats.<format>.<key>`, dropping tables left empty.
 fn set(doc: &mut toml_edit::DocumentMut, format: &str, key: &str, value: Option<toml_edit::Item>) {
     let Some(value) = value else {
         if let Some(formats) = doc.get_mut("formats").and_then(|i| i.as_table_like_mut()) {
@@ -639,10 +617,10 @@ fn set(doc: &mut toml_edit::DocumentMut, format: &str, key: &str, value: Option<
     }
 }
 
-/// `~/x` against `home`, made absolute and free of `.`/`..`, then its
-/// longest existing ancestor canonicalized, so it compares equal to the
-/// canonical paths indexing records, including once a folder that is missing
-/// now is created (on Silverblue, `/home` is a symlink to `/var/home`).
+/// `~/x` against `home`, absolute and free of `.`/`..`, its longest existing
+/// ancestor canonicalized so it equals the canonical paths indexing records, even
+/// once a missing folder is created (on Silverblue `/home` is a symlink to
+/// `/var/home`).
 fn resolve(entry: &str, home: &Path) -> Result<PathBuf> {
     let raw = match entry.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -665,8 +643,6 @@ fn resolve(entry: &str, home: &Path) -> Result<PathBuf> {
     Ok(canonical_prefix(&clean))
 }
 
-/// `path` with its longest existing ancestor canonicalized and the rest
-/// appended as written.
 fn canonical_prefix(path: &Path) -> PathBuf {
     for base in path.ancestors() {
         if let Ok(canon) = fs::canonicalize(base) {

@@ -4,11 +4,9 @@
 //! code and sessions as a list with their snippet, narrowed by kind, folder,
 //! date and file type.
 //!
-//! A window of its own rather than a page among the settings: it opens per
-//! query, wants the room a grid needs, and the settings already have a Search
-//! page (what counts as a match). It shares their theme, header and
-//! accessibility helpers. Like them it asks the runner over D-Bus and never
-//! loads the model itself.
+//! A window of its own rather than a settings page: it opens per query and wants the room a grid
+//! needs. It shares the settings' theme, header and accessibility helpers, and asks the runner over
+//! D-Bus; it never loads the model.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,24 +32,17 @@ use thumbs::{Thumb, Thumbs};
 const TITLE: &str = "vinoSearch";
 /// As KRunner's plugin and GNOME Shell's provider: fewer letters say too little.
 const MIN_QUERY_CHARS: usize = 3;
-/// Typing pauses this long before the query is searched.
 const TYPING_PAUSE: f64 = 0.4;
 const TILE: f32 = 150.0;
-/// Below a tile, its file name.
 const TILE_LABEL: f32 = 24.0;
 const TILE_RADIUS: f32 = 10.0;
-/// The file tile standing in for a thumbnail the grid can't make.
 const GRID_TILE: f32 = 60.0;
 const DAY: i64 = 86_400;
-/// A filter menu's width, and the least it is squeezed to before it wraps.
 const MENU_WIDTH: f32 = 180.0;
 const MENU_MIN: f32 = 140.0;
-/// A filter menu's icon, and the gap after it.
 const MENU_ICON: f32 = 16.0 + 6.0;
-/// The header's content, from the window's left and right edges.
 const HEADER_INSET: f32 = 20.0;
-/// The sections shown as grids: a video's thumbnail is its picture, so media
-/// is a grid as photos are.
+/// Sections shown as grids: a video's thumbnail is its picture.
 const GRIDS: [(&str, [Kind; 1]); 2] = [("Images", [Kind::Image]), ("Media", [Kind::Media])];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +73,6 @@ impl Modified {
         }
     }
 
-    /// The oldest mtime that passes, in Unix seconds.
     fn since(self, now: i64) -> i64 {
         now - match self {
             Modified::Any => return i64::MIN,
@@ -102,10 +92,8 @@ struct Filters {
     code: bool,
     sessions: bool,
     media: bool,
-    /// An indexed root; None for all of them.
     folder: Option<String>,
     modified: Modified,
-    /// A lowercased extension; None for any.
     extension: Option<String>,
 }
 
@@ -144,11 +132,9 @@ impl Filters {
     }
 }
 
-/// An action on a result.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Act {
     Open,
-    /// A session that plays its recording by default: its transcript.
     OpenTranscript,
     OpenFolder,
     Copy,
@@ -156,9 +142,7 @@ enum Act {
 
 pub struct SearchWindow {
     query: String,
-    /// The query the results are for, or are being searched for.
     searched: String,
-    /// When the query was last typed in, until it is searched.
     typed_at: Option<f64>,
     /// Numbers each search, so an answer to an older one is dropped.
     asked: u64,
@@ -166,20 +150,15 @@ pub struct SearchWindow {
     results: Vec<Found>,
     error: Option<String>,
     filters: Filters,
-    /// A result's path.
     selected: Option<String>,
     notice: Option<String>,
     link: Link,
     thumbs: Thumbs,
-    /// Put the cursor in the search field on the next frame.
     focus_query: bool,
-    /// Move focus to the first result on the next frame.
     focus_first: bool,
-    /// Unix seconds, for the date filter; the clock in the app.
     now: fn() -> i64,
     focused: bool,
     kde_header: Option<theme::KdeHeader>,
-    /// The window's buttons and edges are drawn here, not by the desktop.
     app_title_bar: bool,
     text_scale: f32,
 }
@@ -255,7 +234,6 @@ impl SearchWindow {
             .collect()
     }
 
-    /// Answers from the link thread.
     fn take_answers(&mut self) {
         let (results, refused) = {
             let mut shared = self.link.shared.lock().unwrap();
@@ -287,7 +265,6 @@ impl SearchWindow {
         }
     }
 
-    /// A filter for a type these results don't have would hide everything.
     fn drop_a_type_filter_these_results_lack(&mut self) {
         if let Some(e) = &self.filters.extension
             && !self.results.iter().any(|f| f.extension() == *e)
@@ -331,8 +308,6 @@ impl SearchWindow {
             });
     }
 
-    /// Back from the background: the desktop's light/dark switch or text
-    /// size may have changed.
     fn catch_up_on_focus(&mut self, ctx: &egui::Context) {
         theme::follow_desktop(ctx);
         self.kde_header = theme::kde_header();
@@ -381,9 +356,8 @@ impl SearchWindow {
         }
     }
 
-    /// The query and the filters. With the app's title bar the window's
-    /// buttons go up in the corner, as in the settings window's bar, and the
-    /// filters keep the inset the buttons gave up (pinned by
+    /// The query and the filters. With the app's title bar the window buttons go up in the corner
+    /// and the filters keep the inset they gave up (pinned by
     /// `window::search::ui_tests::the_window_buttons_sit_in_the_top_right_corner`).
     fn header(&mut self, root: &mut egui::Ui, p: &theme::Palette, header: theme::Header) {
         egui::Panel::top("search-header")
@@ -414,8 +388,7 @@ impl SearchWindow {
             });
     }
 
-    /// Enter searches and keeps the field focused, so Enter again goes to the
-    /// results, as Down does.
+    /// Enter searches and keeps the field focused, so Enter again goes to the results.
     fn query_row(&mut self, ui: &mut egui::Ui, right_inset: f32) {
         ui.spacing_mut().item_spacing.x = 12.0;
         vino_ui::logo::search(ui, 28.0);
@@ -457,7 +430,6 @@ impl SearchWindow {
         }
     }
 
-    /// The selected result's actions, along the bottom.
     fn actions(&mut self, root: &mut egui::Ui, p: &theme::Palette, f: &Found) {
         egui::Panel::bottom("actions")
             .show_separator_line(false)
@@ -798,9 +770,8 @@ impl SearchWindow {
         response
     }
 
-    /// Focus and select `f`, which an arrow key moved to. egui's own
-    /// arrow-key move is dropped: it goes to the nearest widget, which in a
-    /// wrapped grid is often the wrong one.
+    /// Focus and select `f`, which an arrow key moved to; egui's own arrow-key move is dropped
+    /// because it goes to the nearest widget, often the wrong one in a wrapped grid.
     fn move_to(&mut self, ui: &egui::Ui, f: Option<&Found>) {
         if let Some(f) = f {
             ui.memory_mut(|m| {
@@ -811,9 +782,6 @@ impl SearchWindow {
         }
     }
 
-    /// What every result does: named for a screen reader, selected on a
-    /// click or when Tab reaches it, opened on a double click or Enter, and
-    /// a menu of actions on a right click.
     fn respond(&mut self, ui: &egui::Ui, response: &egui::Response, f: &Found, first: &mut bool) {
         let selected = self.selected.as_deref() == Some(f.path.as_str());
         let mut name = f.name().to_owned();
@@ -853,13 +821,11 @@ impl SearchWindow {
     }
 }
 
-/// A vinoWhisper session bundle's extension (the indexer's
-/// `extract::session::EXTENSION`, which this crate can't reach).
+/// A vinoWhisper session bundle's extension (the indexer's `extract::session::EXTENSION`).
 const SESSION: &str = "vwsession";
 
-/// A file's tile: vino-ui's for its format, by extension, so a file looks
-/// the same here as in vinoSpeak; the vinoWhisper logo for a session, and
-/// for a recording found in one.
+/// A file's tile: vino-ui's for its format, so a file looks the same here as in vinoSpeak; the
+/// vinoWhisper logo for a session or a recording found in one.
 fn tile(ui: &mut egui::Ui, f: &Found, size: f32) -> egui::Response {
     match format_of(&f.path) {
         Some(format) => file_tile::file(ui, format, size),
@@ -867,7 +833,6 @@ fn tile(ui: &mut egui::Ui, f: &Found, size: f32) -> egui::Response {
     }
 }
 
-/// The format a path's tile shows, or None for a session.
 fn format_of(path: &str) -> Option<Format> {
     let path = Path::new(path);
     let session = path
@@ -876,8 +841,6 @@ fn format_of(path: &str) -> Option<Format> {
     (!session).then(|| Format::of(path))
 }
 
-/// Where an arrow key moves from result `i` of `len`, the focused one: `down`
-/// results on for Down, `across` for Right (0 where Left and Right do nothing).
 fn arrows(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -904,17 +867,16 @@ fn arrows(
     to.filter(|&to| to < len)
 }
 
-/// A result's own id, whatever is around it: one from its place in the layout
-/// changes when the action bar appears, which would drop its focus.
+/// A result's own id: one from its place in the layout changes when the action bar appears, which
+/// would drop its focus.
 fn result_id(f: &Found) -> egui::Id {
     egui::Id::unique(("vinosearch-result", &f.path))
 }
 
-/// A filter's menu with an icon before it, named by `label` for a screen
-/// reader and kept on one line with its icon when the bar wraps, which it
-/// does at `wrap_at`: a wrapping row's own width grows with what overflows it.
-/// A group of its own doesn't wrap as a widget does, and the combo would
-/// shrink into whatever the row has left, so it goes on to the next row.
+/// A filter's menu with an icon before it, named by `label` for a screen reader and kept on one
+/// line with its icon when the bar wraps at `wrap_at` (a wrapping row's own width grows with what
+/// overflows it; a group of its own doesn't wrap as a widget does, so the combo goes on to the next
+/// row).
 fn menu(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -937,8 +899,6 @@ fn menu(
     });
 }
 
-/// The three filter menus stay together: on the chips' row behind a rule
-/// where they fit, else on a row of their own.
 fn keep_the_menus_together(ui: &mut egui::Ui, p: &theme::Palette, wrap_at: f32) {
     const MENUS: f32 = 3.0 * (MENU_ICON + MENU_WIDTH) + 2.0 * 8.0;
     if wrap_at - ui.cursor().left() < 1.0 + 8.0 + MENUS {
@@ -961,7 +921,6 @@ fn window_buttons_at_the_top(ui: &mut egui::Ui) {
     });
 }
 
-/// "PDF", "JPG"; "No extension" for none.
 fn type_name(extension: &str) -> String {
     if extension.is_empty() {
         "No extension".to_owned()
@@ -970,7 +929,6 @@ fn type_name(extension: &str) -> String {
     }
 }
 
-/// A section's label: small caps with the count after it, read as "Images (8)".
 fn section(ui: &mut egui::Ui, title: &str, n: usize) {
     let p = theme::palette(ui.ctx());
     ui.add_space(8.0);
@@ -1053,10 +1011,8 @@ mod ui_tests;
 mod tests {
     use super::*;
 
-    /// The lists vinoSearch indexes by (`src/extract.rs`, `src/index/code.rs`, the
-    /// default image extensions) aren't reachable from this crate; vino-ui's
-    /// own test walks them. This checks the tile picked for each kind, and
-    /// that a session gets the logo.
+    /// The lists vinoSearch indexes by aren't reachable from this crate; vino-ui's own test walks
+    /// them. This checks the tile for each kind, and that a session gets the logo.
     #[test]
     fn a_file_gets_the_tile_of_its_format_and_a_session_the_logo() {
         assert_eq!(format_of("/a/b.PDF"), Some(Format::Pdf));

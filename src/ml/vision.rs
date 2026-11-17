@@ -24,19 +24,15 @@ pub const PATCHES: usize = SOFT_TOKENS * POOL * POOL;
 pub const PATCH_DIM: usize = PATCH * PATCH * 3;
 use vinosearch_shared::limits::MAX_DECODED_BYTES;
 
-/// One image, patched and padded for the vision encoder.
 pub struct Pixels {
     /// `[PATCHES, PATCH_DIM]`: each patch's rows, then columns, then RGB, in
     /// 0..1. Padding patches are 0.
     pub values: Vec<f32>,
-    /// `[PATCHES, 2]`: each patch's (column, row); padding is (-1, -1).
     pub positions: Vec<i64>,
-    /// Soft tokens the image fills, so the rows of the encoder's output that
-    /// are the image: (rows / 3) * (columns / 3) of its patch grid.
+    /// Soft tokens the image fills: (rows / 3) * (columns / 3) of its patch grid.
     pub tokens: usize,
 }
 
-/// Gemma4ImageProcessor's `get_aspect_ratio_preserving_size`, as (height, width).
 fn target_size(height: u32, width: u32) -> Result<(u32, u32)> {
     let side = (POOL * PATCH) as f64;
     let factor = ((PATCHES * PATCH * PATCH) as f64 / (f64::from(height) * f64::from(width))).sqrt();
@@ -55,10 +51,8 @@ fn target_size(height: u32, width: u32) -> Result<(u32, u32)> {
     Ok((h as u32, w as u32))
 }
 
-/// HEIF containers: HEIC from iPhones (and some Android phones), AVIF. The
-/// `image` crate decodes neither, so they go through libheif's heif-convert
-/// when it is installed. By extension, as `formats.images.extensions`
-/// names them.
+/// HEIF containers: HEIC from phones, AVIF. The `image` crate decodes neither, so they go through
+/// libheif's heif-convert when installed.
 pub const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
 /// heif-convert on a 12-megapixel photo takes about a second; a hang
 /// shouldn't hold indexing for long.
@@ -66,13 +60,12 @@ const CONVERT_WALL: Duration = Duration::from_secs(60);
 /// What heif-convert names the first image of a file holding several (a
 /// burst), instead of `out.jpg`.
 const FIRST_OF_A_BURST: &str = "out-1.jpg";
-/// Catmull-Rom is bicubic with a = -0.5, which is what torchvision's
-/// antialiased bicubic resize uses; image's filter widens when shrinking, as
-/// antialiasing does.
+/// Catmull-Rom is bicubic with a = -0.5, torchvision's antialiased bicubic; image's filter widens
+/// when shrinking, as antialiasing does.
 const ANTIALIASED_BICUBIC: FilterType = FilterType::CatmullRom;
 
-/// An image this build has no decoder for, told apart from a broken file so
-/// the indexer can count it and say what to install.
+/// An image this build has no decoder for, told apart from a broken file so the indexer can count
+/// it.
 #[derive(Debug)]
 pub struct NoDecoder;
 
@@ -88,8 +81,7 @@ impl std::fmt::Display for NoDecoder {
 
 impl std::error::Error for NoDecoder {}
 
-/// An ISO base media file whose brand is a HEIF image: `ftyp` at byte 4,
-/// then the major brand.
+/// An ISO base media file whose major brand is HEIF (`ftyp` at byte 4).
 fn is_heif(bytes: &[u8]) -> bool {
     bytes.len() >= 12
         && &bytes[4..8] == b"ftyp"
@@ -108,8 +100,7 @@ fn is_heif(bytes: &[u8]) -> bool {
         )
 }
 
-/// heif-convert, if it is on PATH. Looked up once: a tree of HEIC files
-/// with no decoder would otherwise search PATH for each.
+/// heif-convert, if on PATH; looked up once.
 pub fn heif_convert() -> Option<&'static Path> {
     static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOUND
@@ -139,8 +130,7 @@ fn heif_scratch() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// A new directory under `parent`, made by this call and no earlier one: a
-/// name left behind by a crash is skipped, not reused.
+/// A new directory made by this call and no earlier one: a name left by a crash is skipped.
 fn fresh_dir(parent: &Path) -> Result<PathBuf> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..100 {
@@ -155,9 +145,8 @@ fn fresh_dir(parent: &Path) -> Result<PathBuf> {
     bail!("no free directory under {}", parent.display())
 }
 
-/// Decode a HEIF file by converting it to JPEG with heif-convert in a
-/// directory of its own. libheif applies the file's rotation and mirroring
-/// properties as it decodes.
+/// Decode a HEIF file by converting it to JPEG with heif-convert in a directory of its own; libheif
+/// applies rotation and mirroring.
 fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
     let Some(tool) = heif_convert() else {
         return Err(NoDecoder.into());
@@ -183,8 +172,6 @@ fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
     decode(&converted?)
 }
 
-/// Decode an image file's bytes, turned upright by its EXIF orientation.
-/// Animations give their first frame.
 pub fn load(bytes: &[u8]) -> Result<RgbImage> {
     if is_heif(bytes) {
         return load_heif(bytes);
@@ -216,8 +203,7 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
     Ok(img.to_rgb8())
 }
 
-/// What decoding, orienting and converting to RGB hold, judged from the
-/// header (pinned by
+/// What decoding, orienting and converting to RGB hold, judged from the header (pinned by
 /// `tests::an_image_too_big_to_decode_is_refused_from_its_header`).
 fn bytes_to_decode(w: u32, h: u32, decoded: u64) -> u64 {
     2 * decoded + u64::from(w) * u64::from(h) * 3
@@ -235,8 +221,8 @@ pub fn prepare(img: &RgbImage) -> Result<Pixels> {
     patchify(img)
 }
 
-/// Cut an image whose sides are multiples of 48 into patches, padded to `PATCHES`.
-/// It needs one whole soft token at least, so it has a row of features
+/// Cut an image whose sides are multiples of 48 into patches, padded to `PATCHES`; needs a whole
+/// soft token at least
 /// (pinned by `tests::a_grid_of_one_whole_soft_token_is_taken`,
 /// `tests::a_grid_without_a_whole_soft_token_is_refused`).
 fn patchify(img: &RgbImage) -> Result<Pixels> {
@@ -305,8 +291,6 @@ mod tests {
         std::fs::remove_dir_all(&parent).unwrap();
     }
 
-    /// As `get_aspect_ratio_preserving_size(h, w, 16, 1260, 3)` in transformers
-    /// 5.20.1 gives them.
     #[test]
     fn sizes_match_the_processor() {
         for ((h, w), want) in [
@@ -336,7 +320,6 @@ mod tests {
         assert!(err.contains("needs"), "{err}");
     }
 
-    /// A 24-bit BMP's header alone; 40,000 x 40,000 is 4.8 GB decoded.
     fn bmp_header(w: i32, h: i32) -> Vec<u8> {
         const FILE_SIZE_UNCHECKED: u32 = 54;
         const PIXEL_DATA_OFFSET: u32 = 54;
@@ -422,8 +405,6 @@ mod tests {
         assert!(right[2] > 200 && right[0] < 60, "right {right:?}");
     }
 
-    /// An APP1 segment to follow SOI: Exif, a little-endian TIFF header, one
-    /// IFD entry, Orientation (0x0112) SHORT 6.
     fn exif_orientation_6_app1() -> Vec<u8> {
         let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0".to_vec();
         exif.extend([0; 4]);

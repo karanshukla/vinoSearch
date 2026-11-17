@@ -2,18 +2,16 @@
 //!
 //! OpenVINO's handles are not Send, so queries (from the KRunner interface)
 //! come here over a channel. Everything else is state the worker brings the
-//! index in line with, a step at a time (#137): the settings as the watcher
-//! last read them and requests that change the index (`Pending`), and the
-//! paths that need checking (`Work`), each once however often it was asked
-//! for. A step applies what changed in the settings, then takes the most
-//! urgent item: a path the watcher saw change, a root to index, a path a
-//! walk found, the rest of a long document. No item carries a copy of the
-//! settings, so each is checked under the current ones, and a file being
-//! indexed when they change stops after its chunk and is checked again.
+//! index in line with a step at a time: the settings as last read and requests
+//! that change the index (`Pending`), and paths to check (`Work`), each once.
+//! A step applies what changed in the settings, then takes the most urgent
+//! item: a changed path, a root, a walk's finding, the rest of a long document.
+//! A file being indexed when settings change stops after its chunk and is
+//! checked again under them.
 //!
 //! The model is loaded on demand and dropped, with the vector cache, after
-//! `idle` without a job, as the other vino projects do. What the worker is
-//! doing is published in `Status`, so status queries never wait behind it.
+//! `idle` without a job. `Status` publishes what the worker is doing, so status
+//! queries never wait behind it.
 
 use crate::config::{self, Config, Excludes};
 use crate::index::encryption::{self, Want};
@@ -29,45 +27,32 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-/// How long the document stage stays compiled after its last use. It holds
-/// ~430 MB on top of the query stage and reloads from the cache in ~0.1 s,
-/// so it goes long before the model's idle unload, which queries keep
-/// putting off. Long enough to cover a run of saves a few seconds apart.
+/// How long the document stage stays compiled after its last use: it holds
+/// ~430 MB and reloads from the cache in ~0.1 s, so it goes well before the
+/// model's idle unload.
 const DOCS_HOLD: Duration = Duration::from_secs(60);
 
 pub enum Job {
-    /// Best `k` chunks of each kind for a query, text first; of code alone
-    /// for one starting `code:` (#110).
     Match {
         query: String,
         k: usize,
         reply: oneshot::Sender<Vec<Hit>>,
     },
-    /// Something arrived in `Work` or `Pending`: look, if the worker is
-    /// waiting for a job.
     Wake,
-    /// The model may load now (a download finished), or indexing was
-    /// resumed (a pause ended, power allows it): run what waited for it.
+    /// The model may load now, or indexing resumed: run what waited.
     Retry,
 }
 
-/// A change to the index outside indexing, applied at the worker's next
-/// step. Those that drop or convert what a file being indexed may be going
-/// into stop that file first (`stops_indexing`); the others wait for it.
+/// A change to the index outside indexing. Those that drop or convert what a
+/// file being indexed may be going into stop it first (`stops_indexing`); the
+/// others wait.
 #[derive(Debug, PartialEq)]
 pub enum Request {
-    /// Stop indexing and watching a root, and drop what was indexed under it.
     Forget(PathBuf),
-    /// Bring the index to the config file's `encryption` now, rather than
-    /// at the watcher's next read of it, or try again after a refusal.
     Encryption(Want),
-    /// Encrypt the index again under a new key.
     Rekey,
-    /// Free the model now instead of waiting for the idle timeout.
     Unload,
-    /// Unload and delete the model's files.
     DeleteModel,
-    /// Delete OpenVINO's compiled-model cache (the next load recompiles).
     ClearCache,
 }
 
@@ -82,12 +67,10 @@ impl Request {
     }
 }
 
-/// The config file as the watcher last read it, and requests that change
-/// the index, for the worker to apply at its next step: nothing waits in a
-/// queue behind indexing. The generation moves with every write that a file
-/// being indexed must not run past (new exclusions, a forgotten root,
-/// encryption): the worker stops after the chunk it is on, applies what is
-/// here, and checks the file again under the new settings.
+/// The config as last read, and requests that change the index, applied at
+/// the worker's next step. The generation moves with every write a file being
+/// indexed must not run past (new exclusions, a forgotten root, encryption):
+/// the worker stops after its chunk and checks the file again.
 #[derive(Default)]
 pub struct Pending {
     generation: AtomicU64,
@@ -100,7 +83,6 @@ struct Waiting {
     requests: Vec<Request>,
 }
 
-/// What a take of `Pending` hands over, and the generation it is current to.
 struct Arrived {
     generation: u64,
     config: Option<Config>,
@@ -108,9 +90,7 @@ struct Arrived {
 }
 
 impl Pending {
-    /// The config file changed. The latest one stands; its exclusions and
-    /// file types (dropping what is now excluded or turned off), device,
-    /// idle timeout and the rest apply, except where a flag overrides them.
+    /// The latest config stands, except where a flag overrides it.
     pub fn config(&self, file: Config) {
         let mut p = self.inner.lock().unwrap();
         p.config = Some(file);
@@ -131,7 +111,6 @@ impl Pending {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// What arrived since the last take.
     fn take(&self) -> Arrived {
         let mut p = self.inner.lock().unwrap();
         Arrived {
@@ -141,9 +120,8 @@ impl Pending {
         }
     }
 
-    /// Take the encryption requests alone, leaving the rest for the worker
-    /// once the index's key is had: the last Want asked for, if any. A
-    /// Rekey goes too: there is nothing to re-key until the key is had.
+    /// The encryption requests alone: the last Want, and a Rekey; the rest wait
+    /// for the index's key.
     fn take_encryption(&self) -> Option<Want> {
         let mut p = self.inner.lock().unwrap();
         let mut want = None;
@@ -159,14 +137,10 @@ impl Pending {
     }
 }
 
-/// Paths to check against the index, each once however many times it was
-/// asked for: the watcher's debounced batches, its check of every root and
-/// a Reindex of one can all name the same file. The worker takes the most
-/// urgent: a root to register and walk (asked for, and needing no model, so
-/// a busy watcher can't hold it back), then a path the watcher saw change
-/// (what the user is working on), then what a walk found the index behind on.
-/// Held work (paused, for power, or for a model that failed to load) simply
-/// stays here, and queries never wait behind any of it.
+/// Paths to check, each once however often asked. The worker takes the most
+/// urgent: a root to register and walk (needs no model, so a busy watcher can't
+/// hold it back), a path the watcher saw change, then what a walk found. Held
+/// work stays here, and queries never wait behind it.
 #[derive(Default)]
 pub struct Work(Mutex<Set>);
 
@@ -177,23 +151,15 @@ struct Set {
     stale: BTreeSet<PathBuf>,
 }
 
-/// One step of indexing.
 #[derive(Debug, PartialEq)]
 pub enum Item {
-    /// Index the file if it is wanted and changed, drop it if it is gone,
-    /// and for a directory find what under it the index is behind on.
     Check(PathBuf),
-    /// Make the path a root (as `vinosearch index` does) and find what under
-    /// it needs checking. Needs no model.
+    /// Make the path a root and find what under it needs checking. Needs no model.
     Root(PathBuf),
-    /// The next run of parts of a long document (#108), once nothing else
-    /// waits. The worker makes this itself.
     Rest,
 }
 
 impl Work {
-    /// Paths created, modified, renamed or removed under a root: first in
-    /// line, ahead of any walk's findings.
     pub fn changed(&self, paths: impl IntoIterator<Item = PathBuf>) {
         let mut s = self.0.lock().unwrap();
         for p in paths {
@@ -202,8 +168,6 @@ impl Work {
         }
     }
 
-    /// Paths a walk found the index behind on (a root's, or the watcher's
-    /// check of every root), behind what changed.
     pub fn found(&self, paths: impl IntoIterator<Item = PathBuf>) {
         let mut s = self.0.lock().unwrap();
         for p in paths {
@@ -213,7 +177,6 @@ impl Work {
         }
     }
 
-    /// A root to index, new or existing, in the order asked.
     pub fn root(&self, root: PathBuf) {
         let mut s = self.0.lock().unwrap();
         if !s.roots.contains(&root) {
@@ -221,8 +184,7 @@ impl Work {
         }
     }
 
-    /// The most urgent item; with `roots_only`, the next root (whose walk
-    /// needs no model) and nothing else.
+    /// The most urgent item; with `roots_only`, only a root (whose walk needs no model).
     fn take(&self, roots_only: bool) -> Option<Item> {
         let mut s = self.0.lock().unwrap();
         if !s.roots.is_empty() {
@@ -237,9 +199,8 @@ impl Work {
             .map(Item::Check)
     }
 
-    /// Drop a forgotten root: a Reindex of it still waiting would make it a
-    /// root again, and the paths under it, except where one of `roots`
-    /// (which can nest) still covers them.
+    /// Drop a forgotten root: a Reindex of it still waiting would make it a root
+    /// again. Paths under it stay if one of `roots` (which can nest) covers them.
     fn forget(&self, root: &Path, roots: &[PathBuf]) {
         let mut s = self.0.lock().unwrap();
         s.roots.retain(|r| r != root);
@@ -248,63 +209,45 @@ impl Work {
         s.stale.retain(covered);
     }
 
-    /// Anything waits to be checked.
     pub fn pending(&self) -> bool {
         let s = self.0.lock().unwrap();
         !(s.changes.is_empty() && s.roots.is_empty() && s.stale.is_empty())
     }
 }
 
-/// What the runner is doing, for status queries. The worker owns the model
-/// and indexing fields; the model download runs on its own thread.
+/// What the runner is doing, for status queries. The model download runs on its own thread.
 #[derive(Default)]
 pub struct Status {
     pub loaded: AtomicBool,
-    /// The worker is on an item of work, model load included.
     pub working: AtomicBool,
-    /// Files embedded so far by the current run of indexing: since the
-    /// worker last found nothing to do.
+    /// Files embedded by the current run of indexing.
     pub indexed_files: AtomicU64,
-    /// The item is the rest of a long document (#108).
     pub indexing_rest: AtomicBool,
     pub fetching: AtomicBool,
     pub fetch_done: AtomicU64,
     pub fetch_total: AtomicU64,
-    /// Why the last model download failed, cleared when one starts.
     pub fetch_error: std::sync::Mutex<String>,
-    /// The device the model runs, or will next load, on.
     pub device: std::sync::Mutex<String>,
     /// Unix seconds when the watcher last compared every root with the
     /// index, and when indexing last changed it; 0 for not yet.
     pub last_checked: AtomicU64,
     pub last_indexed: AtomicU64,
-    /// Set by CheckNow; the watcher takes it.
     pub check_now: AtomicBool,
-    /// Set by ApplyEncryption: the watcher takes it and reads the config
-    /// file now, rather than at its next 30-second read.
+    /// Set by ApplyEncryption: the watcher reads the config now, not at its next 30 s read.
     pub reload_config: AtomicBool,
-    /// Settings and requests for the worker's next step.
     pub pending: Pending,
-    /// Paths for the worker to check.
     pub work: Work,
-    /// The model failed to load (not fetched yet, or the device failed):
-    /// what needs it waits for a Retry, or for a query to load it.
+    /// The model failed to load: what needs it waits for a Retry or a query.
     pub waiting_model: AtomicBool,
-    /// Indexing is paused: a file being indexed stops after its current
-    /// chunk, and the rest waits until Retry.
+    /// Indexing is paused: a file being indexed stops after its chunk.
     pub paused: AtomicBool,
-    /// What may hold indexing for power (#109), as `paused` does.
     pub power: crate::service::power::State,
-    /// Why this start dropped part of the index to be indexed again (a model
-    /// changed, #80), until that indexing is done; empty otherwise.
+    /// Why this start dropped part of the index to be indexed again, until that is done.
     pub model_changed: std::sync::Mutex<String>,
-    /// Whether the index is encrypted, and why a change to that failed (#4).
     pub encryption: std::sync::Mutex<encryption::State>,
-    /// systemd can seal a key to a TPM here, as of this start.
     pub tpm: AtomicBool,
 }
 
-/// An indexing item stopped part way, to be run again.
 #[derive(Debug)]
 struct Interrupted;
 
@@ -335,31 +278,28 @@ impl Status {
         }
     }
 
-    /// Indexing waits: paused, or held for power.
     pub fn held(&self) -> bool {
         self.paused.load(Ordering::Relaxed) || self.power.hold().is_some()
     }
 
-    /// Indexing is running, or will as soon as the worker gets to it: what
-    /// Control1's Status reports (true from the moment Reindex returns), and
-    /// what the watcher waits out before comparing every root with the
-    /// index. False while the work is held, or waits for the model.
+    /// Indexing is running, or will be as soon as the worker gets to it (true from
+    /// the moment Reindex returns); false while held or waiting for the model. The
+    /// watcher waits this out before comparing every root.
     pub fn indexing(&self) -> bool {
         self.working.load(Ordering::Relaxed)
             || (!self.held() && !self.waiting_model.load(Ordering::Relaxed) && self.work.pending())
     }
 }
 
-/// Before the watcher compares the roots with the index: encrypt or
-/// decrypt it as the config file asks, or rebuild it if its key is lost
-/// (#4); drop what must be indexed again (vectors from another model, #80;
-/// photos skipped for want of a decoder that is installed now, #79; scans
-/// OCR can read now, #106; files of a format read differently now, #97), so
-/// that first comparison finds it, and say so in `status` for the Index page.
+/// Before the watcher compares the roots with the index: encrypt or decrypt it
+/// as the config asks, rebuild it if its key is lost, and drop what must be
+/// indexed again (vectors from another model, photos now decodable, scans OCR
+/// can read now, files of a format read differently), so that first comparison
+/// finds it. Says so in `status`.
 ///
-/// A key that can't be had yet (a locked keyring) isn't asked for with a
-/// prompt here, so the runner is on the bus at once to say so; the worker
-/// asks, and waits for it (`wait_for_key`), and does the rest then.
+/// A key that can't be had yet (a locked keyring) isn't prompted for here, so
+/// the runner is on the bus at once; the worker asks, waiting for it
+/// (`wait_for_key`).
 pub fn prepare(status: &Status, file: &Config) -> Result<()> {
     let db = index::default_db()?;
     encryption::hold_shared(&db)?;
@@ -381,7 +321,6 @@ pub fn prepare(status: &Status, file: &Config) -> Result<()> {
     }
 }
 
-/// `prepare`'s part that needs the index open.
 fn prepare_index(status: &Status, conn: &rusqlite::Connection) -> Result<()> {
     let purged = index::purge_other_models(conn)?;
     if let Some(why) = model_changed(&purged) {
@@ -404,8 +343,6 @@ fn prepare_index(status: &Status, conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-/// `encryption::apply`, its outcome logged and kept for Status. A rebuild
-/// reported earlier stays until a later one replaces it.
 fn apply_encryption(status: &Status, db: &Path, want: Want, rekey: bool, sealer: &Sealer) {
     let st = encryption::apply(db, want, rekey, sealer);
     if !st.error.is_empty() {
@@ -424,14 +361,12 @@ fn apply_encryption(status: &Status, db: &Path, want: Want, rekey: bool, sealer:
     *kept = encryption::State { broken, ..st };
 }
 
-/// How often a key that can't be had (a locked keyring) is looked for again,
-/// without a prompt.
 const KEY_RETRY: Duration = Duration::from_secs(30);
 
-/// The index's key can't be had yet (a locked keyring): ask for it once with
-/// a prompt (bounded by `seal::PROMPT_WAIT`), then look again quietly every
-/// `KEY_RETRY`, and with a prompt whenever ApplyEncryption asks. Queries
-/// find nothing meanwhile; Status says why (`seal_waiting`).
+/// A key that can't be had yet: ask once with a prompt (bounded by
+/// `seal::PROMPT_WAIT`), then quietly every `KEY_RETRY`, and with a prompt
+/// whenever ApplyEncryption asks. Queries find nothing meanwhile; Status says
+/// why (`seal_waiting`).
 fn wait_for_key(
     jobs: &mpsc::Receiver<Job>,
     status: &Status,
@@ -492,8 +427,6 @@ fn wait_for_key(
     }
 }
 
-/// One sentence on what `purge_other_models` dropped, for the Index page;
-/// None when nothing was.
 pub fn model_changed(purged: &[(Kind, usize)]) -> Option<String> {
     let dropped = |kind: Kind| purged.iter().any(|(k, _)| *k == kind);
     let files: usize = purged.iter().map(|(_, n)| n).sum();
@@ -507,8 +440,7 @@ pub fn model_changed(purged: &[(Kind, usize)]) -> Option<String> {
     Some(format!("{what} ({files} files) will be indexed again."))
 }
 
-/// Settings given as flags or environment variables, which config file
-/// changes leave alone.
+/// Settings given as flags or environment variables, which config changes leave alone.
 #[derive(Clone, Copy, Default)]
 pub struct Pinned {
     pub device: bool,
@@ -520,7 +452,6 @@ struct Loaded<E> {
     vectors: Vectors,
 }
 
-/// What a check goes by: the exclusions and file types as they are now.
 struct Rules {
     excludes: Excludes,
     types: FileTypes,
@@ -529,32 +460,25 @@ struct Rules {
 pub struct Options {
     pub openvino_dir: Option<PathBuf>,
     pub device: String,
-    /// The device when the config file names none: the best one found at
-    /// start.
     pub default_device: String,
     pub idle: Option<Duration>,
     pub excludes: Excludes,
     pub types: FileTypes,
-    /// The config file the settings came from, which the watcher re-reads.
     pub config: PathBuf,
-    /// Its contents at startup.
     pub file: Config,
     pub pinned: Pinned,
     pub status: Arc<Status>,
-    /// The index.
     pub db: PathBuf,
 }
 
-/// Check one path against the index under the settings as they are now:
-/// index it if it is a wanted file that changed, drop it if it is gone,
-/// and for a directory (new, or renamed in) find what under it the index
-/// is behind on, which goes to `work`. Gone matters there too: by the time
-/// a debounced batch runs, a directory renamed away may already have been
-/// recreated at the same path, and its old files must not stay indexed.
+/// Check one path against the index under the current settings: index it if
+/// wanted and changed, drop it if gone, and for a directory find what under it
+/// the index is behind on (to `work`). Gone matters there too: a directory
+/// renamed away may be recreated at the same path before a debounced batch
+/// runs, and its old files must not stay indexed.
 ///
-/// A path excluded now, or under no root (forgotten since the path was
-/// queued), is left alone: indexing it would leave rows nothing ever
-/// removes. Removal still goes ahead.
+/// A path excluded now, or under no root, is left alone: indexing it would
+/// leave rows nothing removes. Removal still goes ahead.
 fn check<E: Embed>(
     conn: &mut rusqlite::Connection,
     emb: &mut E,
@@ -606,11 +530,9 @@ fn forget_root(conn: &rusqlite::Connection, db: &Path, work: &Work, root: &Path)
     work.forget(root, &index::roots(conn).unwrap_or_default());
 }
 
-/// vinoWhisper's folders of sessions (a native install's, and its
-/// Flatpak's) are roots while sessions are on (#143), registered as one
-/// added in the settings window is, and forgotten once they're off. A
-/// folder vinoWhisper makes later is followed from the next start or change
-/// of settings.
+/// vinoWhisper's session folders are roots while sessions are on, registered
+/// as one added in the settings window is, and forgotten once off. A folder made
+/// later is followed from the next start or settings change.
 fn follow_sessions(conn: &rusqlite::Connection, db: &Path, types: &FileTypes, work: &Work) {
     let (dirs, on) = types.sessions_dirs();
     for dir in dirs {
@@ -626,9 +548,8 @@ fn follow_sessions(conn: &rusqlite::Connection, db: &Path, types: &FileTypes, wo
     }
 }
 
-/// Make `root` a root, as `vinosearch index` does, and find what under it
-/// the index is behind on, as the watcher's check of a root does. Needs no
-/// model: what it finds waits in `Work` for one.
+/// Make `root` a root and find what under it the index is behind on; what it
+/// finds waits in `Work` for a model.
 fn register_root(
     conn: &rusqlite::Connection,
     db: &Path,
@@ -643,9 +564,8 @@ fn register_root(
     index::stale(conn, &root, &rules.excludes, &rules.types)
 }
 
-/// Best `k` chunks of each kind for `query`, text first, or of code alone
-/// for one starting `code:` (#110): what a Match job answers, and what
-/// `vinosearch eval` ranks (#107).
+/// Best `k` chunks of each kind for `query`, text first, or of code alone for
+/// one starting `code:`; what a Match job answers and `vinosearch eval` ranks.
 pub(crate) fn matches<E: Embed>(
     conn: &rusqlite::Connection,
     emb: &mut E,
@@ -677,8 +597,6 @@ fn answer<E: Embed>(
     }));
 }
 
-/// Folders `old` excluded that `new` doesn't. Their files are new to the
-/// index, and a check of each folder finds them.
 fn no_longer_excluded(old: &Excludes, new: &Excludes) -> Vec<PathBuf> {
     old.paths()
         .iter()
@@ -687,7 +605,6 @@ fn no_longer_excluded(old: &Excludes, new: &Excludes) -> Vec<PathBuf> {
         .collect()
 }
 
-/// A cache that was never written is cleared already.
 fn clear_compiled_cache() -> Result<()> {
     match std::fs::remove_dir_all(crate::cache_dir()?) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -695,10 +612,9 @@ fn clear_compiled_cache() -> Result<()> {
     }
 }
 
-/// The most urgent item, unless the work is held: roots, changes and what
-/// walks found, then the rest of long documents a run of parts at a time,
-/// then audio and video on AC only (`power` sends a Retry when a charger
-/// comes). A model that won't load leaves only roots, whose walk needs none.
+/// The most urgent item unless held: roots, changes, walk findings, then the
+/// rest of long documents, then media on AC only (`power` sends a Retry). A
+/// model that won't load leaves only roots.
 fn next_item(
     status: &Status,
     conn: &rusqlite::Connection,
@@ -716,9 +632,7 @@ fn next_item(
     })
 }
 
-/// The worker has nothing left to do: log what this run did, and once
-/// nothing is left to check, the re-indexing a model change asked for is
-/// done.
+/// Log the run; once nothing is left to check, a model change's re-indexing is done.
 fn finish_run(status: &Status, run: index::Stats) {
     if run.files_embedded + run.removed + run.duplicates > 0 {
         eprintln!(
@@ -731,8 +645,6 @@ fn finish_run(status: &Status, run: index::Stats) {
     }
 }
 
-/// Encrypt, decrypt or re-key: the worker's connection closed while the file
-/// is replaced, and the vector cache read again from the new one.
 fn reencrypt<E: Embed>(
     status: &Status,
     db: &Path,
@@ -750,7 +662,6 @@ fn reencrypt<E: Embed>(
     Ok(())
 }
 
-/// Runs of the rest of long documents that failed in a row; `TAKEN_FOR_THE_DEVICE` of them stop it.
 #[derive(Default)]
 struct RestFailures(u32);
 
@@ -761,7 +672,6 @@ impl RestFailures {
         self.0 = 0;
     }
 
-    /// Whether the rest should stop being tried.
     fn failed(&mut self) -> bool {
         self.0 += 1;
         let give_up = self.0 >= Self::TAKEN_FOR_THE_DEVICE;
@@ -779,8 +689,7 @@ pub fn run(jobs: mpsc::Receiver<Job>, opts: Options) -> Result<()> {
     })
 }
 
-/// `run` with the model `load_model` gives for a device: tests run the
-/// worker through a stand-in, with no OpenVINO.
+/// `run` with the model `load_model` gives: tests use a stand-in, with no OpenVINO.
 fn run_with<E: Embed>(
     jobs: mpsc::Receiver<Job>,
     opts: Options,
@@ -789,7 +698,6 @@ fn run_with<E: Embed>(
     Worker::start(jobs, opts, load_model)?.run()
 }
 
-/// `index_busy_percent` from the config file, as a share.
 fn index_share(file: &Config) -> Result<f64> {
     config::index_share(
         file.index_busy_percent
@@ -797,7 +705,6 @@ fn index_share(file: &Config) -> Result<f64> {
     )
 }
 
-/// The worker loop's state.
 struct Worker<E, L> {
     jobs: mpsc::Receiver<Job>,
     status: Arc<Status>,
@@ -812,14 +719,11 @@ struct Worker<E, L> {
     idle: Option<Duration>,
     pace: sched::Pace,
     loaded: Option<Loaded<E>>,
-    /// False once the rest of long documents failed, until a Retry or a load
-    /// succeeds.
+    /// False once the rest of long documents failed, until a Retry or a load.
     rest_ready: bool,
     rest_failures: RestFailures,
-    /// False once media's models were missing, until a Retry (a fetch sends
-    /// one): not found out again by loading the model.
+    /// False once media's models were missing, until a Retry (a fetch sends one).
     media_models: bool,
-    /// What indexing did since the worker last had nothing to do.
     run: index::Stats,
     did_work: bool,
     last_job: Instant,
@@ -827,7 +731,6 @@ struct Worker<E, L> {
     timed_out: bool,
 }
 
-/// What waiting for a job came to.
 enum Waited {
     Job(Job),
     TimedOut,
@@ -835,8 +738,6 @@ enum Waited {
 }
 
 impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
-    /// Opened (waiting for the key if need be), purged of what the settings
-    /// leave out, and following vinoWhisper's folder.
     fn start(jobs: mpsc::Receiver<Job>, opts: Options, load_model: L) -> Result<Self> {
         let mut want = Want::of(&opts.file);
         let conn = match index::open(&opts.db) {
@@ -887,8 +788,7 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         })
     }
 
-    /// Each turn applies what arrived first, so anything taken after it is
-    /// checked under it.
+    /// Each turn applies what arrived first, so anything taken after it is checked under it.
     fn run(mut self) -> Result<()> {
         loop {
             if !std::mem::take(&mut self.timed_out) {
@@ -918,7 +818,6 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         Ok(())
     }
 
-    /// The config file changed: apply what changed in it.
     fn apply_config(&mut self, file: Config) -> Result<()> {
         match file.excludes() {
             Ok(ex) if ex != self.rules.excludes => {
@@ -1038,8 +937,6 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         }
     }
 
-    /// Nothing to do: wait for a job, or until the model has been idle long
-    /// enough to unload or the document stage to free.
     fn wait_for_job(&mut self) -> Waited {
         let unload_at = self
             .idle
@@ -1071,7 +968,6 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         }
     }
 
-    /// A job that came while nothing was being indexed.
     fn take_job(&mut self, job: Job) {
         match job {
             Job::Match { query, k, reply } => {
@@ -1104,8 +1000,6 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         }
     }
 
-    /// Register a root, or check a path or index a run of the rest under
-    /// the settings current to `applied`.
     fn work_on(&mut self, item: Item, applied: u64) {
         self.status.working.store(true, Ordering::Relaxed);
         self.did_work = true;
@@ -1144,8 +1038,8 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
         self.status.working.store(false, Ordering::Relaxed);
     }
 
-    /// `item` with the model loaded, at idle priority. Stops between chunks
-    /// for a hold or for what arrived (the item goes back first in line).
+    /// Index with the model loaded, at idle priority; stops between chunks for a hold or an
+    /// arrival.
     fn index_item(&mut self, item: Item, applied: u64) {
         let Loaded { emb, vectors } = self.loaded.as_mut().unwrap();
         // Compiled before dropping to idle priority: OpenVINO's threads
@@ -1392,7 +1286,6 @@ mod tests {
         assert_eq!(pending.generation(), g0 + 1);
     }
 
-    /// A temporary tree and index of their own, removed when dropped.
     struct Harness {
         dir: PathBuf,
         status: Arc<Status>,
@@ -1427,9 +1320,6 @@ mod tests {
             path
         }
 
-        /// Run the worker over what `status` holds until the channel closes
-        /// (it is dropped here, so the worker stops once nothing is left),
-        /// with `on_document` called before each chunk is embedded.
         fn run(&self, on_document: impl FnMut(&str) + Send + 'static) {
             let (tx, rx) = mpsc::channel();
             let file = Config::default();
@@ -1500,7 +1390,6 @@ mod tests {
         }
     }
 
-    /// Enough text for several chunks, so a file can be stopped part way.
     fn long(word: &str) -> String {
         format!("{word} ").repeat(600)
     }
@@ -1564,9 +1453,6 @@ mod tests {
         assert_eq!(h.embedded.load(Ordering::Relaxed), 2);
     }
 
-    /// A file being indexed when the exclusions change stops after its
-    /// chunk, and the exclusions apply before any more of it, or anything
-    /// else, is indexed.
     #[test]
     fn an_exclusion_arriving_mid_file_stops_it_within_a_chunk() {
         let h = Harness::new("exclude");

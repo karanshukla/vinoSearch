@@ -50,24 +50,19 @@ fn too_long(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The FIB's wIdent for Word 97 and later.
 const WORD_97: u16 = 0xA5EC;
 const WORD_95: u16 = 0xA5DC;
 /// The lowest nFib with a piece table like this: 0xC1 since Word 97.
 const MIN_NFIB: u16 = 0xC0;
 const F_ENCRYPTED: u16 = 0x0100;
-/// The table is in 1Table rather than 0Table.
 const F_WHICH_TBL_STM: u16 = 0x0200;
 /// fcClx and lcbClx are this pair of FibRgFcLcb97, from 0.
 const CLX_PAIR: usize = 33;
-/// The Clx's record types.
 const PRC: u8 = 1;
 const PCDT: u8 = 2;
 /// A piece's fc flag: 8-bit text, at half the offset.
 const FC_COMPRESSED: u32 = 0x4000_0000;
 
-/// What the text needs from the FIB ([MS-DOC] 2.5.1): a fixed base, then
-/// three arrays that each start with their length.
 struct Fib {
     /// The main document's length in characters: footnotes, headers and the
     /// rest follow it.
@@ -145,7 +140,6 @@ pub fn doc(bytes: &[u8]) -> Result<String> {
     Ok(word_text(&raw))
 }
 
-/// The Pcdt's PlcPcd in `clx`, past the formatting (Prc) before it.
 fn piece_table(clx: &[u8]) -> Result<&[u8]> {
     let mut at = 0;
     while clx.get(at) == Some(&PRC) {
@@ -165,9 +159,8 @@ fn piece_table(clx: &[u8]) -> Result<&[u8]> {
     Ok(plc)
 }
 
-/// `chars` characters of the piece at `fc` in `word`, cut short at its end.
-/// A compressed piece is 8-bit, [MS-DOC] 2.9.73's mapping being
-/// Windows-1252's; the rest are UTF-16.
+/// A compressed piece is 8-bit, [MS-DOC] 2.9.73's mapping being Windows-1252's; the rest are
+/// UTF-16.
 fn piece(word: &[u8], fc: u32, chars: usize) -> Option<String> {
     let compressed = fc & FC_COMPRESSED != 0;
     let fc = (fc & 0x3FFF_FFFF) as usize;
@@ -192,11 +185,9 @@ const FIELD_SEPARATOR: char = '\u{14}';
 const FIELD_END: char = '\u{15}';
 const NON_BREAKING_HYPHEN: char = '\u{1e}';
 
-/// Word's special characters out of the text: a paragraph or line break as a
-/// newline, a table cell's end as a tab. A field (a page number, a link, a
-/// table of contents) shows its result; its code is left out. Other control
-/// characters (pictures, footnote marks, an optional hyphen) are dropped
-/// (pinned by `extract::tests::doc_reads_the_piece_table`).
+/// Word's special characters out of the text: paragraph or line break as newline, table cell end as
+/// tab; a field shows its result, not its code; other control characters are dropped (pinned by
+/// `extract::tests::doc_reads_the_piece_table`).
 fn word_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut open_fields_in_code: Vec<bool> = Vec::new();
@@ -229,26 +220,21 @@ fn word_text(raw: &str) -> String {
     out
 }
 
-/// PowerPoint record types ([MS-PPT] 2.13.24).
 const DOCUMENT: u16 = 0x03E8;
 const SLIDE: u16 = 0x03EE;
 const SLIDE_PERSIST: u16 = 0x03F3;
 const TEXT_CHARS: u16 = 0x0FA0;
-/// A text atom of UTF-16's low bytes, so Latin-1.
 const TEXT_BYTES: u16 = 0x0FA8;
 const SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 const USER_EDIT: u16 = 0x0FF5;
 const PERSIST_DIRECTORY: u16 = 0x1772;
 
-/// Where the Current User stream holds its header token, and the offset of
-/// the last edit.
 const HEADER_TOKEN_AT: usize = 12;
 const LAST_EDIT_AT: usize = 16;
 const ENCRYPTED_TOKEN: u32 = 0xF3D1_C4DF;
 /// A UserEditAtom this long has an encryptSessionPersistIdRef, the field only
 /// an encrypted file has.
 const ENCRYPTED_EDIT_LEN: usize = 32;
-/// A slide number's or date's placeholder text.
 const NUMBER_OR_DATE_PLACEHOLDER: &str = "*";
 
 struct Record<'a> {
@@ -258,8 +244,6 @@ struct Record<'a> {
     body: &'a [u8],
 }
 
-/// The records in `data` one after another. One that runs past the end is
-/// cut short; a header that does stops the walk.
 fn records(data: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let mut at = 0;
     std::iter::from_fn(move || {
@@ -286,7 +270,6 @@ fn record_at(data: &[u8], at: usize) -> Option<Record<'_>> {
 /// levels down, and a crafted file could nest a record per 8 bytes.
 const MAX_DEPTH: u32 = 32;
 
-/// The text atoms anywhere in `data`, in order.
 fn texts(data: &[u8], depth: u32, out: &mut Vec<String>) {
     if depth > MAX_DEPTH {
         return;
@@ -300,7 +283,6 @@ fn texts(data: &[u8], depth: u32, out: &mut Vec<String>) {
     }
 }
 
-/// `rec`'s text onto `out`, if it's a text atom.
 fn atom_text(rec: &Record, out: &mut Vec<String>) {
     match rec.kind {
         TEXT_CHARS => out.push(utf16(rec.body)),
@@ -309,8 +291,6 @@ fn atom_text(rec: &Record, out: &mut Vec<String>) {
     }
 }
 
-/// A `.ppt`'s text, slide by slide in show order. Notes and masters are left
-/// out, as they are for a `.pptx`.
 pub fn ppt(bytes: &[u8]) -> Result<Vec<String>> {
     let mut file = open(bytes)?;
     let doc = stream(&mut file, "PowerPoint Document")?;
@@ -354,8 +334,6 @@ fn stored_slides(doc: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A slide's text blocks, a line each, without the number's or date's
-/// placeholder.
 fn slide_text(texts: Vec<String>) -> String {
     let mut slide = String::new();
     for t in texts
@@ -373,10 +351,9 @@ fn slide_text(texts: Vec<String>) -> String {
     slide
 }
 
-/// Each slide's text blocks, found the way PowerPoint does: the current
-/// edit's persist directory gives where each object is, the document's
-/// slide list which slides are shown and in what order ([MS-PPT] 2.1.2).
-/// Placeholder text sits in the slide list, a text box's in the slide.
+/// Each slide's text blocks, found the way PowerPoint does ([MS-PPT] 2.1.2): the current edit's
+/// persist directory gives where each object is, the document's slide list which slides are shown
+/// and in what order. Placeholder text sits in the slide list, a text box's in the slide.
 fn persisted_slides(doc: &[u8], user: &[u8]) -> Result<Vec<Vec<String>>> {
     let persisted = Persisted::read(doc, user)?;
     let at = persisted
@@ -401,17 +378,12 @@ fn persisted_slides(doc: &[u8], user: &[u8]) -> Result<Vec<Vec<String>>> {
     Ok(persisted.slides(doc, slides))
 }
 
-/// The edits' persist directories, merged.
 struct Persisted {
-    /// Each object's latest offset in the stream, by persist id.
     offsets: HashMap<u32, usize>,
-    /// The persist id of the document record.
     document: u32,
 }
 
 impl Persisted {
-    /// Walks the edits newest first, so an object's latest offset is the one
-    /// kept.
     fn read(doc: &[u8], user: &[u8]) -> Result<Persisted> {
         let mut edit = le32(user, LAST_EDIT_AT).context("no current user")? as usize;
         let mut offsets: HashMap<u32, usize> = HashMap::new();

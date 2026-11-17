@@ -24,28 +24,20 @@ use vinosearch_shared::dbus::{CONTROL_INTERFACE, CONTROL_PATH, names};
 use vinosearch_shared::sandbox;
 use vinosearch_shared::xdg::{cache_home, config_home, state_home};
 
-/// The systemd user unit installs before this one wrote and enabled.
 const OLD_UNIT: &str = "vinosearch.service";
-/// The autostart entry, under the XDG config directory.
 const AUTOSTART: &str = "autostart/dev.vinosearch.Runner.desktop";
-/// Exit code of a runner that stopped before it owned the bus name: a
-/// broken install or another runner, which starting it again won't fix.
+/// Exit code of a runner that stopped before owning the bus name (a broken install or another
+/// runner): starting it again won't fix that.
 pub const NOT_STARTED: u8 = 3;
-/// A runner that crashes is started again after 1 s, then 2, 4... up to a
-/// minute while it keeps crashing; one that ran 5 minutes starts the count
-/// again.
+/// A crashing runner is restarted after 1 s, then 2, 4... up to a minute; one that ran 5 minutes
+/// resets the count.
 const RESTART_FIRST: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(60);
 const HEALTHY: Duration = Duration::from_secs(5 * 60);
-/// The log is moved to `.old` past this, when the runner (re)starts.
 const LOG_MAX: u64 = 1 << 20;
 
-/// The journal's entries for the runner, whichever unit systemd ran it in:
-/// one per D-Bus activation, one for the autostart entry.
 const JOURNAL: &str = "journalctl --user -u '*dev.vinosearch*'";
 
-/// Where to read the runner's output, for someone to be told: the journal
-/// where systemd starts it, the file anywhere else.
 pub fn log_where() -> Result<String> {
     Ok(format!(
         "{JOURNAL}, or {} where systemd doesn't start it",
@@ -53,8 +45,6 @@ pub fn log_where() -> Result<String> {
     ))
 }
 
-/// Where the runner's output goes when neither a terminal nor the journal
-/// has it.
 pub fn log_path() -> Result<PathBuf> {
     Ok(state_home()?.join("vinosearch/service.log"))
 }
@@ -63,7 +53,6 @@ pub fn autostart_path() -> Result<PathBuf> {
     Ok(config_home()?.join(AUTOSTART))
 }
 
-/// The autostart entry running `exec`, an Exec value already quoted.
 pub fn autostart_entry(exec: &str) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch\n\
@@ -74,9 +63,8 @@ pub fn autostart_entry(exec: &str) -> String {
     )
 }
 
-/// `vinosearch krunner`: run the runner, `worker` (`vinosearch krunner
-/// --worker`), unless another `krunner` already does. Returns the runner's
-/// last exit, or None when another runs it.
+/// `vinosearch krunner`: run the runner `worker` unless another `krunner` already does. Returns its
+/// last exit, None when another runs it.
 pub fn supervise(worker: Command) -> Result<Option<ExitStatus>> {
     let lock = instance_lock_path()?;
     let Some(held) = single_instance(&lock, Duration::from_secs(30))? else {
@@ -90,8 +78,6 @@ pub fn supervise(worker: Command) -> Result<Option<ExitStatus>> {
     Ok(Some(status))
 }
 
-/// Let go of the instance lock and start the new build, whose `krunner`
-/// takes the lock and the name from here.
 fn hand_over_to_new_build(held: File) {
     drop(held);
     if let Err(e) = start(&names().service) {
@@ -114,12 +100,9 @@ fn instance_lock_path() -> Result<PathBuf> {
     Ok(dir.join(format!("{}.lock", names().service)))
 }
 
-/// The instance lock, held while the file is open; None once the runner
-/// another `krunner` holds it for owns the bus name, or after `wait`. Tried
-/// again meanwhile, so a `krunner` started while the last one exits (a
-/// restart) takes over from it. Not given up before the other's runner owns
-/// the name: an activation that started this one is answered only then, and
-/// exiting sooner would fail it.
+/// The instance lock, held while the file is open; None once the runner another `krunner` holds it
+/// for owns the bus name, or after `wait`. Not given up before then: an activation that started
+/// this one is answered only then, and exiting sooner would fail it.
 fn single_instance(path: &Path, wait: Duration) -> Result<Option<File>> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -148,16 +131,14 @@ fn single_instance(path: &Path, wait: Duration) -> Result<Option<File>> {
     }
 }
 
-/// What to do once the runner exits.
 #[derive(Debug, PartialEq, Eq)]
 enum After {
     Stop,
     Restart,
 }
 
-/// As systemd's Restart=on-failure: not after a clean exit or a stop
-/// signal; nor when it never came up, as starting it again won't help
-/// (pinned by `tests::a_crash_restarts_the_runner_and_a_stop_does_not`).
+/// As systemd's Restart=on-failure: not after a clean exit or stop signal, nor when it never came
+/// up (pinned by `tests::a_crash_restarts_the_runner_and_a_stop_does_not`).
 fn after(status: ExitStatus) -> After {
     match (status.code(), status.signal()) {
         (Some(0), _) => After::Stop,
@@ -167,8 +148,7 @@ fn after(status: ExitStatus) -> After {
     }
 }
 
-/// The wait before starting again a runner that crashed after `ran`, the
-/// last wait being `last`
+/// The wait before restarting a runner that crashed after `ran`, the last wait being `last`
 /// (pinned by `tests::crashes_in_a_row_wait_longer_up_to_a_minute`).
 fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
     match last {
@@ -177,8 +157,7 @@ fn backoff(last: Option<Duration>, ran: Duration) -> Duration {
     }
 }
 
-/// Run `worker` until it stops for good. A build that changed or went is not
-/// started again, crashed or not.
+/// Run `worker` until it stops for good; a build that changed or went is not restarted.
 fn supervised(mut worker: Command, changed: &OnceLock<Change>) -> Result<ExitStatus> {
     let log = log_file();
     stop_with_this_process(&mut worker);
@@ -199,10 +178,8 @@ fn supervised(mut worker: Command, changed: &OnceLock<Change>) -> Result<ExitSta
     }
 }
 
-/// Where to keep the runner's output: nowhere new under a terminal, or where
-/// systemd started it (D-Bus activation, the autostart entry), since stderr
-/// is the journal's already, with timestamps, rotation and a rate limit. With
-/// no HOME to keep a file under, output stays where it was going.
+/// Where to keep the runner's output: nowhere new under a terminal or where systemd started it
+/// (stderr is the journal's already); with no HOME, where it was going.
 fn log_file() -> Option<PathBuf> {
     let elsewhere =
         std::io::stderr().is_terminal() || systemd_journal_logger::connected_to_journal();
@@ -227,23 +204,20 @@ fn stop_with_this_process(worker: &mut Command) {
     }
 }
 
-/// A full or read-only disk costs the log, not search.
 fn log_to_or_warn(log: &Path) {
     if let Err(e) = log_to(log) {
         eprintln!("no log at {}: {e:#}", log.display());
     }
 }
 
-/// Set `path`'s mode, for one that was there before (or made by hand) with
-/// the umask's.
 fn restrict(path: &Path, mode: u32) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
-/// Send this process's stdout and stderr, which the runner inherits, to the
-/// end of `path`, moving it to `.old` first when it is over LOG_MAX. The log
-/// names files being indexed, so it is the user's alone, as the journal was.
+/// Send stdout and stderr, which the runner inherits, to the end of `path`, moved to `.old` first
+/// when over LOG_MAX. The log names files being indexed, so it is the user's alone, as the journal
+/// was.
 fn log_to(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::DirBuilder::new()
@@ -271,7 +245,6 @@ fn log_to(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether something owns `name`; None without a session bus.
 pub fn owned(name: &str) -> Option<bool> {
     zbus::block_on(async {
         let conn = zbus::Connection::session().await.ok()?;
@@ -280,7 +253,6 @@ pub fn owned(name: &str) -> Option<bool> {
     })
 }
 
-/// Wait up to `wait` for `name` to be owned (or not); true once it is.
 fn wait_owned(name: &str, want: bool, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     loop {
@@ -294,11 +266,10 @@ fn wait_owned(name: &str, want: bool, wait: Duration) -> bool {
     }
 }
 
-/// Stop whatever owns `name`: call `quit` (path, interface, method) on it,
-/// or signal it when it has no such method (a runner from before Quit), and
-/// wait for the name to go. True when something was running. Any other
-/// error from the call is ignored: exiting can beat the reply, which the bus
-/// then answers NoReply for.
+/// Stop whatever owns `name`: call `quit` (path, interface, method) on it, or signal it when it has
+/// no such method (a runner from before Quit), and wait for the name to go. True when something was
+/// running. Errors from the call are ignored: exiting can beat the reply, which the bus then
+/// answers NoReply for.
 pub fn stop(name: &str, quit: (&str, &str, &str)) -> Result<bool> {
     if owned(name) != Some(true) {
         return Ok(false);
@@ -330,16 +301,13 @@ pub fn stop(name: &str, quit: (&str, &str, &str)) -> Result<bool> {
     Ok(true)
 }
 
-/// Stop the runner, through Control1's Quit.
 pub fn stop_runner() -> Result<bool> {
     stop(&names().service, (CONTROL_PATH, CONTROL_INTERFACE, "Quit"))
 }
 
-/// Have the bus start `name` from its activation file, rereading the files
-/// first so one just written counts. The bus starts it, so it doesn't
-/// depend on the process asking (a terminal, the settings window).
-/// dbus-broker rereads the files only when asked. Not asked from the
-/// Flatpak, whose bus proxy refuses it (and whose file is installed with it).
+/// Have the bus start `name` from its activation file, rereading the files first so one just
+/// written counts (dbus-broker rereads only when asked). The bus starts it, so it doesn't depend on
+/// the asking process. Not asked from the Flatpak, whose bus proxy refuses it.
 pub fn start(name: &str) -> Result<()> {
     zbus::block_on(async {
         let conn = zbus::Connection::session().await?;
@@ -353,10 +321,9 @@ pub fn start(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stop, disable and remove the systemd user unit an older install wrote,
-/// so it and the autostart entry never both start the runner. Quiet where
-/// there is no systemctl, whose `disable` link is removed by hand too. The
-/// unit's path when there was one.
+/// Stop, disable and remove the systemd user unit an older install wrote, so it and the autostart
+/// entry never both start the runner. Quiet where there is no systemctl. The unit's path when there
+/// was one.
 pub fn remove_old_unit() -> Result<Option<PathBuf>> {
     let dir = config_home()?.join("systemd/user");
     let unit = dir.join(OLD_UNIT);

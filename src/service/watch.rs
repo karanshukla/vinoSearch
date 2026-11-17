@@ -24,8 +24,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Quiet period before a batch of changes is indexed: editors write a file in
-/// several steps, and builds touch many at once.
+/// Quiet period before a batch of changes is indexed: editors write a file in steps, and builds
+/// touch many at once.
 const DEBOUNCE: Duration = Duration::from_secs(2);
 /// How often to look for roots added by `vinosearch index`, and re-read the
 /// config, while running.
@@ -33,20 +33,16 @@ const ROOTS_EVERY: Duration = Duration::from_secs(30);
 /// How often every root is compared with the index. It reads no files and
 /// loads no model: 0.5 s for 45,418 paths under a home directory (2026-10-18).
 const CATCH_UP_EVERY: Duration = Duration::from_secs(60 * 60);
-/// Wall time running this far ahead of monotonic time means the machine slept.
 const SLEPT: Duration = Duration::from_secs(60);
-/// How long to wait for an event before looking at the timers.
 const POLL: Duration = Duration::from_millis(500);
 
 struct State {
     watcher: RecommendedWatcher,
     status: Arc<Status>,
     roots: Vec<PathBuf>,
-    /// Directories with a watch. Dropped when the directory is removed or
-    /// renamed away, so one recreated at the same path is watched again.
     watched: HashSet<PathBuf>,
-    /// A watch was refused, most likely for want of inotify watches
-    /// (fs.inotify.max_user_watches): warned once, retried at the next catch-up.
+    /// A watch was refused, likely for fs.inotify.max_user_watches: warned once, retried at the
+    /// next catch-up.
     warned_limit: bool,
     excludes: Excludes,
     types: FileTypes,
@@ -75,9 +71,8 @@ impl State {
         }
     }
 
-    /// Drop the watches on `dir` and everything under it that `keep` rejects.
-    /// Returns how many were dropped. The kernel already dropped those on
-    /// deleted directories, so unwatching them fails harmlessly.
+    /// Drop the watches on `dir` and everything under it that `keep` rejects; returns how many.
+    /// Unwatching deleted directories fails harmlessly.
     fn unwatch_tree(&mut self, dir: &Path, keep: impl Fn(&Self, &Path) -> bool) -> usize {
         let drop: Vec<PathBuf> = self
             .watched
@@ -92,7 +87,6 @@ impl State {
         drop.len()
     }
 
-    /// Watch directories `old` excluded that are excluded no longer.
     fn watch_unexcluded(&mut self, old: &Excludes) {
         for dir in old.paths() {
             if !self.excludes.contains(dir)
@@ -104,8 +98,6 @@ impl State {
         }
     }
 
-    /// Follow roots added since the last look, and drop forgotten ones with
-    /// their watches (except under a root still followed: roots can nest).
     fn sync_roots(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>) {
         let Ok(roots) = index::roots(conn) else {
             return;
@@ -125,9 +117,8 @@ impl State {
         }
     }
 
-    /// Watch a new root, then catch up on what changed while nothing watched
-    /// it (before login, or with the runner stopped). The watches go in
-    /// first, so no change falls between the check and them.
+    /// Watch a new root, then catch up on what changed while nothing watched it. The watches go in
+    /// first, so no change falls between.
     fn follow(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: PathBuf) {
         let before = self.watched.len();
         self.watch_tree(&root);
@@ -140,7 +131,6 @@ impl State {
         self.roots.push(root);
     }
 
-    /// Put whatever under `root` differs from the index to the worker.
     fn check(&self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, root: &Path) {
         let t0 = Instant::now();
         match index::stale(conn, root, &self.excludes, &self.types) {
@@ -159,8 +149,7 @@ impl State {
         }
     }
 
-    /// Check every root, and retry watches the limit refused last time, in
-    /// case it was raised.
+    /// Check every root, and retry watches the limit refused in case it was raised.
     fn catch_up(&mut self, conn: &rusqlite::Connection, jobs: &mpsc::Sender<Job>, why: &str) {
         eprintln!("checking for missed changes ({why})");
         for root in self.roots.clone() {
@@ -184,8 +173,8 @@ impl State {
     }
 }
 
-/// Whether a change to `path` could alter the index. A path that is gone
-/// counts whatever its name: it may have been an indexed file or directory
+/// Whether a change to `path` could alter the index: a gone path counts whatever its name (it may
+/// have been indexed) (pinned by
 /// (pinned by `tests::a_path_that_is_gone_is_relevant_whatever_its_type`
 /// and `tests::an_existing_file_of_an_unindexed_type_is_not_relevant`).
 fn relevant(root: &Path, path: &Path, ex: &Excludes, types: &FileTypes) -> bool {
@@ -202,8 +191,8 @@ fn relevant(root: &Path, path: &Path, ex: &Excludes, types: &FileTypes) -> bool 
     !path.exists() || index::wanted(path, types)
 }
 
-/// Paths an event says are no longer there: removed, or renamed away. A
-/// rename with both names lists them as [from, to].
+/// Paths an event says are gone: removed, or renamed away ([from, to] for a rename with both
+/// names).
 fn gone(event: &Event) -> &[PathBuf] {
     match event.kind {
         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
@@ -227,8 +216,7 @@ fn interesting(kind: &EventKind) -> bool {
     }
 }
 
-/// Monotonic time stops while the machine is suspended (Rust's Instant is
-/// CLOCK_MONOTONIC on Linux); wall time does not.
+/// Monotonic time stops while the machine is suspended; wall time does not.
 struct Clock {
     mono: Instant,
     wall: SystemTime,
@@ -242,8 +230,8 @@ impl Clock {
         }
     }
 
-    /// Whether the machine slept since the last call. A wall clock stepped
-    /// forward reads the same, and costs one needless check.
+    /// Whether the machine slept since the last call; a wall clock stepped forward reads the same
+    /// and costs one needless check.
     fn slept(&mut self) -> bool {
         let now = Clock::now();
         let slept = now.ahead_of(self) > SLEPT;
@@ -259,30 +247,24 @@ impl Clock {
     }
 }
 
-/// The worker hung up: the service is stopping.
 struct WorkerGone;
 
-/// The watch thread: `State` plus the config, the timers and what is waiting.
 struct Watch {
     st: State,
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
-    /// What `config` held when last applied.
     file: Config,
     status: Arc<Status>,
-    /// Closed and opened again under it when encryption changes.
     db: Arc<crate::index::encryption::Live>,
     pending: HashSet<PathBuf>,
     last_event: Instant,
     last_roots: Instant,
     last_check: Instant,
     clock: Clock,
-    /// Why the next catch-up is due, once indexing allows it.
     due: Option<&'static str>,
 }
 
 impl Watch {
-    /// Follow the roots already indexed, then start the timers.
     fn start(
         mut st: State,
         jobs: mpsc::Sender<Job>,
@@ -352,8 +334,8 @@ impl Watch {
         }
     }
 
-    /// Watches under paths that went are dropped before any are added, so a
-    /// rename's destination is watched again.
+    /// Watches under gone paths are dropped before any are added, so a rename's destination is
+    /// watched again.
     fn on_change(&mut self, event: Event) {
         for path in gone(&event) {
             self.st.unwatch_tree(path, |_, _| false);
@@ -382,10 +364,9 @@ impl Watch {
         self.wake()
     }
 
-    /// A config that fails to parse, or has a bad exclusion or file type,
-    /// changes nothing: better the last good exclusions than index what a
-    /// typo un-excluded. The file types also follow what is installed (media
-    /// once ffmpeg is there), so they can change with the file as it was.
+    /// A config that fails to parse, or has a bad exclusion or file type, changes nothing: better
+    /// the last good exclusions than index what a typo un-excluded. File types also follow what is
+    /// installed (media once ffmpeg is there).
     fn reload_config(&mut self) -> Result<(), WorkerGone> {
         let loaded = Config::load(&self.config)
             .and_then(|c| Ok((c.excludes()?, FileTypes::new(&c.formats)?, c)));
@@ -453,9 +434,8 @@ impl Watch {
     }
 }
 
-/// `config` is re-read every ROOTS_EVERY; when it differs from `file` (what
-/// it held at startup), the new contents go to the worker's `Pending`.
-/// `status` carries CheckNow requests in, and when the last check ran out.
+/// `config` is re-read every ROOTS_EVERY; a changed one goes to the worker's `Pending`. `status`
+/// carries CheckNow requests in and when the last check ran out.
 pub fn spawn(
     jobs: mpsc::Sender<Job>,
     config: PathBuf,
@@ -511,8 +491,6 @@ mod tests {
         assert_eq!(stepped_back.ahead_of(&before), Duration::ZERO);
     }
 
-    /// A root with `src`, `target`, `.git` and an excluded `private`, in a
-    /// temp dir of its own, removed on drop.
     struct Tree {
         dir: PathBuf,
         root: PathBuf,

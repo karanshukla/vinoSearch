@@ -23,45 +23,36 @@ use html::entity;
 pub use html::html;
 use pdf::pdf;
 
-/// Address space the extracting child may map. The runner's own share
-/// is small: this subcommand loads no runtime or model. A 32 MiB PDF's
-/// streams, decompressed, and lopdf's objects for them fit many times over.
+/// Address space the child may map: a 32 MiB PDF's streams, decompressed, and lopdf's objects fit
+/// many times over.
 const CHILD_ADDRESS_SPACE: u64 = 1 << 30;
-/// CPU seconds before the child gets SIGXCPU, for each run of parts. Parsing
-/// is well under a second a document; a zip bomb or a quadratic parser isn't.
+/// CPU seconds before SIGXCPU per run of parts. Parsing takes well under a second; a zip bomb or
+/// quadratic parser doesn't.
 const CHILD_CPU_SECONDS: u64 = 30;
-/// Wall-clock limit, for a child that hangs rather than spins. Indexing
-/// runs at idle priority, so a busy machine can stretch 30 CPU seconds out.
+/// Wall-clock limit for a child that hangs; idle priority stretches 30 CPU seconds on a busy
+/// machine.
 const CHILD_WALL: Duration = Duration::from_secs(120);
 
-/// Long documents are read and embedded a run of parts at a time:
-/// the first run with everything else, the rest after. A part is a page,
-/// slide or chapter, or for formats without them PART_CHUNKS chunks.
+/// A long document is read a run of parts at a time: the first with everything else, the rest
+/// after.
 pub const PARTS_AT_ONCE: usize = 30;
-/// Parts past this are left out.
 pub const MAX_PARTS: usize = 5_000;
 /// A part of a format without pages: about a printed page of text.
 pub const PART_CHUNKS: usize = 3;
 
-/// What a run of parts gave: the chunks of parts `from..from + count`, and
-/// how many parts the whole document has.
 #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Extract {
     pub parts: usize,
     pub chunks: Vec<(usize, String)>,
 }
 
-/// A document's bytes to the chunks of parts `from..from + count`:
-/// `parts`, or `parts_in_child`.
 pub type Parser = fn(&Path, &[u8], usize, usize) -> Result<Extract>;
 
-/// `parts`, run in a child process (the runner executing itself as
-/// `vinosearch extract <path>`, with `bytes` on its stdin) under memory, CPU
-/// and wall-clock limits, so a parser that aborts, overflows its stack, eats
-/// memory or hangs costs that process, not the runner. The limits are
-/// for each run of parts, so a long document gets them afresh each run. Err
-/// for a parser error, a child its limits stopped, or one that failed to
-/// start.
+/// `parts`, run in a child (the runner executing itself as `vinosearch extract
+/// <path>`, bytes on stdin) under memory, CPU and wall-clock limits, so a parser
+/// that aborts, overflows its stack, eats memory or hangs costs that process, not
+/// the runner. The limits apply afresh to each run of parts. Err for a parser
+/// error, a child its limits stopped, or one that failed to start.
 pub fn parts_in_child(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("extract")
@@ -74,9 +65,8 @@ pub fn parts_in_child(path: &Path, bytes: &[u8], from: usize, count: usize) -> R
     serde_json::from_slice(&out).context("reading the extractor's output")
 }
 
-/// `path`'s whole text, for reading aloud: parsed in the child as indexing
-/// does, every part in one run, then joined back up. Still held to
-/// MAX_FILE_BYTES: past that is hours of speech.
+/// `path`'s whole text, for reading aloud: every part in one run, still held to MAX_FILE_BYTES
+/// (past that is hours of speech).
 pub fn text(path: &Path) -> Result<String> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
@@ -93,10 +83,9 @@ pub fn text(path: &Path) -> Result<String> {
     Ok(join(path, chunks))
 }
 
-/// Chunks back into the text they came from. `chunk` cuts without overlap,
-/// so a part's chunks concatenate back into it; pages and slides are kept
-/// apart by a blank line. A table's chunks each repeat its header (and a
-/// sheet's name), which is kept once per sheet.
+/// Chunks back into their text: `chunk` cuts without overlap, so a part's chunks
+/// concatenate; pages and slides are kept apart by a blank line. A table's header,
+/// repeated on each chunk, is kept once per sheet.
 fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
     if ext(path) == "pdf" {
         return pdf_pages(&chunks);
@@ -137,9 +126,8 @@ fn join(path: &Path, chunks: Vec<(usize, String)>) -> String {
     out
 }
 
-/// A PDF's pages, each on one line, a blank line apart. A text layer's line
-/// breaks are layout, not meaning: some PDFs put every word on its own line,
-/// which read aloud as one sentence per word.
+/// A PDF's pages, each on one line, a blank line apart: a text layer's line breaks
+/// are layout, not meaning (some PDFs put every word on its own line).
 fn pdf_pages(chunks: &[(usize, String)]) -> String {
     let mut pages: Vec<(usize, String)> = Vec::new();
     for (n, text) in chunks {
@@ -156,9 +144,8 @@ fn pdf_pages(chunks: &[(usize, String)]) -> String {
         .join("\n\n")
 }
 
-/// The child's side: set the limits, read the document from stdin, write
-/// the chunks of parts `from..from + count` to stdout as JSON. `path` is
-/// only for its extension.
+/// The child's side: set the limits, read the document from stdin, write the chunks as JSON. `path`
+/// is only for its extension.
 pub fn child_main(path: &Path, from: usize, count: usize) -> Result<()> {
     limit(libc::RLIMIT_AS, CHILD_ADDRESS_SPACE)?;
     limit(libc::RLIMIT_CPU, CHILD_CPU_SECONDS)?;
@@ -187,7 +174,6 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> Result<()> {
     Ok(())
 }
 
-/// Taken as documents while they are on.
 pub const EXTENSIONS: &[&str] = &[
     "pdf", "docx", "docm", "dotx", "dotm", "odt", "ott", "fodt", "pptx", "pptm", "potx", "ppsx",
     "ppsm", "odp", "otp", "fodp", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "ods", "ots",
@@ -211,13 +197,10 @@ pub fn is_document(path: &Path) -> bool {
     EXTENSIONS.contains(&ext(path).as_str())
 }
 
-/// A vinoWhisper session bundle, by its name.
 pub fn is_session(path: &Path) -> bool {
     ext(path) == session::EXTENSION
 }
 
-/// What a chunk's number counts in `path`: "page", "slide", "row" or
-/// "paragraph".
 pub fn unit(path: &Path) -> &'static str {
     match ext(path).as_str() {
         "pdf" => "page",
@@ -231,14 +214,11 @@ pub fn unit(path: &Path) -> &'static str {
     }
 }
 
-/// Whether `path`'s chunks are numbered by the part they came from (a page,
-/// slide or chapter) rather than a line or row.
 fn paged(path: &Path) -> bool {
     matches!(unit(path), "page" | "slide" | "chapter")
 }
 
-/// What a part of `path` is, for "120 of 640 pages": a page, slide or
-/// chapter, or for formats without them PART_CHUNKS chunks, a "part".
+/// What a part of `path` is, for "120 of 640 pages": a page, slide, chapter or "part".
 pub fn part_unit(path: &Path) -> &'static str {
     if is_document(path) && paged(path) {
         unit(path)
@@ -247,10 +227,9 @@ pub fn part_unit(path: &Path) -> &'static str {
     }
 }
 
-/// The chunks of `path`'s parts `from..from + count`, from `bytes`, and how
-/// many parts it has. Only a PDF's pages are read a run at a time; the
-/// other formats are parsed whole, which takes a fraction of the time, and
-/// the run picked out of them.
+/// The chunks of `path`'s parts `from..from + count`, and how many parts it has.
+/// Only a PDF's pages are read a run at a time; other formats are parsed whole (a
+/// fraction of the time) and the run picked out.
 pub fn parts(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     if ext(path) == "pdf" {
         return pdf(bytes, from, count);
@@ -258,9 +237,7 @@ pub fn parts(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Ext
     Ok(select(chunks(path, bytes)?, paged(path), from, count))
 }
 
-/// Parts `from..from + count` (counted from 0) of `chunks`, and how many
-/// parts there are. `paged` chunks are numbered by their part from 1; any
-/// others go PART_CHUNKS to a part.
+/// `paged` chunks are numbered by part from 1; others go PART_CHUNKS to a part.
 pub fn select(chunks: Vec<(usize, String)>, paged: bool, from: usize, count: usize) -> Extract {
     let end = from.saturating_add(count);
     if paged {
@@ -281,7 +258,6 @@ pub fn select(chunks: Vec<(usize, String)>, paged: bool, from: usize, count: usi
     }
 }
 
-/// `path`'s text as numbered chunks, from `bytes`, its content.
 pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     if bytes.starts_with(b"PK") {
         check_zip(bytes)?;
@@ -315,8 +291,7 @@ pub fn chunks(path: &Path, bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     }
 }
 
-/// A Word 97 .doc, or what else goes by that name: RTF, as older Words
-/// saved it, or a renamed .docx (pinned by
+/// A Word 97 .doc, or an RTF or renamed .docx (pinned by
 /// `tests::an_rtf_file_saved_as_doc_reads_as_rtf`,
 /// `tests::a_docx_renamed_to_doc_reads_as_a_docx`).
 fn legacy_doc(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
@@ -343,8 +318,8 @@ fn utf8(bytes: &[u8]) -> Result<&str> {
     std::str::from_utf8(bytes).context("not UTF-8")
 }
 
-/// Each chapter in reading order. The size check in `chunks` has already run on the
-/// zip; rbook reads its entries without a limit of its own.
+/// Each chapter in reading order. rbook reads zip entries without a limit; the size check in
+/// `chunks` has already run.
 fn epub(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     let book = rbook::Epub::read(Cursor::new(bytes.to_vec()))?;
     let mut reader = book.reader();
@@ -355,8 +330,8 @@ fn epub(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     Ok(numbered(chapters.iter()))
 }
 
-/// What's said in an SRT or WebVTT file: cue numbers and ids, timings, VTT's header
-/// and NOTE/STYLE blocks, and inline tags left out.
+/// An SRT or WebVTT file's speech: cue numbers, ids, timings, VTT's header and NOTE/STYLE blocks
+/// and inline tags left out.
 fn subtitles(text: &str) -> String {
     let mut out = String::new();
     let mut lines = text
@@ -392,14 +367,12 @@ fn subtitles(text: &str) -> String {
     out
 }
 
-/// Read as text, but through `html`.
 const HTML: &[&str] = &["html", "htm"];
 
 pub fn is_html(path: &Path) -> bool {
     HTML.contains(&ext(path).as_str())
 }
 
-/// One chunk or more per part, numbered from 1 by the part it came from.
 fn numbered<S: AsRef<str>>(parts: impl Iterator<Item = S>) -> Vec<(usize, String)> {
     parts
         .enumerate()
@@ -407,8 +380,7 @@ fn numbered<S: AsRef<str>>(parts: impl Iterator<Item = S>) -> Vec<(usize, String
         .collect()
 }
 
-/// Each slide in slide order; MAX_PART_BYTES caps the slides together, not
-/// each one.
+/// Each slide in order; MAX_PART_BYTES caps the slides together, not each.
 fn pptx(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
     let slide = |name: &str| {
@@ -436,7 +408,6 @@ fn pptx(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     Ok(numbered(texts.iter()))
 }
 
-/// Each sheet as tab-separated rows, its name and header row on every chunk.
 fn sheets(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     use calamine::Reader;
     let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes))?;
@@ -457,9 +428,8 @@ fn sheets(bytes: &[u8]) -> Result<Vec<(usize, String)>> {
     Ok(out)
 }
 
-/// Rows packed into chunks that each start with `header`, so the model sees
-/// what the columns are; numbered by their first row, `first` being the row
-/// after the header.
+/// Rows packed into chunks that each start with `header`, so the model sees what the columns are;
+/// numbered by first row.
 fn table(header: &str, rows: impl Iterator<Item = String>, first: usize) -> Vec<(usize, String)> {
     let header = cut(header, CHUNK_CHARS / 2);
     let budget = CHUNK_CHARS - header.len() - 1;
@@ -484,7 +454,6 @@ fn table(header: &str, rows: impl Iterator<Item = String>, first: usize) -> Vec<
     out
 }
 
-/// `s` up to `max` bytes, on a char boundary.
 fn cut(s: &str, max: usize) -> &str {
     let mut end = max.min(s.len());
     while !s.is_char_boundary(end) {
@@ -493,10 +462,9 @@ fn cut(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Zips that say they unpack past this, or hold more entries, aren't opened.
-/// Their text would be over MAX_TEXT_BYTES anyway, and calamine unpacks
-/// without a limit of its own. A zip can lie about its sizes, so this stops
-/// accidents and naive zip bombs, not a crafted one.
+/// Zips that say they unpack past this, or hold more entries, aren't opened:
+/// their text would be over MAX_TEXT_BYTES anyway, and calamine has no limit. A zip
+/// can lie about its sizes, so this stops accidents and naive zip bombs, not a crafted one.
 const MAX_UNZIPPED_BYTES: u64 = 256 << 20;
 const MAX_ZIP_ENTRIES: usize = 10_000;
 
@@ -533,17 +501,12 @@ fn read(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<String> 
     Ok(s)
 }
 
-/// Element names that matter in a format's XML.
 struct Tags {
-    /// Where text sits; empty for any text at all.
     text: &'static str,
-    /// Ends a paragraph: a newline.
     paragraph: &'static [&'static str],
     tab: &'static [&'static str],
     line_break: &'static [&'static str],
-    /// Ends a page or slide: a form feed.
     page: &'static str,
-    /// Nothing inside these is text.
     skip: &'static [&'static str],
 }
 
@@ -572,7 +535,6 @@ impl Tags {
         page: "draw:page",
         skip: &[],
     };
-    /// An EPUB chapter.
     const XHTML: Tags = Tags {
         text: "",
         paragraph: &[
@@ -600,9 +562,9 @@ impl Tags {
 }
 
 impl Tags {
-    /// The whitespace an opening or empty element stands for. ODF's run of
-    /// spaces, `<text:s text:c="3"/>`, is one: enough to keep words apart
-    /// (pinned by `tests::an_odf_run_of_spaces_reads_as_one_space`).
+    /// The whitespace an opening or empty element stands for. ODF's run of spaces
+    /// `<text:s text:c="3"/>` is one: enough to keep words apart (pinned by
+    /// `tests::an_odf_run_of_spaces_reads_as_one_space`).
     fn mark(&self, out: &mut String, name: &str) {
         if self.tab.contains(&name) {
             out.push('\t');
@@ -614,7 +576,6 @@ impl Tags {
     }
 }
 
-/// The text in `xml`, a newline at each paragraph's end.
 fn xml_text(xml: &str, tags: &Tags) -> String {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut out = String::new();
@@ -752,8 +713,6 @@ mod tests {
         assert_eq!(join(path, c), csv);
     }
 
-    /// One page drawn in a Type 3 font the way Chromium writes one: made-up glyph names
-    /// in /Differences, the text only in /ToUnicode.
     fn type3_pdf(codes: &[u8], unicode: &str) -> Vec<u8> {
         use lopdf::{Document, Object, Stream, dictionary};
         let mut doc = Document::with_version("1.7");
@@ -813,7 +772,6 @@ mod tests {
         out
     }
 
-    /// A PDF with a page for each of `pages`, in Helvetica.
     fn text_pdf(pages: &[String]) -> Vec<u8> {
         use lopdf::{Document, Object, Stream, dictionary};
         let mut doc = Document::with_version("1.7");
@@ -848,8 +806,6 @@ mod tests {
         out
     }
 
-    /// Seven pages with no line in common: one on every page would be a
-    /// running header.
     fn seven_page_pdf() -> Vec<u8> {
         let pages: Vec<String> = ["one", "two", "three", "four", "five", "six", "seven"]
             .iter()
@@ -881,14 +837,12 @@ mod tests {
         );
     }
 
-    /// Page `n`'s own word: with its digits blanked, "page 3" is on every page.
     fn word(n: usize) -> &'static str {
         [
             "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
         ][n]
     }
 
-    /// `pages`, numbered from 1, after `drop_furniture`.
     fn without_furniture(pages: &[&str]) -> Vec<String> {
         let mut pages: Vec<(usize, String)> = pages
             .iter()
@@ -1007,8 +961,6 @@ mod tests {
     }
 
     const FURNITURE: &str = "tests/fixtures/furniture.pdf";
-    /// Four pages, each with a header on two lines, a footer and a page
-    /// number; made by make-furniture-pdf.py next to it.
     const FURNITURE_PDF: &[u8] = include_bytes!("../tests/fixtures/furniture.pdf");
 
     #[test]
@@ -1373,8 +1325,6 @@ mod tests {
         }
     }
 
-    /// A compound file holding `streams`, version 3 (512-byte sectors) as
-    /// Office writes them.
     fn ole_of(streams: &[(&str, &[u8])]) -> Vec<u8> {
         let mut file =
             cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
@@ -1386,9 +1336,6 @@ mod tests {
         file.into_inner().into_inner()
     }
 
-    /// A Word 97 file whose text is `pieces`, each stored as 8-bit
-    /// Windows-1252 (true) or UTF-16, the main document being the first
-    /// `main` characters.
     fn doc_of(pieces: &[(&str, bool)], main: u32) -> Vec<u8> {
         const F_WHICH_TBL_STM_IS_1TABLE: u16 = 0x0200;
         let mut word = vec![0u8; 1024];
@@ -1478,8 +1425,6 @@ mod tests {
         ppt_record(0x0FA0, 0, &body)
     }
 
-    /// A slide whose drawing holds `texts` a couple of containers down, as a
-    /// text box's would be.
     fn slide_container(texts: &[&str]) -> Vec<u8> {
         let boxes: Vec<Vec<u8>> = texts
             .iter()
@@ -1496,10 +1441,9 @@ mod tests {
         )
     }
 
-    /// `slides`' placeholder texts in the slide list, in order, and each
-    /// slide's own texts in its container. An old version of a slide sits
-    /// in the stream unreferenced, as a fast save leaves it, and the list
-    /// runs in reverse of the stream's order, so only the list can order them.
+    /// Slides' placeholder texts in the slide list, and each slide's own in its container;
+    /// an old slide version sits unreferenced as a fast save leaves it, so only the list can order
+    /// them.
     fn ppt_of(slides: &[(&[&str], &[&str])]) -> Vec<u8> {
         let mut stream = slide_container(&["stale"]);
         let mut offsets = Vec::new();
@@ -1693,8 +1637,6 @@ Caf\'e9 \u233?s, \u-10179?\u-8704? and {\uc2\u8364 EU} done\par
         );
     }
 
-    /// Cut short and with bytes overwritten, at many places: errors or less
-    /// text, never a panic or a hang.
     #[test]
     fn broken_doc_ppt_and_rtf_do_not_panic() {
         let doc = doc_of(&[("Some text\r", true), ("more\r", false)], 15);

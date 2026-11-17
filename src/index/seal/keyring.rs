@@ -30,7 +30,6 @@ use zeroize::Zeroizing;
 /// space), so never taken for a `systemd-creds` credential (pinned by
 /// `tests::a_key_file_is_never_read_as_a_systemd_creds_credential`).
 pub const HEAD: &str = "secret-service 1 ";
-/// The item's `xdg:schema`, beside an `id` naming this key.
 const SCHEMA: &str = "dev.vinosearch.IndexKey";
 const LABEL: &str = "vinoSearch index key";
 
@@ -48,18 +47,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Default)]
 pub struct Keyring {
     pub address: Option<String>,
-    /// How long a prompt may wait for the user; None never shows one, so a
-    /// locked keyring is `Unavailable` at once.
+    /// How long a prompt may wait for the user; None never shows one.
     pub prompt: Option<Duration>,
 }
 
-/// `(session, parameters, value, content type)`; parameters are empty in a
-/// `plain` session.
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 impl Keyring {
-    /// Store `secret` as a new item in the default collection; what
-    /// `index.key` holds for it.
     pub fn store(&self, secret: &[u8]) -> Result<Vec<u8>> {
         let mut id = [0u8; 16];
         random(&mut id)?;
@@ -98,11 +92,9 @@ impl Keyring {
         Ok(format!("{HEAD}{id}\n").into_bytes())
     }
 
-    /// The secret the item `blob` names. Every failure is `Unavailable`, an
-    /// item that isn't there too (pinned by
-    /// `tests::a_deleted_item_is_waited_out_never_a_lost_key`): unlike a
-    /// cleared TPM, that may be another keyring serving this session (another
-    /// desktop), or one whose collection isn't open yet.
+    /// The secret the item `blob` names. Every failure is `Unavailable`, a missing item too (pinned
+    /// by `tests::a_deleted_item_is_waited_out_never_a_lost_key`): unlike a cleared TPM, it may be
+    /// another keyring serving this session, or a collection not open yet.
     pub fn fetch(&self, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let id = id_of(blob).context("not a keyring key file")?;
         self.block(async |c: &Client| {
@@ -120,7 +112,6 @@ impl Keyring {
         })
     }
 
-    /// Remove the item `blob` names, if it's there and unlocked; never prompts.
     pub fn delete(&self, blob: &[u8]) -> Result<()> {
         let id = id_of(blob).context("not a keyring key file")?;
         let quiet = Keyring {
@@ -135,9 +126,8 @@ impl Keyring {
         })
     }
 
-    /// Run `f` against a fresh connection and session, on a thread of its
-    /// own: `zbus::block_on` panics inside a task zbus runs (a served
-    /// method), and the connection ends with it.
+    /// Run `f` against a fresh connection and session on its own thread: `zbus::block_on` panics
+    /// inside a task zbus runs.
     fn block<T: Send>(&self, f: impl AsyncFnOnce(&Client) -> Result<T> + Send) -> Result<T> {
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -161,7 +151,6 @@ impl Keyring {
     }
 }
 
-/// The item id in a keyring `index.key`.
 pub fn id_of(blob: &[u8]) -> Option<&str> {
     let id = std::str::from_utf8(blob.strip_prefix(HEAD.as_bytes())?)
         .ok()?
@@ -206,8 +195,7 @@ fn transient(e: zbus::Error) -> anyhow::Error {
     Unavailable(why).into()
 }
 
-/// `fut`, or None once `wait` has passed. The timer is a thread: zbus's own
-/// is private. Dropping `cancel` ends it early.
+/// `fut`, or None once `wait` has passed; the timer is a thread because zbus's own is private.
 async fn within<T>(wait: Duration, fut: impl Future<Output = T>) -> Option<T> {
     let (cancel, timer) = mpsc::channel::<()>();
     let (fire, fired) = futures_channel::oneshot::channel::<()>();
@@ -276,8 +264,6 @@ impl Client {
         self.call(SERVICE_PATH, SERVICE, method, body).await
     }
 
-    /// The item for `id`, unlocked (prompting if allowed); None if there is
-    /// none.
     async fn find(&self, id: &str) -> Result<Option<OwnedObjectPath>> {
         let attributes = HashMap::from([("xdg:schema", SCHEMA), ("id", id)]);
         let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
@@ -301,8 +287,6 @@ impl Client {
         Ok(())
     }
 
-    /// Show `prompt` and wait for the user, at most `self.prompt`; dismissed
-    /// when that runs out.
     async fn prompt(&self, prompt: &OwnedObjectPath) -> Result<()> {
         if prompt.as_str() == "/" {
             return Ok(());
@@ -339,8 +323,8 @@ impl Client {
         }
     }
 
-    /// `prompt`'s `Completed` signals. Subscribe before the prompt shows, so
-    /// its answer isn't missed.
+    /// `prompt`'s `Completed` signals; subscribe before the prompt shows so its answer isn't
+    /// missed.
     async fn completion(&self, prompt: &OwnedObjectPath) -> Result<zbus::MessageStream> {
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
@@ -387,8 +371,6 @@ mod tests {
         assert_eq!(sealed_with(b"secret-service 1 junk"), None);
     }
 
-    /// A mock Secret Service named `tag` holding one stored key, and the
-    /// keyring file for it; None without a dbus-daemon.
     fn stored(tag: &str, secret: [u8; 32]) -> Option<(Mock, Keyring, Vec<u8>)> {
         let Some(m) = Mock::start(tag) else {
             eprintln!("no dbus-daemon: skipped");
@@ -444,7 +426,6 @@ mod tests {
         assert!(format!("{e:#}").contains("no item"), "{e:#}");
     }
 
-    /// A key stored, then its keyring locked.
     fn locked(tag: &str) -> Option<(Mock, Keyring, Vec<u8>)> {
         let (m, k, b) = stored(tag, [3; 32])?;
         m.state().locked = true;
@@ -487,7 +468,6 @@ mod tests {
         assert_eq!(m.state().prompts, 1);
     }
 
-    /// A key stored, then its keyring locked behind a prompt nobody answers.
     fn locked_and_ignored(tag: &str) -> Option<(Mock, Vec<u8>)> {
         let m = Mock::start(tag)?;
         let b = m.keyring(None).store(&[4; 32]).unwrap();
@@ -568,12 +548,10 @@ mod tests {
         assert!(is_unavailable(&k.fetch(&blob(ID)).unwrap_err()));
     }
 
-    /// Against a real Secret Service, on the session bus it is run under:
-    /// `VINOSEARCH_REAL_KEYRING=1`, inside a throwaway `dbus-run-session`
-    /// with its own keyring daemon, never the desktop's. Writes the stored
-    /// secret's id and hex to `$VINOSEARCH_REAL_KEYRING_OUT` for
-    /// `secret-tool` to check, and reads back the item libsecret stored under
-    /// `$VINOSEARCH_REAL_KEYRING_ID`.
+    /// Against a real Secret Service on the session bus it runs under (`VINOSEARCH_REAL_KEYRING=1`,
+    /// inside a throwaway `dbus-run-session` with its own keyring daemon): writes the stored
+    /// secret's id and hex to `$VINOSEARCH_REAL_KEYRING_OUT` for `secret-tool` to check, and reads
+    /// back the item under `$VINOSEARCH_REAL_KEYRING_ID`.
     #[test]
     fn real_secret_service() {
         if std::env::var_os("VINOSEARCH_REAL_KEYRING").is_none() {

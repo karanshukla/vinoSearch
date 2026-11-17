@@ -4,15 +4,11 @@
 //! the desktop keyring where that can't be used (seal.rs), named by
 //! `index.key` beside it.
 //!
-//! The key file is what says the index is encrypted. Every open unseals it
-//! (once per process, then held), and a key that won't unseal or doesn't open
-//! the index is never answered with a plaintext index: `apply`, run at start
-//! and when the setting changes, rebuilds the index from the files instead.
-//! A key that can't be had yet (a locked keyring) is waited for: every open
-//! fails at once meanwhile, without asking the keyring again, until `apply`
-//! does.
-//! The folder list survives that in `index.roots`, beside the key, in
-//! plaintext: folder paths, as `exclude` in config.toml already holds.
+//! The key file is what says the index is encrypted. Every open unseals it (once per process), and
+//! a key that won't unseal or doesn't open the index is never answered with a plaintext index:
+//! `apply` rebuilds it from the files. A key that can't be had yet (a locked keyring) is waited
+//! for: every open fails at once until `apply` asks again. The folder list survives a rebuild in
+//! `index.roots`, in plaintext (folder paths, as `exclude` in config.toml already holds).
 //!
 //! The vector cache in memory is not locked or wiped on unload: anyone who
 //! can read this process's memory is this user, who can unseal the key
@@ -33,13 +29,12 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use vinosearch_shared::config::Config;
 use vinosearch_shared::dbus::seal as seal_name;
 
-/// The sealed key, beside the database: `index.key` for `index.sqlite`.
 pub fn key_file(db: &Path) -> PathBuf {
     db.with_extension("key")
 }
 
-/// The roots, one per line, kept while the index is encrypted so a lost key
-/// costs the index and not the list of folders in it.
+/// The roots, one per line, kept while encrypted so a lost key costs the index, not the folder
+/// list.
 pub fn roots_file(db: &Path) -> PathBuf {
     db.with_extension("roots")
 }
@@ -50,8 +45,6 @@ fn sibling(db: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// The index's key can't be used: it doesn't unseal (TPM cleared or
-/// replaced, the host key changed), it's gone, or it doesn't open the index.
 #[derive(Debug)]
 pub struct Unusable(pub String);
 
@@ -67,18 +60,17 @@ pub fn is_unusable(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Unusable>().is_some()
 }
 
-/// Keys this process holds, by database: unsealed once, then reused while
-/// the key file is unchanged.
 enum Held {
     Sealed {
         credential: Vec<u8>,
         key: Arc<Key>,
         seal: Seal,
     },
-    /// Nothing could seal it: lost when the process ends.
     Memory(Arc<Key>),
-    /// `credential`'s key couldn't be had, for now (`seal::Unavailable`).
-    Waiting { credential: Vec<u8>, why: String },
+    Waiting {
+        credential: Vec<u8>,
+        why: String,
+    },
 }
 
 static HELD: Mutex<Vec<(PathBuf, Held)>> = Mutex::new(Vec::new());
@@ -95,16 +87,13 @@ fn hold(db: &Path, h: Option<Held>) {
     }
 }
 
-/// Encrypt `db` with a key kept in memory only, for a throwaway index
-/// (`vinosearch eval --encrypted`).
 pub fn hold_in_memory(db: &Path) -> Result<()> {
     hold(db, Some(Held::Memory(Arc::new(Key::random()?))));
     Ok(())
 }
 
-/// The key `db` opens with; None while it is plaintext. Never prompts to
-/// unlock the keyring: that is `apply`'s, so no open (a query's) waits on
-/// the user.
+/// The key `db` opens with; None while plaintext. Never prompts to unlock the keyring (that is
+/// `apply`'s), so no query waits on the user.
 pub fn key_for(db: &Path) -> Result<Option<Arc<Key>>> {
     key_with(db, &Sealer::default().quiet())
 }
@@ -164,8 +153,6 @@ fn waiting(why: String) -> anyhow::Error {
     anyhow::Error::new(seal::Unavailable(why)).context("the index's key can't be had yet")
 }
 
-/// Key `conn` (None leaves it plaintext) and check it reads: a wrong key, or
-/// none for an encrypted file, is `Unusable`.
 pub fn unlock(conn: &Connection, key: Option<&Key>) -> Result<()> {
     if let Some(key) = key {
         let raw = key.raw();
@@ -196,14 +183,12 @@ pub fn unlock(conn: &Connection, key: Option<&Key>) -> Result<()> {
     }
 }
 
-/// `db` read-only, as it is: not created, not converted.
 pub fn open_read_only(db: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     unlock(&conn, key_for(db)?.as_deref())?;
     Ok(conn)
 }
 
-/// Encryption as the config file asks for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Want {
     pub on: bool,
@@ -219,18 +204,13 @@ impl Want {
     }
 }
 
-/// Where encryption stands, for Status.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
     pub encrypted: bool,
-    /// A `dbus::seal` value; empty while plaintext.
     pub seal: &'static str,
-    /// Why the last change was refused or failed.
     pub error: String,
-    /// Why the index was rebuilt from the files.
     pub broken: String,
-    /// Why its key can't be had yet (a locked keyring): the index is kept,
-    /// and opens once it can.
+    /// Why its key can't be had yet (a locked keyring): the index is kept and opens once it can.
     pub waiting: String,
 }
 
@@ -257,20 +237,17 @@ fn state_of(db: &Path) -> State {
     }
 }
 
-/// Bring `db` to `want`: encrypt it, decrypt it, or with `rekey` re-encrypt
-/// it under a new key, converting what is there (sqlcipher_export), so
-/// nothing needs indexing again. A key that can't be used rebuilds the index
-/// from the files instead. Never leaves plaintext where encryption was: a
-/// lost key with nothing to seal a new one holds the new one in memory.
+/// Bring `db` to `want`: encrypt, decrypt, or with `rekey` re-encrypt under a new key, converting
+/// what is there (sqlcipher_export) so nothing needs indexing again. A key that can't be used
+/// rebuilds the index from the files. Never leaves plaintext where encryption was: a lost key with
+/// nothing to seal a new one holds the new one in memory.
 ///
-/// Connections opened through `Live` are closed meanwhile and reopen on
-/// their next use; any other this process holds on `db` must be closed
-/// first. Another process with the index open (`vinosearch index` beside the
-/// runner) holds it shared, and the change is refused until it is done
+/// Connections opened through `Live` are closed meanwhile and reopen on next use; any other on `db`
+/// must be closed first. Another process with the index open holds it shared, and the change is
+/// refused until it is done
 /// (pinned by `tests::another_process_holding_the_index_blocks_a_conversion`).
 ///
-/// A key that can't be had yet is asked for again here, and only here. It
-/// isn't an `error`: `waiting` says why.
+/// A key that can't be had yet is asked for again here only; `waiting` says why.
 pub fn apply(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> State {
     let mut broken = String::new();
     held().retain(|(p, h)| p != db || !matches!(h, Held::Waiting { .. }));
@@ -286,8 +263,7 @@ pub fn apply(db: &Path, want: Want, rekey: bool, sealer: &Sealer) -> State {
     st
 }
 
-/// `apply`'s work. A settled index takes no lock, so `vinosearch index`
-/// beside the runner just opens it.
+/// A settled index takes no lock, so `vinosearch index` beside the runner just opens it.
 fn apply_inner(
     db: &Path,
     want: Want,
@@ -343,7 +319,6 @@ fn apply_inner(
     Ok(())
 }
 
-/// The key that opens `db` now, checked against it.
 fn current_key(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
     let k = key_with(db, sealer)?;
     if db.exists() {
@@ -353,17 +328,16 @@ fn current_key(db: &Path, sealer: &Sealer) -> Result<Option<Arc<Key>>> {
     Ok(k)
 }
 
-/// Encryption turned off by the user now while the key can't be had: the way
-/// to start over, and their choice, so the index is rebuilt as a lost key's
-/// would be. Never at the start or from `vinosearch index`, where a keyring
-/// that is locked or not up yet mustn't cost the index (pinned by
+/// Encryption turned off by the user now while the key can't be had: their way to start over, so
+/// the index is rebuilt as for a lost key. Never at start or from `vinosearch index`, where a
+/// locked or not-yet-up keyring mustn't cost the index (pinned by
 /// `tests::a_keyring_item_gone_is_waited_for_until_encryption_starts_over`).
 fn starts_over(e: &anyhow::Error, want: Want, sealer: &Sealer) -> bool {
     !want.on && sealer.starts_over() && seal::is_unavailable(e)
 }
 
-/// Replace `db`, whose key is lost (`why`), with an empty index as `want`
-/// asks, holding the folders it had for the watcher to index again (pinned by
+/// Replace `db`, whose key is lost (`why`), with an empty index as `want` asks, holding its folders
+/// for the watcher (pinned by
 /// `tests::a_key_that_wont_unseal_rebuilds_the_index_encrypted`).
 fn rebuild(
     db: &Path,
@@ -390,9 +364,8 @@ fn rebuild(
     Ok(())
 }
 
-/// A new key for `db`, sealed and held, while `want` is on; whether there is
-/// one. A key that won't seal is held in memory: an index wanted encrypted is
-/// never plaintext (pinned by
+/// A new key for `db`, sealed and held, while `want` is on. A key that won't seal is held in
+/// memory: an index wanted encrypted is never plaintext (pinned by
 /// `tests::a_key_that_wont_unseal_rebuilds_the_index_encrypted`).
 fn hold_new_key(db: &Path, want: Want, sealer: &Sealer) -> Result<bool> {
     match new_key(want, sealer) {
@@ -423,8 +396,7 @@ fn held_in_memory(db: &Path) -> bool {
         .any(|(p, h)| p == db && matches!(h, Held::Memory(_)))
 }
 
-/// `db` is as `want` asks, and opens. A key in memory is never settled:
-/// sealed when it can be, or dropped.
+/// A key in memory is never settled: sealed when it can be, or dropped.
 fn settled(db: &Path, want: Want, sealer: &Sealer) -> bool {
     let Ok(key) = key_with(db, sealer) else {
         return false;
@@ -439,7 +411,6 @@ fn settled(db: &Path, want: Want, sealer: &Sealer) -> bool {
 
 type Sealed = (Arc<Key>, Vec<u8>, Seal);
 
-/// A new key, sealed as `want` allows; None when encryption is off.
 fn new_key(want: Want, sealer: &Sealer) -> Option<Result<Sealed>> {
     want.on.then(|| {
         let key = Key::random()?;
@@ -448,10 +419,9 @@ fn new_key(want: Want, sealer: &Sealer) -> Option<Result<Sealed>> {
     })
 }
 
-/// Copy `db` (keyed with `from`) into a new file keyed with `to`'s key, or
-/// plaintext, then put the new key file and the new database in its place.
-/// A crash part way leaves a key that doesn't open the database, which
-/// `apply` rebuilds: never a plaintext index beside a key.
+/// Copy `db` (keyed with `from`) into a new file keyed with `to`, then put the new key file and
+/// database in place. A crash part way leaves a key that doesn't open the database, which `apply`
+/// rebuilds: never a plaintext index beside a key.
 fn convert(db: &Path, from: Option<&Key>, to: Option<(&Key, &Vec<u8>)>) -> Result<()> {
     let new = sibling(db, ".new");
     remove(&new)?;
@@ -490,13 +460,11 @@ fn convert(db: &Path, from: Option<&Key>, to: Option<(&Key, &Vec<u8>)>) -> Resul
     sync_dir(db)
 }
 
-/// Moves the WAL's pages into the database file, so none is left behind.
 fn checkpoint(conn: &Connection) -> Result<()> {
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     Ok(())
 }
 
-/// Removes `db`'s journal, so the old file's isn't read as a new one's.
 fn remove_journal(db: &Path) -> Result<()> {
     for ext in ["-wal", "-shm"] {
         remove(&sibling(db, ext))?;
@@ -504,7 +472,6 @@ fn remove_journal(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the database, its journal and its key.
 fn wipe(db: &Path) -> Result<()> {
     for p in [
         db.to_path_buf(),
@@ -528,7 +495,6 @@ fn remove(p: &Path) -> Result<()> {
     }
 }
 
-/// Create `p`'s folder, if missing, for this user only.
 fn private_parent(p: &Path) -> Result<()> {
     if let Some(dir) = p.parent() {
         fs::DirBuilder::new()
@@ -539,7 +505,6 @@ fn private_parent(p: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create `p` empty and readable by this user only.
 fn private(p: &Path) -> Result<File> {
     private_parent(p)?;
     OpenOptions::new()
@@ -551,7 +516,6 @@ fn private(p: &Path) -> Result<File> {
         .with_context(|| p.display().to_string())
 }
 
-/// Write `contents` to `p` whole: to a new file, synced, renamed over.
 fn write_private(p: &Path, contents: &[u8]) -> Result<()> {
     let tmp = sibling(p, ".new");
     let mut f = private(&tmp)?;
@@ -572,8 +536,6 @@ fn sync_dir(db: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Keep `index.roots` up to date while the index is encrypted; called once
-/// the roots change.
 pub fn save_roots(db: &Path, conn: &Connection) -> Result<()> {
     if !key_file(db).exists() && !state_of(db).encrypted {
         return Ok(());
@@ -595,18 +557,15 @@ fn read_roots(db: &Path) -> Vec<String> {
         .collect()
 }
 
-/// `<db>.lock`, flocked: shared by every long-running process with the index
-/// open, exclusive while `apply` converts it.
+/// `<db>.lock`, flocked: shared by every process with the index open, exclusive while `apply`
+/// converts it.
 struct Lock {
     file: Arc<File>,
-    /// Shared again when done, if this process held it shared before.
     keep: bool,
 }
 
 static HOLDING: Mutex<Vec<(PathBuf, Arc<File>)>> = Mutex::new(Vec::new());
 
-/// Hold `db` shared for this process's lifetime, so another process's
-/// `apply` doesn't convert it underneath.
 pub fn hold_shared(db: &Path) -> Result<()> {
     let mut all = HOLDING.lock().unwrap_or_else(|e| e.into_inner());
     if all.iter().any(|(p, _)| p == db) {
@@ -677,16 +636,14 @@ impl Drop for Lock {
     }
 }
 
-/// A connection to the index that `apply` can close under its user: opened
-/// again, with whatever key is current, on the next `lock`.
 pub struct Live {
     path: PathBuf,
     conn: Mutex<Option<Connection>>,
 }
 
 static LIVE: Mutex<Vec<Weak<Live>>> = Mutex::new(Vec::new());
-/// Read while a Live connection is in use, written while `apply` closes
-/// them, so none is closed mid-query.
+/// Read while a Live connection is in use, written while `apply` closes them: none is closed
+/// mid-query.
 static SWAP: RwLock<()> = RwLock::new(());
 
 pub struct LiveGuard<'a> {
@@ -702,7 +659,6 @@ impl Deref for LiveGuard<'_> {
 }
 
 impl Live {
-    /// Opened now, or at its first use if its key can't be had yet.
     pub fn open(path: &Path) -> Result<Arc<Live>> {
         let conn = match index::open(path) {
             Ok(c) => Some(c),
@@ -729,8 +685,6 @@ impl Live {
     }
 }
 
-/// Close every Live connection to `db`, and keep them closed while the
-/// guard lives.
 fn close_all(db: &Path) -> std::sync::RwLockWriteGuard<'static, ()> {
     let w = SWAP.write().unwrap_or_else(|e| e.into_inner());
     let all: Vec<Arc<Live>> = LIVE
