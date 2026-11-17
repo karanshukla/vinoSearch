@@ -20,6 +20,16 @@
   <!-- Newest first, one per release: software centres and vinoPilot read
        the installed version from here. release.yml checks the tag has its line. -->
   <releases>
+    <release version="12.0.0" date="2026-11-17">
+      <description>
+        <ul>
+          <li>Index and open vinoWhisper sessions from its Flatpak</li>
+          <li>Status says how many audio and video files wait for a charger</li>
+          <li>A wide settings window shows a page's groups in two columns</li>
+          <li>A build that isn't a release says dev, so vinoPilot can tell them apart</li>
+        </ul>
+      </description>
+    </release>
     <release version="11.0.0" date="2026-11-14">
       <description>
         <ul>
