@@ -19,6 +19,11 @@ the number only says which one is newer.
    gh release create vN --verify-tag --generate-notes
    ```
 
+A binary reports `vinosearch <number>` only when `release.yml` built it, which sets
+`VINOSEARCH_VERSION` to the crates' version (the build fails if the two differ); the Flatpak job
+adds it to the manifest's build env on the runner. Every other build, a `cargo install` or a local
+Flatpak build included, reports `vinosearch dev`, and is never offered an update.
+
 Publishing runs [`release.yml`](https://github.com/karanshukla/vinoSearch/blob/main/.github/workflows/release.yml),
 which attaches `vinosearch-x86_64-linux.tar.gz` and its `.sha256`, then builds the Flatpak and
 attaches `vinosearch-x86_64.flatpak` and its `.sha256` about 20 minutes later.

@@ -14,6 +14,7 @@ vinosearch-settings: the vinoSearch settings window
 
 Usage: vinosearch-settings [--page index|folders|search|model|hardware|integration]
        vinosearch-settings --search [QUERY]
+       vinosearch-settings --version
 
 --search opens the search window, searching QUERY if given (its words
 need no quotes).
@@ -26,6 +27,13 @@ fn main() -> ExitCode {
         ["--page", page] => window::run(&vinosearch_shared::dbus::names().app_id, Some(page)),
         ["--search", ref query @ ..] => {
             window::search::run(&vinosearch_shared::dbus::names().app_id, &query.join(" "))
+        }
+        ["-V" | "--version"] => {
+            println!(
+                "vinosearch-settings {}",
+                vinosearch_shared::version::VERSION
+            );
+            ExitCode::SUCCESS
         }
         ["-h" | "--help"] => {
             print!("{USAGE}");

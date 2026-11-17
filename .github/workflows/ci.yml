@@ -46,6 +46,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      # A release build, as release.yml makes it: the stamp is the version
+      # `--version` prints, and the version tests take their release branch.
+      - name: Stamped build reports its version
+        run: |
+          export VINOSEARCH_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          cargo test --locked --workspace version
+          cargo build --locked -p vinosearch -p vinosearch-settings
+          [ "$(target/debug/vinosearch --version)" = "vinosearch $VINOSEARCH_VERSION" ]
+          [ "$(target/debug/vinosearch-settings --version)" = "vinosearch-settings $VINOSEARCH_VERSION" ]
 
   # Every `tests::name` a comment cites is a real #[test] fn
   # (docs/comment-style.md). Also part of `cargo test`; its own job so a

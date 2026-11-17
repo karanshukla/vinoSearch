@@ -35,6 +35,10 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           grep -q "<release version=\"$version\"" packaging/flatpak/dev.vinosearch.VinoSearch.metainfo.xml ||
             { echo "::error::the metainfo has no <release version=\"$version\">"; exit 1; }
+      # The binaries report this as their version; any other build says `dev`.
+      # The build fails if it differs from the crates' version.
+      - name: Stamp the build as this release
+        run: echo "VINOSEARCH_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The tag passed CI on main; this checks it again on the release image.
@@ -61,7 +65,8 @@ jobs:
           sha256sum -c vinosearch-x86_64-linux.tar.gz.sha256
           tar xzf vinosearch-x86_64-linux.tar.gz -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP/vinosearch"
-          bin/vinosearch --version
+          [ "$(bin/vinosearch --version)" = "vinosearch $VINOSEARCH_VERSION" ]
+          [ "$(bin/vinosearch-settings --version)" = "vinosearch-settings $VINOSEARCH_VERSION" ]
           bin/ovfetch --version
           bin/vinosearch-settings --help > /dev/null
           printf 'a,b\n1,2\n' | bin/vinosearch extract /x/a.csv | jq -e '.parts == 1'
@@ -101,6 +106,14 @@ jobs:
           flatpak install --user -y --noninteractive flathub org.flatpak.Builder \
             org.freedesktop.Platform//26.08 org.freedesktop.Sdk//26.08 \
             org.freedesktop.Sdk.Extension.rust-stable//26.08
+      # The manifest builds from source with no stamp, as a local build does;
+      # a release bundle's binaries get the tag's version. cargo fails the
+      # build if it is not the crates' version.
+      - name: Stamp the build as this release
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          sed -i "s|^\( *\)CARGO_HOME: /run/build/vinosearch/cargo$|&\n\1VINOSEARCH_VERSION: \"$version\"|" "packaging/flatpak/$APP.yml"
+          grep -B1 -A1 VINOSEARCH_VERSION "packaging/flatpak/$APP.yml"
       # Branch stable: a build from a checkout is master, and only a stable
       # build offers to install the next release's bundle over itself.
       - name: Build
@@ -127,6 +140,8 @@ jobs:
             "vinosearch ${TAG#v}" | "vinosearch ${TAG#v}.0" | "vinosearch ${TAG#v}.0.0") ;;
             *) echo "the $TAG bundle is $version"; exit 1 ;;
           esac
+          settings=$(dbus-run-session -- flatpak run --command=vinosearch-settings "$APP" --version)
+          [ "$settings" = "vinosearch-settings ${version#vinosearch }" ]
           dbus-run-session -- flatpak run "$APP" doctor --device CPU
       - name: Upload
         env:

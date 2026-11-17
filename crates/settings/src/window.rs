@@ -288,7 +288,8 @@ struct SettingsWindow {
 /// with `vinosearch flatpak-update`. A build from source has neither, and links to the release
 /// instead.
 fn updater() -> vino_ui::update::Updater {
-    let updater = vino_ui::update::Updater::new(vino_ui::App::Search, env!("CARGO_PKG_VERSION"));
+    let updater =
+        vino_ui::update::Updater::new(vino_ui::App::Search, vinosearch_shared::version::VERSION);
     if sandbox::flatpak_id().is_some() {
         let release =
             sandbox::info_value("Instance", "branch").as_deref() == Some(sandbox::RELEASE_BRANCH);
