@@ -5,33 +5,31 @@ nav_order: 3
 
 # Using it
 
-- **Plasma:** Alt+Space opens KRunner. Results come in **vinoSearch Text**, **vinoSearch Documents** and **vinoSearch Images** groups, vinoWhisper sessions in **vinoWhisper sessions**, and `code:` queries in **vinoSearch Code**.
-- **GNOME:** the overview's search, from the next login.
-- **Sway, Hyprland, COSMIC and the rest:** see [below](#other-wayland-desktops).
-- **Terminal:** see [the CLI](#the-cli).
+- **KDE Plasma:** Press `Alt+Space` to open KRunner. Results appear under **vinoSearch Text**, **vinoSearch Documents**, **vinoSearch Images**, **vinoWhisper sessions**, and (for `code:` queries) **vinoSearch Code**.
+- **GNOME:** Search directly from the GNOME Shell overview (available starting on the next login).
+- **Sway, Hyprland, COSMIC, and other Wayland desktops:** See [Other Wayland desktops](#other-wayland-desktops).
+- **Terminal:** See [The CLI](#the-cli).
 
-Results need 3 or more characters. Enter opens the file: a text file at the matching line in your
-editor, a PDF at the matching page in Okular, Evince, Papers or Zathura, an audio or video file from
-the matching time in mpv, VLC or Celluloid. A vinoWhisper session made from a recording plays that
-recording from the matching stamp when the recording is indexed too; **Open transcript** opens the
-text instead. Other files, and apps that can't be told where (Haruna, Totem and Showtime take no
-start time), open at the top. [The D-Bus page](dbus.md#opening-at-the-match) has which
-editors and viewers count.
+Queries require at least 3 characters. Pressing `Enter` opens the matched file directly at the relevant location:
+- Text files open at the matching line in your configured or default editor.
+- PDFs open at the matching page in Okular, Evince, Papers, or Zathura.
+- Audio and video files play from the matching timestamp in mpv, VLC, or Celluloid.
+- vinoWhisper sessions created from a recording play that recording from the matched timestamp when the recording is also indexed; choose **Open transcript** to open the text instead.
+- Other file types and players that do not accept a start time on the command line (such as Haruna, Totem, and Showtime) open at the beginning.
+
+See [Opening at the match](dbus.md#opening-at-the-match) for the full list of supported editors, viewers, and players.
 
 ## All results
 
-KRunner's **Show all results** on any match, or the vinoSearch icon beside GNOME's results, opens the
-query in a search window (needs `vinosearch-settings`): up to 100 files of each kind, photos as a grid
-of thumbnails, text and documents with their snippet and line or page, filtered by kind, folder, date
-and file type. Enter or a double click opens a result at its match; **Open folder** and **Copy file**
-(pastes as the file in a file manager; needs `wl-copy`) are below.
+Select **Show all results** on any KRunner match, or click the vinoSearch icon next to GNOME Shell results, to open the full search window (requires `vinosearch-settings`). It displays up to 100 files per category—photos in a thumbnail grid, and text/documents with snippets and line or page numbers—along with filters for category, folder, date, and file type.
 
-`vinosearch-settings --search "query"` opens it from a key binding.
+Press `Enter` or double-click an entry to open it at the match. Action buttons at the bottom provide **Open folder** and **Copy file** (which copies the file URI for pasting in a file manager; requires `wl-copy`).
+
+You can also open the search window directly from a shortcut with `vinosearch-settings --search "query"`.
 
 ## Other Wayland desktops
 
-`vinosearch menu` asks for a query in fuzzel, wofi, rofi, tofi or bemenu (the first it finds), shows
-the results in it, and opens the one you pick. Bind it to a key:
+`vinosearch menu` prompts for a query using the first available dmenu-style launcher (`fuzzel`, `wofi`, `rofi`, `tofi`, or `bemenu`), displays matching results, and opens your selection. Bind it to a shortcut in your compositor configuration:
 
 ```
 # sway
@@ -41,18 +39,17 @@ bindsym $mod+s exec vinosearch menu
 bind = SUPER, S, exec, vinosearch menu
 ```
 
-`--launcher "rofi -dmenu -i"` (or `VINOSEARCH_LAUNCHER`) picks another dmenu-style command. It asks
-the running service, so a warm query is as quick as KRunner's.
+Pass `--launcher "rofi -dmenu -i"` (or set `VINOSEARCH_LAUNCHER`) to specify a custom dmenu command. Because it queries the running background service, warm queries match KRunner's latency.
 
 ## The CLI
 
 ```bash
 vinosearch search "how do I rotate the signing key"
-vinosearch search "code: retry a failed download"   # code only
-vinosearch similar ~/Pictures/IMG_2041.jpg           # indexed photos that look like one
-vinosearch read-text screenshot.png                  # the text OCR reads, as indexing reads it
-vinosearch estimate ~/Development                    # how long indexing would take
-vinosearch doctor                                    # check the NPU, driver and runtime
+vinosearch search "code: retry a failed download"   # search source code only
+vinosearch similar ~/Pictures/IMG_2041.jpg           # find visually similar indexed photos
+vinosearch read-text screenshot.png                  # print the OCR text extracted during indexing
+vinosearch estimate ~/Development                    # estimate indexing duration and size
+vinosearch doctor                                    # verify NPU, driver, and runtime
 ```
 
-`vinosearch --help` lists the rest.
+Run `vinosearch --help` to see all available subcommands and flags.

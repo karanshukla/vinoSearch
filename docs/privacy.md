@@ -5,34 +5,31 @@ nav_order: 5
 
 # Privacy
 
-The only network calls download the model and the runtime, and each model file is checked against a
-pinned SHA-256. Nothing you index or search leaves the machine.
+The only network requests vinoSearch makes are for downloading models and the OpenVINO runtime, and every model file is verified against a pinned SHA-256 checksum. Indexed content and search queries never leave your machine.
 
-The index is SQLite in `~/.local/share/vinosearch/index.sqlite`, readable only by you (0600,
-directory 0700). Embeddings can be partly inverted back to their text, so treat the index like the
-files it covers.
+The index is stored in SQLite at `~/.local/share/vinosearch/index.sqlite` with permissions restricted to your user (`0600` file inside a `0700` directory). Because vector embeddings can be partially inverted back to source text, treat the index with the same sensitivity as the files it covers.
 
 ## Encryption at rest
 
-The index can be encrypted at rest ([#4](https://github.com/karanshukla/vinoSearch/issues/4)): the
-settings window's Security page, or `enabled = true` under `[encryption]` in the config file. Off by
-default.
+Index encryption is optional and disabled by default ([#4](https://github.com/karanshukla/vinoSearch/issues/4)). Enable it from the settings window's Security page, or by setting `enabled = true` under `[encryption]` in `config.toml`.
 
-- The whole database is SQLCipher (AES-256), so text, vectors, file names and the word index are all covered.
-- Its random key is sealed by `systemd-creds` to this machine's TPM and your user.
-- Turning it on or off converts the index in place; nothing is indexed again, and search is unchanged.
-- Without a TPM it's refused unless you allow systemd's host key, which root can read.
-- If the key stops unsealing (TPM cleared, board replaced), the index is rebuilt from your files, never left readable.
-- Where `systemd-creds` can't be used (no systemd, or one older than 256), the key goes in your desktop keyring instead (gnome-keyring, KWallet or anything else speaking the Secret Service API). That is weaker than the TPM: the keyring is unlocked when you log in, and from then on anything running as you in your session can read the key. The key also crosses your session bus unencrypted on its way to and from the keyring (a `plain` Secret Service session). Only your own processes can connect to that bus, and any of them could read the key from the unlocked keyring anyway, so this exposes it to no one the keyring doesn't already. What it protects is a backup, a synced copy of your home folder, or a disk taken out: the keyring file on disk is encrypted with your keyring's password, usually your login password. A keyring set up with an empty password is stored unencrypted, and then the key with it. If you log in without a password (autologin, a fingerprint), the keyring stays locked until something asks you to unlock it.
-- A machine that seals with `systemd-creds` today keeps doing so; an index is never moved from the TPM to the keyring, and an index sealed one way is always unsealed the same way.
-- The Flatpak seals and unseals with the host's `systemd-creds` (through `flatpak-spawn --host`), so its key is sealed to the same TPM and user as a native install's, and the key is handed to the host's `systemd-creds` on a pipe, never through another process. If it can't reach the host, the index is kept and waited for, never moved to the keyring.
-- While the keyring is locked, the index is kept as it is and searches find nothing; the runner asks you to unlock it once at start (the prompt gives up after a minute), looks again quietly every 30 seconds, and asks again from the Security page's Unlock button. It never falls back to a plaintext index. The same goes when the keyring has no item for the key: unlike a cleared TPM that may not be for good (another desktop's keyring serving this login, or one not opened yet), so the index isn't dropped for it. To start over instead, turn encryption off: once the key still can't be had after the unlock prompt, the index is rebuilt from your files, and turning encryption on again makes a new key.
+- **Full-database encryption:** Uses SQLCipher (AES-256) across the entire database, protecting extracted text, embeddings, filenames, and the FTS5 word index.
+- **In-place conversion:** Turning encryption on or off converts the existing database in place without re-indexing, and search behavior remains unchanged.
+- **TPM sealing (`systemd-creds`):** On systems with systemd 256+, a random key is sealed via `systemd-creds` to your machine's TPM and user ID. Without a TPM, encryption is refused unless you explicitly allow systemd's host key (`allow_host_key = true`), which `root` can read. If a sealed key can no longer be unsealed (for example, after clearing the TPM or replacing the motherboard), the index is rebuilt from your files rather than left readable.
+- **Flatpak support:** The Flatpak seals and unseals keys using the host's `systemd-creds` over `flatpak-spawn --host`, piping the key directly to `systemd-creds` so it binds to the same TPM and user as a native install. If the host cannot be reached, the encrypted index is preserved while waiting and never silently migrated to the keyring.
+- **No silent downgrade between backends:** Once an index is sealed with `systemd-creds`, it is never migrated to the keyring; an index is always unsealed with the same mechanism that sealed it.
 
-Details in [How it works](how-it-works.md#encryption-at-rest).
+### Desktop keyring fallback (without `systemd-creds`)
+
+On systems without systemd or with systemd older than 256, the key is stored in your desktop keyring via the freedesktop Secret Service API (GNOME Keyring, KWallet, or compatible backends):
+
+- **Threat model:** Keyring storage is weaker than TPM sealing. Once unlocked at login, any process running under your user session can read the key. The key also travels across your session D-Bus unencrypted (`plain` Secret Service session); since only your own processes can connect to the session bus and could already query the unlocked keyring directly, this does not expand exposure beyond the keyring itself. Keyring encryption primarily protects backups, synced home directories, and removed disks, provided your keyring has a non-empty password (an empty keyring password stores the keyring unencrypted). If you log in without a password (such as autologin or fingerprint), the keyring stays locked until unlocked manually.
+- **Locked keyring or missing entry:** While the keyring is locked, the encrypted index is preserved and searches return empty results. The runner prompts once to unlock at startup (timing out after 1 minute), retries quietly every 30 seconds, and re-prompts when you click **Unlock** on the Security page; it never falls back to plaintext. The same applies if no matching item is found in the current keyring (which can happen when switching desktop keyrings). To start over, turn encryption off: if the key still cannot be retrieved after prompting, the index is rebuilt in plaintext from your folders, and re-enabling encryption generates a fresh key.
+
+See [Encryption at rest](how-it-works.md#encryption-at-rest) for low-level implementation details.
 
 ## Documents and code
 
-Documents are off by default because they're where statements, tax forms and bank exports live, and
-their text sits in the index readable unless it's encrypted. Code is off by default too; when it's
-on, files named for secrets and any file holding a private key or a recognisable API token are left
-out. [What gets indexed](how-it-works.md#what-gets-indexed) has the rules.
+Document indexing is disabled by default because document folders often contain financial statements, tax forms, and bank exports whose extracted text remains readable in the index unless encryption is enabled.
+
+Source code indexing is also disabled by default. When enabled, files named for secrets and files containing private keys or recognizable API tokens are automatically excluded. See [What gets indexed](how-it-works.md#what-gets-indexed) for the full filtering rules.
