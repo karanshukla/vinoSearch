@@ -7,9 +7,9 @@ nav_order: 2
 
 ## Requirements
 
-- Linux with an Intel NPU (Core Ultra or newer) and the [NPU driver](https://github.com/intel/linux-npu-driver). No NPU (AMD, older Intel)? `install.sh` runs it on the CPU, just slower; `--device CPU` does the same explicitly.
-- KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC and other Wayland desktops work through `vinosearch menu` and a dmenu-style launcher (fuzzel, wofi, rofi, tofi or bemenu). The settings window is Wayland only.
-- Rust, a C compiler and OpenSSL's headers, only to build from source.
+- Linux with an Intel NPU (Core Ultra or newer) and the [Intel Linux NPU driver](https://github.com/intel/linux-npu-driver). On systems without an NPU (such as AMD or older Intel CPUs), `install.sh` falls back to the CPU at lower speed; pass `--device CPU` to select CPU explicitly.
+- KDE Plasma or GNOME on Wayland. Sway, Hyprland, COSMIC, and other Wayland desktops work via `vinosearch menu` with a dmenu-style launcher (`fuzzel`, `wofi`, `rofi`, `tofi`, or `bemenu`). The settings window requires Wayland.
+- Rust, a C compiler, and OpenSSL development headers are only required when building from source.
 
 ## Release download
 
@@ -18,15 +18,9 @@ curl -L https://github.com/karanshukla/vinoSearch/releases/latest/download/vinos
 vinosearch/scripts/install.sh --index ~/Documents
 ```
 
-That installs the prebuilt binaries into `~/.local/bin` (x86_64, glibc 2.39 or newer), fetches
-OpenVINO and the 340 MB model, indexes the folders you name (`--index` is repeatable, or it asks),
-and registers vinoSearch with the running desktop's search (KRunner on Plasma, GNOME Shell on GNOME)
-as a service started at login. It skips whatever is already done, so re-running it from a newer
-download upgrades in place. If something is missing (the NPU driver, say), it stops with one line
-saying what.
+This installs prebuilt binaries into `~/.local/bin` (`x86_64`, glibc 2.39+), downloads OpenVINO and the 340 MB base models, indexes the directories you pass (`--index` can be repeated, or the script will prompt you), and registers vinoSearch with your desktop's search (KRunner on Plasma, GNOME Shell on GNOME) as a login service. Already-completed steps are skipped, so re-running from a newer archive upgrades in place. If a prerequisite such as the NPU driver is missing, the script stops and prints what is required.
 
-The release's `install.sh` does the same without unpacking anything first, and checks the download
-against its `.sha256`:
+You can also run the release `install.sh` directly, which downloads the archive, verifies its `.sha256` checksum, and runs the same setup:
 
 ```bash
 curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --index ~/Documents
@@ -34,47 +28,38 @@ curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/in
 
 ## Upgrading
 
-Use **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (a
-release tag like `vinosearch-upgrade v6` installs that one). It skips whatever is already done and
-restarts the service.
+Click **Check for updates** on the settings window's About page, or run `vinosearch-upgrade` (pass a tag such as `vinosearch-upgrade v6` to install a specific release). It skips steps that are already up to date and restarts the background service.
 
 ## From source
 
-Needs Rust and a C compiler. The same script builds the binaries with cargo into `~/.cargo/bin`
-when run from a checkout, and `git pull` then a re-run upgrades:
+Building from source requires Rust and a C compiler. Running `scripts/install.sh` from a git checkout compiles and installs binaries with `cargo` into `~/.cargo/bin`; run `git pull` followed by `scripts/install.sh` to upgrade:
 
 ```bash
 git clone https://github.com/karanshukla/vinoSearch && cd vinoSearch
 scripts/install.sh --index ~/Documents
 ```
 
-Or step by step:
+Or run the steps manually:
 
 ```bash
-cargo install --path .                     # vinosearch into ~/.cargo/bin
-cargo install --path crates/settings       # vinosearch-settings, the settings window (optional)
-cargo install ovfetch                      # 0.6.0 or newer
-scripts/install-runtime.sh                 # OpenVINO via ovfetch
-vinosearch fetch-model                     # 340 MB, every file checked against a pinned SHA-256
-vinosearch estimate ~/Development          # how long indexing would take, and which subfolders take longest
-vinosearch index ~/Documents ~/Development # once per root; unchanged files are skipped on re-runs
-vinosearch krunner --install               # the service (started now and at login), the app menu entry and the running desktop's search
-vinosearch integrate gnome                 # or kde: add the other desktop's search; --off removes one
+cargo install --path .                     # install vinosearch into ~/.cargo/bin
+cargo install --path crates/settings       # install vinosearch-settings GUI (optional)
+cargo install ovfetch                      # requires 0.6.0 or newer
+scripts/install-runtime.sh                 # install OpenVINO via ovfetch
+vinosearch fetch-model                     # download 340 MB base models (verified against pinned SHA-256)
+vinosearch estimate ~/Development          # estimate indexing time and largest subfolders
+vinosearch index ~/Documents ~/Development # index each root (unchanged files are skipped on re-runs)
+vinosearch krunner --install               # install login service, app menu entry, and active desktop search integration
+vinosearch integrate gnome                 # or kde: add another desktop's search integration (--off removes it)
 ```
 
-`vinosearch doctor` checks the NPU, driver and runtime, then compiles and runs a probe model.
+Run `vinosearch doctor` to verify the NPU, driver, and runtime, and to compile and run a probe model.
 
 ## Other distros
 
-The release download runs on x86_64 with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13,
-Arch, openSUSE Tumbleweed, and the image-based Fedora Atomic (Silverblue, Kinoite, Bazzite) and
-openSUSE Aeon. On anything older (Debian 12, Ubuntu 22.04, openSUSE Leap 15) `install.sh` says so;
-build from source there. The binaries also need the standard dynamic linker, so on NixOS enable
-`programs.nix-ld`.
+Prebuilt binaries require `x86_64` with glibc 2.39 or newer: Fedora 40+, Ubuntu 24.04+, Debian 13, Arch, openSUSE Tumbleweed, Fedora Atomic (Silverblue, Kinoite, Bazzite), and openSUSE Aeon. On older distributions (Debian 12, Ubuntu 22.04, openSUSE Leap 15), `install.sh` detects the glibc version and directs you to build from source. On NixOS, enable `programs.nix-ld` so the dynamic linker is available.
 
-Building needs Rust 1.95 or newer, which Debian's and Ubuntu's packaged Rust isn't, so get it from
-[rustup](https://rustup.rs). The C compiler and OpenSSL's headers (SQLCipher links the system's
-libcrypto) are:
+Building from source requires Rust 1.95 or newer; because Debian and Ubuntu repositories ship older versions, install Rust via [rustup](https://rustup.rs). Install a C compiler and OpenSSL development headers (SQLCipher links against the system `libcrypto`):
 
 | Distro | Command |
 |---|---|
@@ -85,21 +70,13 @@ libcrypto) are:
 
 ## Fedora Atomic and openSUSE Aeon
 
-Everything goes in your home: binaries in `~/.local/bin`, the runtime, model and index under
-`~/.local`, the service's autostart entry in `~/.config/autostart`. Nothing touches `/usr`, so the release download
-needs no layering or reboot. The NPU driver is the one system package; layer it (`rpm-ostree install`
-on Fedora Atomic, `transactional-update pkg install` on Aeon) or use an image that ships it.
+Everything installs inside your home directory: binaries in `~/.local/bin`, runtime/models/index under `~/.local`, and the autostart entry in `~/.config/autostart`. Because nothing modifies `/usr`, the prebuilt release requires no package layering or reboot. The only required system package is the Intel NPU driver—layer it with `rpm-ostree install` (Fedora Atomic) or `transactional-update pkg install` (Aeon), or use an image that already includes it.
 
-To build from source instead, run `install.sh` inside a toolbox or distrobox whose release matches
-the host: the home directory is shared, so the host runs the same binaries and index, and the host's
-session starts the service from the same autostart entry.
-`/var/home` and a `/home` symlink are both fine; indexed paths are resolved to the real one.
+If you prefer building from source, run `install.sh` inside a toolbox or distrobox matching your host distribution. Because the home directory is shared, the host runs the compiled binaries, uses the same index, and starts the service from the same autostart entry. Both `/var/home` and a `/home` symlink work properly because indexed paths are canonicalized.
 
 ## Flatpak
 
-A `.flatpak` bundle holds the service, the CLI and the settings window, with OpenVINO and Intel's
-NPU and GPU drivers inside it, so the host needs only the kernel's NPU driver (`intel_vpu`) and
-its firmware. Each release has it as `vinosearch-x86_64.flatpak`, with its checksum:
+The `.flatpak` bundle packages the background service, CLI, and settings window together with OpenVINO and Intel's NPU and GPU userspace drivers, so the host only needs the kernel NPU driver (`intel_vpu`) and its firmware. Each release includes `vinosearch-x86_64.flatpak` and its checksum:
 
 ```bash
 curl -fLO https://github.com/karanshukla/vinoSearch/releases/latest/download/vinosearch-x86_64.flatpak
@@ -108,94 +85,55 @@ sha256sum -c vinosearch-x86_64.flatpak.sha256
 flatpak install --user vinosearch-x86_64.flatpak
 ```
 
-The runtime (`org.freedesktop.Platform` 26.08) comes from Flathub if it isn't installed yet. Open
-vinoSearch from the app menu once: it starts the service, asks the desktop to start it at
-login (the Background portal), turns on the running desktop's search, and its Model page downloads
-the model. GNOME Shell's search finds it from the next login.
+If `org.freedesktop.Platform` 26.08 is not installed yet, Flatpak fetches it from Flathub. Launch **vinoSearch** once from your application menu to start the service, register login autostart through the Background portal, enable search for the current desktop, and download the model from the Model page. GNOME Shell search results appear starting on the next login.
 
-To update, use **Update** on the settings window's About page. It downloads the new release's
-bundle and checksum, refuses the bundle unless the checksum matches, has the host's `flatpak`
-install it where this one is installed, and restarts the service if it was running, so the next
-search runs the new build. Reopen the settings window to run its new version too. A system-wide
-install (`flatpak install --system`) asks for an administrator's password first, as any system
-Flatpak install does. By hand, download and check the new bundle as above and run the same
-`flatpak install --user vinosearch-x86_64.flatpak`: a newer build replaces the installed one, and a
-running service keeps the old build until it stops. Restart it with:
+### Updating and building the Flatpak
 
-```bash
-busctl --user call dev.vinosearch.VinoSearch.Runner /control dev.vinosearch.Control1 Quit
-```
+- **In-app updates:** Click **Update** on the settings window's About page. It downloads the latest bundle and `.sha256` file, verifies the checksum, asks the host's `flatpak` to install it into the same scope, and restarts the service if it was running. Reopen the settings window to use the updated UI. System-wide installs (`flatpak install --system`) prompt for administrator authentication as usual.
+- **Manual updates:** Download and verify the new bundle as shown above, then run `flatpak install --user vinosearch-x86_64.flatpak`. Because an already-running service continues using the previous version until stopped, restart it with:
+  ```bash
+  busctl --user call dev.vinosearch.VinoSearch.Runner /control dev.vinosearch.Control1 Quit
+  ```
+  The next search activates the updated service automatically.
+- **Switching from a checkout build:** Self-updates only apply to release bundles (branch `stable`); local builds (branch `master`) link to the GitHub releases page instead. To switch to a release bundle, run `flatpak uninstall dev.vinosearch.VinoSearch//master` first (your index, models, and config under `~/.var/app` are preserved), then install the release bundle.
+- **Building from a checkout:**
+  ```bash
+  flatpak install --user flathub org.flatpak.Builder org.freedesktop.Sdk//26.08 \
+    org.freedesktop.Sdk.Extension.rust-stable//26.08
+  flatpak run --filesystem=$HOME org.flatpak.Builder --user --install --force-clean \
+    --repo=repo build packaging/flatpak/dev.vinosearch.VinoSearch.yml
+  flatpak build-bundle repo vinosearch.flatpak dev.vinosearch.VinoSearch
+  ```
 
-The next search starts it again. Only a release bundle (branch `stable`) updates itself; a bundle
-built from a checkout (branch `master`) links to the release page instead. To move from one to a
-release, run `flatpak uninstall dev.vinosearch.VinoSearch//master` first (the index, models and
-config under `~/.var/app` stay) and install the release's bundle. To build the bundle from a
-checkout:
+Invoke the CLI via `flatpak run dev.vinosearch.VinoSearch` (for example, `flatpak run dev.vinosearch.VinoSearch doctor` or `... index ~/Documents`).
 
-```bash
-flatpak install --user flathub org.flatpak.Builder org.freedesktop.Sdk//26.08 \
-  org.freedesktop.Sdk.Extension.rust-stable//26.08
-flatpak run --filesystem=$HOME org.flatpak.Builder --user --install --force-clean \
-  --repo=repo build packaging/flatpak/dev.vinosearch.VinoSearch.yml
-flatpak build-bundle repo vinosearch.flatpak dev.vinosearch.VinoSearch
-```
+### Flatpak permissions
 
-The CLI is `flatpak run dev.vinosearch.VinoSearch` (for example `... doctor` or `... index ~/Documents`).
-
-What it is allowed, and why:
-
-| Permission | For |
+| Permission | Purpose |
 |---|---|
-| `--device=all` | the NPU (`/dev/accel`), which nothing narrower exposes, and the GPU |
-| `--filesystem=home` | the files it indexes |
-| `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | the host's app entries: which app opens a file at its line, page or second, and the editor and player lists |
-| `--share=network` | downloading the models |
-| `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | the settings and search windows |
-| `--talk-name=org.freedesktop.Flatpak` | opening results in the host's apps, turning search places on and off in the host's settings, installing an update, and sealing the index key with the host's `systemd-creds` (`flatpak-spawn --host`) |
-| `--talk-name=org.freedesktop.secrets` | keeping the index key in the desktop keyring, on a host without `systemd-creds` |
-| `--system-talk-name=net.hadess.PowerProfiles` | holding indexing while power saver is on |
+| `--device=all` | Access to the NPU (`/dev/accel`, which no narrower Flatpak permission exposes) and GPU |
+| `--filesystem=home` | Read files to be indexed |
+| `--filesystem=host-os:ro`, `--filesystem=/var/lib/flatpak/exports/share/applications:ro` | Inspect host `.desktop` entries to populate editor/player lists and open files at a matching line, page, or timestamp |
+| `--share=network` | Download models and check for updates |
+| `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | Display the settings and search windows |
+| `--talk-name=org.freedesktop.Flatpak` | Open search results in host apps, toggle desktop search settings, install Flatpak updates, and seal the index key with the host's `systemd-creds` via `flatpak-spawn --host` |
+| `--talk-name=org.freedesktop.secrets` | Store the index key in the desktop keyring on hosts without `systemd-creds` |
+| `--system-talk-name=net.hadess.PowerProfiles` | Pause indexing when the system power-saver profile is active |
 
-What differs from the native install:
+### Differences from a native install
 
-- Its config, index and models are its own, under `~/.var/app/dev.vinosearch.VinoSearch`
-  (`config/vinosearch/config.toml`, `data/vinosearch`), so it can sit beside a native install. Its
-  log is the journal's where systemd starts it, and `.local/state/vinosearch/service.log` under
-  that folder elsewhere; `doctor` says where to read it. Its bus name is
-  `dev.vinosearch.VinoSearch.Runner`.
-- The KRunner plugin, GNOME Shell provider and D-Bus activation file come with it. Flatpak leaves
-  exported search providers off, so the Integration page's switches (and `integrate kde|gnome`)
-  turn them on and off in the desktop's own setting, the one its search settings page shows. The
-  search window is the **Search Files** action of the app menu entry; the App menu switch (and
-  `integrate menu`) adds it as an entry of its own, a file in `~/.local/share/applications` that
-  `krunner --uninstall` or turning the switch off removes. `flatpak uninstall` leaves the file,
-  which the menu stops showing.
-- The service switch, and `krunner --install` / `--uninstall`, turn starting at login on and off
-  through the Background portal, with the running desktop's search place.
-- On sway, Hyprland and the like, bind `flatpak run dev.vinosearch.VinoSearch menu` to a key. The
-  launcher (fuzzel, wofi, rofi, tofi or bemenu, or `--launcher`) is the host's, and runs there.
-- An editor or player in `config.toml` that the host doesn't have falls back to the default app,
-  as natively.
-- With no `device` in `config.toml` it uses the NPU, else the GPU, else the CPU (natively too).
-- Encrypting the index works as natively. Its key is sealed by the host's `systemd-creds`, run
-  with `flatpak-spawn --host`, to the host's TPM; a key the native install sealed opens in the
-  Flatpak and the other way round, so `index.sqlite` and `index.key` can be moved between them.
-  On a host without `systemd-creds` the key goes in the desktop keyring. Starting with an
-  encrypted index takes about 10 ms more than natively, for the trip to the host. If the host
-  can't be reached (the `org.freedesktop.Flatpak` permission taken away with `flatpak override`),
-  the index is kept and waited for, as with a locked keyring, never moved to the keyring.
-- HEIC and AVIF photos aren't indexed: the runtime has no `heif-convert`.
+- **Isolated data directory and bus name:** Configuration, index, and models live under `~/.var/app/dev.vinosearch.VinoSearch` (`config/vinosearch/config.toml`, `data/vinosearch`), allowing side-by-side use with a native installation. Logs go to the systemd journal when launched by systemd, or `.local/state/vinosearch/service.log` inside the app directory otherwise (`doctor` prints the exact location). The D-Bus name is `dev.vinosearch.VinoSearch.Runner`.
+- **Search providers and app menu:** The KRunner plugin, GNOME Shell provider, and D-Bus activation file are bundled, but Flatpak leaves exported search providers disabled by default. Use the Integration page switches (or `integrate kde|gnome`) to enable them in your desktop's search settings. The search window is available as the **Search Files** action on the app menu entry; toggling the App menu switch (or running `integrate menu`) adds a standalone launcher in `~/.local/share/applications` (removed by turning off the switch or running `krunner --uninstall`; `flatpak uninstall` leaves the file behind, though the menu hides it).
+- **Autostart:** The service switch and `krunner --install` / `--uninstall` manage login startup through the Background portal along with the current desktop's search integration.
+- **dmenu launchers:** On sway, Hyprland, and similar desktops, bind `flatpak run dev.vinosearch.VinoSearch menu` to a shortcut. The launcher (`fuzzel`, `wofi`, `rofi`, `tofi`, `bemenu`, or `--launcher`) runs on the host.
+- **Fallback behavior:** Configured editors or players missing on the host fall back to the default application, matching native installs. With no `device` specified in `config.toml`, device selection defaults to NPU, then GPU, then CPU.
+- **Encryption:** Works identically to native installs. The index key is sealed to the host TPM using the host's `systemd-creds` via `flatpak-spawn --host`, so `index.sqlite` and `index.key` are interchangeable between native and Flatpak installations (startup adds ~10 ms for the host round-trip). On hosts without `systemd-creds`, the desktop keyring is used instead. If the host cannot be reached (for example, if `org.freedesktop.Flatpak` is revoked via `flatpak override`), vinoSearch preserves the encrypted index and waits rather than falling back to the keyring.
+- **HEIC and AVIF photos:** Not indexed inside the Flatpak because the runtime does not include `heif-convert`.
 
-`flatpak uninstall dev.vinosearch.VinoSearch` removes it; add `--delete-data` to delete its index,
-models and config too.
+Run `flatpak uninstall dev.vinosearch.VinoSearch` to remove the Flatpak; add `--delete-data` to also delete its index, models, and configuration.
 
 ## Uninstalling
 
-`vinosearch/scripts/install.sh --uninstall` (or the `curl ... install.sh | bash -s -- --uninstall`
-form) removes the service, the KRunner and GNOME files and the
-binaries, and deletes the models (`~/.local/share/vinosearch/models`) and their compiled cache
-(`~/.cache/vinosearch/ov-cache`). The index, `config.toml` and the OpenVINO runtime are kept. Add
-`--purge` to also delete the index and the runtime; `config.toml` is still kept.
+Run `vinosearch/scripts/install.sh --uninstall` (or `curl -fsSL https://github.com/karanshukla/vinoSearch/releases/latest/download/install.sh | bash -s -- --uninstall`) to remove the background service, KRunner and GNOME Shell integration files, binaries, downloaded models (`~/.local/share/vinosearch/models`), and compiled model cache (`~/.cache/vinosearch/ov-cache`). Your index, `config.toml`, and OpenVINO runtime are kept by default; pass `--purge` to delete the index and runtime as well (`config.toml` is still preserved).
 
-To delete only the models, use **Delete…** on the settings window's Model page, or run
-`vinosearch delete-model`. Search and indexing need `vinosearch fetch-model` (or Download) again
-afterwards. With the service not running, the Model page deletes the files itself.
+To remove only the downloaded models, click **Delete…** on the settings window's Model page or run `vinosearch delete-model`. You will need to run `vinosearch fetch-model` (or click **Download**) before searching or indexing again. If the service is stopped, the Model page deletes the files directly.
