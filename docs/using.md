@@ -29,7 +29,7 @@ You can also open the search window directly from a shortcut with `vinosearch-se
 
 ## The tray icon
 
-While indexing runs, a vinoSearch icon shows in the system tray with how many files it has indexed so far, **Pause indexing** (or **Resume indexing**), **Settings…** and **Quit**. **Quit** stops the service until the next search starts it again. Clicking the icon opens the settings window. It shows up only after a few seconds of indexing, so a single changed file doesn't flash it, and it goes away once indexing has been quiet for a few seconds. On GNOME it needs the AppIndicator extension.
+While indexing runs, a vinoSearch icon shows in the system tray with how many files it has indexed so far, **Pause indexing** (or **Resume indexing**), **Settings…** and **Quit**. **Quit** stops the service until the next search starts it again. Clicking the icon opens the settings window. It shows up only after a few seconds of indexing, so a single changed file doesn't flash it, and it goes away once indexing has been quiet for a few seconds (on KDE Plasma, into the tray's hidden icons). On GNOME it needs the AppIndicator extension.
 
 ## Other Wayland desktops
 

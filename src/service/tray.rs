@@ -1,9 +1,15 @@
-//! A tray icon while indexing runs, and none otherwise (#235): the runner has
-//! nothing to show between runs, so it isn't in the panel then.
+//! The tray icon: in the panel while indexing runs, hidden otherwise (#235).
 //!
-//! The item is registered when indexing has run for `SHOW_AFTER` and removed
-//! once it has been quiet for `HIDE_AFTER`, so one changed file doesn't flash
-//! an icon. It stays while paused with work left, to offer Resume.
+//! The item is registered for the runner's life and is Passive between runs,
+//! which panels hide (Plasma in the tray's hidden list). Unregistering would
+//! hide it too, but Plasma 6.7 then shows its generic "background app" entry
+//! for the windowless Flatpak: it leaves that out only while the same Flatpak
+//! instance has its own item registered. vinoWhisper's tray never goes away,
+//! so it never gets one.
+//!
+//! It turns Active once indexing has run for `SHOW_AFTER` polls and Passive
+//! after `HIDE_AFTER` quiet ones, so one changed file doesn't flash it. It
+//! stays Active while paused with work left, to offer Resume.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -12,7 +18,6 @@ use std::time::Duration;
 use futures_channel::oneshot;
 use ksni::menu::StandardItem;
 use ksni::{Category, MenuItem, ToolTip};
-use vino_ui::tray::MenuIcon;
 use vinosearch_shared::dbus::names;
 use vinosearch_shared::sandbox;
 
@@ -23,6 +28,17 @@ pub mod icon;
 const POLL: Duration = Duration::from_secs(1);
 const SHOW_AFTER: u32 = 3;
 const HIDE_AFTER: u32 = 5;
+
+/// `vino_ui::tray::MenuIcon`'s names, by what the item does, as in every
+/// vinoPilot tray (vinoUserInterface's DESIGN.md, "Tray menus"). Copied, not
+/// linked: vino-ui needs a newer Rust than this crate's MSRV.
+mod menu_icon {
+    pub const INFO: &str = "dialog-information-symbolic";
+    pub const PAUSE: &str = "window-close-symbolic";
+    pub const RESUME: &str = "view-refresh-symbolic";
+    pub const SETTINGS: &str = "preferences-system-symbolic";
+    pub const QUIT: &str = "application-exit-symbolic";
+}
 
 pub type Quit = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 
@@ -94,6 +110,7 @@ struct Tray {
     jobs: std::sync::mpsc::Sender<Job>,
     quit: Quit,
     view: View,
+    active: bool,
 }
 
 impl ksni::Tray for Tray {
@@ -107,6 +124,14 @@ impl ksni::Tray for Tray {
 
     fn category(&self) -> Category {
         Category::ApplicationStatus
+    }
+
+    fn status(&self) -> ksni::Status {
+        if self.active {
+            ksni::Status::Active
+        } else {
+            ksni::Status::Passive
+        }
     }
 
     /// `<icon>-symbolic`, installed natively and exported by the Flatpak, as
@@ -134,21 +159,21 @@ impl ksni::Tray for Tray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let (label, icon) = if self.view.paused {
-            ("Resume indexing", MenuIcon::Refresh)
+            ("Resume indexing", menu_icon::RESUME)
         } else {
-            ("Pause indexing", MenuIcon::Cancel)
+            ("Pause indexing", menu_icon::PAUSE)
         };
         vec![
             StandardItem {
                 label: self.view.text(),
-                icon_name: MenuIcon::Info.name().into(),
+                icon_name: menu_icon::INFO.into(),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: label.into(),
-                icon_name: icon.name().into(),
+                icon_name: icon.into(),
                 activate: Box::new(|tray: &mut Self| {
                     let pause = !tray.view.paused;
                     tray.status.paused.store(pause, Ordering::Relaxed);
@@ -162,7 +187,7 @@ impl ksni::Tray for Tray {
             .into(),
             StandardItem {
                 label: "Settings…".into(),
-                icon_name: MenuIcon::Settings.name().into(),
+                icon_name: menu_icon::SETTINGS.into(),
                 activate: Box::new(|_: &mut Self| crate::service::krunner::launch_settings(&[])),
                 ..Default::default()
             }
@@ -170,7 +195,7 @@ impl ksni::Tray for Tray {
             MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
-                icon_name: MenuIcon::Quit.name().into(),
+                icon_name: menu_icon::QUIT.into(),
                 activate: Box::new(|tray: &mut Self| {
                     if let Some(quit) = tray.quit.lock().unwrap().take() {
                         let _ = quit.send(());
@@ -189,47 +214,40 @@ impl ksni::Tray for Tray {
     }
 }
 
-/// Watch `status` for the runner's life, showing and hiding the icon.
+/// Register the item and keep it current for the runner's life.
 pub fn spawn(status: Arc<Status>, jobs: std::sync::mpsc::Sender<Job>, quit: Quit) {
+    use ksni::blocking::TrayMethods;
+    let tray = Tray {
+        status: status.clone(),
+        jobs,
+        quit,
+        view: View::of(&status),
+        active: false,
+    };
+    // A Flatpak may not own the item's well-known name.
+    let handle = match tray
+        .disable_dbus_name(sandbox::flatpak_id().is_some())
+        .assume_sni_available(true)
+        .spawn()
+    {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("no tray icon: {e}");
+            return;
+        }
+    };
     std::thread::spawn(move || {
-        use ksni::blocking::TrayMethods;
         let mut shown = Shown::default();
-        let mut handle: Option<ksni::blocking::Handle<Tray>> = None;
         loop {
             std::thread::sleep(POLL);
-            let changed = shown.next(wanted(&status));
-            let view = View::of(&status);
-            match (&handle, changed && shown.up, changed && !shown.up) {
-                (None, true, _) => {
-                    let tray = Tray {
-                        status: status.clone(),
-                        jobs: jobs.clone(),
-                        quit: quit.clone(),
-                        view,
-                    };
-                    // A Flatpak may not own the item's well-known name.
-                    match tray
-                        .disable_dbus_name(sandbox::flatpak_id().is_some())
-                        .assume_sni_available(true)
-                        .spawn()
-                    {
-                        Ok(h) => handle = Some(h),
-                        Err(e) => eprintln!("no tray icon: {e}"),
-                    }
+            shown.next(wanted(&status));
+            let (view, active) = (View::of(&status), shown.up);
+            handle.update(|tray| {
+                if tray.view != view || tray.active != active {
+                    tray.view = view;
+                    tray.active = active;
                 }
-                (Some(h), _, true) => {
-                    h.shutdown().wait();
-                    handle = None;
-                }
-                (Some(h), _, _) => {
-                    h.update(|tray| {
-                        if tray.view != view {
-                            tray.view = view;
-                        }
-                    });
-                }
-                _ => {}
-            }
+            });
         }
     });
 }
