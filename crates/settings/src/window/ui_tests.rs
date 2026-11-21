@@ -1069,3 +1069,35 @@ fn the_media_row_says_how_many_files_wait_for_a_charger() {
         }
     }
 }
+
+#[test]
+fn a_reindex_says_when_it_found_nothing() {
+    let (w, requests) = window(Page::Folders, "reindex");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.indexing = false;
+        s.walks = Some(Vec::new());
+    }
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_role_and_label(Role::Button, "Re-index /srv/notes")
+        .click();
+    settle(&mut h);
+    assert!(
+        sent(&requests)
+            .iter()
+            .any(|r| matches!(r, Request::Reindex(p) if p == "/srv/notes"))
+    );
+    assert!(h.query_by_label("Checking…").is_some());
+    assert!(h.query_by_label("Up to date").is_none());
+
+    if let Some(Ok(s)) = &mut h.state().link.shared.lock().unwrap().status {
+        s.walks = Some(vec![crate::control::Walk {
+            root: "/srv/notes".into(),
+            found: 0,
+            seq: 1,
+            error: String::new(),
+        }]);
+    }
+    settle(&mut h);
+    assert!(h.query_by_label("Checking…").is_none());
+    assert!(h.query_by_label("Up to date").is_some());
+}

@@ -1,5 +1,6 @@
 use eframe::egui;
 
+use crate::control::Walk;
 use crate::window::{
     Button, Column, Confirm, Icon, Path, Request, Row, SettingsWindow, Status, Target, Tone, a11y,
     path_label, theme, tilde, widgets,
@@ -37,6 +38,8 @@ impl SettingsWindow {
         self.joining.retain(|r| !roots.contains(r));
         roots.extend(self.joining.iter().cloned());
         roots.sort();
+        self.reindexing.retain(|r, _| roots.contains(r));
+        self.reindexed.retain(|r| roots.contains(r));
         let indexing = reachable.is_some_and(|s| s.indexing);
         widgets::group(ui, |ui| {
             if reachable.is_some() && roots.is_empty() {
@@ -91,11 +94,31 @@ impl SettingsWindow {
                                 self.confirm = Some(forget.clone());
                                 self.focus_cancel = true;
                             }
-                            if of(ui.add_enabled(!indexing, Button::ghost("Re-index").small()))
-                                .on_hover_text("Look for anything the watcher missed")
-                                .clicked()
+                            let walk = reachable.and_then(|s| s.walk(root));
+                            let told = reachable.is_some_and(|s| s.walks.is_some());
+                            if let Some(&asked) = self.reindexing.get(root)
+                                && (!told || walk.is_some_and(|w| w.seq != asked))
                             {
-                                self.link.send(Request::Reindex(root.clone()));
+                                self.reindexing.remove(root);
+                                self.reindexed.insert(root.clone());
+                            }
+                            if self.reindexing.contains_key(root) {
+                                widgets::small(ui, "Checking…");
+                            } else {
+                                if of(ui.add_enabled(!indexing, Button::ghost("Re-index").small()))
+                                    .on_hover_text("Look for anything the watcher missed")
+                                    .clicked()
+                                {
+                                    self.link.send(Request::Reindex(root.clone()));
+                                    self.reindexed.remove(root);
+                                    self.reindexing
+                                        .insert(root.clone(), walk.map_or(0, |w| w.seq));
+                                }
+                                if self.reindexed.contains(root)
+                                    && let Some(w) = walk
+                                {
+                                    walk_result(ui, w);
+                                }
                             }
                         }
                     },
@@ -210,5 +233,17 @@ fn field_name(target: Target) -> &'static str {
     match target {
         Target::Root => "Folder to add",
         Target::Exclude => "Folder to exclude",
+    }
+}
+
+/// What a Re-index found: nothing, changes now being indexed, or why it couldn't look.
+fn walk_result(ui: &mut egui::Ui, w: &Walk) {
+    if !w.error.is_empty() {
+        widgets::small(ui, "Couldn't check").on_hover_text(&w.error);
+    } else if w.found == 0 {
+        widgets::small(ui, "Up to date");
+    } else {
+        let s = if w.found == 1 { "" } else { "s" };
+        widgets::small(ui, format!("{} change{s} found", w.found));
     }
 }

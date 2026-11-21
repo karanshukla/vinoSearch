@@ -246,6 +246,18 @@ pub struct Status {
     pub model_changed: std::sync::Mutex<String>,
     pub encryption: std::sync::Mutex<encryption::State>,
     pub tpm: AtomicBool,
+    /// The last walk of each root: what it found or why it failed, and a count of walks so far that
+    /// tells a new one from the last.
+    pub walks: std::sync::Mutex<Vec<Walk>>,
+    walked: AtomicU64,
+}
+
+/// One root's last walk: paths found to check, or why it failed; `seq` grows with every walk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Walk {
+    pub root: PathBuf,
+    pub found: std::result::Result<u64, String>,
+    pub seq: u64,
 }
 
 #[derive(Debug)]
@@ -276,6 +288,17 @@ impl Status {
             device: std::sync::Mutex::new(device.to_owned()),
             ..Default::default()
         }
+    }
+
+    fn walked(&self, root: &Path, found: std::result::Result<u64, String>) {
+        let seq = self.walked.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut walks = self.walks.lock().unwrap();
+        walks.retain(|w| w.root != root);
+        walks.push(Walk {
+            root: root.to_owned(),
+            found,
+            seq,
+        });
     }
 
     pub fn held(&self) -> bool {
@@ -1008,9 +1031,13 @@ impl<E: Embed, L: FnMut(&str) -> Result<E>> Worker<E, L> {
             match register_root(&self.conn, &self.db, &root, &self.rules) {
                 Ok(paths) => {
                     eprintln!("{}: {} paths to check", root.display(), paths.len());
+                    self.status.walked(&root, Ok(paths.len() as u64));
                     self.status.work.found(paths);
                 }
-                Err(e) => eprintln!("indexing {}: {e:#}", root.display()),
+                Err(e) => {
+                    eprintln!("indexing {}: {e:#}", root.display());
+                    self.status.walked(&root, Err(format!("{e:#}")));
+                }
             }
             self.status.working.store(false, Ordering::Relaxed);
             return;
@@ -1424,6 +1451,19 @@ mod tests {
         assert_eq!(h.status.indexed_files.load(Ordering::Relaxed), 2);
         assert!(h.status.last_indexed.load(Ordering::Relaxed) > 0);
         assert!(!h.status.indexing());
+        let first = h.status.walks.lock().unwrap().clone();
+        assert!(
+            matches!(first.as_slice(), [Walk { root, found: Ok(2), .. }] if *root == h.root()),
+            "{first:?}"
+        );
+
+        h.status.work.root(h.root());
+        h.run(|_| {});
+        let again = h.status.walks.lock().unwrap().clone();
+        assert!(
+            matches!(again.as_slice(), [Walk { found: Ok(0), seq, .. }] if *seq > first[0].seq),
+            "a walk again that finds nothing new replaces the last, and is told from it: {again:?}"
+        );
     }
 
     #[test]
