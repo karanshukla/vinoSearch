@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -235,6 +235,11 @@ struct SettingsWindow {
     /// isn't left on nothing.
     focus_cancel: bool,
     check_asked: Option<u64>,
+    /// Roots a Re-index was asked of, each with its last walk's `seq` then (0 for none): done once
+    /// Status has a newer walk.
+    reindexing: HashMap<String, u64>,
+    /// Roots whose Re-index is done this session, its result shown by the button.
+    reindexed: HashSet<String>,
     forgetting: HashSet<String>,
     /// Folders added that Status doesn't list yet: the service registers one only once its worker
     /// takes it, behind changes under the other roots.
@@ -322,6 +327,8 @@ impl SettingsWindow {
             confirm: None,
             focus_cancel: false,
             check_asked: None,
+            reindexing: HashMap::new(),
+            reindexed: HashSet::new(),
             forgetting: HashSet::new(),
             joining: HashSet::new(),
             notice: None,
@@ -600,9 +607,11 @@ impl SettingsWindow {
         self.save_once_numbers_settle(ctx);
     }
 
-    /// A refusal doesn't say which request it was, so every folder still joining is dropped.
+    /// A refusal doesn't say which request it was, so every folder still joining or re-indexing is
+    /// dropped.
     fn show_refusal(&mut self, refused: String) {
         self.joining.clear();
+        self.reindexing.clear();
         self.notice = Some(refused);
     }
 

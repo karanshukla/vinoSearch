@@ -70,6 +70,9 @@ pub struct Status {
     pub partial: Vec<Partial>,
     /// Audio and video files waiting for a charger.
     pub media_waiting_for_ac: u64,
+    /// Each root's last walk; None from a service older than the key, which can't say when a
+    /// Re-index is done.
+    pub walks: Option<Vec<Walk>>,
     /// The index on disk is encrypted.
     pub encrypted: bool,
     /// What its key is sealed with: a `dbus::seal` value, or empty.
@@ -98,7 +101,22 @@ pub struct Partial {
     pub total: u64,
 }
 
+/// A root's last walk: what Re-index found, or why it failed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Walk {
+    pub root: String,
+    pub found: u64,
+    /// Grows with every walk, so a new one is told from the last.
+    pub seq: u64,
+    pub error: String,
+}
+
 impl Status {
+    /// The last walk of `root`, if any; None too from a service that doesn't say.
+    pub fn walk(&self, root: &str) -> Option<&Walk> {
+        self.walks.as_ref()?.iter().find(|w| w.root == root)
+    }
+
     fn parse(map: &HashMap<String, OwnedVariant>) -> Self {
         let get = |key: &str| map.get(key).map(|v| &**v);
         let flag = |key| matches!(get(key), Some(Variant::Bool(true)));
@@ -147,6 +165,30 @@ impl Status {
                 .collect(),
             _ => Vec::new(),
         };
+        let walks = match get(status::WALKS) {
+            Some(Variant::Array(a)) => Some(
+                a.iter()
+                    .filter_map(|v| match v {
+                        Variant::Structure(s) => match s.fields() {
+                            [
+                                Variant::Str(root),
+                                Variant::U64(found),
+                                Variant::U64(seq),
+                                Variant::Str(error),
+                            ] => Some(Walk {
+                                root: root.to_string(),
+                                found: *found,
+                                seq: *seq,
+                                error: error.to_string(),
+                            }),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
         Status {
             model_loaded: flag(status::MODEL_LOADED),
             indexing: flag(status::INDEXING),
@@ -190,6 +232,7 @@ impl Status {
             indexing_rest: flag(status::INDEXING_REST),
             partial,
             media_waiting_for_ac: unsigned(status::MEDIA_WAITING_FOR_AC),
+            walks,
             encrypted: flag(status::ENCRYPTED),
             seal: text(status::SEAL),
             tpm: flag(status::TPM),
@@ -382,6 +425,32 @@ mod tests {
         let old = Status::parse(&from_an_older_service());
         assert!(old.images_model_present && old.ffmpeg);
         assert!(!old.media_model_present);
+        assert!(old.walks.is_none(), "can't say when a Re-index is done");
+    }
+
+    #[test]
+    fn walks_are_read_as_the_service_sends_them() {
+        let mut map = HashMap::new();
+        let walks = vec![
+            ("/srv/notes".to_owned(), 3u64, 7u64, String::new()),
+            ("/srv/gone".to_owned(), 0, 8, "no such folder".to_owned()),
+        ];
+        map.insert(
+            status::WALKS.to_owned(),
+            OwnedVariant::try_from(Variant::from(walks)).unwrap(),
+        );
+        let s = Status::parse(&map);
+        assert_eq!(
+            s.walk("/srv/notes"),
+            Some(&Walk {
+                root: "/srv/notes".into(),
+                found: 3,
+                seq: 7,
+                error: String::new(),
+            })
+        );
+        assert_eq!(s.walk("/srv/gone").unwrap().error, "no such folder");
+        assert!(s.walk("/srv/photos").is_none());
     }
 
     #[test]

@@ -870,6 +870,20 @@ impl Control {
             })
             .collect();
         out.insert(key::PARTIAL.into(), owned(Variant::from(partial)));
+        let walks: Vec<(String, u64, u64, String)> = st
+            .walks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| {
+                let (found, error) = match &w.found {
+                    Ok(n) => (*n, String::new()),
+                    Err(e) => (0, e.clone()),
+                };
+                (w.root.to_string_lossy().into_owned(), found, w.seq, error)
+            })
+            .collect();
+        out.insert(key::WALKS.into(), owned(Variant::from(walks)));
         out.insert(
             key::MODEL_CHANGED.into(),
             owned(Variant::from(st.model_changed.lock().unwrap().clone())),

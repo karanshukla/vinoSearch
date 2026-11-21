@@ -117,6 +117,9 @@ pub mod status {
     /// in, parts in all); unit is "page", "slide", "chapter" or "part".
     pub const PARTIAL: &str = "partial";
     pub const PARTIAL_MAX: usize = 100;
+    /// Each root's last walk since the runner started, as asked by Reindex: `a(stts)` of (root,
+    /// paths found to check, walks so far when it ran, why it failed or empty).
+    pub const WALKS: &str = "walks";
     /// Audio and video waiting for a charger: the media rows in `partial` on battery, else 0.
     pub const MEDIA_WAITING_FOR_AC: &str = "media_waiting_for_ac";
     /// PauseIndexing was called and ResumeIndexing not since.
