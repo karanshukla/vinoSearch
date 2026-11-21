@@ -577,7 +577,7 @@ const OPEN_FOLDER: &str = "open-folder";
 const OPEN_SUMMARY: &str = "open-summary";
 const OPEN_TRANSCRIPT: &str = "open-transcript";
 
-fn launch_settings(args: &[&str]) {
+pub(crate) fn launch_settings(args: &[&str]) {
     let settings = std::env::current_exe().map(|e| e.with_file_name("vinosearch-settings"));
     match settings {
         Ok(s) if s.is_file() => {
@@ -613,7 +613,7 @@ struct Control {
     status: Arc<Status>,
     db: Db,
     config: PathBuf,
-    quit: Mutex<Option<oneshot::Sender<()>>>,
+    quit: crate::service::tray::Quit,
     counted: Mutex<Option<(Stamp, Counted)>>,
 }
 
@@ -1193,12 +1193,14 @@ pub fn serve(opts: Options) -> Result<()> {
         .and_then(|p| crate::index::encryption::Live::open(&p))
         .map_err(NotStarted)?;
     let (quit, quitting) = oneshot::channel();
+    let quit: crate::service::tray::Quit = Arc::new(Mutex::new(Some(quit)));
+    crate::service::tray::spawn(opts.status.clone(), tx.clone(), quit.clone());
     let control = Control {
         jobs: Mutex::new(tx.clone()),
         status: opts.status.clone(),
         db: db.clone(),
         config: opts.config.clone(),
-        quit: Mutex::new(Some(quit)),
+        quit: quit.clone(),
         counted: Mutex::new(None),
     };
     let config = opts.config.clone();

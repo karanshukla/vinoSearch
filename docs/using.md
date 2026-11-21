@@ -27,6 +27,10 @@ Press `Enter` or double-click an entry to open it at the match. Action buttons a
 
 You can also open the search window directly from a shortcut with `vinosearch-settings --search "query"`.
 
+## The tray icon
+
+While indexing runs, a vinoSearch icon shows in the system tray with how many files it has indexed so far, **Pause indexing** (or **Resume indexing**), **Settings…** and **Quit**. **Quit** stops the service until the next search starts it again. Clicking the icon opens the settings window. It shows up only after a few seconds of indexing, so a single changed file doesn't flash it, and it goes away once indexing has been quiet for a few seconds (on KDE Plasma, into the tray's hidden icons). On GNOME it needs the AppIndicator extension.
+
 ## Other Wayland desktops
 
 `vinosearch menu` prompts for a query using the first available dmenu-style launcher (`fuzzel`, `wofi`, `rofi`, `tofi`, or `bemenu`), displays matching results, and opens your selection. Bind it to a shortcut in your compositor configuration:

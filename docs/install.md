@@ -118,6 +118,7 @@ Invoke the CLI via `flatpak run dev.vinosearch.VinoSearch` (for example, `flatpa
 | `--socket=wayland`, `--socket=fallback-x11`, `--share=ipc` | Display the settings and search windows |
 | `--talk-name=org.freedesktop.Flatpak` | Open search results in host apps, toggle desktop search settings, install Flatpak updates, and seal the index key with the host's `systemd-creds` via `flatpak-spawn --host` |
 | `--talk-name=org.freedesktop.secrets` | Store the index key in the desktop keyring on hosts without `systemd-creds` |
+| `--talk-name=org.kde.StatusNotifierWatcher` | Show the tray icon while indexing runs |
 | `--system-talk-name=net.hadess.PowerProfiles` | Pause indexing when the system power-saver profile is active |
 
 ### Differences from a native install

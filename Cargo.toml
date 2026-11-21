@@ -42,6 +42,9 @@ walkdir = "2.5"
 # .gitignore and .ignore files, for code (#110).
 ignore = "0.4"
 zbus = "6"
+# The tray icon while indexing (src/service/tray.rs), as the other vinoPilot
+# trays draw theirs; it brings zbus 5 beside our 6.
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
 futures-lite = "2"
 toml = "1.1"
 futures-channel = "0.3"

@@ -39,6 +39,8 @@ finish-args:
   # The index key in the desktop keyring, where the host has no
   # systemd-creds to seal it with.
   - --talk-name=org.freedesktop.secrets
+  # The tray icon while indexing runs (src/service/tray.rs).
+  - --talk-name=org.kde.StatusNotifierWatcher
   # Holding indexing while power saver is on (src/service/power.rs).
   - --system-talk-name=net.hadess.PowerProfiles
   - --env=VINOSEARCH_OPENVINO_DIR=/app/lib/vinosearch/openvino

@@ -9,5 +9,6 @@ pub mod krunner;
 pub mod power;
 pub mod sched;
 pub mod start;
+pub mod tray;
 pub mod watch;
 pub mod worker;
