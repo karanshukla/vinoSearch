@@ -145,8 +145,8 @@ fn fresh_dir(parent: &Path) -> Result<PathBuf> {
     bail!("no free directory under {}", parent.display())
 }
 
-const HEIF_ADDRESS_SPACE: u64 = 1 << 30;
-const HEIF_CPU_SECONDS: u64 = 30;
+const HEIF_ADDRESS_SPACE: u64 = 4 << 30;
+const HEIF_CPU_SECONDS: u64 = 60;
 
 /// Decode a HEIF file by converting it to JPEG with heif-convert in a directory of its own; libheif
 /// applies rotation and mirroring.
