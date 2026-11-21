@@ -55,7 +55,11 @@ while [ $# -gt 0 ]; do
         --index) [ $# -ge 2 ] || { echo "--index needs a directory" >&2; exit 2; }
                  roots+=("$2"); shift ;;
         --device) [ $# -ge 2 ] || { echo "--device needs NPU, GPU or CPU" >&2; exit 2; }
-                  device="$2"; shift ;;
+                  case "$2" in
+                      NPU|GPU|CPU|GPU.[0-9]*) device="$2" ;;
+                      *) echo "--device must be NPU, GPU or CPU (got '$2')" >&2; exit 2 ;;
+                  esac
+                  shift ;;
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;
@@ -269,7 +273,7 @@ if [ ${#roots[@]} -eq 0 ] && [ -t 0 ]; then
 fi
 if [ ${#roots[@]} -gt 0 ]; then
     step "Indexing ${roots[*]}"
-    vinosearch index "${roots[@]}"
+    vinosearch index -- "${roots[@]}"
 else
     echo "nothing indexed; add folders later with vinosearch index DIR or the settings window"
 fi

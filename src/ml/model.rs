@@ -349,6 +349,15 @@ fn fetch_files(
     Ok(())
 }
 
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(!cfg!(test))
+        .timeout_connect(Some(std::time::Duration::from_secs(20)))
+        .timeout_per_read(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .into()
+}
+
 fn download(
     url: &str,
     part: &Path,
@@ -357,7 +366,8 @@ fn download(
     size: u64,
     progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
-    let mut resp = ureq::get(url)
+    let mut resp = agent()
+        .get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
     let mut body = resp.body_mut().as_reader();

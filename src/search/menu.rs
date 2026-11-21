@@ -67,7 +67,7 @@ fn on_host(cmd: Vec<String>) -> Vec<String> {
     if cmd[0] == "flatpak-spawn" {
         return cmd;
     }
-    ["flatpak-spawn", "--host"]
+    ["flatpak-spawn", "--host", "--"]
         .into_iter()
         .map(String::from)
         .chain(cmd)
@@ -263,7 +263,7 @@ mod tests {
         let words = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
         assert_eq!(
             on_host(words("fuzzel --dmenu")),
-            ["flatpak-spawn", "--host", "fuzzel", "--dmenu"]
+            ["flatpak-spawn", "--host", "--", "fuzzel", "--dmenu"]
         );
         assert_eq!(
             on_host(words("flatpak-spawn --host wofi --dmenu")),

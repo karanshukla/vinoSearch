@@ -56,11 +56,12 @@ pub type Parser = fn(&Path, &[u8], usize, usize) -> Result<Extract>;
 pub fn parts_in_child(path: &Path, bytes: &[u8], from: usize, count: usize) -> Result<Extract> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("extract")
-        .arg(path)
         .arg("--from")
         .arg(from.to_string())
         .arg("--count")
-        .arg(count.to_string());
+        .arg(count.to_string())
+        .arg("--")
+        .arg(path);
     let out = crate::proc::run(cmd, bytes, CHILD_WALL)?;
     serde_json::from_slice(&out).context("reading the extractor's output")
 }

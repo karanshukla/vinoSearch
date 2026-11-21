@@ -11,7 +11,7 @@
 // The 2026-11-10 linuxlab run is bench/results/av_spike.json.
 import { AutoModel, AutoProcessor, RawImage, RawVideo, env } from "@huggingface/transformers";
 import fs from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 env.cacheDir = "hf-cache";
 const id = "onnx-community/embeddinggemma-2-ONNX";
@@ -53,7 +53,7 @@ for (let s = 0; s + 1 < dur; s += HOP) {
 
 // Transcript paragraphs from the vinoWhisper session.
 const bundle = fs.readdirSync("vw").find((f) => f.endsWith(".vwsession"));
-const text = execSync(`unzip -p vw/${bundle} transcript.txt`).toString();
+const text = execFileSync("unzip", ["-p", "--", `vw/${bundle}`, "transcript.txt"], { encoding: "utf8" });
 const paras = [...text.matchAll(/^\[(\d+):(\d\d)\] (.*)$/gm)].map((m) => ({ s: +m[1] * 60 + +m[2], text: m[3] }));
 paras.forEach((p, i) => (p.e = paras[i + 1]?.s ?? dur));
 const pv = await timed("transcript", () => embed(paras.map((p) => `title: none | text: ${p.text}`)));

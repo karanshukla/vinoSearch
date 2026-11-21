@@ -102,7 +102,7 @@ pub const GNOME_SEARCH: &str = "org.gnome.desktop.search-providers";
 /// succeeds. Its stderr is dropped.
 pub fn host_output(argv: &[&str]) -> Option<String> {
     let out = std::process::Command::new("flatpak-spawn")
-        .arg("--host")
+        .args(["--host", "--"])
         .args(argv)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
