@@ -145,9 +145,14 @@ fn fresh_dir(parent: &Path) -> Result<PathBuf> {
     bail!("no free directory under {}", parent.display())
 }
 
+const HEIF_ADDRESS_SPACE: u64 = 4 << 30;
+const HEIF_CPU_SECONDS: u64 = 60;
+
 /// Decode a HEIF file by converting it to JPEG with heif-convert in a directory of its own; libheif
 /// applies rotation and mirroring.
 fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
     let Some(tool) = heif_convert() else {
         return Err(NoDecoder.into());
     };
@@ -162,11 +167,37 @@ fn load_heif(bytes: &[u8]) -> Result<RgbImage> {
             .open(&input)?
             .write_all(bytes)?;
         let mut cmd = std::process::Command::new(tool);
-        cmd.arg("-q").arg("90").arg(&input).arg(&output);
+        cmd.arg("-q").arg("90").arg("--").arg(&input).arg(&output);
+        // SAFETY: setrlimit is async-signal-safe and allocates nothing.
+        unsafe {
+            cmd.pre_exec(|| {
+                for (resource, value) in [
+                    (libc::RLIMIT_AS, HEIF_ADDRESS_SPACE),
+                    (libc::RLIMIT_CPU, HEIF_CPU_SECONDS),
+                ] {
+                    let lim = libc::rlimit {
+                        rlim_cur: value as libc::rlim_t,
+                        rlim_max: value as libc::rlim_t,
+                    };
+                    if libc::setrlimit(resource, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         crate::proc::run(cmd, &[], CONVERT_WALL).context("heif-convert")?;
         let first = dir.join(FIRST_OF_A_BURST);
         let path = if output.is_file() { output } else { first };
-        std::fs::read(&path).context("heif-convert wrote nothing")
+        let mut jpg = Vec::new();
+        std::fs::File::open(&path)
+            .context("heif-convert wrote nothing")?
+            .take(MAX_DECODED_BYTES + 1)
+            .read_to_end(&mut jpg)?;
+        if jpg.len() as u64 > MAX_DECODED_BYTES {
+            bail!("heif-convert output exceeds {MAX_DECODED_BYTES} bytes");
+        }
+        Ok(jpg)
     })();
     let _ = std::fs::remove_dir_all(&dir);
     decode(&converted?)
@@ -206,7 +237,8 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
 /// What decoding, orienting and converting to RGB hold, judged from the header (pinned by
 /// `tests::an_image_too_big_to_decode_is_refused_from_its_header`).
 fn bytes_to_decode(w: u32, h: u32, decoded: u64) -> u64 {
-    2 * decoded + u64::from(w) * u64::from(h) * 3
+    let rgb = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(3);
+    decoded.saturating_mul(2).saturating_add(rgb)
 }
 
 pub fn prepare(img: &RgbImage) -> Result<Pixels> {

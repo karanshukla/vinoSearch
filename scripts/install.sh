@@ -269,7 +269,7 @@ if [ ${#roots[@]} -eq 0 ] && [ -t 0 ]; then
 fi
 if [ ${#roots[@]} -gt 0 ]; then
     step "Indexing ${roots[*]}"
-    vinosearch index "${roots[@]}"
+    vinosearch index -- "${roots[@]}"
 else
     echo "nothing indexed; add folders later with vinosearch index DIR or the settings window"
 fi

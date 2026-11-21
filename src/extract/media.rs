@@ -431,9 +431,19 @@ fn cpu_seconds(probe: &Probe) -> u64 {
     60 + (probe.seconds.clamp(0.0, MAX_SECONDS) * CPU_PER_SECOND) as u64
 }
 
+/// Container demuxers allowed for media files (excludes playlist/redirect/glob
+/// demuxers such as hls, concat, dash, sdp, rtp, image2).
+const FORMAT_WHITELIST: &str =
+    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,asf,mp3,aac,flac,ogg,wav";
+
 fn limited(tool: &str, cpu_seconds: u64) -> Command {
     let mut cmd = Command::new(tool);
-    cmd.args(["-protocol_whitelist", "file"]);
+    cmd.args([
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        FORMAT_WHITELIST,
+    ]);
     // SAFETY: setrlimit is async-signal-safe, and the closure allocates nothing.
     unsafe {
         cmd.pre_exec(move || {

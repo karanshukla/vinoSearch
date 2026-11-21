@@ -413,22 +413,30 @@ struct Span {
     inside: Option<usize>,
 }
 
+const MAX_DEPTH: usize = 32;
+
 /// `lines` as units no longer than CHUNK_CHARS where the code allows: whole definitions, or a long
 /// one split at its inner definitions or paragraphs, its first line kept with the first of them.
 /// Inside a definition indented `header`, units sit at the least indentation deeper, so a closing
 /// brace back at `header` stays with the last.
-fn units(lines: &[&str], first: usize, header: Option<usize>, out: &mut Vec<Span>) {
+fn units(lines: &[&str], first: usize, header: Option<usize>, depth: usize, out: &mut Vec<Span>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     let size = |r: &[&str]| r.iter().map(|l| l.len() + 1).sum::<usize>();
     let indents = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
         .map(|l| indent(l));
-    let base = indents
-        .clone()
-        .filter(|&i| header.is_none_or(|h| i > h))
-        .min()
-        .or_else(|| indents.min())
-        .unwrap_or(0);
+    let base = match header {
+        Some(h) => {
+            let Some(deeper) = indents.filter(|&i| i > h).min() else {
+                return;
+            };
+            deeper
+        }
+        None => indents.min().unwrap_or(0),
+    };
     let mut cuts = breaks(lines, base);
     cuts.push(lines.len());
     for w in cuts.windows(2) {
@@ -443,16 +451,22 @@ fn units(lines: &[&str], first: usize, header: Option<usize>, out: &mut Vec<Span
             out.push(whole);
             continue;
         }
-        match split_below_first_line(unit, first + a) {
+        match split_below_first_line(unit, first + a, depth + 1) {
             Some(inner) => out.extend(inner),
             None => out.push(whole),
         }
     }
 }
 
-fn split_below_first_line(unit: &[&str], line: usize) -> Option<Vec<Span>> {
+fn split_below_first_line(unit: &[&str], line: usize, depth: usize) -> Option<Vec<Span>> {
     let mut inner = Vec::new();
-    units(&unit[1..], line + 1, Some(indent(unit[0])), &mut inner);
+    units(
+        &unit[1..],
+        line + 1,
+        Some(indent(unit[0])),
+        depth,
+        &mut inner,
+    );
     if inner.len() < 2 {
         return None;
     }
@@ -496,7 +510,7 @@ impl Pending {
 pub fn chunk(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut spans = Vec::new();
-    units(&lines, 1, None, &mut spans);
+    units(&lines, 1, None, 0, &mut spans);
     let joined = |from: usize, n: usize| -> String {
         lines[from - 1..from - 1 + n]
             .iter()
@@ -727,6 +741,17 @@ mod tests {
         assert_eq!(
             chunks.iter().map(|(_, c)| c.lines().count()).sum::<usize>(),
             400
+        );
+    }
+
+    #[test]
+    fn a_20000_line_flat_indented_file_does_not_overflow_stack() {
+        let text = "x = 1\n".repeat(20_000);
+        let chunks = chunk(&text);
+        assert!(chunks.len() > 10);
+        assert_eq!(
+            chunks.iter().map(|(_, c)| c.lines().count()).sum::<usize>(),
+            20_000
         );
     }
 
