@@ -53,7 +53,7 @@ fn update(tag: Option<String>) -> Result<()> {
         .context("/.flatpak-info doesn't say where the app is installed")?;
     let home = vinosearch_shared::xdg::home()?;
     let scope = installation(&app_path, app, &home)?;
-    let base = release_base(&tag)?;
+    let base = release_base(&tag);
     let scratch = Scratch::new(scratch_dir(&home, app))?;
     eprintln!("downloading {tag} from {base}");
     let bundle = download_verified(&base, &scratch.0)?;
@@ -83,18 +83,12 @@ fn requested_tag(tag: Option<String>) -> Result<String> {
     Ok(tag)
 }
 
-/// Where release `tag`'s assets are: `$VINOSEARCH_RELEASE_BASE` (an HTTPS mirror,
-/// or a test's fake release, whose checksum is checked the same), else GitHub.
-fn release_base(tag: &str) -> Result<String> {
+/// Where release `tag`'s assets are: `$VINOSEARCH_RELEASE_BASE` (a mirror, or
+/// a test's fake release, whose checksum is checked the same), else GitHub.
+fn release_base(tag: &str) -> String {
     match std::env::var("VINOSEARCH_RELEASE_BASE") {
-        Ok(base) if !base.is_empty() => {
-            let base = base.trim_end_matches('/').to_owned();
-            if !cfg!(test) && !base.starts_with("https://") {
-                bail!("VINOSEARCH_RELEASE_BASE must start with https://");
-            }
-            Ok(base)
-        }
-        _ => Ok(format!("https://github.com/{REPO}/releases/download/{tag}")),
+        Ok(base) if !base.is_empty() => base.trim_end_matches('/').to_owned(),
+        _ => format!("https://github.com/{REPO}/releases/download/{tag}"),
     }
 }
 
@@ -259,7 +253,6 @@ fn expected_sum(sums: &str, name: &str) -> Option<String> {
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .https_only(!cfg!(test))
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_per_read(Some(Duration::from_secs(60)))
         .build()

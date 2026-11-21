@@ -200,29 +200,16 @@ pub struct Options {
 struct Scratch(PathBuf);
 
 impl Scratch {
-    /// A new 0o700 directory under the temp directory with a random suffix: an
-    /// index already there is never reused and other local users cannot pre-create
-    /// or inspect it.
+    /// A new directory under the temp directory. Made with create_dir, not
+    /// create_dir_all: an index already there is never reused.
     fn new() -> Result<Scratch> {
-        use std::io::Read;
-        use std::os::unix::fs::DirBuilderExt;
-        let mut rng = fs::File::open("/dev/urandom")?;
-        for _ in 0..32 {
-            let mut buf = [0u8; 8];
-            rng.read_exact(&mut buf)?;
-            let dir = std::env::temp_dir().join(format!(
-                "vinosearch-eval-{}-{}-{:016x}",
-                std::process::id(),
-                worker::unix_now(),
-                u64::from_ne_bytes(buf)
-            ));
-            match fs::DirBuilder::new().mode(0o700).create(&dir) {
-                Ok(()) => return Ok(Scratch(dir)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e).with_context(|| dir.display().to_string()),
-            }
-        }
-        bail!("could not create temporary eval directory")
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "vinosearch-eval-{}-{}",
+            std::process::id(),
+            worker::unix_now()
+        )));
+        fs::create_dir(&scratch.0).with_context(|| scratch.0.display().to_string())?;
+        Ok(scratch)
     }
 }
 

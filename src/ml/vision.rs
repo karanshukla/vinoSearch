@@ -237,9 +237,7 @@ fn decode(bytes: &[u8]) -> Result<RgbImage> {
 /// What decoding, orienting and converting to RGB hold, judged from the header (pinned by
 /// `tests::an_image_too_big_to_decode_is_refused_from_its_header`).
 fn bytes_to_decode(w: u32, h: u32, decoded: u64) -> u64 {
-    let rgb = u64::from(w)
-        .saturating_mul(u64::from(h))
-        .saturating_mul(3);
+    let rgb = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(3);
     decoded.saturating_mul(2).saturating_add(rgb)
 }
 

@@ -465,7 +465,7 @@ fn in_sandbox_argv(argv: Vec<String>, sandboxed: bool) -> Vec<String> {
     if !sandboxed {
         return argv;
     }
-    ["flatpak-spawn", "--host", "--"]
+    ["flatpak-spawn", "--host"]
         .into_iter()
         .map(String::from)
         .chain(argv)
@@ -951,7 +951,7 @@ mod tests {
         assert_eq!(in_sandbox_argv(argv.clone(), false), argv);
         assert_eq!(
             in_sandbox_argv(argv, true),
-            ["flatpak-spawn", "--host", "--", "okular", "/home/u/a b.pdf"]
+            ["flatpak-spawn", "--host", "okular", "/home/u/a b.pdf"]
         );
     }
 

@@ -419,13 +419,7 @@ const MAX_DEPTH: usize = 32;
 /// one split at its inner definitions or paragraphs, its first line kept with the first of them.
 /// Inside a definition indented `header`, units sit at the least indentation deeper, so a closing
 /// brace back at `header` stays with the last.
-fn units(
-    lines: &[&str],
-    first: usize,
-    header: Option<usize>,
-    depth: usize,
-    out: &mut Vec<Span>,
-) {
+fn units(lines: &[&str], first: usize, header: Option<usize>, depth: usize, out: &mut Vec<Span>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -466,7 +460,13 @@ fn units(
 
 fn split_below_first_line(unit: &[&str], line: usize, depth: usize) -> Option<Vec<Span>> {
     let mut inner = Vec::new();
-    units(&unit[1..], line + 1, Some(indent(unit[0])), depth, &mut inner);
+    units(
+        &unit[1..],
+        line + 1,
+        Some(indent(unit[0])),
+        depth,
+        &mut inner,
+    );
     if inner.len() < 2 {
         return None;
     }

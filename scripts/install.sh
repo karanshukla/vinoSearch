@@ -55,11 +55,7 @@ while [ $# -gt 0 ]; do
         --index) [ $# -ge 2 ] || { echo "--index needs a directory" >&2; exit 2; }
                  roots+=("$2"); shift ;;
         --device) [ $# -ge 2 ] || { echo "--device needs NPU, GPU or CPU" >&2; exit 2; }
-                  case "$2" in
-                      NPU|GPU|CPU|GPU.[0-9]*) device="$2" ;;
-                      *) echo "--device must be NPU, GPU or CPU (got '$2')" >&2; exit 2 ;;
-                  esac
-                  shift ;;
+                  device="$2"; shift ;;
         --no-settings) settings=0 ;;
         --uninstall) uninstall=1 ;;
         --purge) purge=1 ;;

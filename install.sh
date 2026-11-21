@@ -68,8 +68,10 @@ main() {
         base="https://github.com/$REPO/releases/latest/download"
     fi
 
+    local work
     work="$(mktemp -d)"
-    trap 'rm -rf -- "$work"' EXIT
+    # shellcheck disable=SC2064 # expand now: $work is local
+    trap "rm -rf '$work'" EXIT
 
     echo "== Downloading ${tag:-the latest release} from $base"
     local name

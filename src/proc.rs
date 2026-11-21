@@ -40,9 +40,9 @@ fn run_with_max_stdout(
     let stdin = child.stdin.take().expect("piped");
     let mut stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
+    let overflowed = AtomicBool::new(false);
+    let overflow_flag = &overflowed;
     std::thread::scope(|s| {
-        let overflowed = AtomicBool::new(false);
-        let overflow_flag = &overflowed;
         s.spawn(move || feed(stdin, input));
         let out = s.spawn(move || -> std::io::Result<Vec<u8>> {
             let mut v = Vec::new();
@@ -163,7 +163,10 @@ mod tests {
     #[test]
     fn excessive_stderr_is_capped_and_drained_without_blocking() {
         let mut sh = Command::new("sh");
-        sh.args(["-c", "head -c 262144 /dev/zero | tr '\\0' 'e' >&2; echo done; exit 1"]);
+        sh.args([
+            "-c",
+            "head -c 262144 /dev/zero | tr '\\0' 'e' >&2; echo done; exit 1",
+        ]);
         let e = run(sh, b"", Duration::from_secs(10)).unwrap_err();
         assert!(e.to_string().len() <= MAX_STDERR_BYTES as usize);
         assert_eq!(e.to_string().len(), MAX_STDERR_BYTES as usize);
@@ -171,7 +174,7 @@ mod tests {
 
     #[test]
     fn stdout_over_limit_stops_child_and_returns_error() {
-        let mut yes = Command::new("yes");
+        let yes = Command::new("yes");
         let e = run_with_max_stdout(yes, b"", Duration::from_secs(10), 4096).unwrap_err();
         assert!(e.to_string().contains("exceeded 4096 bytes"), "{e}");
     }
