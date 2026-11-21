@@ -316,6 +316,15 @@ pub(crate) fn icon_file(n: &Names) -> String {
     format!("icons/hicolor/scalable/apps/{}.svg", n.icon)
 }
 
+/// The tray icon (`service::tray`), which Plasma recolours to the panel.
+fn symbolic_icon_path() -> Result<PathBuf> {
+    Ok(data_home()?.join(symbolic_icon_file(names())))
+}
+
+pub(crate) fn symbolic_icon_file(n: &Names) -> String {
+    format!("icons/hicolor/symbolic/apps/{}-symbolic.svg", n.icon)
+}
+
 pub fn install(
     openvino_dir: Option<&Path>,
     device: Option<&str>,
@@ -380,10 +389,12 @@ fn install_service(
     let service = data.join(&names().dbus_service_file);
     let autostart = start::autostart_path()?;
     let icon = icon_path()?;
-    for p in [&service, &autostart, &icon] {
+    let symbolic = symbolic_icon_path()?;
+    for p in [&service, &autostart, &icon, &symbolic] {
         fs::create_dir_all(p.parent().unwrap())?;
     }
     fs::write(&icon, ICON_SVG)?;
+    fs::write(&symbolic, crate::service::tray::icon::SYMBOLIC_SVG)?;
     let launcher = install_launcher()?;
     fs::write(
         &service,
@@ -479,6 +490,7 @@ pub fn uninstall() -> Result<()> {
         data.join(&names().dbus_service_file),
         start::autostart_path()?,
         icon_path()?,
+        symbolic_icon_path()?,
         launcher_path()?,
     ] {
         if p.exists() {

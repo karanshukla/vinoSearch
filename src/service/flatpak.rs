@@ -40,6 +40,10 @@ pub fn export(share: &Path, app: &str) -> Result<()> {
         ),
         (install::icon_file(&n), install::ICON_SVG.to_owned()),
         (
+            install::symbolic_icon_file(&n),
+            crate::service::tray::icon::SYMBOLIC_SVG.to_owned(),
+        ),
+        (
             n.dbus_service_file.clone(),
             install::dbus_service(&n, "vinosearch krunner"),
         ),
