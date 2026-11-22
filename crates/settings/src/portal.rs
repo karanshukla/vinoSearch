@@ -57,8 +57,11 @@ async fn pick(title: &str) -> Result<Option<PathBuf>> {
     let _: zbus::OwnedObjectPath = chooser
         .call("OpenFile", &("", title, options))
         .await
-        .context("the desktop has no file chooser portal")?;
-    let message = responses.next().await.context("the portal went away")?;
+        .context("no desktop file chooser portal is available")?;
+    let message = responses
+        .next()
+        .await
+        .context("the file chooser portal closed unexpectedly")?;
     let (code, results): (u32, HashMap<String, OwnedVariant>) = message.body().deserialize()?;
     if code != 0 {
         return Ok(None);

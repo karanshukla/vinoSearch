@@ -74,7 +74,7 @@ impl SettingsWindow {
             match status {
                 None => {
                     Row::new("Now")
-                        .help("Asking the search service…")
+                        .help("Connecting to the search service…")
                         .show(ui, |_, _| {});
                 }
                 Some(Err(why)) => {
@@ -129,13 +129,13 @@ impl SettingsWindow {
                 });
             }
             let now = if s.paused {
-                "Indexing stopped. What's indexed so far is kept.".to_owned()
+                "Indexing paused. Previously indexed files remain searchable.".to_owned()
             } else if let Some(why) = power_hold(&s.power_hold) {
                 why.to_owned()
             } else if s.indexing && s.indexing_rest {
-                "Indexing the rest of long documents".to_owned()
+                "Indexing remaining pages of long documents".to_owned()
             } else if s.indexing {
-                format!("Indexing, {} files so far", count(s.indexed_files as i64))
+                format!("Indexing ({} files indexed)", count(s.indexed_files as i64))
             } else {
                 "Up to date".to_owned()
             };
@@ -152,14 +152,14 @@ impl SettingsWindow {
                 }
             });
             if !s.model_changed.is_empty() {
-                Row::new("Indexing again")
+                Row::new("Re-indexing")
                     .help(&s.model_changed)
                     .show(ui, |_, _| {});
             }
             if s.no_decoder > 0 {
                 Row::new("Skipped")
                     .help(&format!(
-                        "{} photos: HEIC and AVIF need heif-convert ({}).",
+                        "{} photos skipped. HEIC and AVIF files require heif-convert ({}).",
                         count(s.no_decoder),
                         config::HEIF_CONVERT_PACKAGES
                     ))
@@ -167,13 +167,13 @@ impl SettingsWindow {
                     .show(ui, |_, _| {});
             }
             if !s.partial.is_empty() {
-                Row::new("In part")
-                    .help("Long documents finish later.")
+                Row::new("Partially indexed")
+                    .help("Long documents finish indexing in the background.")
                     .show(ui, |ui, _| partial_list(ui, &s.partial));
             }
             Row::new("Last change").show(ui, |ui, _| {
                 if s.last_indexed == 0 {
-                    widgets::muted(ui, "None since the service started");
+                    widgets::muted(ui, "None since service start");
                 } else {
                     ui.label(format!("Indexed {}", ago(s.last_indexed)));
                 }
@@ -182,7 +182,7 @@ impl SettingsWindow {
                 self.check_asked = None;
             }
             Row::new("Checked")
-                .help("Also hourly and after sleep.")
+                .help("Also runs hourly and after waking from sleep.")
                 .show(ui, |ui, _| {
                     if self.check_asked.is_some() {
                         let text = if s.indexing {
@@ -226,7 +226,7 @@ impl SettingsWindow {
             self.link.send(Request::LargestFolders(LARGEST));
         }
         widgets::group_label(ui, "Largest folders");
-        widgets::group_help(ui, "Excluding one drops it from the index.");
+        widgets::group_help(ui, "Exclude a folder to remove it from the index.");
         let mut exclude = None;
         widgets::group(ui, |ui| {
             let Some(largest) = largest else {
@@ -237,7 +237,7 @@ impl SettingsWindow {
             };
             if largest.is_empty() {
                 widgets::group_section(ui, |ui| {
-                    widgets::muted(ui, "No folders inside the indexed ones yet.");
+                    widgets::muted(ui, "No subfolders indexed yet.");
                 });
                 return;
             }

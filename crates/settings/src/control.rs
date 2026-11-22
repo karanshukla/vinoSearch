@@ -389,7 +389,8 @@ fn call(conn: &mut Option<zbus::Connection>, request: &Request) -> Result<(), St
 }
 
 /// What a call answers when nothing owns or can start the service's name.
-pub const NOT_INSTALLED: &str = "The search service isn't installed. Turn it on under Integration.";
+pub const NOT_INSTALLED: &str =
+    "The search service is not installed. Enable it on the Integration page.";
 
 /// The runner's own message for a refusal; otherwise what went wrong on the
 /// bus, after which the next call reconnects.

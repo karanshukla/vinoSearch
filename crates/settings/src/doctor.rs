@@ -46,7 +46,7 @@ pub fn run(state: Arc<Mutex<State>>, ctx: &egui::Context) {
             Err(e) => Report {
                 ok: false,
                 lines: Vec::new(),
-                error: Some(format!("Couldn't run vinosearch: {e}")),
+                error: Some(format!("Could not run vinosearch: {e}")),
             },
         };
         *state.lock().unwrap() = State {

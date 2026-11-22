@@ -98,8 +98,8 @@ const DEVICES: [&str; 3] = ["NPU", "GPU", "CPU"];
 
 fn power_hold(key: &str) -> Option<&'static str> {
     match key {
-        hold::CHARGER => Some("Waiting for a charger"),
-        hold::POWER_SAVER => Some("Paused: power saver"),
+        hold::CHARGER => Some("Waiting for AC power"),
+        hold::POWER_SAVER => Some("Paused (power saver)"),
         _ => None,
     }
 }
@@ -363,7 +363,7 @@ impl SettingsWindow {
             return;
         }
         if let Err(e) = self.config.save(&self.config_path) {
-            self.notice = Some(format!("Couldn't save the settings: {e:#}"));
+            self.notice = Some(format!("Could not save settings: {e:#}"));
         }
     }
 
@@ -372,8 +372,8 @@ impl SettingsWindow {
         let picked = Arc::clone(&self.picked);
         let ctx = ctx.clone();
         let title = match target {
-            Target::Root => "Add a folder to the index",
-            Target::Exclude => "Exclude a folder",
+            Target::Root => "Add folder to index",
+            Target::Exclude => "Exclude folder",
         };
         std::thread::spawn(move || {
             let answer = portal::pick_folder(title).map_err(|e| format!("{e:#}"));
@@ -407,7 +407,9 @@ impl SettingsWindow {
             _ => PathBuf::from(typed),
         };
         if !path.is_absolute() {
-            self.notice = Some(format!("{typed}: use a full path, or one starting with ~/"));
+            self.notice = Some(format!(
+                "{typed}: enter an absolute path, or a path starting with ~/"
+            ));
             return;
         }
         self.add(target, &path);
@@ -492,8 +494,8 @@ fn score_row(
             .speed(0.01)
             .fixed_decimals(2);
         let number = named(ui.add(number));
-        ui.label(text(ui, "Closer"));
-        let looser = text(ui, "Looser");
+        ui.label(text(ui, "Stricter"));
+        let looser = text(ui, "Broader");
         let room = ui.available_width() - looser.size().x - 2.0 * ui.spacing().item_spacing.x;
         ui.spacing_mut().slider_width = room.clamp(48.0, 240.0);
         let bar = egui::Slider::new(&mut v, range)
@@ -799,7 +801,7 @@ impl SettingsWindow {
             match answer {
                 Ok(Some(path)) => self.add(target, &path),
                 Ok(None) => {}
-                Err(e) => self.notice = Some(format!("No folder chooser: {e}")),
+                Err(e) => self.notice = Some(format!("Could not open folder chooser: {e}")),
             }
         }
     }

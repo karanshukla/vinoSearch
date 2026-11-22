@@ -40,35 +40,35 @@ impl SettingsWindow {
                 widgets::group_label(ui, "Search places");
                 widgets::group_help(
                     ui,
-                    "Each place has its own switch; only what's on is installed.",
+                    "Toggle each integration independently; only enabled integrations are installed.",
                 );
                 widgets::group(ui, |ui| {
                     switch_row(
                         ui,
                         "KRunner",
-                        "Alt+Space, and the search in the Plasma app launcher.",
+                        "Search from KRunner (Alt+Space) and the Plasma application launcher.",
                         integration::Switch::Kde,
-                        (!kde).then_some("Plasma isn't running in this session."),
+                        (!kde).then_some("Plasma is not running in this session."),
                     );
                     switch_row(
                         ui,
                         "GNOME Shell",
                         if fixed {
-                            "The overview's search."
+                            "Search from the GNOME Shell overview."
                         } else {
-                            "The overview's search, from the next login."
+                            "Search from the GNOME Shell overview (takes effect on next login)."
                         },
                         integration::Switch::Gnome,
-                        (!gnome).then_some("GNOME isn't running in this session."),
+                        (!gnome).then_some("GNOME is not running in this session."),
                     );
                     switch_row(
                         ui,
                         "App menu",
                         if fixed {
-                            "The search window as an app of its own. Search Files, in vinoSearch's \
-                             menu entry's actions, opens it either way."
+                            "Adds a standalone search window entry to your app menu. You can also \
+                             open it via the Search Files action on vinoSearch's app entry."
                         } else {
-                            "The search window as an app of its own."
+                            "Adds a standalone search window entry to your app menu."
                         },
                         integration::Switch::Menu,
                         None,
@@ -82,9 +82,11 @@ impl SettingsWindow {
                         ui,
                         "Search service",
                         if fixed {
-                            "Runs at login. Turning it off turns every search place off too."
+                            "Starts automatically at login. Turning it off disables all desktop \
+                             search integrations."
                         } else {
-                            "Runs at login. Turning it off removes every search place too."
+                            "Starts automatically at login. Turning it off removes all desktop \
+                             search integrations."
                         },
                         integration::Switch::Service,
                         None,

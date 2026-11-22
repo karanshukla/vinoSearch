@@ -162,7 +162,7 @@ fn search_entry_path() -> Result<PathBuf> {
 pub(crate) fn search_entry(settings: &str, only_with: Option<&str>) -> String {
     let mut entry = format!(
         "[Desktop Entry]\nType=Application\nName=vinoSearch Search\n\
-         Comment=Search your files by what's in them\nKeywords=find;files;photos;documents;\n\
+         Comment=Search your local files by content\nKeywords=find;files;photos;documents;\n\
          Icon={}\nExec={settings} --search\nCategories=Utility;\nTerminal=false\n",
         names().icon
     );

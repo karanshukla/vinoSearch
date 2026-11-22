@@ -250,12 +250,13 @@ impl Runner {
     fn explain(&mut self, e: zbus::Error) -> String {
         match e {
             zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("ServiceUnknown") => {
-                "The search service isn't installed. Turn it on in vinoSearch settings, \
-                 under Integration."
+                "The search service is not installed. Enable it in vinoSearch settings under \
+                 Integration."
                     .to_owned()
             }
             zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("UnknownMethod") => {
-                "The search service is older than this window. Restart it to search here."
+                "The running search service is older than this window. Restart the service to \
+                 search here."
                     .to_owned()
             }
             zbus::Error::MethodError(_, Some(message), _) => message,
@@ -335,7 +336,7 @@ impl Source for Runner {
             .status()
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => {
-                    "Copying a file needs wl-copy, from the wl-clipboard package.".to_owned()
+                    "Copying files requires wl-copy (from the wl-clipboard package).".to_owned()
                 }
                 _ => format!("wl-copy: {e}"),
             })?;

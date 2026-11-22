@@ -62,13 +62,13 @@ impl View {
     fn text(&self) -> String {
         let files = match self.files {
             0 => String::new(),
-            1 => ", 1 file so far".into(),
-            n => format!(", {n} files so far"),
+            1 => " (1 file indexed)".into(),
+            n => format!(" ({n} files indexed)"),
         };
         if self.paused {
             format!("Indexing paused{files}")
         } else if self.rest {
-            format!("Indexing the rest of a long document{files}")
+            format!("Indexing remaining pages of long documents{files}")
         } else {
             format!("Indexing{files}")
         }
@@ -312,14 +312,14 @@ mod tests {
             rest,
         };
         assert_eq!(v(false, 0, false).text(), "Indexing");
-        assert_eq!(v(false, 1, false).text(), "Indexing, 1 file so far");
+        assert_eq!(v(false, 1, false).text(), "Indexing (1 file indexed)");
         assert_eq!(
             v(true, 12, false).text(),
-            "Indexing paused, 12 files so far"
+            "Indexing paused (12 files indexed)"
         );
         assert_eq!(
             v(false, 0, true).text(),
-            "Indexing the rest of a long document"
+            "Indexing remaining pages of long documents"
         );
     }
 }

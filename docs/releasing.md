@@ -15,7 +15,7 @@ vinoSearch uses consecutive integer release numbers (`v1`, `v2`, ...) rather tha
    gh release create vN --verify-tag --generate-notes
    ```
 
-A binary reports `vinosearch <number>` only when built by `release.yml`, which sets `VINOSEARCH_VERSION` from the crate version and fails if the tag and crate versions disagree (the Flatpak job injects the same environment variable into the manifest on the runner). All other builds—including `cargo install` and local Flatpak builds—report `vinosearch dev` and never prompt for self-updates.
+A binary reports `vinosearch <number>` only when built by `release.yml`, which sets `VINOSEARCH_VERSION` from the crate version and fails if the tag and crate versions disagree (the Flatpak job injects the same environment variable into the manifest on the runner). All other builds (including `cargo install` and local Flatpak builds) report `vinosearch dev` and never prompt for self-updates.
 
 Publishing triggers [`release.yml`](https://github.com/karanshukla/vinoSearch/blob/main/.github/workflows/release.yml), which uploads `vinosearch-x86_64-linux.tar.gz` and its `.sha256` checksum, then builds and attaches `vinosearch-x86_64.flatpak` and its `.sha256` roughly 20 minutes later.
 

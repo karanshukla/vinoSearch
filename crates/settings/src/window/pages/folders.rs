@@ -31,7 +31,7 @@ impl SettingsWindow {
     pub(in crate::window) fn included(&mut self, ui: &mut egui::Ui, reachable: Option<&Status>) {
         let p = theme::palette(ui.ctx());
         widgets::group_label(ui, "Included");
-        widgets::group_help(ui, "Indexed and watched for changes.");
+        widgets::group_help(ui, "These folders are indexed and watched for changes.");
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
         self.forgetting.retain(|r| roots.contains(r));
         roots.retain(|r| !self.forgetting.contains(r));
@@ -44,7 +44,7 @@ impl SettingsWindow {
         widgets::group(ui, |ui| {
             if reachable.is_some() && roots.is_empty() {
                 widgets::group_section(ui, |ui| {
-                    widgets::muted(ui, "Nothing is indexed yet.");
+                    widgets::muted(ui, "No folders are indexed yet.");
                 });
             }
             for root in &roots {
@@ -79,7 +79,7 @@ impl SettingsWindow {
                     |ui, _| {
                         let of = |r| a11y::for_what(r, &path);
                         if confirming {
-                            if of(ui.add(Button::destructive("Remove and drop its index").small()))
+                            if of(ui.add(Button::destructive("Remove and clear index").small()))
                                 .clicked()
                             {
                                 self.link.send(Request::Forget(root.clone()));
@@ -106,7 +106,7 @@ impl SettingsWindow {
                                 widgets::small(ui, "Checking…");
                             } else {
                                 if of(ui.add_enabled(!indexing, Button::ghost("Re-index").small()))
-                                    .on_hover_text("Look for anything the watcher missed")
+                                    .on_hover_text("Scan for changes missed by the file watcher")
                                     .clicked()
                                 {
                                     self.link.send(Request::Reindex(root.clone()));
@@ -133,13 +133,13 @@ impl SettingsWindow {
 
     pub(in crate::window) fn excluded(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Excluded");
-        widgets::group_help(ui, "Never indexed, even inside an included folder.");
+        widgets::group_help(ui, "Skipped even when inside an included folder.");
         if let Some(why) = &self.config_broken {
             widgets::banner(
                 ui,
                 Tone::Error,
                 &format!(
-                    "{} doesn't parse, so it isn't changed from here: {why}",
+                    "Could not parse {} ({why}). Fix the file before changing settings here.",
                     self.config_path.display()
                 ),
                 |_| {},
@@ -150,7 +150,7 @@ impl SettingsWindow {
         widgets::group(ui, |ui| {
             if self.config.exclude.is_empty() {
                 widgets::group_section(ui, |ui| {
-                    widgets::muted(ui, "Nothing is excluded.");
+                    widgets::muted(ui, "No folders are excluded.");
                 });
             }
             for (i, entry) in self.config.exclude.iter().enumerate() {
@@ -191,8 +191,8 @@ impl SettingsWindow {
         widgets::group_section(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (button, hint) = match target {
-                    Target::Root => ("Add folder…", "or type a path, e.g. ~/Documents"),
-                    Target::Exclude => ("Exclude folder…", "or type a path, e.g. ~/Downloads/tax"),
+                    Target::Root => ("Add folder…", "or enter a path, e.g. ~/Documents"),
+                    Target::Exclude => ("Exclude folder…", "or enter a path, e.g. ~/Downloads/tax"),
                 };
                 if ui
                     .add_enabled(!self.picking, Button::secondary(button).icon(Icon::Plus))
@@ -239,7 +239,7 @@ fn field_name(target: Target) -> &'static str {
 /// What a Re-index found: nothing, changes now being indexed, or why it couldn't look.
 fn walk_result(ui: &mut egui::Ui, w: &Walk) {
     if !w.error.is_empty() {
-        widgets::small(ui, "Couldn't check").on_hover_text(&w.error);
+        widgets::small(ui, "Check failed").on_hover_text(&w.error);
     } else if w.found == 0 {
         widgets::small(ui, "Up to date");
     } else {

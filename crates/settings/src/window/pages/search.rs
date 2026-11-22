@@ -20,7 +20,7 @@ impl SettingsWindow {
                 ui,
                 Tone::Error,
                 &format!(
-                    "{} doesn't parse, so it isn't changed from here: {why}",
+                    "Could not parse {} ({why}). Fix the file before changing settings here.",
                     self.config_path.display()
                 ),
                 |_| {},
@@ -51,7 +51,7 @@ impl SettingsWindow {
         widgets::group_label(ui, "What to index");
         widgets::group(ui, |ui| {
             Row::new("Text")
-                .help("Notes, Markdown and web pages.")
+                .help("Plain text, Markdown, and HTML files.")
                 .show(ui, |ui, _| {
                     widgets::chip(ui, ChipKind::Neutral, "Always on");
                     if let Some(s) = s
@@ -62,7 +62,7 @@ impl SettingsWindow {
                 });
             let mut images = self.config.formats.images_enabled();
             Row::new("Images")
-                .help("By what's in them. 671 MB download.")
+                .help("Search photos by visual content and text (671 MB download).")
                 .show(ui, |ui, _| {
                     if widgets::switch(ui, &mut images, "Index images").changed() {
                         self.config.formats.images.enabled = images.then_some(true);
@@ -84,7 +84,7 @@ impl SettingsWindow {
                         ui.horizontal(|ui| {
                             icons::icon(ui, Icon::Warning, 16.0, p.warn);
                             let shown = ui.add(
-                                egui::Label::new("The vision model isn't downloaded yet.").wrap(),
+                                egui::Label::new("Vision model is not downloaded yet.").wrap(),
                             );
                             a11y::live(&shown);
                         });
@@ -101,7 +101,7 @@ impl SettingsWindow {
             }
             if images {
                 Row::new("Image types")
-                    .help("Empty restores the defaults.")
+                    .help("Leave blank to restore default extensions.")
                     .show(ui, |ui, named| {
                         let current = self
                             .config
@@ -143,10 +143,10 @@ impl SettingsWindow {
                     });
             }
             let documents = if self.config.encryption.on() {
-                "PDF, Office, EPUB, subtitles, CSV."
+                "PDF, Office, EPUB, subtitles, and CSV files."
             } else {
-                "PDF, Office, EPUB, subtitles, CSV. Stored unencrypted unless the index is \
-                 encrypted (Security)."
+                "PDF, Office, EPUB, subtitles, and CSV files. Stored unencrypted unless index \
+                 encryption is enabled (Security)."
             };
             Row::new("Documents").help(documents).show(ui, |ui, _| {
                 let mut on = self.config.formats.documents_enabled();
@@ -161,7 +161,7 @@ impl SettingsWindow {
                 }
             });
             Row::new("Code")
-                .help("Found with “code:” searches. Secrets and ignored files skipped.")
+                .help("Matched only by “code:” queries. Secrets and ignored files are skipped.")
                 .show(ui, |ui, _| {
                     let mut on = self.config.formats.code_enabled();
                     if widgets::switch(ui, &mut on, "Index code").changed() {
@@ -177,7 +177,7 @@ impl SettingsWindow {
             let sessions_on = self.config.formats.sessions_enabled();
             let (sessions_help, tone) = if sessions_on && !self.config.encryption.on() {
                 (
-                    "Turn on encryption (Security) to keep transcripts encrypted.",
+                    "Enable encryption on the Security page to keep transcripts encrypted.",
                     Tone::Warn,
                 )
             } else {
@@ -201,7 +201,7 @@ impl SettingsWindow {
             let media = self.config.formats.media_enabled();
             Row::new("Media")
                 .help(
-                    "Audio and video, by what's heard and seen. Plugged in only. 295 MB download, and 671 MB more with photos off.",
+                    "Search audio and video by sound and video frames. Indexes on AC power only (295 MB download, plus 671 MB if images are off).",
                 )
                 .show(ui, |ui, _| {
                     let mut on = media;
@@ -220,7 +220,7 @@ impl SettingsWindow {
                 && !s.ffmpeg
             {
                 Row::new("")
-                    .help("Needs ffmpeg: install it from your distribution's packages.")
+                    .help("Requires ffmpeg. Install it using your distribution's package manager.")
                     .tone(Tone::Error)
                     .show(ui, |_, _| {});
             } else if media
@@ -233,10 +233,8 @@ impl SettingsWindow {
                         ui.horizontal(|ui| {
                             icons::icon(ui, Icon::Warning, 16.0, p.warn);
                             let shown = ui.add(
-                                egui::Label::new(
-                                    "The audio and vision models aren't downloaded yet.",
-                                )
-                                .wrap(),
+                                egui::Label::new("Audio and vision models are not downloaded yet.")
+                                    .wrap(),
                             );
                             a11y::live(&shown);
                         });
@@ -257,9 +255,9 @@ impl SettingsWindow {
                 let n = s.media_waiting_for_ac;
                 Row::new("")
                     .help(&format!(
-                        "{} {} for a charger.",
+                        "{} {} waiting for AC power.",
                         count(n as i64),
-                        if n == 1 { "file waits" } else { "files wait" }
+                        if n == 1 { "file is" } else { "files are" }
                     ))
                     .show(ui, |_, _| {});
             }
@@ -267,9 +265,9 @@ impl SettingsWindow {
                 && s.sessions_unread > 0
             {
                 let n = s.sessions_unread;
-                Row::new("Not read")
+                Row::new("Unreadable")
                     .help(&format!(
-                        "{n} {}: made by a newer vinoWhisper, or damaged.",
+                        "{n} {} could not be read (newer vinoWhisper format or damaged file).",
                         if n == 1 { "session" } else { "sessions" }
                     ))
                     .tone(Tone::Error)
@@ -289,8 +287,8 @@ impl SettingsWindow {
                 ui,
                 &AppPicker {
                     label: "Editor",
-                    help: "Opens at the matching line.",
-                    command_help: "With {file} and {line} in it, run without a shell.",
+                    help: "Opens text results at the matching line.",
+                    command_help: "Include {file} and {line} placeholders (run directly without a shell).",
                     hint: "foot -e nvim +{line} {file}",
                     apps: &editors,
                 },
@@ -302,8 +300,8 @@ impl SettingsWindow {
                 ui,
                 &AppPicker {
                     label: "Player",
-                    help: "Plays audio and video from the matching time: mpv, VLC or Celluloid.",
-                    command_help: "With {file} and {seconds} in it, run without a shell.",
+                    help: "Plays audio and video from the matching timestamp (mpv, VLC, or Celluloid).",
+                    command_help: "Include {file} and {seconds} placeholders (run directly without a shell).",
                     hint: "mpv --start={seconds} {file}",
                     apps: &players,
                 },
@@ -313,8 +311,8 @@ impl SettingsWindow {
             );
         });
 
-        widgets::group_label(ui, "How close results must be");
-        widgets::group_help(ui, "Higher means fewer, better results.");
+        widgets::group_label(ui, "Match threshold");
+        widgets::group_help(ui, "Higher values return fewer, stricter matches.");
         widgets::group(ui, |ui| {
             let text = self.config.formats.text.min_score;
             if let Some(v) = score_row(ui, "Text", text, DEFAULT_TEXT_MIN_SCORE, 0.45..=0.85) {

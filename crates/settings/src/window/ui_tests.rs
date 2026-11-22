@@ -231,7 +231,7 @@ fn index_page_buttons_reach_the_runner() {
         let heading = h.get_by_role_and_label(Role::Heading, section);
         assert_eq!(heading.accesskit_node().data().level(), Some(2));
     }
-    h.get_by_label("Indexing, 12 files so far");
+    h.get_by_label("Indexing (12 files indexed)");
     for button in ["Stop", "Check now", "Exclude /srv/notes/build"] {
         h.get_by_role_and_label(Role::Button, button).click();
         settle(&mut h);
@@ -266,7 +266,7 @@ fn removing_a_folder_confirms_moves_focus_and_escape_backs_out() {
     assert!(h.state().confirm.is_none());
     first_remove(&h).click();
     settle(&mut h);
-    h.get_by_role_and_label(Role::Button, "Remove and drop its index /srv/notes")
+    h.get_by_role_and_label(Role::Button, "Remove and clear index /srv/notes")
         .click();
     settle(&mut h);
     let sent = sent(&requests);
@@ -417,7 +417,7 @@ fn code_is_opt_in_and_saved_as_it_is_turned_on() {
 fn sessions_are_opt_in_with_a_nudge_towards_encryption() {
     let h = search_page_with_switched_on("search-sessions", "Index vinoWhisper sessions");
     assert!(h.state().config.formats.sessions_enabled());
-    h.get_by_label("Turn on encryption (Security) to keep transcripts encrypted.");
+    h.get_by_label("Enable encryption on the Security page to keep transcripts encrypted.");
     let saved = saved_config(&h);
     assert!(
         saved.contains("[formats.sessions]\nenabled = true"),
@@ -613,7 +613,7 @@ fn a_partial_download_can_be_deleted() {
     h.get_by_label("Incomplete, 306 MB");
     h.get_by_role_and_label(Role::Button, "Delete…").click();
     settle(&mut h);
-    h.get_by_label_contains("Deletes 306 MB of models.");
+    h.get_by_label_contains("Deletes 306 MB of model files.");
     h.get_by_role_and_label(Role::Button, "Delete the model")
         .click();
     settle(&mut h);
@@ -644,9 +644,7 @@ fn nothing_downloaded_has_nothing_to_delete() {
 #[test]
 fn without_the_service_the_models_are_deleted_from_disk() {
     let (w, requests) = window(Page::Model, "offline");
-    w.link.shared.lock().unwrap().status = Some(Err(
-        "The search service isn't installed. Turn it on under Integration.".into(),
-    ));
+    w.link.shared.lock().unwrap().status = Some(Err(NOT_INSTALLED.into()));
     let models = w.models_dir.clone().unwrap();
     for name in models::ALL {
         std::fs::create_dir_all(models.join(name)).unwrap();
@@ -735,8 +733,8 @@ fn index_on_battery_is_a_checkbox_saved_only_when_off() {
 #[test]
 fn the_index_page_says_why_power_holds_indexing() {
     for (key, says) in [
-        (hold::CHARGER, "Waiting for a charger"),
-        (hold::POWER_SAVER, "Paused: power saver"),
+        (hold::CHARGER, "Waiting for AC power"),
+        (hold::POWER_SAVER, "Paused (power saver)"),
     ] {
         let (w, _requests) = window(Page::Index, key);
         if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
@@ -767,7 +765,7 @@ fn the_index_page_lists_documents_indexed_in_part() {
         s.partial[1].total = 41;
     }
     let h = harness(w, WIDE, Theme::Light);
-    h.get_by_label("Indexing the rest of long documents");
+    h.get_by_label("Indexing remaining pages of long documents");
     h.get_by_label("book0.pdf");
     h.get_by_label("book1.pdf");
     h.get_by_label(", 30 of 41 chapters");
@@ -954,7 +952,7 @@ fn no_tpm_refuses_encryption_until_the_host_key_is_allowed() {
 fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
     let (w, requests) = security("keyring", |s| s.new_seal = "keyring".into());
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_label_contains("desktop keyring, which your session can read");
+    h.get_by_label_contains("desktop keyring (readable by your session after login)");
     assert!(
         h.query_by_label("Use the host key instead (weaker)")
             .is_none(),
@@ -980,8 +978,8 @@ fn a_keyring_index_waiting_for_its_key_offers_to_unlock_it() {
         s.seal_waiting = "the keyring is locked".into();
     });
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_label("Encrypted, waiting for its key");
-    h.get_by_label_contains("can't be read yet (the keyring is locked)");
+    h.get_by_label("Encrypted (waiting for key)");
+    h.get_by_label_contains("currently unavailable (the keyring is locked)");
     h.get_by_role_and_label(Role::Button, "Unlock…").click();
     settle(&mut h);
     assert!(
@@ -1000,8 +998,8 @@ fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
         s.seal_broken = "Failed to unseal secret using TPM2".into();
     });
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_label("Encrypted, the key sealed to this machine's TPM");
-    h.get_by_label_contains("so the index is being built again from your files");
+    h.get_by_label("Encrypted (TPM-sealed key)");
+    h.get_by_label_contains("so the index is being rebuilt from your files");
     h.get_by_role_and_label(Role::Button, "New key…").click();
     settle(&mut h);
     assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused());
@@ -1050,8 +1048,8 @@ fn each_legend_entry_stays_on_one_line() {
 #[test]
 fn the_media_row_says_how_many_files_wait_for_a_charger() {
     for (waiting, says) in [
-        (12, Some("12 files wait for a charger.")),
-        (1, Some("1 file waits for a charger.")),
+        (12, Some("12 files are waiting for AC power.")),
+        (1, Some("1 file is waiting for AC power.")),
         (0, None),
     ] {
         let (mut w, _requests) = window(Page::Search, &format!("media-ac-{waiting}"));
@@ -1065,7 +1063,7 @@ fn the_media_row_says_how_many_files_wait_for_a_charger() {
             Some(text) => {
                 h.get_by_label(text);
             }
-            None => assert!(h.query_by_label_contains("for a charger").is_none()),
+            None => assert!(h.query_by_label_contains("waiting for AC power").is_none()),
         }
     }
 }
