@@ -115,7 +115,7 @@ All methods return promptly even while indexing or downloading: `Status` reads s
 
 ## Settings
 
-Settings are not stored over D-Bus; they live in `~/.config/vinosearch/config.toml` (`vinosearch_shared::config::{default_path, Config}`), which the settings window edits directly:
+Settings are not stored over D-Bus; they are stored in `~/.config/vinosearch/config.toml` (`vinosearch_shared::config::{default_path, Config}`), which the settings window edits directly:
 
 ```toml
 exclude = ["~/Downloads"]

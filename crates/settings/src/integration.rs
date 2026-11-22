@@ -152,7 +152,7 @@ pub fn run(state: Arc<Mutex<State>>, ctx: &egui::Context, switch: Switch, on: bo
                 }
                 text.trim().to_owned()
             }
-            Err(e) => format!("Couldn't run vinosearch: {e}"),
+            Err(e) => format!("Could not run vinosearch: {e}"),
         };
         let mut s = state.lock().unwrap();
         *s = State {

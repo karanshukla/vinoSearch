@@ -21,7 +21,7 @@ See [Opening at the match](dbus.md#opening-at-the-match) for the full list of su
 
 ## All results
 
-Select **Show all results** on any KRunner match, or click the vinoSearch icon next to GNOME Shell results, to open the full search window (requires `vinosearch-settings`). It displays up to 100 files per category—photos in a thumbnail grid, and text/documents with snippets and line or page numbers—along with filters for category, folder, date, and file type.
+Select **Show all results** on any KRunner match, or click the vinoSearch icon next to GNOME Shell results, to open the full search window (requires `vinosearch-settings`). It displays up to 100 files per category (photos in a thumbnail grid, and text/documents with snippets and line or page numbers), along with filters for category, folder, date, and file type.
 
 Press `Enter` or double-click an entry to open it at the match. Action buttons at the bottom provide **Open folder** and **Copy file** (which copies the file URI for pasting in a file manager; requires `wl-copy`).
 
@@ -29,7 +29,7 @@ You can also open the search window directly from a shortcut with `vinosearch-se
 
 ## The tray icon
 
-While indexing runs, a vinoSearch icon shows in the system tray with how many files it has indexed so far, **Pause indexing** (or **Resume indexing**), **Settings…** and **Quit**. **Quit** stops the service until the next search starts it again. Clicking the icon opens the settings window. It shows up only after a few seconds of indexing, so a single changed file doesn't flash it, and it goes away once indexing has been quiet for a few seconds (on KDE Plasma, into the tray's hidden icons). On GNOME it needs the AppIndicator extension.
+While indexing is active, a vinoSearch icon appears in the system tray displaying the number of indexed files, along with **Pause indexing** (or **Resume indexing**), **Settings…**, and **Quit** (**Quit** stops the service until the next search restarts it). Clicking the icon opens the settings window. To avoid flashing during brief updates, the icon appears only after a few seconds of continuous indexing and hides automatically once indexing finishes (moving into the hidden icons area on KDE Plasma). On GNOME, the tray icon requires the AppIndicator extension.
 
 ## Other Wayland desktops
 

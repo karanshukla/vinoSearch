@@ -47,7 +47,7 @@ pub fn run(path: &Path) -> Result<Answer, String> {
         .args(["estimate", "--json"])
         .arg(path)
         .output()
-        .map_err(|e| format!("Couldn't run vinosearch: {e}"))?;
+        .map_err(|e| format!("Could not run vinosearch: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let last = err.lines().rev().find(|l| !l.trim().is_empty());
@@ -60,7 +60,7 @@ pub fn run(path: &Path) -> Result<Answer, String> {
 
 fn parse(json: &[u8]) -> Result<Answer, String> {
     let v: serde_json::Value =
-        serde_json::from_slice(json).map_err(|e| format!("Couldn't read the estimate: {e}"))?;
+        serde_json::from_slice(json).map_err(|e| format!("Could not read estimate: {e}"))?;
     let text = |v: &serde_json::Value, key: &str| v[key].as_str().unwrap_or_default().to_owned();
     Ok(Answer {
         summary: text(&v, "summary"),
@@ -134,7 +134,8 @@ impl SettingsWindow {
                 Some(Err(why)) => {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(format!("Couldn't estimate it: {why}")).color(p.error),
+                            RichText::new(format!("Could not estimate folder: {why}"))
+                                .color(p.error),
                         )
                         .wrap(),
                     );
@@ -145,7 +146,7 @@ impl SettingsWindow {
                         widgets::small(ui, note);
                     }
                     if !a.folders.is_empty() {
-                        widgets::small(ui, "Longest to index; excluding one leaves it out:");
+                        widgets::small(ui, "Slowest subfolders to index (exclude to skip):");
                         for f in &a.folders {
                             let entry = tilde(Path::new(&f.path));
                             let excluded = self.config.exclude.contains(&entry);

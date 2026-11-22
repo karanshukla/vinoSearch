@@ -573,18 +573,19 @@ impl SearchWindow {
         let p = theme::palette(ui.ctx());
         ui.add_space(8.0);
         let status = if let Some(e) = &self.error {
-            Some(RichText::new(format!("Couldn't search: {e}")).color(p.error))
+            Some(RichText::new(format!("Search failed: {e}")).color(p.error))
         } else if self.searching && self.results.is_empty() {
             Some(RichText::new("Searching…").color(p.muted))
         } else if self.searched.is_empty() {
             let hint = if self.query.trim().is_empty() {
-                "Type what you're looking for: a sentence works better than a file name."
+                "Type a query to search your files (a descriptive phrase works better than a \
+                 filename)."
             } else {
                 "Press Enter to search."
             };
             Some(RichText::new(hint).color(p.muted))
         } else if self.results.is_empty() {
-            Some(RichText::new(format!("Nothing found for “{}”.", self.searched)).color(p.muted))
+            Some(RichText::new(format!("No results found for “{}”.", self.searched)).color(p.muted))
         } else if shown.is_empty() {
             Some(RichText::new("No results match the filters.").color(p.muted))
         } else {

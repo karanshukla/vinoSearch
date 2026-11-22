@@ -587,7 +587,7 @@ fn the_keyboard_reaches_the_results_and_opens_one() {
 fn typing_searches_once_it_pauses_and_errors_are_said() {
     let (w, asked_, dir) = window("", "typing");
     let mut h = harness(w, WIDE);
-    h.get_by_label_contains("a sentence works better");
+    h.get_by_label_contains("descriptive phrase works better");
     h.get_by_role_and_label(Role::TextInput, "Search")
         .type_text("fail");
     h.step();
@@ -598,7 +598,7 @@ fn typing_searches_once_it_pauses_and_errors_are_said() {
     );
     asked(&asked_, &mut h, &Ask::Search(0, "fail".into()));
     answered(&mut h);
-    h.get_by_label("Couldn't search: the worker has stopped");
+    h.get_by_label("Search failed: the worker has stopped");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

@@ -9,8 +9,8 @@
   <url type="homepage">https://github.com/karanshukla/vinoSearch</url>
   <description>
     <p>
-      Finds files by what is in them, from KRunner and GNOME Shell's search.
-      The models run on an Intel NPU through OpenVINO, or on the GPU or CPU.
+      Search your local files by content from KRunner and GNOME Shell.
+      Models run locally on an Intel NPU through OpenVINO, with GPU and CPU fallback.
     </p>
   </description>
   <provides>
@@ -24,18 +24,18 @@
       <description>
         <ul>
           <li>Index and open vinoWhisper sessions from its Flatpak</li>
-          <li>Status says how many audio and video files wait for a charger</li>
-          <li>A wide settings window shows a page's groups in two columns</li>
-          <li>A build that isn't a release says dev, so vinoPilot can tell them apart</li>
+          <li>Show how many audio and video files are waiting for AC power</li>
+          <li>Use a two-column layout for setting groups in wide windows</li>
+          <li>Report "dev" as the version on non-release builds so vinoPilot can distinguish them</li>
         </ul>
       </description>
     </release>
     <release version="11.0.0" date="2026-11-14">
       <description>
         <ul>
-          <li>The first release as a Flatpak bundle</li>
-          <li>Encrypt the index in the Flatpak, sealed by the host's TPM</li>
-          <li>The settings and search windows draw their own title bar</li>
+          <li>Initial Flatpak bundle release</li>
+          <li>Support TPM-sealed index encryption inside Flatpak via the host TPM</li>
+          <li>Add custom client-side title bars to the settings and search windows</li>
         </ul>
       </description>
     </release>

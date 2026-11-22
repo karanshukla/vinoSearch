@@ -5,7 +5,7 @@ nav_order: 5
 
 # Privacy
 
-The only network requests vinoSearch makes are for downloading models and the OpenVINO runtime, and every model file is verified against a pinned SHA-256 checksum. Indexed content and search queries never leave your machine.
+The only network requests vinoSearch makes are for downloading models and the OpenVINO runtime, and every model file is verified against a pinned SHA-256 checksum. Indexed content and search queries are processed locally.
 
 The index is stored in SQLite at `~/.local/share/vinosearch/index.sqlite` with permissions restricted to your user (`0600` file inside a `0700` directory). Because vector embeddings can be partially inverted back to source text, treat the index with the same sensitivity as the files it covers.
 
@@ -24,7 +24,7 @@ Index encryption is optional and disabled by default ([#4](https://github.com/ka
 On systems without systemd or with systemd older than 256, the key is stored in your desktop keyring via the freedesktop Secret Service API (GNOME Keyring, KWallet, or compatible backends):
 
 - **Threat model:** Keyring storage is weaker than TPM sealing. Once unlocked at login, any process running under your user session can read the key. The key also travels across your session D-Bus unencrypted (`plain` Secret Service session); since only your own processes can connect to the session bus and could already query the unlocked keyring directly, this does not expand exposure beyond the keyring itself. Keyring encryption primarily protects backups, synced home directories, and removed disks, provided your keyring has a non-empty password (an empty keyring password stores the keyring unencrypted). If you log in without a password (such as autologin or fingerprint), the keyring stays locked until unlocked manually.
-- **Locked keyring or missing entry:** While the keyring is locked, the encrypted index is preserved and searches return empty results. The runner prompts once to unlock at startup (timing out after 1 minute), retries quietly every 30 seconds, and re-prompts when you click **Unlock** on the Security page; it never falls back to plaintext. The same applies if no matching item is found in the current keyring (which can happen when switching desktop keyrings). To start over, turn encryption off: if the key still cannot be retrieved after prompting, the index is rebuilt in plaintext from your folders, and re-enabling encryption generates a fresh key.
+- **Locked keyring or missing entry:** While the keyring is locked, the encrypted index is preserved and searches return empty results. The runner prompts once to unlock at startup (timing out after 1 minute), retries in the background every 30 seconds, and re-prompts when you click **Unlock** on the Security page; it never falls back to plaintext. The same applies if no matching item is found in the current keyring (which can happen when switching desktop keyrings). To start over, turn encryption off: if the key still cannot be retrieved after prompting, the index is rebuilt in plaintext from your folders, and re-enabling encryption generates a fresh key.
 
 See [Encryption at rest](how-it-works.md#encryption-at-rest) for low-level implementation details.
 

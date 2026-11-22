@@ -70,7 +70,7 @@ Building from source requires Rust 1.95 or newer; because Debian and Ubuntu repo
 
 ## Fedora Atomic and openSUSE Aeon
 
-Everything installs inside your home directory: binaries in `~/.local/bin`, runtime/models/index under `~/.local`, and the autostart entry in `~/.config/autostart`. Because nothing modifies `/usr`, the prebuilt release requires no package layering or reboot. The only required system package is the Intel NPU driver—layer it with `rpm-ostree install` (Fedora Atomic) or `transactional-update pkg install` (Aeon), or use an image that already includes it.
+Everything installs inside your home directory: binaries in `~/.local/bin`, runtime/models/index under `~/.local`, and the autostart entry in `~/.config/autostart`. Because nothing modifies `/usr`, the prebuilt release requires no package layering or reboot. The only required system package is the Intel NPU driver; layer it with `rpm-ostree install` (Fedora Atomic) or `transactional-update pkg install` (Aeon), or use an image that already includes it.
 
 If you prefer building from source, run `install.sh` inside a toolbox or distrobox matching your host distribution. Because the home directory is shared, the host runs the compiled binaries, uses the same index, and starts the service from the same autostart entry. Both `/var/home` and a `/home` symlink work properly because indexed paths are canonicalized.
 
@@ -123,7 +123,7 @@ Invoke the CLI via `flatpak run dev.vinosearch.VinoSearch` (for example, `flatpa
 
 ### Differences from a native install
 
-- **Isolated data directory and bus name:** Configuration, index, and models live under `~/.var/app/dev.vinosearch.VinoSearch` (`config/vinosearch/config.toml`, `data/vinosearch`), allowing side-by-side use with a native installation. Logs go to the systemd journal when launched by systemd, or `.local/state/vinosearch/service.log` inside the app directory otherwise (`doctor` prints the exact location). The D-Bus name is `dev.vinosearch.VinoSearch.Runner`.
+- **Isolated data directory and bus name:** Configuration, index, and models are stored under `~/.var/app/dev.vinosearch.VinoSearch` (`config/vinosearch/config.toml`, `data/vinosearch`), allowing side-by-side use with a native installation. Logs go to the systemd journal when launched by systemd, or `.local/state/vinosearch/service.log` inside the app directory otherwise (`doctor` prints the exact location). The D-Bus name is `dev.vinosearch.VinoSearch.Runner`.
 - **Search providers and app menu:** The KRunner plugin, GNOME Shell provider, and D-Bus activation file are bundled, but Flatpak leaves exported search providers disabled by default. Use the Integration page switches (or `integrate kde|gnome`) to enable them in your desktop's search settings. The search window is available as the **Search Files** action on the app menu entry; toggling the App menu switch (or running `integrate menu`) adds a standalone launcher in `~/.local/share/applications` (removed by turning off the switch or running `krunner --uninstall`; `flatpak uninstall` leaves the file behind, though the menu hides it).
 - **Autostart:** The service switch and `krunner --install` / `--uninstall` manage login startup through the Background portal along with the current desktop's search integration.
 - **dmenu launchers:** On sway, Hyprland, and similar desktops, bind `flatpak run dev.vinosearch.VinoSearch menu` to a shortcut. The launcher (`fuzzel`, `wofi`, `rofi`, `tofi`, `bemenu`, or `--launcher`) runs on the host.

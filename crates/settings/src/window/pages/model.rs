@@ -19,7 +19,7 @@ impl SettingsWindow {
         widgets::group_label(ui, "EmbeddingGemma 2");
         widgets::group(ui, |ui| {
             let warning = format!(
-                "Deletes {} of models. Search and indexing need them downloaded again.",
+                "Deletes {} of model files. Search and indexing require downloading them again.",
                 size(bytes)
             );
             let row = if deleting {
@@ -28,7 +28,7 @@ impl SettingsWindow {
                     .tint(p.error_tint)
                     .tone(Tone::Error)
             } else {
-                Row::new("Download").help("Downloading needs the search service running.")
+                Row::new("Download").help("Start the search service to download models.")
             };
             row.show(ui, |ui, _| {
                 if deleting {
@@ -37,7 +37,7 @@ impl SettingsWindow {
                         .clicked()
                     {
                         if let Err(e) = models::delete(&dir) {
-                            self.notice = Some(format!("Couldn't delete the model: {e:#}"));
+                            self.notice = Some(format!("Could not delete the model: {e:#}"));
                         }
                         self.confirm = None;
                     }
@@ -103,8 +103,8 @@ impl SettingsWindow {
         let deleting = self.confirm == Some(Confirm::DeleteModel);
         widgets::group(ui, |ui| {
             let warning = format!(
-                "Deletes {} of models. Search and indexing stop until you download them \
-                 again.",
+                "Deletes {} of model files. Search and indexing will stop until they are \
+                 downloaded again.",
                 size(s.model_bytes)
             );
             let row = if deleting {
@@ -113,7 +113,7 @@ impl SettingsWindow {
                     .tint(p.error_tint)
                     .tone(Tone::Error)
             } else {
-                Row::new("Download").help("Needed for search and indexing.")
+                Row::new("Download").help("Required for search and indexing.")
             };
             row.show(ui, |ui, _| {
                 if deleting {
@@ -188,7 +188,7 @@ impl SettingsWindow {
                 }
             });
             Row::new("Compiled cache")
-                .help("Clearing it makes the next load slower.")
+                .help("Clearing the cache forces recompilation on the next model load.")
                 .show(ui, |ui, _| {
                     if ui
                         .add_enabled(s.cache_bytes > 0, Button::secondary("Clear"))
@@ -204,13 +204,16 @@ impl SettingsWindow {
     pub(in crate::window) fn running(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Running");
         if self.config_broken.is_some() {
-            widgets::group_help(ui, "The settings file doesn't parse; see the Folders page.");
+            widgets::group_help(
+                ui,
+                "Could not parse the settings file. See the Folders page for details.",
+            );
             return;
         }
         let mut changed = false;
         widgets::group(ui, |ui| {
             Row::new("Device")
-                .help("The NPU is fastest and uses the least power. Without one, NPU means the GPU, else the CPU.")
+                .help("The NPU is fastest and uses the least power. If no NPU is available, selecting NPU falls back to the GPU, then the CPU.")
                 .show(ui, |ui, _| {
                     let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
                     let mut picked = DEVICES
@@ -224,7 +227,7 @@ impl SettingsWindow {
                     }
                 });
             Row::new("Unload after")
-                .help("0 keeps it loaded.")
+                .help("Set to 0 to keep the model loaded.")
                 .show(ui, |ui, named| {
                     let mut minutes = self
                         .config
@@ -253,7 +256,7 @@ impl SettingsWindow {
                     }
                 });
             Row::new("Indexing share")
-                .help("Halved on battery.")
+                .help("Maximum device share for background indexing (halved on battery).")
                 .show(ui, |ui, named| {
                     let mut percent = self
                         .config
