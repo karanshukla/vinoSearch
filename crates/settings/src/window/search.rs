@@ -695,15 +695,25 @@ impl SearchWindow {
     }
 
     fn list(&mut self, ui: &mut egui::Ui, texts: &[&Found], first: &mut bool) {
+        let p = theme::palette(ui.ctx());
         ui.vertical(|ui| {
             a11y::list_box(ui, "Text and documents");
             ui.set_max_width(ui.available_width().min(760.0));
-            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
             let mut to = None;
+            let mut last_rect = None;
             for (i, f) in texts.iter().enumerate() {
                 let response = self.row(ui, f);
+                last_rect = Some(response.rect);
                 self.respond(ui, &response, f, first);
                 to = to.or_else(|| arrows(ui, &response, i, texts.len(), 1, 0));
+            }
+            if let Some(rect) = last_rect {
+                ui.painter().hline(
+                    rect.left()..=rect.right(),
+                    rect.bottom(),
+                    egui::Stroke::new(1.0_f32, p.rule),
+                );
             }
             self.move_to(ui, to.map(|i| texts[i]));
         });
@@ -715,32 +725,38 @@ impl SearchWindow {
         let width = ui.available_width();
         let bg = ui.painter().add(egui::Shape::Noop);
         let inner = egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .corner_radius(TILE_RADIUS)
+            .inner_margin(egui::Margin::symmetric(10, 10))
             .show(ui, |ui| {
-                ui.set_width(width - 24.0);
+                ui.set_width(width - 20.0);
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 12.0;
                     tile(ui, f, 30.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add(
-                                egui::Label::new(RichText::new(f.name()).family(theme::semibold()))
+                        let place = f.place();
+                        let mut detail = tilde(f.folder());
+                        if !place.is_empty() {
+                            detail = format!("{detail}, {place}");
+                        }
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&detail).color(p.muted).size(12.5),
+                                    )
                                     .truncate()
                                     .selectable(false),
-                            );
-                            let place = f.place();
-                            let mut detail = tilde(f.folder());
-                            if !place.is_empty() {
-                                detail = format!("{detail}, {place}");
-                            }
-                            ui.add(
-                                egui::Label::new(RichText::new(detail).color(p.muted).size(12.5))
-                                    .truncate()
-                                    .selectable(false),
-                            );
+                                );
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(f.name()).family(theme::semibold()),
+                                        )
+                                        .truncate()
+                                        .selectable(false),
+                                    );
+                                });
+                            });
                         });
                         if !f.snippet.is_empty() {
                             ui.add(
@@ -754,19 +770,22 @@ impl SearchWindow {
             });
         let rect = inner.response.rect;
         let response = ui.interact(rect, result_id(f), Sense::click());
+        let painter = ui.painter();
         if selected || response.has_focus() {
-            ui.painter()
-                .set(bg, egui::Shape::rect_filled(rect, TILE_RADIUS, p.tint));
-            ui.painter().rect_stroke(
-                rect,
-                TILE_RADIUS,
-                egui::Stroke::new(1.0_f32, p.accent),
-                egui::StrokeKind::Inside,
+            painter.set(bg, egui::Shape::rect_filled(rect, 0.0, p.tint));
+            painter.rect_filled(
+                egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+                0.0,
+                p.accent,
             );
         } else if response.hovered() {
-            ui.painter()
-                .set(bg, egui::Shape::rect_filled(rect, TILE_RADIUS, p.field));
+            painter.set(bg, egui::Shape::rect_filled(rect, 0.0, p.field));
         }
+        painter.hline(
+            rect.left()..=rect.right(),
+            rect.top(),
+            egui::Stroke::new(1.0_f32, p.rule),
+        );
         a11y::decorative(ui, inner.response.id);
         response
     }
@@ -795,6 +814,7 @@ impl SearchWindow {
             name = format!("{name}: {}", f.snippet);
         }
         a11y::list_box_option(response, &name, selected);
+        hover_preview(response, f, (self.now)());
         if std::mem::take(first) {
             response.request_focus();
             self.selected = Some(f.path.clone());
@@ -819,6 +839,72 @@ impl SearchWindow {
                 }
             }
         });
+    }
+}
+
+/// In-context hover card for a search result: full filename, path, match
+/// location, relative modified time, and snippet without leaving the results.
+fn hover_preview(response: &egui::Response, f: &Found, now: i64) {
+    let title = f.name().to_owned();
+    let full_path = tilde(Path::new(&f.path));
+    let mut meta = Vec::new();
+    let place = f.place();
+    if !place.is_empty() {
+        meta.push(place);
+    }
+    if f.mtime > 0 {
+        meta.push(relative_age(now, f.mtime));
+    }
+    let meta = meta.join(" · ");
+    let snippet = f.snippet.clone();
+    response.clone().on_hover_ui(move |ui| {
+        let p = theme::palette(ui.ctx());
+        ui.set_max_width(280.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.add(
+            egui::Label::new(
+                RichText::new(&title)
+                    .size(13.5)
+                    .family(theme::semibold())
+                    .color(p.text),
+            )
+            .wrap(),
+        );
+        ui.add(
+            egui::Label::new(
+                RichText::new(&full_path)
+                    .monospace()
+                    .size(11.5)
+                    .color(p.muted),
+            )
+            .wrap(),
+        );
+        if !meta.is_empty() {
+            widgets::small(ui, &meta);
+        }
+        if !snippet.is_empty() {
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(RichText::new(&snippet).size(12.5).color(p.text)).wrap());
+        }
+    });
+}
+
+fn relative_age(now: i64, mtime: i64) -> String {
+    let days = ((now - mtime).max(0)) / DAY;
+    match days {
+        0 => "Modified today".to_owned(),
+        1 => "Modified yesterday".to_owned(),
+        2..=29 => format!("Modified {days} days ago"),
+        30..=364 => {
+            let months = (days / 30).max(1);
+            let s = if months == 1 { "" } else { "s" };
+            format!("Modified {months} month{s} ago")
+        }
+        _ => {
+            let years = (days / 365).max(1);
+            let s = if years == 1 { "" } else { "s" };
+            format!("Modified {years} year{s} ago")
+        }
     }
 }
 
