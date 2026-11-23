@@ -4434,7 +4434,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "calamine",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch-settings"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4495,7 +4495,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch-shared"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "configparser",

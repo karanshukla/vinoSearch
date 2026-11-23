@@ -20,6 +20,16 @@
   <!-- Newest first, one per release: software centres and vinoPilot read
        the installed version from here. release.yml checks the tag has its line. -->
   <releases>
+    <release version="13.0.0" date="2026-11-23">
+      <description>
+        <ul>
+          <li>Show a tray icon while indexing runs</li>
+          <li>Show what Re-index found in the settings window</li>
+          <li>Fix a stack overflow when indexing code files, and harden subprocess and HTTP handling</li>
+          <li>Redraw the tray icon to match the other vinoPilot apps</li>
+        </ul>
+      </description>
+    </release>
     <release version="12.0.0" date="2026-11-17">
       <description>
         <ul>
