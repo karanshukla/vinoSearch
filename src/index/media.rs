@@ -63,21 +63,25 @@ pub enum Probed {
 /// of ffprobe, so never inside a transaction.
 pub fn probe(path: &Path, max_seconds: Option<f64>) -> Probed {
     match media::probe(path) {
-        Ok(p) if max_seconds.is_some_and(|max| p.seconds > max) => {
-            let max = max_seconds.unwrap();
-            eprintln!(
-                "skip {}: {} long, over the longest indexed ({})",
-                path.display(),
-                media::stamp(p.seconds as i64),
-                media::stamp(max as i64)
-            );
-            Probed::TooLong(p.seconds)
+        Ok(p) => {
+            if let Some(max) = max_seconds
+                && p.seconds > max
+            {
+                eprintln!(
+                    "skip {}: {} long, over the longest indexed ({})",
+                    path.display(),
+                    media::stamp(p.seconds as i64),
+                    media::stamp(max as i64)
+                );
+                return Probed::TooLong(p.seconds);
+            }
+            if !p.audio && !p.video {
+                eprintln!("skip {}: no sound or picture", path.display());
+                Probed::Unreadable
+            } else {
+                Probed::Ok(p)
+            }
         }
-        Ok(p) if !p.audio && !p.video => {
-            eprintln!("skip {}: no sound or picture", path.display());
-            Probed::Unreadable
-        }
-        Ok(p) => Probed::Ok(p),
         Err(e) => {
             eprintln!("skip {}: {e:#}", path.display());
             Probed::Unreadable
@@ -173,13 +177,28 @@ pub struct Fitted {
 /// taken up, so `index_rest` indexes it afresh, hash and all.
 const NO_STAMP: i64 = -1;
 
+struct Waiting {
+    id: i64,
+    path: String,
+    seconds: f64,
+    hash: Option<Vec<u8>>,
+}
+
 /// Hold the index to `max_seconds` of media per file after the setting
 /// changed: files now over it lose their chunks and wait, and files that
 /// waited and now fit (or all of them when `max_seconds` is `None`) are
 /// queued for `index_rest`. Nothing is probed or hashed for it.
 pub fn fit(conn: &Connection, max_seconds: Option<f64>) -> Result<Fitted> {
     let tx = conn.unchecked_transaction()?;
-    let (out, fits): (usize, Vec<(i64, String, f64, Option<Vec<u8>>)>) = match max_seconds {
+    let read_waiting = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Waiting> {
+        Ok(Waiting {
+            id: r.get(0)?,
+            path: r.get(1)?,
+            seconds: r.get(2)?,
+            hash: r.get(3)?,
+        })
+    };
+    let (out, fits) = match max_seconds {
         Some(max_seconds) => {
             let over = "SELECT file_id FROM media WHERE too_long = 0 AND seconds > ?1";
             tx.execute(
@@ -194,29 +213,33 @@ pub fn fit(conn: &Connection, max_seconds: Option<f64>) -> Result<Fitted> {
                 "UPDATE media SET too_long = 1 WHERE too_long = 0 AND seconds > ?1",
                 [max_seconds],
             )?;
-            let fits = tx
+            let fits: Vec<Waiting> = tx
                 .prepare(
                     "SELECT f.id, f.path, m.seconds, f.sha256 FROM media m JOIN files f ON f.id = m.file_id
                      WHERE m.too_long = 1 AND m.seconds <= ?1 ORDER BY f.id",
                 )?
-                .query_map([max_seconds], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?
+                .query_map([max_seconds], read_waiting)?
                 .collect::<rusqlite::Result<_>>()?;
             (out, fits)
         }
         None => {
-            let fits = tx
+            let fits: Vec<Waiting> = tx
                 .prepare(
                     "SELECT f.id, f.path, m.seconds, f.sha256 FROM media m JOIN files f ON f.id = m.file_id
                      WHERE m.too_long = 1 ORDER BY f.id",
                 )?
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .query_map([], read_waiting)?
                 .collect::<rusqlite::Result<_>>()?;
             (0, fits)
         }
     };
-    for (id, path, seconds, hash) in &fits {
+    for Waiting {
+        id,
+        path,
+        seconds,
+        hash,
+    } in &fits
+    {
         tx.execute("UPDATE media SET too_long = 0 WHERE file_id = ?1", [id])?;
         let copy_of_one_taken_up = match hash {
             Some(hash) => super::holder_of(&tx, hash, path)?.is_some(),
