@@ -69,7 +69,7 @@ const SKIP_DIRS: &[&str] = &[
     "htmlcov",
 ];
 const SKIP_DIR_PREFIXES: &[&str] = &["cmake-build-"];
-/// `Kind::max_bytes` for media, which `formats.media.max_hours` limits by duration.
+/// `Kind::max_bytes` for media, which `formats.media.max_minutes` limits by duration.
 const HELD_BY_DURATION: u64 = u64::MAX;
 
 use vinosearch_shared::limits::MAX_IMAGE_BYTES;
@@ -169,7 +169,7 @@ pub struct FileTypes {
     sessions: bool,
     sessions_dirs: Vec<PathBuf>,
     media: bool,
-    max_media_seconds: f64,
+    max_media_seconds: Option<f64>,
     ignores: SharedIgnores,
 }
 
@@ -198,7 +198,7 @@ impl FileTypes {
     }
 
     #[cfg(test)]
-    pub fn with_media(mut self, on: bool, max_seconds: f64) -> Self {
+    pub fn with_media(mut self, on: bool, max_seconds: Option<f64>) -> Self {
         self.media = on;
         self.max_media_seconds = max_seconds;
         self
@@ -640,7 +640,7 @@ fn probe_media(
     path: &Path,
     seen: &Seen,
     known: Option<&Known>,
-    max_seconds: f64,
+    max_seconds: Option<f64>,
 ) -> Result<ControlFlow<Outcome, Option<crate::extract::media::Probe>>> {
     if let Some(known) = known
         && known.is_stamped(seen)

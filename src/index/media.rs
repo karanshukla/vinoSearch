@@ -61,14 +61,15 @@ pub enum Probed {
 
 /// Probe `path`, saying why on stderr when it won't be indexed. Up to 30 s
 /// of ffprobe, so never inside a transaction.
-pub fn probe(path: &Path, max_seconds: f64) -> Probed {
+pub fn probe(path: &Path, max_seconds: Option<f64>) -> Probed {
     match media::probe(path) {
-        Ok(p) if p.seconds > max_seconds => {
+        Ok(p) if max_seconds.is_some_and(|max| p.seconds > max) => {
+            let max = max_seconds.unwrap();
             eprintln!(
                 "skip {}: {} long, over the longest indexed ({})",
                 path.display(),
                 media::stamp(p.seconds as i64),
-                media::stamp(max_seconds as i64)
+                media::stamp(max as i64)
             );
             Probed::TooLong(p.seconds)
         }
@@ -103,7 +104,10 @@ pub fn leave_out(conn: &mut Connection, row: (&str, i64, i64), seconds: f64) -> 
 }
 
 /// File `id` was left out as too long, and at `max_seconds` still is.
-pub fn left_out(conn: &Connection, id: i64, max_seconds: f64) -> Result<bool> {
+pub fn left_out(conn: &Connection, id: i64, max_seconds: Option<f64>) -> Result<bool> {
+    let Some(max_seconds) = max_seconds else {
+        return Ok(false);
+    };
     Ok(conn
         .query_row(
             "SELECT 1 FROM media WHERE file_id = ?1 AND too_long = 1 AND seconds > ?2",
@@ -171,32 +175,47 @@ const NO_STAMP: i64 = -1;
 
 /// Hold the index to `max_seconds` of media per file after the setting
 /// changed: files now over it lose their chunks and wait, and files that
-/// waited and now fit are queued for `index_rest`. Nothing is probed or
-/// hashed for it.
-pub fn fit(conn: &Connection, max_seconds: f64) -> Result<Fitted> {
+/// waited and now fit (or all of them when `max_seconds` is `None`) are
+/// queued for `index_rest`. Nothing is probed or hashed for it.
+pub fn fit(conn: &Connection, max_seconds: Option<f64>) -> Result<Fitted> {
     let tx = conn.unchecked_transaction()?;
-    let over = "SELECT file_id FROM media WHERE too_long = 0 AND seconds > ?1";
-    tx.execute(
-        &format!("DELETE FROM chunks WHERE file_id IN ({over})"),
-        [max_seconds],
-    )?;
-    tx.execute(
-        &format!("DELETE FROM partial WHERE file_id IN ({over})"),
-        [max_seconds],
-    )?;
-    let out = tx.execute(
-        "UPDATE media SET too_long = 1 WHERE too_long = 0 AND seconds > ?1",
-        [max_seconds],
-    )?;
-    let fits: Vec<(i64, String, f64, Option<Vec<u8>>)> = tx
-        .prepare(
-            "SELECT f.id, f.path, m.seconds, f.sha256 FROM media m JOIN files f ON f.id = m.file_id
-             WHERE m.too_long = 1 AND m.seconds <= ?1 ORDER BY f.id",
-        )?
-        .query_map([max_seconds], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let (out, fits): (usize, Vec<(i64, String, f64, Option<Vec<u8>>)>) = match max_seconds {
+        Some(max_seconds) => {
+            let over = "SELECT file_id FROM media WHERE too_long = 0 AND seconds > ?1";
+            tx.execute(
+                &format!("DELETE FROM chunks WHERE file_id IN ({over})"),
+                [max_seconds],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM partial WHERE file_id IN ({over})"),
+                [max_seconds],
+            )?;
+            let out = tx.execute(
+                "UPDATE media SET too_long = 1 WHERE too_long = 0 AND seconds > ?1",
+                [max_seconds],
+            )?;
+            let fits = tx
+                .prepare(
+                    "SELECT f.id, f.path, m.seconds, f.sha256 FROM media m JOIN files f ON f.id = m.file_id
+                     WHERE m.too_long = 1 AND m.seconds <= ?1 ORDER BY f.id",
+                )?
+                .query_map([max_seconds], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            (out, fits)
+        }
+        None => {
+            let fits = tx
+                .prepare(
+                    "SELECT f.id, f.path, m.seconds, f.sha256 FROM media m JOIN files f ON f.id = m.file_id
+                     WHERE m.too_long = 1 ORDER BY f.id",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            (0, fits)
+        }
+    };
     for (id, path, seconds, hash) in &fits {
         tx.execute("UPDATE media SET too_long = 0 WHERE file_id = ?1", [id])?;
         let copy_of_one_taken_up = match hash {
@@ -216,11 +235,17 @@ pub fn fit(conn: &Connection, max_seconds: f64) -> Result<Fitted> {
     }
     tx.commit()?;
     if out + fits.len() > 0 {
-        eprintln!(
-            "longest media indexed is now {}: {out} files left out, {} taken up",
-            media::stamp(max_seconds as i64),
-            fits.len()
-        );
+        match max_seconds {
+            Some(max_seconds) => eprintln!(
+                "longest media indexed is now {}: {out} files left out, {} taken up",
+                media::stamp(max_seconds as i64),
+                fits.len()
+            ),
+            None => eprintln!(
+                "media duration limit removed: {} files taken up",
+                fits.len()
+            ),
+        }
     }
     Ok(Fitted {
         left_out: out,

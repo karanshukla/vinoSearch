@@ -532,7 +532,7 @@ fn a_copy_of_a_session_is_not_unread() {
 }
 
 /// Media on, as if ffmpeg were installed, held to `max_seconds`.
-fn media_on(max_seconds: f64) -> FileTypes {
+fn media_on(max_seconds: Option<f64>) -> FileTypes {
     FileTypes::default().with_media(true, max_seconds)
 }
 
@@ -581,7 +581,7 @@ fn media_goes_in_by_slices_from_index_rest() {
     let Some(path) = film(&t, "walk.mp4") else {
         return;
     };
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     let st = check(&mut conn, &mut emb, &t, &types);
@@ -682,7 +682,7 @@ fn media_waits_for_documents() {
     let book = t.write("book.txt", &line.repeat(1500));
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
-    let types = media_on(3600.0);
+    let types = media_on(None);
     check(&mut conn, &mut emb, &t, &types);
     assert!(has_partial(&conn, false).unwrap());
     let next = index_rest(&mut conn, &mut emb, &types, &mut |_, _| Ok(()))
@@ -702,7 +702,7 @@ fn media_over_the_longest_allowed_is_a_row_with_no_chunks_and_nothing_waiting() 
     };
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
-    let st = check(&mut conn, &mut emb, &t, &media_on(60.0));
+    let st = check(&mut conn, &mut emb, &t, &media_on(Some(60.0)));
     assert_eq!(st.files_embedded, 0);
     assert!(partial(&conn, 10).unwrap().is_empty());
     assert!(is_indexed(&conn, path.to_str().unwrap()).unwrap());
@@ -753,7 +753,7 @@ fn copies_of_a_recording_wait_as_one_and_either_can_go() {
     };
     let b = t.root().join("b.wav");
     fs::copy(&a, &b).unwrap();
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     let key = |p: &Path| p.to_str().unwrap().to_owned();
@@ -834,7 +834,7 @@ fn a_copy_takes_over_when_the_recording_it_waits_behind_changes() {
     };
     let b = t.root().join("b.wav");
     fs::copy(&a, &b).unwrap();
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     check(&mut conn, &mut emb, &t, &types);
@@ -990,7 +990,7 @@ fn sound_that_isnt_numbers_stops_its_file_and_not_the_ones_after() {
         return;
     }
     let broken = broken_wav(&t, "broken.wav");
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     check(&mut conn, &mut emb, &t, &types);
@@ -1024,7 +1024,7 @@ fn a_recording_the_model_fails_on_goes_behind_the_others() {
     let Some(a) = tone(&t, "a.wav", 440, 12) else {
         return;
     };
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     check(&mut conn, &mut emb, &t, &types);
@@ -1069,7 +1069,7 @@ fn media_waits_while_its_models_are_not_fetched() {
     };
     let line = format!("{}\n", "lorem ipsum dolor sit amet ".repeat(3));
     let book = t.write("book.txt", &line.repeat(1500));
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed {
         no_media_models: true,
@@ -1111,7 +1111,7 @@ fn a_file_found_with_neither_track_stops_instead_of_panicking() {
         .unwrap()
         .success();
     assert!(ok);
-    let types = media_on(3600.0);
+    let types = media_on(None);
     let mut conn = t.db();
     let mut emb = FakeEmbed::default();
     let st = check(&mut conn, &mut emb, &t, &types);
@@ -1156,7 +1156,7 @@ fn the_longest_media_indexed_follows_the_setting() {
         .unwrap()
     };
 
-    let short = media_on(30.0);
+    let short = media_on(Some(30.0));
     let st = check(&mut conn, &mut emb, &t, &short);
     assert_eq!((st.files_seen, st.files_embedded), (1, 0));
     assert!(
@@ -1165,13 +1165,13 @@ fn the_longest_media_indexed_follows_the_setting() {
     );
     assert!(!has_partial(&conn, true).unwrap());
     assert_eq!(check(&mut conn, &mut emb, &t, &short).files_embedded, 0);
-    purge_types(&conn, &media_on(35.0)).unwrap();
+    purge_types(&conn, &media_on(Some(35.0))).unwrap();
     assert!(
         !has_partial(&conn, true).unwrap(),
         "left alone while the limit moves but not past it"
     );
 
-    let long = media_on(60.0);
+    let long = media_on(Some(60.0));
     assert_eq!(purge_types(&conn, &long).unwrap(), 0);
     assert!(
         has_partial(&conn, true).unwrap(),
@@ -1211,6 +1211,17 @@ fn the_longest_media_indexed_follows_the_setting() {
         partial(&conn, 10).unwrap().len(),
         1,
         "a copy of one that fits is its copy, not a second run"
+    );
+
+    // Turning the duration limit off takes up previously skipped files too.
+    purge_types(&conn, &short).unwrap();
+    assert!(!has_partial(&conn, true).unwrap());
+    let unlimited = media_on(None);
+    purge_types(&conn, &unlimited).unwrap();
+    assert_eq!(
+        partial(&conn, 10).unwrap().len(),
+        1,
+        "with the limit turned off, skipped media is queued for indexing"
     );
 }
 

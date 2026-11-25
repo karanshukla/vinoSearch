@@ -31,7 +31,7 @@
 //!
 //! [formats.media]
 //! enabled = true
-//! max_hours = 3
+//! max_minutes = 60
 //!
 //! [encryption]
 //! enabled = true
@@ -79,7 +79,8 @@ pub const DEFAULT_IMAGE_MIN_SCORE: f32 = 0.68;
 /// less. On 36 home-folder videos (2026-11-13), off-topic words put most at up to
 /// 0.66 (two at 0.69, 0.70), videos named for the query at 0.68 to 0.82.
 pub const DEFAULT_MEDIA_MIN_SCORE: f32 = 0.68;
-pub const DEFAULT_MEDIA_MAX_HOURS: f32 = 3.0;
+/// Initial limit offered when skipping long audio and video is turned on.
+pub const DEFAULT_MEDIA_MAX_MINUTES: f64 = 60.0;
 /// Audio and video files, by extension. Not `ts`: TypeScript has it.
 pub const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "mpg", "mpeg", "wmv", "mp3", "m4a", "aac", "flac",
@@ -246,7 +247,11 @@ pub struct MediaFormat {
     pub enabled: Option<bool>,
     /// Results scoring below this are left out [default: 0.68].
     pub min_score: Option<f32>,
-    /// Longer files are left out [default: 3].
+    /// Longer audio and video files are left out; 0 or unset means no limit
+    /// [default: off].
+    pub max_minutes: Option<f64>,
+    /// Legacy alias for `max_minutes`, in hours; used only when `max_minutes`
+    /// is unset.
     pub max_hours: Option<f32>,
 }
 
@@ -299,12 +304,32 @@ impl Formats {
         min_score(self.media.min_score, DEFAULT_MEDIA_MIN_SCORE)
     }
 
-    pub fn media_max_seconds(&self) -> Result<f64> {
-        let h = self.media.max_hours.unwrap_or(DEFAULT_MEDIA_MAX_HOURS);
-        if !(h > 0.0 && h <= 24.0) {
-            bail!("max_hours must be over 0 and at most 24");
+    /// Configured duration limit for audio and video in minutes, or `None` when
+    /// off. Legacy `max_hours` is converted to minutes when `max_minutes` is unset.
+    pub fn media_max_minutes(&self) -> Option<f64> {
+        if let Some(m) = self.media.max_minutes {
+            return (m > 0.0 && m.is_finite()).then_some(m);
         }
-        Ok(f64::from(h) * 3600.0)
+        if let Some(h) = self.media.max_hours {
+            return (h > 0.0 && h.is_finite()).then_some(f64::from(h) * 60.0);
+        }
+        None
+    }
+
+    pub fn media_max_seconds(&self) -> Result<Option<f64>> {
+        if let Some(m) = self.media.max_minutes {
+            if !(m >= 0.0 && m.is_finite()) {
+                bail!("max_minutes must be 0 or more");
+            }
+            return Ok((m > 0.0).then_some(m * 60.0));
+        }
+        if let Some(h) = self.media.max_hours {
+            if !(h >= 0.0 && h.is_finite()) {
+                bail!("max_hours must be 0 or more");
+            }
+            return Ok((h > 0.0).then_some(f64::from(h) * 3600.0));
+        }
+        Ok(None)
     }
 
     pub fn code_min_score(&self) -> Result<f32> {
@@ -466,6 +491,12 @@ impl Config {
             "media",
             "min_score",
             f.media.min_score.map(shortest_decimal),
+        );
+        set(
+            &mut doc,
+            "media",
+            "max_minutes",
+            f.media.max_minutes.map(minutes_as_written),
         );
         set(
             &mut doc,
@@ -911,17 +942,32 @@ mod tests {
     }
 
     #[test]
-    fn media_is_opt_in_and_held_to_three_hours_unless_set() {
+    fn media_is_opt_in_and_duration_limit_defaults_to_off() {
         let d = Config::default().formats;
         assert!(!d.media_enabled());
-        assert_eq!(d.media_max_seconds().unwrap(), 3.0 * 3600.0);
+        assert_eq!(d.media_max_minutes(), None);
+        assert_eq!(d.media_max_seconds().unwrap(), None);
+
         let c: Config =
-            toml::from_str("[formats.media]\nenabled = true\nmax_hours = 0.5\nmin_score = 0.7\n")
+            toml::from_str("[formats.media]\nenabled = true\nmax_minutes = 45\nmin_score = 0.7\n")
                 .unwrap();
         assert!(c.formats.media_enabled());
-        assert_eq!(c.formats.media_max_seconds().unwrap(), 1800.0);
+        assert_eq!(c.formats.media_max_minutes(), Some(45.0));
+        assert_eq!(c.formats.media_max_seconds().unwrap(), Some(2700.0));
         assert_eq!(c.formats.media_min_score().unwrap(), 0.7);
-        for bad in ["0", "-1", "25", "nan"] {
+
+        let zero: Config = toml::from_str("[formats.media]\nmax_minutes = 0\n").unwrap();
+        assert_eq!(zero.formats.media_max_minutes(), None);
+        assert_eq!(zero.formats.media_max_seconds().unwrap(), None);
+
+        let legacy: Config = toml::from_str("[formats.media]\nmax_hours = 0.5\n").unwrap();
+        assert_eq!(legacy.formats.media_max_minutes(), Some(30.0));
+        assert_eq!(legacy.formats.media_max_seconds().unwrap(), Some(1800.0));
+
+        for bad in ["-1", "nan", "inf"] {
+            let c: Config =
+                toml::from_str(&format!("[formats.media]\nmax_minutes = {bad}\n")).unwrap();
+            assert!(c.formats.media_max_seconds().is_err(), "{bad}");
             let c: Config =
                 toml::from_str(&format!("[formats.media]\nmax_hours = {bad}\n")).unwrap();
             assert!(c.formats.media_max_seconds().is_err(), "{bad}");
@@ -967,7 +1013,7 @@ mod tests {
         c.formats.code.min_score = Some(0.6);
         c.formats.sessions.enabled = Some(true);
         c.formats.media.enabled = Some(true);
-        c.formats.media.max_hours = Some(1.5);
+        c.formats.media.max_minutes = Some(90.0);
         c.save(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("enabled = true # big download"), "{text}");
@@ -985,7 +1031,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("[formats.media]\nenabled = true\nmax_hours = 1.5"),
+            text.contains("[formats.media]\nenabled = true\nmax_minutes = 90"),
             "{text}"
         );
         assert_eq!(Config::load(&path).unwrap(), c);
