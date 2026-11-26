@@ -21,8 +21,12 @@ impl SettingsWindow {
             };
             Row::new(label).help(&help).show(ui, |ui, _| {
                 let on = state.is_on(switch);
-                let button = if on { "Turn off" } else { "Turn on" };
-                let button = ui.add_enabled(!state.running, Button::secondary(button));
+                let button = if on {
+                    Button::secondary("Turn off")
+                } else {
+                    Button::tonal("Turn on")
+                };
+                let button = ui.add_enabled(!state.running, button);
                 if a11y::for_what(button, label).clicked() {
                     flip = Some((switch, !on));
                 }

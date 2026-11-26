@@ -143,7 +143,7 @@ impl SettingsWindow {
                     "Download"
                 };
                 let button = if s.model_present {
-                    Button::secondary(label)
+                    Button::tonal(label)
                 } else {
                     Button::primary(label).icon(Icon::Download)
                 };
@@ -221,7 +221,7 @@ impl SettingsWindow {
                         .find(|d| d.eq_ignore_ascii_case(current))
                         .unwrap_or(DEFAULT_DEVICE);
                     let options: Vec<(&str, &str)> = DEVICES.iter().map(|d| (*d, *d)).collect();
-                    if widgets::segmented(ui, "Device", &mut picked, &options) {
+                    if widgets::button_group(ui, "Device", &mut picked, &options) {
                         self.config.device = (picked != DEFAULT_DEVICE).then(|| picked.to_owned());
                         changed = true;
                     }

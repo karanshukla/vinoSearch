@@ -591,7 +591,7 @@ impl SettingsWindow {
             self.sidebar(root, p, window, status);
         } else {
             let header = theme::header(ctx, self.kde_header.as_ref(), focused);
-            self.header(root, p, header);
+            self.header(root, p, header, window);
         }
         let bar = wide && self.app_title_bar;
         if bar {
@@ -662,12 +662,19 @@ impl SettingsWindow {
             });
     }
 
-    fn header(&mut self, root: &mut egui::Ui, p: &theme::Palette, header: theme::Header) {
+    fn header(
+        &mut self,
+        root: &mut egui::Ui,
+        p: &theme::Palette,
+        header: theme::Header,
+        window: f32,
+    ) {
+        let inset = widgets::content_inset(window) as i8;
         egui::Panel::top("header")
             .show_separator_line(false)
             .frame(widgets::header_frame(header, p).inner_margin(egui::Margin {
-                left: 16,
-                right: 16,
+                left: inset,
+                right: inset,
                 top: 8,
                 bottom: 0,
             }))
@@ -739,14 +746,20 @@ impl SettingsWindow {
     ) {
         widgets::page_scroll(ui, self.page.title(), self.page.max_width(), |ui| {
             if !bar {
-                ui.horizontal(|ui| {
-                    widgets::title(ui, self.page.title());
-                    if self.page == Page::Index {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let title = self.page.title();
+                let is_index = self.page == Page::Index;
+                widgets::responsive_bar(
+                    ui,
+                    420.0,
+                    |ui| {
+                        widgets::title(ui, title);
+                    },
+                    |ui| {
+                        if is_index {
                             Self::index_status(ui, status);
-                        });
-                    }
-                });
+                        }
+                    },
+                );
             }
             if let Some(notice) = self.notice.clone() {
                 ui.add_space(12.0);
@@ -887,11 +900,7 @@ fn service_chip(ui: &mut egui::Ui, status: Option<&Result<Status, String>>) {
 /// from title to content as in the scroll area.
 fn page_margin(window: f32, wide: bool, bar: bool) -> egui::Margin {
     egui::Margin {
-        left: if wide {
-            widgets::page_inset(window) as i8
-        } else {
-            16
-        },
+        left: widgets::content_inset(window) as i8,
         right: 0,
         top: match (wide, bar) {
             (_, true) => 2,

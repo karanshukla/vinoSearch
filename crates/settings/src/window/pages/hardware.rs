@@ -46,7 +46,7 @@ impl SettingsWindow {
                 .show(ui, |ui, _| {
                     if state.running {
                         widgets::chip(ui, ChipKind::Neutral, "Checking…");
-                    } else if ui.add(Button::secondary("Check again")).clicked() {
+                    } else if ui.add(Button::tonal("Check again")).clicked() {
                         doctor::run(Arc::clone(&self.doctor), ui.ctx());
                     }
                 });

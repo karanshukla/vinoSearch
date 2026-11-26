@@ -195,7 +195,7 @@ impl SettingsWindow {
                     Target::Exclude => ("Exclude folder…", "or enter a path, e.g. ~/Downloads/tax"),
                 };
                 if ui
-                    .add_enabled(!self.picking, Button::secondary(button).icon(Icon::Plus))
+                    .add_enabled(!self.picking, Button::tonal(button).icon(Icon::Plus))
                     .clicked()
                 {
                     self.pick(ui.ctx(), target);
