@@ -76,7 +76,7 @@ pub fn open(path: &Path) -> Result<Connection> {
              total INTEGER NOT NULL
          );
          -- How long each audio or video file runs, and whether it is
-         -- left out for running over `formats.media.max_hours`, so a change
+         -- left out for running over `formats.media.max_minutes`, so a change
          -- to that setting reaches files already seen (`media::fit`).
          CREATE TABLE IF NOT EXISTS media (
              file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,

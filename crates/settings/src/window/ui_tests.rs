@@ -434,6 +434,39 @@ fn media_is_opt_in_and_saved_as_it_is_turned_on() {
 }
 
 #[test]
+fn media_duration_limit_defaults_to_off_and_saves_minutes_when_enabled() {
+    let mut h = search_page_with_switched_on("search-media-limit", "Index media");
+    assert_eq!(h.state().config.formats.media_max_minutes(), None);
+    assert!(
+        h.query_by_role_and_label(Role::SpinButton, "Maximum duration")
+            .is_none(),
+        "duration field stays hidden while the limit is off"
+    );
+
+    h.get_by_role_and_label(Role::Switch, "Skip long media")
+        .click();
+    settle(&mut h);
+    assert_eq!(
+        h.state().config.formats.media_max_minutes(),
+        Some(DEFAULT_MEDIA_MAX_MINUTES)
+    );
+    h.get_by_role_and_label(Role::SpinButton, "Maximum duration");
+    let saved = saved_config(&h);
+    assert!(saved.contains("max_minutes = 60"), "{saved}");
+
+    h.get_by_role_and_label(Role::Switch, "Skip long media")
+        .click();
+    settle(&mut h);
+    assert_eq!(h.state().config.formats.media_max_minutes(), None);
+    assert!(
+        h.query_by_role_and_label(Role::SpinButton, "Maximum duration")
+            .is_none()
+    );
+    let saved = saved_config(&h);
+    assert!(!saved.contains("max_minutes"), "{saved}");
+}
+
+#[test]
 fn search_page_controls_are_named_by_their_row_labels() {
     let h = search_page_with_switched_on("search", "Index images");
     for row in ["Text", "Images", "Code", "Media"] {

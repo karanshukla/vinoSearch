@@ -2,9 +2,9 @@ use eframe::egui;
 
 use crate::window::{
     AppPicker, Button, ChipKind, Column, DEFAULT_CODE_MIN_SCORE, DEFAULT_IMAGE_EXTENSIONS,
-    DEFAULT_IMAGE_MIN_SCORE, DEFAULT_MEDIA_MIN_SCORE, DEFAULT_TEXT_MIN_SCORE, Icon, Request, Row,
-    SettingsWindow, Status, Tone, a11y, app_picker, apps, count, fetch_progress, icons, score_row,
-    theme, widgets,
+    DEFAULT_IMAGE_MIN_SCORE, DEFAULT_MEDIA_MAX_MINUTES, DEFAULT_MEDIA_MIN_SCORE,
+    DEFAULT_TEXT_MIN_SCORE, Icon, Request, Row, SettingsWindow, Status, Tone, a11y, app_picker,
+    apps, count, fetch_progress, icons, score_row, theme, widgets,
 };
 
 impl SettingsWindow {
@@ -260,6 +260,47 @@ impl SettingsWindow {
                         if n == 1 { "file is" } else { "files are" }
                     ))
                     .show(ui, |_, _| {});
+            }
+            if media {
+                let mut limit_on = self.config.formats.media_max_minutes().is_some();
+                Row::new("Skip long media")
+                    .help("Skip audio and video files longer than a set duration.")
+                    .show(ui, |ui, _| {
+                        if widgets::switch(ui, &mut limit_on, "Skip long media").changed() {
+                            self.config.formats.media.max_minutes =
+                                limit_on.then_some(DEFAULT_MEDIA_MAX_MINUTES);
+                            self.config.formats.media.max_hours = None;
+                            changed = true;
+                        }
+                    });
+                if let Some(mut minutes) = self.config.formats.media_max_minutes() {
+                    Row::new("Maximum duration")
+                        .help("Audio and video files longer than this are not indexed.")
+                        .show(ui, |ui, named| {
+                            widgets::small(ui, "min");
+                            let response = ui
+                                .add(
+                                    egui::DragValue::new(&mut minutes)
+                                        .range(1.0..=1440.0)
+                                        .speed(1.0)
+                                        .custom_formatter(|m, _| {
+                                            if m.fract() == 0.0 {
+                                                format!("{m:.0}")
+                                            } else {
+                                                format!("{m:.1}")
+                                            }
+                                        }),
+                                )
+                                // DragValue's resize-arrow cursor reads as a splitter here.
+                                .on_hover_cursor(egui::CursorIcon::Text);
+                            let response = named(response);
+                            if response.changed() {
+                                self.config.formats.media.max_minutes = Some(minutes);
+                                self.config.formats.media.max_hours = None;
+                                self.idle_dirty = true;
+                            }
+                        });
+                }
             }
             if let Some(s) = s
                 && s.sessions_unread > 0

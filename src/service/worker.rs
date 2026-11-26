@@ -1579,7 +1579,7 @@ mod tests {
             excludes: file.excludes().unwrap(),
             types: FileTypes::new(&file.formats)
                 .unwrap()
-                .with_media(true, 3600.0),
+                .with_media(true, Some(3600.0)),
             config: h.dir.join("config.toml"),
             file,
             pinned: Pinned::default(),

@@ -40,7 +40,7 @@ enabled = true              # off by default; indexes vinoWhisper saved transcri
 [formats.media]
 enabled = true              # off by default; indexes audio and video by sound and frames (requires ffmpeg)
 min_score = 0.68
-max_hours = 3               # skip longer files; changing this applies to previously seen files too
+max_minutes = 60            # off by default; skip longer audio and video files (changing this applies to previously seen files too)
 ```
 
 Audio and video indexing ([#187](https://github.com/karanshukla/vinoSearch/issues/187)) runs after all other indexing work, on AC power only, processing five minutes of media at a time: 10-second audio windows sampled every 5 seconds (skipping silent sections) plus one video frame per shot. One hour of video takes roughly 6.5 to 9 minutes of NPU time, mostly for frame encoding. Enabling media downloads the audio encoder (295 MB) as well as the vision encoder (671 MB) if images are not already enabled.
