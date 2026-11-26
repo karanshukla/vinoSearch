@@ -90,10 +90,13 @@ impl SettingsWindow {
             };
             if s.files > 0 {
                 widgets::group_section(ui, |ui| {
-                    ui.columns(3, |cols| {
-                        widgets::stat(&mut cols[0], &count(s.files), "files");
-                        widgets::stat(&mut cols[1], &count(s.chunks), "chunks");
-                        widgets::stat(&mut cols[2], &size(s.index_bytes), "on disk");
+                    let stats = [
+                        (count(s.files), "files"),
+                        (count(s.chunks), "chunks"),
+                        (size(s.index_bytes), "on disk"),
+                    ];
+                    widgets::responsive_grid(ui, &stats, 96.0, 12.0, 3, |ui, (value, label), _| {
+                        widgets::stat(ui, value, label);
                     });
                     let total = s.chunks.max(1) as f32;
                     let shares = [
@@ -141,7 +144,7 @@ impl SettingsWindow {
             };
             Row::new("Now").help(&now).show(ui, |ui, _| {
                 if s.paused {
-                    if ui.add(Button::secondary("Resume")).clicked() {
+                    if ui.add(Button::tonal("Resume")).clicked() {
                         self.link.send(Request::ResumeIndexing);
                     }
                 } else if s.indexing
@@ -192,7 +195,7 @@ impl SettingsWindow {
                         };
                         widgets::chip(ui, ChipKind::Neutral, text);
                     } else {
-                        if ui.add(Button::secondary("Check now")).clicked() {
+                        if ui.add(Button::tonal("Check now")).clicked() {
                             self.check_asked = Some(s.last_checked);
                             self.link.send(Request::CheckNow);
                         }

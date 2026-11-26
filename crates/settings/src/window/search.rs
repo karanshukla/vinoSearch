@@ -293,9 +293,10 @@ impl SearchWindow {
         if let Some(f) = self.selected().cloned() {
             self.actions(root, p, &f);
         }
+        let inset = widgets::content_inset(ctx.content_rect().width()) as i8;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin {
-                left: 20,
+                left: inset,
                 right: 0,
                 top: 4,
                 bottom: 0,
@@ -431,62 +432,93 @@ impl SearchWindow {
     }
 
     fn actions(&mut self, root: &mut egui::Ui, p: &theme::Palette, f: &Found) {
+        let inset = widgets::content_inset(root.ctx().content_rect().width()).min(20.0) as i8;
+        let mut chosen = None;
         egui::Panel::bottom("actions")
             .show_separator_line(false)
             .frame(
                 egui::Frame::NONE
                     .fill(p.surface)
                     .stroke(egui::Stroke::new(1.0_f32, p.rule))
-                    .inner_margin(egui::Margin::symmetric(20, 10)),
+                    .inner_margin(egui::Margin::symmetric(inset, 10)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    tile(ui, f, 20.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let named = |r| a11y::for_what(r, f.name());
-                        let open = if f.timed() {
-                            format!("Play at {}", f.place())
-                        } else if f.place().is_empty() {
-                            "Open".to_owned()
-                        } else {
-                            format!("Open at {}", f.place())
-                        };
-                        if named(ui.add(Button::primary(open)))
-                            .on_hover_text("Enter")
-                            .clicked()
-                        {
-                            self.act(Act::Open, f);
-                        }
-                        if f.timed()
-                            && format_of(&f.path).is_none()
-                            && named(ui.add(Button::secondary("Open transcript"))).clicked()
-                        {
-                            self.act(Act::OpenTranscript, f);
-                        }
-                        if named(ui.add(Button::secondary("Open folder"))).clicked() {
-                            self.act(Act::OpenFolder, f);
-                        }
-                        if named(ui.add(Button::secondary("Copy file")))
-                            .on_hover_text("Ctrl+C")
-                            .clicked()
-                        {
-                            self.act(Act::Copy, f);
-                        }
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(tilde(Path::new(&f.path)))
-                                        .monospace()
-                                        .color(p.muted),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&f.path);
+                let open = if f.timed() {
+                    format!("Play at {}", f.place())
+                } else if f.place().is_empty() {
+                    "Open".to_owned()
+                } else {
+                    format!("Open at {}", f.place())
+                };
+                let has_transcript = f.timed() && format_of(&f.path).is_none();
+                let wide = ui.available_width() >= widgets::COMPACT_MAX;
+                let draw_path = |ui: &mut egui::Ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(tilde(Path::new(&f.path)))
+                                .monospace()
+                                .color(p.muted),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&f.path);
+                };
+                let named = |r| a11y::for_what(r, f.name());
+                let draw_open = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::primary(open.clone())))
+                        .on_hover_text("Enter")
+                        .clicked()
+                    {
+                        *chosen = Some(Act::Open);
+                    }
+                };
+                let draw_transcript = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if has_transcript && named(ui.add(Button::tonal("Open transcript"))).clicked() {
+                        *chosen = Some(Act::OpenTranscript);
+                    }
+                };
+                let draw_folder = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::secondary("Open folder"))).clicked() {
+                        *chosen = Some(Act::OpenFolder);
+                    }
+                };
+                let draw_copy = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::secondary("Copy file")))
+                        .on_hover_text("Ctrl+C")
+                        .clicked()
+                    {
+                        *chosen = Some(Act::Copy);
+                    }
+                };
+                if wide {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        tile(ui, f, 20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            draw_open(ui, &mut chosen);
+                            draw_transcript(ui, &mut chosen);
+                            draw_folder(ui, &mut chosen);
+                            draw_copy(ui, &mut chosen);
+                            ui.with_layout(Layout::left_to_right(Align::Center), draw_path);
                         });
                     });
-                });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        tile(ui, f, 20.0);
+                        draw_path(ui);
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        draw_open(ui, &mut chosen);
+                        draw_transcript(ui, &mut chosen);
+                        draw_folder(ui, &mut chosen);
+                        draw_copy(ui, &mut chosen);
+                    });
+                }
             });
+        if let Some(act) = chosen {
+            self.act(act, f);
+        }
     }
 
     fn notice_line(&mut self, ui: &mut egui::Ui) {
@@ -859,7 +891,7 @@ fn hover_preview(response: &egui::Response, f: &Found, now: i64) {
     let snippet = f.snippet.clone();
     response.clone().on_hover_ui(move |ui| {
         let p = theme::palette(ui.ctx());
-        ui.set_max_width(280.0);
+        ui.set_max_width(widgets::popup_width(ui.ctx(), 280.0));
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.add(
             egui::Label::new(
