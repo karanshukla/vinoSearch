@@ -451,66 +451,70 @@ impl SearchWindow {
                     format!("Open at {}", f.place())
                 };
                 let has_transcript = f.timed() && format_of(&f.path).is_none();
-                widgets::responsive_bar(
-                    ui,
-                    widgets::COMPACT_MAX,
-                    |ui| {
+                let wide = ui.available_width() >= widgets::COMPACT_MAX;
+                let draw_path = |ui: &mut egui::Ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(tilde(Path::new(&f.path)))
+                                .monospace()
+                                .color(p.muted),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&f.path);
+                };
+                let named = |r| a11y::for_what(r, f.name());
+                let draw_open = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::primary(open.clone())))
+                        .on_hover_text("Enter")
+                        .clicked()
+                    {
+                        *chosen = Some(Act::Open);
+                    }
+                };
+                let draw_transcript = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if has_transcript && named(ui.add(Button::tonal("Open transcript"))).clicked() {
+                        *chosen = Some(Act::OpenTranscript);
+                    }
+                };
+                let draw_folder = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::secondary("Open folder"))).clicked() {
+                        *chosen = Some(Act::OpenFolder);
+                    }
+                };
+                let draw_copy = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
+                    if named(ui.add(Button::secondary("Copy file")))
+                        .on_hover_text("Ctrl+C")
+                        .clicked()
+                    {
+                        *chosen = Some(Act::Copy);
+                    }
+                };
+                if wide {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        tile(ui, f, 20.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            draw_open(ui, &mut chosen);
+                            draw_transcript(ui, &mut chosen);
+                            draw_folder(ui, &mut chosen);
+                            draw_copy(ui, &mut chosen);
+                            ui.with_layout(Layout::left_to_right(Align::Center), draw_path);
+                        });
+                    });
+                } else {
+                    ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         tile(ui, f, 20.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(tilde(Path::new(&f.path)))
-                                    .monospace()
-                                    .color(p.muted),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(&f.path);
-                    },
-                    |ui| {
-                        let named = |r| a11y::for_what(r, f.name());
-                        let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
-                        let draw_open = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
-                            if named(ui.add(Button::primary(open.clone())))
-                                .on_hover_text("Enter")
-                                .clicked()
-                            {
-                                *chosen = Some(Act::Open);
-                            }
-                        };
-                        let draw_transcript = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
-                            if has_transcript
-                                && named(ui.add(Button::tonal("Open transcript"))).clicked()
-                            {
-                                *chosen = Some(Act::OpenTranscript);
-                            }
-                        };
-                        let draw_folder = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
-                            if named(ui.add(Button::secondary("Open folder"))).clicked() {
-                                *chosen = Some(Act::OpenFolder);
-                            }
-                        };
-                        let draw_copy = |ui: &mut egui::Ui, chosen: &mut Option<Act>| {
-                            if named(ui.add(Button::secondary("Copy file")))
-                                .on_hover_text("Ctrl+C")
-                                .clicked()
-                            {
-                                *chosen = Some(Act::Copy);
-                            }
-                        };
-                        if rtl {
-                            draw_open(ui, &mut chosen);
-                            draw_transcript(ui, &mut chosen);
-                            draw_folder(ui, &mut chosen);
-                            draw_copy(ui, &mut chosen);
-                        } else {
-                            draw_copy(ui, &mut chosen);
-                            draw_folder(ui, &mut chosen);
-                            draw_transcript(ui, &mut chosen);
-                            draw_open(ui, &mut chosen);
-                        }
-                    },
-                );
+                        draw_path(ui);
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        draw_open(ui, &mut chosen);
+                        draw_transcript(ui, &mut chosen);
+                        draw_folder(ui, &mut chosen);
+                        draw_copy(ui, &mut chosen);
+                    });
+                }
             });
         if let Some(act) = chosen {
             self.act(act, f);
