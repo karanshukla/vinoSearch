@@ -20,6 +20,16 @@
   <!-- Newest first, one per release: software centres and vinoPilot read
        the installed version from here. release.yml checks the tag has its line. -->
   <releases>
+    <release version="14.0.0" date="2026-11-27">
+      <description>
+        <ul>
+          <li>Hairline result rows with hover preview cards</li>
+          <li>Optional media duration limit, in minutes (off by default)</li>
+          <li>Refreshed settings controls and shorter interface text</li>
+          <li>Fix: keep actions ahead of a truncated path on wide result bars</li>
+        </ul>
+      </description>
+    </release>
     <release version="13.0.0" date="2026-11-23">
       <description>
         <ul>

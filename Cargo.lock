@@ -4432,9 +4432,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vino-user-interface"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765bb676fe0244c7efafb5c5ac92416295e3d7ac943ec4b1d9e999b8a31a59bc"
+checksum = "bfe54460c938c6e4decc2205d27de68aae865664e301537aabb31196a3537a21"
 dependencies = [
  "egui",
  "serde_json",
@@ -4443,7 +4443,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch"
-version = "13.0.0"
+version = "14.0.0"
 dependencies = [
  "anyhow",
  "calamine",
@@ -4486,7 +4486,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch-settings"
-version = "13.0.0"
+version = "14.0.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4504,7 +4504,7 @@ dependencies = [
 
 [[package]]
 name = "vinosearch-shared"
-version = "13.0.0"
+version = "14.0.0"
 dependencies = [
  "anyhow",
  "configparser",
