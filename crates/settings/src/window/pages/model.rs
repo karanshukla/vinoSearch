@@ -19,7 +19,7 @@ impl SettingsWindow {
         widgets::group_label(ui, "EmbeddingGemma 2");
         widgets::group(ui, |ui| {
             let warning = format!(
-                "Deletes {} of model files. Search and indexing require downloading them again.",
+                "Deletes {}. Re-download to resume search and indexing.",
                 size(bytes)
             );
             let row = if deleting {
@@ -103,8 +103,7 @@ impl SettingsWindow {
         let deleting = self.confirm == Some(Confirm::DeleteModel);
         widgets::group(ui, |ui| {
             let warning = format!(
-                "Deletes {} of model files. Search and indexing will stop until they are \
-                 downloaded again.",
+                "Deletes {}. Re-download to resume search and indexing.",
                 size(s.model_bytes)
             );
             let row = if deleting {
@@ -113,7 +112,7 @@ impl SettingsWindow {
                     .tint(p.error_tint)
                     .tone(Tone::Error)
             } else {
-                Row::new("Download").help("Required for search and indexing.")
+                Row::new("Download")
             };
             row.show(ui, |ui, _| {
                 if deleting {
@@ -188,7 +187,7 @@ impl SettingsWindow {
                 }
             });
             Row::new("Compiled cache")
-                .help("Clearing the cache forces recompilation on the next model load.")
+                .help("Rebuilt automatically on next load.")
                 .show(ui, |ui, _| {
                     if ui
                         .add_enabled(s.cache_bytes > 0, Button::secondary("Clear"))
@@ -203,17 +202,13 @@ impl SettingsWindow {
 
     pub(in crate::window) fn running(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Running");
-        if self.config_broken.is_some() {
-            widgets::group_help(
-                ui,
-                "Could not parse the settings file. See the Folders page for details.",
-            );
+        if self.config_broken_banner(ui) {
             return;
         }
         let mut changed = false;
         widgets::group(ui, |ui| {
             Row::new("Device")
-                .help("The NPU is fastest and uses the least power. If no NPU is available, selecting NPU falls back to the GPU, then the CPU.")
+                .help("NPU is fastest and lowest power (falls back to GPU, then CPU).")
                 .show(ui, |ui, _| {
                     let current = self.config.device.as_deref().unwrap_or(DEFAULT_DEVICE);
                     let mut picked = DEVICES
@@ -226,37 +221,47 @@ impl SettingsWindow {
                         changed = true;
                     }
                 });
-            Row::new("Unload after")
-                .help("Set to 0 to keep the model loaded.")
-                .show(ui, |ui, named| {
-                    let mut minutes = self
-                        .config
-                        .idle_unload_minutes
-                        .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
+            Row::new("Unload after").show(ui, |ui, named| {
+                let mut minutes = self
+                    .config
+                    .idle_unload_minutes
+                    .unwrap_or(DEFAULT_IDLE_UNLOAD_MINUTES);
+                if minutes > 0.0 {
                     widgets::small(ui, "min");
-                    let response = ui
-                        .add(
-                            egui::DragValue::new(&mut minutes)
-                                .range(0.0..=1440.0)
-                                .speed(0.25)
-                                .custom_formatter(|m, _| {
-                                    if m.fract() == 0.0 {
-                                        format!("{m:.0}")
-                                    } else {
-                                        format!("{m:.1}")
-                                    }
-                                }),
-                        )
-                        // DragValue's resize-arrow cursor reads as a splitter here.
-                        .on_hover_cursor(egui::CursorIcon::Text);
-                    let response = named(response);
-                    if response.changed() {
-                        self.config.idle_unload_minutes = Some(minutes);
-                        self.idle_dirty = true;
-                    }
-                });
+                }
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut minutes)
+                            .range(0.0..=1440.0)
+                            .speed(0.25)
+                            .custom_formatter(|m, _| {
+                                if m <= 0.0 {
+                                    "Never".to_owned()
+                                } else if m.fract() == 0.0 {
+                                    format!("{m:.0}")
+                                } else {
+                                    format!("{m:.1}")
+                                }
+                            })
+                            .custom_parser(|s| {
+                                let s = s.trim();
+                                if s.eq_ignore_ascii_case("never") {
+                                    Some(0.0)
+                                } else {
+                                    s.parse().ok()
+                                }
+                            }),
+                    )
+                    // DragValue's resize-arrow cursor reads as a splitter here.
+                    .on_hover_cursor(egui::CursorIcon::Text);
+                let response = named(response);
+                if response.changed() {
+                    self.config.idle_unload_minutes = Some(minutes);
+                    self.idle_dirty = true;
+                }
+            });
             Row::new("Indexing share")
-                .help("Maximum device share for background indexing (halved on battery).")
+                .help("Device budget for background indexing (halved on battery).")
                 .show(ui, |ui, named| {
                     let mut percent = self
                         .config

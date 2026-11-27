@@ -6,12 +6,6 @@ use crate::window::{
 };
 
 impl SettingsWindow {
-    /// Never weaker than asked (pinned by
-    /// `window::ui_tests::no_tpm_refuses_encryption_until_the_host_key_is_allowed`).
-    fn refused_as_the_runner_would(&self, on: bool, no_tpm: bool) -> bool {
-        on && no_tpm && !self.config.encryption.host_key_allowed()
-    }
-
     /// Encrypting the index at rest: the switch, what the key is sealed with, and a new
     /// key on demand.
     pub(in crate::window) fn security(
@@ -32,60 +26,44 @@ impl SettingsWindow {
         widgets::group_label(ui, "Encryption at rest");
         widgets::group_help(
             ui,
-            "The index stores extracted text from your files. When encrypted, it can only be \
-             read by your user account on this machine, protecting backups, copies of your home \
-             folder, and removed disks.",
+            "Encrypts the index on disk so only your account on this machine can read it.",
         );
-        if let Some(why) = &self.config_broken {
-            widgets::group_help(
-                ui,
-                &format!(
-                    "Could not parse the settings file ({why}). Fix it before changing settings \
-                     here."
-                ),
-            );
+        if self.config_broken_banner(ui) {
             return;
         }
         let keyring = keyring_only(s);
         let no_tpm = s.is_some_and(|s| !s.tpm) && !keyring;
+        let needs_host_key = no_tpm && !self.config.encryption.host_key_allowed();
+        let switch_disabled = needs_host_key && !self.config.encryption.on();
         let mut changed = false;
         let rekeying = self.confirm == Some(Confirm::Rekey);
         widgets::group(ui, |ui| {
+            let encrypt_help = if keyring {
+                "Stores the key in your desktop keyring. No re-indexing needed."
+            } else if needs_host_key {
+                "No usable TPM found. Enable host-key fallback below first."
+            } else if no_tpm {
+                "Seals the key with systemd's host key. No re-indexing needed."
+            } else {
+                "Seals the key to your TPM. No re-indexing needed."
+            };
             Row::new("Encrypt the index")
-                .help(if keyring {
-                    "Stores the key in your desktop keyring (readable by your session after \
-                     login) because systemd-creds is unavailable for TPM sealing. Converts in \
-                     place without re-indexing."
-                } else {
-                    "Seals the key to your TPM. Converts in place without re-indexing."
-                })
+                .help(encrypt_help)
                 .show(ui, |ui, _| {
-                    let mut on = self.config.encryption.on();
-                    if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
-                        if self.refused_as_the_runner_would(on, no_tpm) {
-                            self.notice = Some(
-                                "This machine has no TPM usable by systemd, so the key cannot be \
-                                 TPM-sealed. Allow host-key fallback below, or leave encryption \
-                                 off."
-                                    .into(),
-                            );
-                        } else {
+                    ui.add_enabled_ui(!switch_disabled, |ui| {
+                        let mut on = self.config.encryption.on();
+                        if widgets::switch(ui, &mut on, "Encrypt the index").changed() {
                             self.config.encryption.enabled = on.then_some(true);
                             changed = true;
                         }
-                    }
+                    });
                 });
             if no_tpm || self.config.encryption.host_key_allowed() {
-                Row::new("Without a TPM")
-                    .help(
-                        "Seals the key with systemd's host key (readable by root). Protects \
-                         backups, but not a removed system disk.",
-                    )
+                Row::new("Host-key fallback")
+                    .help("Uses systemd's host key (weaker than TPM; readable by root).")
                     .show(ui, |ui, _| {
                         let mut allow = self.config.encryption.host_key_allowed();
-                        if widgets::switch(ui, &mut allow, "Use the host key instead (weaker)")
-                            .changed()
-                        {
+                        if widgets::switch(ui, &mut allow, "Host-key fallback").changed() {
                             self.config.encryption.allow_host_key = allow.then_some(true);
                             changed = true;
                         }
@@ -94,23 +72,31 @@ impl SettingsWindow {
             let Some(s) = s else {
                 return;
             };
-            let error = (!s.encryption_error.is_empty()).then_some(s.encryption_error.as_str());
+            let temporary_key = s.encrypted
+                && s.seal_waiting.is_empty()
+                && !matches!(s.seal.as_str(), seal::TPM | seal::HOST | seal::KEYRING);
+            let (now_help, now_tone) = if !s.encryption_error.is_empty() {
+                (s.encryption_error.as_str(), Tone::Error)
+            } else if temporary_key {
+                (
+                    "Key couldn't be sealed; index will rebuild on next start.",
+                    Tone::Warn,
+                )
+            } else {
+                ("", Tone::Neutral)
+            };
             Row::new("Now")
-                .help(error.unwrap_or(""))
-                .tone(Tone::Error)
+                .help(now_help)
+                .tone(now_tone)
                 .show(ui, |ui, _| {
                     let (kind, text) = match (s.encrypted, s.seal.as_str()) {
                         (true, _) if !s.seal_waiting.is_empty() => {
                             (ChipKind::Warn, "Encrypted (waiting for key)")
                         }
-                        (true, seal::TPM) => (ChipKind::Ok, "Encrypted (TPM-sealed key)"),
-                        (true, seal::HOST) => (ChipKind::Ok, "Encrypted (host-key sealed)"),
-                        (true, seal::KEYRING) => (ChipKind::Ok, "Encrypted (desktop keyring)"),
-                        (true, _) => (
-                            ChipKind::Warn,
-                            "Encrypted with an in-memory key (key could not be sealed; index \
-                             will rebuild on next start)",
-                        ),
+                        (true, seal::TPM) => (ChipKind::Ok, "Encrypted (TPM)"),
+                        (true, seal::HOST) => (ChipKind::Ok, "Encrypted (host key)"),
+                        (true, seal::KEYRING) => (ChipKind::Ok, "Encrypted (keyring)"),
+                        (true, _) => (ChipKind::Warn, "Encrypted (temporary key)"),
                         (false, _)
                             if self.config.encryption.on() && s.encryption_error.is_empty() =>
                         {
@@ -123,9 +109,8 @@ impl SettingsWindow {
             if !s.seal_waiting.is_empty() {
                 Row::new("Waiting")
                     .help(&format!(
-                        "The index key is currently unavailable ({}). Searches return no results \
-                         while the encrypted index is preserved. To start over, turn encryption \
-                         off to rebuild the index from your files.",
+                        "Key unavailable ({}). Unlock to search, or turn encryption off to \
+                         rebuild.",
                         s.seal_waiting
                     ))
                     .tone(Tone::Warn)
@@ -143,15 +128,14 @@ impl SettingsWindow {
             if !s.seal_broken.is_empty() {
                 Row::new("Rebuilt")
                     .help(&format!(
-                        "The previous index key could not be unsealed ({}), so the index is being \
-                         rebuilt from your files.",
+                        "Previous key couldn't be unsealed ({}). Rebuilding the index.",
                         s.seal_broken
                     ))
                     .tone(Tone::Warn)
                     .show(ui, |_, _| {});
             }
             if s.encrypted {
-                let row = Row::new("Key").help("Re-encrypt under a new key.");
+                let row = Row::new("Key");
                 let row = if rekeying {
                     row.tint(p.error_tint)
                 } else {
@@ -179,12 +163,6 @@ impl SettingsWindow {
                 });
             }
         });
-        ui.add_space(8.0);
-        widgets::small(
-            ui,
-            "Previously unencrypted data may remain in free disk space until overwritten. \
-             Full-disk encryption also protects free space and swap.",
-        );
         if changed {
             self.save_config();
             if self.config_broken.is_none() {

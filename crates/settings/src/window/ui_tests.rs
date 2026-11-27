@@ -417,7 +417,7 @@ fn code_is_opt_in_and_saved_as_it_is_turned_on() {
 fn sessions_are_opt_in_with_a_nudge_towards_encryption() {
     let h = search_page_with_switched_on("search-sessions", "Index vinoWhisper sessions");
     assert!(h.state().config.formats.sessions_enabled());
-    h.get_by_label("Enable encryption on the Security page to keep transcripts encrypted.");
+    h.get_by_label("Enable index encryption in Security to protect transcripts.");
     let saved = saved_config(&h);
     assert!(
         saved.contains("[formats.sessions]\nenabled = true"),
@@ -646,7 +646,7 @@ fn a_partial_download_can_be_deleted() {
     h.get_by_label("Incomplete, 306 MB");
     h.get_by_role_and_label(Role::Button, "Delete…").click();
     settle(&mut h);
-    h.get_by_label_contains("Deletes 306 MB of model files.");
+    h.get_by_label_contains("Deletes 306 MB. Re-download to resume search and indexing.");
     h.get_by_role_and_label(Role::Button, "Delete the model")
         .click();
     settle(&mut h);
@@ -798,7 +798,7 @@ fn the_index_page_lists_documents_indexed_in_part() {
         s.partial[1].total = 41;
     }
     let h = harness(w, WIDE, Theme::Light);
-    h.get_by_label("Indexing remaining pages of long documents");
+    h.get_by_label("Finishing long documents…");
     h.get_by_label("book0.pdf");
     h.get_by_label("book1.pdf");
     h.get_by_label(", 30 of 41 chapters");
@@ -943,8 +943,7 @@ fn encryption_is_saved_and_applied_at_once() {
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Not encrypted");
     assert!(
-        h.query_by_label("Use the host key instead (weaker)")
-            .is_none(),
+        h.query_by_label("Host-key fallback").is_none(),
         "with a TPM there's nothing to say about doing without one"
     );
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
@@ -965,15 +964,21 @@ fn encryption_is_saved_and_applied_at_once() {
 fn no_tpm_refuses_encryption_until_the_host_key_is_allowed() {
     let (w, requests) = security("notpm", |_| {});
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_role_and_label(Role::Switch, "Encrypt the index")
-        .click();
-    settle(&mut h);
-    assert!(!h.state().config.encryption.on());
-    assert!(h.state().notice.as_ref().unwrap().contains("no TPM"));
+    h.get_by_label("No usable TPM found. Enable host-key fallback below first.");
+    assert!(
+        h.get_by_role_and_label(Role::Switch, "Encrypt the index")
+            .accesskit_node()
+            .is_disabled()
+    );
     assert!(sent(&requests).is_empty());
-    h.get_by_role_and_label(Role::Switch, "Use the host key instead (weaker)")
+    h.get_by_role_and_label(Role::Switch, "Host-key fallback")
         .click();
     settle(&mut h);
+    assert!(
+        !h.get_by_role_and_label(Role::Switch, "Encrypt the index")
+            .accesskit_node()
+            .is_disabled()
+    );
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
         .click();
     settle(&mut h);
@@ -985,10 +990,9 @@ fn no_tpm_refuses_encryption_until_the_host_key_is_allowed() {
 fn without_systemd_creds_the_keyring_is_used_and_waited_for() {
     let (w, requests) = security("keyring", |s| s.new_seal = "keyring".into());
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_label_contains("desktop keyring (readable by your session after login)");
+    h.get_by_label_contains("Stores the key in your desktop keyring.");
     assert!(
-        h.query_by_label("Use the host key instead (weaker)")
-            .is_none(),
+        h.query_by_label("Host-key fallback").is_none(),
         "no TPM, but nothing to allow: the keyring is what there is"
     );
     h.get_by_role_and_label(Role::Switch, "Encrypt the index")
@@ -1012,7 +1016,7 @@ fn a_keyring_index_waiting_for_its_key_offers_to_unlock_it() {
     });
     let mut h = harness(w, WIDE, Theme::Light);
     h.get_by_label("Encrypted (waiting for key)");
-    h.get_by_label_contains("currently unavailable (the keyring is locked)");
+    h.get_by_label_contains("Key unavailable (the keyring is locked)");
     h.get_by_role_and_label(Role::Button, "Unlock…").click();
     settle(&mut h);
     assert!(
@@ -1031,8 +1035,8 @@ fn an_encrypted_index_says_what_seals_it_and_a_new_key_asks_first() {
         s.seal_broken = "Failed to unseal secret using TPM2".into();
     });
     let mut h = harness(w, WIDE, Theme::Light);
-    h.get_by_label("Encrypted (TPM-sealed key)");
-    h.get_by_label_contains("so the index is being rebuilt from your files");
+    h.get_by_label("Encrypted (TPM)");
+    h.get_by_label_contains("Rebuilding the index.");
     h.get_by_role_and_label(Role::Button, "New key…").click();
     settle(&mut h);
     assert!(h.get_by_role_and_label(Role::Button, "Cancel").is_focused());
@@ -1131,4 +1135,67 @@ fn a_reindex_says_when_it_found_nothing() {
     settle(&mut h);
     assert!(h.query_by_label("Checking…").is_none());
     assert!(h.query_by_label("Up to date").is_some());
+}
+
+#[test]
+fn paused_indexing_shows_paused_chip() {
+    let (w, _requests) = window(Page::Index, "paused");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.paused = true;
+    }
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Paused");
+    h.get_by_label("Paused. Already-indexed files remain searchable.");
+    assert!(h.query_by_label("Stopped").is_none());
+}
+
+#[test]
+fn temporary_key_puts_short_chip_and_detail_in_help() {
+    let (w, _requests) = security("temp-key", |s| {
+        s.encrypted = true;
+        s.seal = String::new();
+    });
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Encrypted (temporary key)");
+    h.get_by_label("Key couldn't be sealed; index will rebuild on next start.");
+}
+
+#[test]
+fn download_sizes_hide_when_models_are_present() {
+    let (w, _requests) = window(Page::Search, "dl-present");
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Search photos by content and text.");
+    h.get_by_label("Audio and video, indexed on AC power.");
+
+    let (w, _requests) = window(Page::Search, "dl-audio-only");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.media_model_present = false;
+    }
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Audio and video, indexed on AC power (295 MB download).");
+
+    let (w, _requests) = window(Page::Search, "dl-neither");
+    if let Some(Ok(s)) = &mut w.link.shared.lock().unwrap().status {
+        s.images_model_present = false;
+        s.media_model_present = false;
+    }
+    let h = harness(w, WIDE, Theme::Light);
+    h.get_by_label("Search photos by content and text (671 MB download).");
+    h.get_by_label("Audio and video, indexed on AC power (966 MB download).");
+}
+
+#[test]
+fn custom_image_types_offer_a_default_reset_button() {
+    let (mut w, _requests) = window(Page::Search, "image-types-default");
+    w.config.formats.images.enabled = Some(true);
+    w.config.formats.images.extensions = Some(vec!["jpg".into(), "png".into()]);
+    let mut h = harness(w, WIDE, Theme::Light);
+    h.get_by_role_and_label(Role::Button, "Default Image types")
+        .click();
+    settle(&mut h);
+    assert_eq!(h.state().config.formats.images.extensions, None);
+    assert!(
+        h.query_by_role_and_label(Role::Button, "Default Image types")
+            .is_none()
+    );
 }

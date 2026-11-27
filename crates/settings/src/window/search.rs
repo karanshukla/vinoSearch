@@ -610,8 +610,7 @@ impl SearchWindow {
             Some(RichText::new("Searching…").color(p.muted))
         } else if self.searched.is_empty() {
             let hint = if self.query.trim().is_empty() {
-                "Type a query to search your files (a descriptive phrase works better than a \
-                 filename)."
+                "Describe a topic, snippet, or photo to search your files."
             } else {
                 "Press Enter to search."
             };

@@ -587,7 +587,7 @@ fn the_keyboard_reaches_the_results_and_opens_one() {
 fn typing_searches_once_it_pauses_and_errors_are_said() {
     let (w, asked_, dir) = window("", "typing");
     let mut h = harness(w, WIDE);
-    h.get_by_label_contains("descriptive phrase works better");
+    h.get_by_label_contains("Describe a topic, snippet, or photo");
     h.get_by_role_and_label(Role::TextInput, "Search")
         .type_text("fail");
     h.step();

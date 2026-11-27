@@ -27,7 +27,7 @@ impl SettingsWindow {
             }
             Some(Ok(s)) => {
                 if s.paused {
-                    widgets::chip(ui, ChipKind::Neutral, "Stopped");
+                    widgets::chip(ui, ChipKind::Neutral, "Paused");
                 } else if power_hold(&s.power_hold).is_some() {
                     widgets::chip(ui, ChipKind::Warn, "On hold");
                 } else if s.indexing {
@@ -132,11 +132,11 @@ impl SettingsWindow {
                 });
             }
             let now = if s.paused {
-                "Indexing paused. Previously indexed files remain searchable.".to_owned()
+                "Paused. Already-indexed files remain searchable.".to_owned()
             } else if let Some(why) = power_hold(&s.power_hold) {
                 why.to_owned()
             } else if s.indexing && s.indexing_rest {
-                "Indexing remaining pages of long documents".to_owned()
+                "Finishing long documents…".to_owned()
             } else if s.indexing {
                 format!("Indexing ({} files indexed)", count(s.indexed_files as i64))
             } else {
@@ -176,7 +176,7 @@ impl SettingsWindow {
             }
             Row::new("Last change").show(ui, |ui, _| {
                 if s.last_indexed == 0 {
-                    widgets::muted(ui, "None since service start");
+                    widgets::muted(ui, "None yet");
                 } else {
                     ui.label(format!("Indexed {}", ago(s.last_indexed)));
                 }
@@ -185,11 +185,11 @@ impl SettingsWindow {
                 self.check_asked = None;
             }
             Row::new("Checked")
-                .help("Also runs hourly and after waking from sleep.")
+                .help("Runs automatically every hour.")
                 .show(ui, |ui, _| {
                     if self.check_asked.is_some() {
                         let text = if s.indexing {
-                            "Waiting for indexing to finish"
+                            "Queued…"
                         } else {
                             "Checking…"
                         };
@@ -229,7 +229,6 @@ impl SettingsWindow {
             self.link.send(Request::LargestFolders(LARGEST));
         }
         widgets::group_label(ui, "Largest folders");
-        widgets::group_help(ui, "Exclude a folder to remove it from the index.");
         let mut exclude = None;
         widgets::group(ui, |ui| {
             let Some(largest) = largest else {

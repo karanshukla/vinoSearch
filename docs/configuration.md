@@ -45,4 +45,6 @@ max_minutes = 60            # off by default; skip longer audio and video files 
 
 Audio and video indexing ([#187](https://github.com/karanshukla/vinoSearch/issues/187)) runs after all other indexing work, on AC power only, processing five minutes of media at a time: 10-second audio windows sampled every 5 seconds (skipping silent sections) plus one video frame per shot. One hour of video takes roughly 6.5 to 9 minutes of NPU time, mostly for frame encoding. Enabling media downloads the audio encoder (295 MB) as well as the vision encoder (671 MB) if images are not already enabled.
 
+Custom `editor` and `player` commands are split on spaces and run directly without a shell, substituting `{file}` and `{line}` (or `{seconds}`).
+
 CLI flags and environment variables override settings in `config.toml`. Package trees such as `~/snap`, `~/go/pkg`, and conda environments are excluded by default; see [What gets indexed](how-it-works.md#what-gets-indexed) for the full list.

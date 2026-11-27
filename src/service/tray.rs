@@ -68,7 +68,7 @@ impl View {
         if self.paused {
             format!("Indexing paused{files}")
         } else if self.rest {
-            format!("Indexing remaining pages of long documents{files}")
+            format!("Finishing long documents{files}")
         } else {
             format!("Indexing{files}")
         }
@@ -317,9 +317,6 @@ mod tests {
             v(true, 12, false).text(),
             "Indexing paused (12 files indexed)"
         );
-        assert_eq!(
-            v(false, 0, true).text(),
-            "Indexing remaining pages of long documents"
-        );
+        assert_eq!(v(false, 0, true).text(), "Finishing long documents");
     }
 }

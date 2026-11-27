@@ -42,38 +42,29 @@ impl SettingsWindow {
         widgets::columns(ui, |ui, column| match column {
             Column::Left => {
                 widgets::group_label(ui, "Search places");
-                widgets::group_help(
-                    ui,
-                    "Toggle each integration independently; only enabled integrations are installed.",
-                );
                 widgets::group(ui, |ui| {
                     switch_row(
                         ui,
                         "KRunner",
-                        "Search from KRunner (Alt+Space) and the Plasma application launcher.",
+                        "KRunner (Alt+Space) and Plasma launcher.",
                         integration::Switch::Kde,
-                        (!kde).then_some("Plasma is not running in this session."),
+                        (!kde).then_some("Plasma isn't running."),
                     );
                     switch_row(
                         ui,
                         "GNOME Shell",
                         if fixed {
-                            "Search from the GNOME Shell overview."
+                            "GNOME Shell overview."
                         } else {
-                            "Search from the GNOME Shell overview (takes effect on next login)."
+                            "GNOME Shell overview (applies next login)."
                         },
                         integration::Switch::Gnome,
-                        (!gnome).then_some("GNOME is not running in this session."),
+                        (!gnome).then_some("GNOME isn't running."),
                     );
                     switch_row(
                         ui,
                         "App menu",
-                        if fixed {
-                            "Adds a standalone search window entry to your app menu. You can also \
-                             open it via the Search Files action on vinoSearch's app entry."
-                        } else {
-                            "Adds a standalone search window entry to your app menu."
-                        },
+                        "Standalone search entry in your app menu.",
                         integration::Switch::Menu,
                         None,
                     );
@@ -85,13 +76,7 @@ impl SettingsWindow {
                     switch_row(
                         ui,
                         "Search service",
-                        if fixed {
-                            "Starts automatically at login. Turning it off disables all desktop \
-                             search integrations."
-                        } else {
-                            "Starts automatically at login. Turning it off removes all desktop \
-                             search integrations."
-                        },
+                        "Starts at login. Required for desktop search integrations.",
                         integration::Switch::Service,
                         None,
                     );
