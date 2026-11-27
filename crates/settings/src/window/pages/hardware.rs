@@ -41,30 +41,24 @@ impl SettingsWindow {
                         .show(ui, |_, _| {});
                 }
             }
-            Row::new("Check")
-                .help("Runs the same diagnostics as vinosearch doctor.")
-                .show(ui, |ui, _| {
-                    if state.running {
-                        widgets::chip(ui, ChipKind::Neutral, "Checking…");
-                    } else if ui.add(Button::tonal("Check again")).clicked() {
-                        doctor::run(Arc::clone(&self.doctor), ui.ctx());
-                    }
-                });
+            Row::new("Check").show(ui, |ui, _| {
+                if state.running {
+                    widgets::chip(ui, ChipKind::Neutral, "Checking…");
+                } else if ui.add(Button::tonal("Check again")).clicked() {
+                    doctor::run(Arc::clone(&self.doctor), ui.ctx());
+                }
+            });
         });
     }
 
     pub(in crate::window) fn power(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Power");
-        if self.config_broken.is_some() {
-            widgets::group_help(
-                ui,
-                "Could not parse the settings file. See the Folders page for details.",
-            );
+        if self.config_broken_banner(ui) {
             return;
         }
         widgets::group(ui, |ui| {
             Row::new("Index on battery")
-                .help("When off, indexing pauses on battery until plugged in. Power saver mode always pauses indexing.")
+                .help("Power saver mode always pauses indexing.")
                 .show(ui, |ui, _| {
                     let mut on = self.config.index_on_battery();
                     if widgets::switch(ui, &mut on, "Index on battery").changed() {

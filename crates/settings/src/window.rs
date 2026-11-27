@@ -358,6 +358,19 @@ impl SettingsWindow {
         }
     }
 
+    fn config_broken_banner(&self, ui: &mut egui::Ui) -> bool {
+        let Some(why) = &self.config_broken else {
+            return false;
+        };
+        widgets::banner(
+            ui,
+            Tone::Error,
+            &format!("Couldn't read {}: {why}", self.config_path.display()),
+            |_| {},
+        );
+        true
+    }
+
     fn save_config(&mut self) {
         if self.config_broken.is_some() {
             return;
@@ -407,9 +420,7 @@ impl SettingsWindow {
             _ => PathBuf::from(typed),
         };
         if !path.is_absolute() {
-            self.notice = Some(format!(
-                "{typed}: enter an absolute path, or a path starting with ~/"
-            ));
+            self.notice = Some(format!("{typed}: enter a full path starting with / or ~/."));
             return;
         }
         self.add(target, &path);

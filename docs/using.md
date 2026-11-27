@@ -25,7 +25,7 @@ Select **Show all results** on any KRunner match, or click the vinoSearch icon n
 
 Press `Enter` or double-click an entry to open it at the match. Action buttons at the bottom provide **Open folder** and **Copy file** (which copies the file URI for pasting in a file manager; requires `wl-copy`).
 
-You can also open the search window directly from a shortcut with `vinosearch-settings --search "query"`.
+You can also open the search window directly from a shortcut with `vinosearch-settings --search "query"`, enable a standalone app-menu entry under **Integration**, or (in the Flatpak) use the **Search Files** action on vinoSearch's app entry.
 
 ## The tray icon
 

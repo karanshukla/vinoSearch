@@ -14,17 +14,9 @@ impl SettingsWindow {
         ui: &mut egui::Ui,
         status: Option<&Result<Status, String>>,
     ) {
-        if let Some(why) = &self.config_broken {
+        if self.config_broken.is_some() {
             ui.add_space(10.0);
-            widgets::banner(
-                ui,
-                Tone::Error,
-                &format!(
-                    "Could not parse {} ({why}). Fix the file before changing settings here.",
-                    self.config_path.display()
-                ),
-                |_| {},
-            );
+            self.config_broken_banner(ui);
             return;
         }
         let [indexing, results] = widgets::columns(ui, |ui, column| match column {
@@ -61,19 +53,22 @@ impl SettingsWindow {
                     }
                 });
             let mut images = self.config.formats.images_enabled();
-            Row::new("Images")
-                .help("Search photos by visual content and text (671 MB download).")
-                .show(ui, |ui, _| {
-                    if widgets::switch(ui, &mut images, "Index images").changed() {
-                        self.config.formats.images.enabled = images.then_some(true);
-                        changed = true;
-                    }
-                    if let Some(s) = s
-                        && let Some(text) = share(s.image_files, None)
-                    {
-                        widgets::small(ui, text);
-                    }
-                });
+            let images_help = if s.is_some_and(|s| s.images_model_present) {
+                "Search photos by content and text."
+            } else {
+                "Search photos by content and text (671 MB download)."
+            };
+            Row::new("Images").help(images_help).show(ui, |ui, _| {
+                if widgets::switch(ui, &mut images, "Index images").changed() {
+                    self.config.formats.images.enabled = images.then_some(true);
+                    changed = true;
+                }
+                if let Some(s) = s
+                    && let Some(text) = share(s.image_files, None)
+                {
+                    widgets::small(ui, text);
+                }
+            });
             if images
                 && let Some(s) = s
                 && !s.images_model_present
@@ -83,9 +78,8 @@ impl SettingsWindow {
                     |ui| {
                         ui.horizontal(|ui| {
                             icons::icon(ui, Icon::Warning, 16.0, p.warn);
-                            let shown = ui.add(
-                                egui::Label::new("Vision model is not downloaded yet.").wrap(),
-                            );
+                            let shown = ui
+                                .add(egui::Label::new("Vision model isn't downloaded yet.").wrap());
                             a11y::live(&shown);
                         });
                         None
@@ -100,68 +94,71 @@ impl SettingsWindow {
                 );
             }
             if images {
-                Row::new("Image types")
-                    .help("Leave blank to restore default extensions.")
-                    .show(ui, |ui, named| {
-                        let current = self
-                            .config
-                            .formats
-                            .images
-                            .extensions
-                            .clone()
-                            .unwrap_or_else(|| {
-                                DEFAULT_IMAGE_EXTENSIONS
-                                    .iter()
-                                    .map(|&e| e.to_owned())
-                                    .collect()
-                            })
-                            .join(", ");
-                        let text = self.image_extensions.get_or_insert(current);
-                        let width = ui.available_width().min(220.0);
-                        let response = named(ui.add(widgets::field(text, "", width)));
-                        if response.lost_focus() {
-                            let typed: Vec<String> = text
-                                .split([',', ' '])
-                                .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-                                .filter(|e| !e.is_empty())
-                                .collect();
-                            let mut next = self.config.formats.clone();
-                            next.images.extensions = (!typed.is_empty()
-                                && typed != DEFAULT_IMAGE_EXTENSIONS)
-                                .then_some(typed);
-                            match next.image_extensions() {
-                                Ok(_) => {
-                                    if next != self.config.formats {
-                                        self.config.formats = next;
-                                        changed = true;
-                                    }
-                                    self.image_extensions = None;
+                let custom_extensions = self.config.formats.images.extensions.is_some();
+                Row::new("Image types").show(ui, |ui, named| {
+                    if custom_extensions
+                        && a11y::for_what(ui.add(Button::ghost("Default").small()), "Image types")
+                            .clicked()
+                    {
+                        self.config.formats.images.extensions = None;
+                        self.image_extensions = None;
+                        changed = true;
+                    }
+                    let current = self
+                        .config
+                        .formats
+                        .images
+                        .extensions
+                        .clone()
+                        .unwrap_or_else(|| {
+                            DEFAULT_IMAGE_EXTENSIONS
+                                .iter()
+                                .map(|&e| e.to_owned())
+                                .collect()
+                        })
+                        .join(", ");
+                    let text = self.image_extensions.get_or_insert(current);
+                    let width = ui.available_width().min(220.0);
+                    let response = named(ui.add(widgets::field(text, "", width)));
+                    if response.lost_focus() {
+                        let typed: Vec<String> = text
+                            .split([',', ' '])
+                            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                            .filter(|e| !e.is_empty())
+                            .collect();
+                        let mut next = self.config.formats.clone();
+                        next.images.extensions = (!typed.is_empty()
+                            && typed != DEFAULT_IMAGE_EXTENSIONS)
+                            .then_some(typed);
+                        match next.image_extensions() {
+                            Ok(_) => {
+                                if next != self.config.formats {
+                                    self.config.formats = next;
+                                    changed = true;
                                 }
-                                Err(e) => self.notice = Some(format!("{e:#}")),
+                                self.image_extensions = None;
                             }
+                            Err(e) => self.notice = Some(format!("{e:#}")),
                         }
-                    });
+                    }
+                });
             }
-            let documents = if self.config.encryption.on() {
-                "PDF, Office, EPUB, subtitles, and CSV files."
-            } else {
-                "PDF, Office, EPUB, subtitles, and CSV files. Stored unencrypted unless index \
-                 encryption is enabled (Security)."
-            };
-            Row::new("Documents").help(documents).show(ui, |ui, _| {
-                let mut on = self.config.formats.documents_enabled();
-                if widgets::switch(ui, &mut on, "Index documents").changed() {
-                    self.config.formats.documents.enabled = on.then_some(true);
-                    changed = true;
-                }
-                if let Some(s) = s
-                    && let Some(text) = share(s.document_files, Some(s.document_chunks))
-                {
-                    widgets::small(ui, text);
-                }
-            });
+            Row::new("Documents")
+                .help("PDF, Office, EPUB, subtitles, and CSV.")
+                .show(ui, |ui, _| {
+                    let mut on = self.config.formats.documents_enabled();
+                    if widgets::switch(ui, &mut on, "Index documents").changed() {
+                        self.config.formats.documents.enabled = on.then_some(true);
+                        changed = true;
+                    }
+                    if let Some(s) = s
+                        && let Some(text) = share(s.document_files, Some(s.document_chunks))
+                    {
+                        widgets::small(ui, text);
+                    }
+                });
             Row::new("Code")
-                .help("Matched only by “code:” queries. Secrets and ignored files are skipped.")
+                .help("Searched with “code:” queries. Skips secrets and gitignored files.")
                 .show(ui, |ui, _| {
                     let mut on = self.config.formats.code_enabled();
                     if widgets::switch(ui, &mut on, "Index code").changed() {
@@ -177,7 +174,7 @@ impl SettingsWindow {
             let sessions_on = self.config.formats.sessions_enabled();
             let (sessions_help, tone) = if sessions_on && !self.config.encryption.on() {
                 (
-                    "Enable encryption on the Security page to keep transcripts encrypted.",
+                    "Enable index encryption in Security to protect transcripts.",
                     Tone::Warn,
                 )
             } else {
@@ -199,43 +196,48 @@ impl SettingsWindow {
                     }
                 });
             let media = self.config.formats.media_enabled();
-            Row::new("Media")
-                .help(
-                    "Search audio and video by sound and video frames. Indexes on AC power only (295 MB download, plus 671 MB if images are off).",
-                )
-                .show(ui, |ui, _| {
-                    let mut on = media;
-                    if widgets::switch(ui, &mut on, "Index media").changed() {
-                        self.config.formats.media.enabled = on.then_some(true);
-                        changed = true;
-                    }
-                    if let Some(s) = s
-                        && let Some(text) = share(s.media_files, Some(s.media_chunks))
-                    {
-                        widgets::small(ui, text);
-                    }
-                });
+            let media_help = if s.is_some_and(|s| s.media_model_present) {
+                "Audio and video, indexed on AC power."
+            } else if s.is_some_and(|s| s.images_model_present) {
+                "Audio and video, indexed on AC power (295 MB download)."
+            } else {
+                "Audio and video, indexed on AC power (966 MB download)."
+            };
+            Row::new("Media").help(media_help).show(ui, |ui, _| {
+                let mut on = media;
+                if widgets::switch(ui, &mut on, "Index media").changed() {
+                    self.config.formats.media.enabled = on.then_some(true);
+                    changed = true;
+                }
+                if let Some(s) = s
+                    && let Some(text) = share(s.media_files, Some(s.media_chunks))
+                {
+                    widgets::small(ui, text);
+                }
+            });
             if media
                 && let Some(s) = s
                 && !s.ffmpeg
             {
                 Row::new("")
-                    .help("Requires ffmpeg. Install it using your distribution's package manager.")
+                    .help("Requires ffmpeg (not installed).")
                     .tone(Tone::Error)
                     .show(ui, |_, _| {});
             } else if media
                 && let Some(s) = s
                 && !s.media_model_present
             {
+                let missing = if s.images_model_present {
+                    "Audio model isn't downloaded yet."
+                } else {
+                    "Audio and vision models aren't downloaded yet."
+                };
                 Row::new("").tint(p.warn_tint).custom(
                     ui,
                     |ui| {
                         ui.horizontal(|ui| {
                             icons::icon(ui, Icon::Warning, 16.0, p.warn);
-                            let shown = ui.add(
-                                egui::Label::new("Audio and vision models are not downloaded yet.")
-                                    .wrap(),
-                            );
+                            let shown = ui.add(egui::Label::new(missing).wrap());
                             a11y::live(&shown);
                         });
                         None
@@ -263,43 +265,39 @@ impl SettingsWindow {
             }
             if media {
                 let mut limit_on = self.config.formats.media_max_minutes().is_some();
-                Row::new("Skip long media")
-                    .help("Skip audio and video files longer than a set duration.")
-                    .show(ui, |ui, _| {
-                        if widgets::switch(ui, &mut limit_on, "Skip long media").changed() {
-                            self.config.formats.media.max_minutes =
-                                limit_on.then_some(DEFAULT_MEDIA_MAX_MINUTES);
+                Row::new("Skip long media").show(ui, |ui, _| {
+                    if widgets::switch(ui, &mut limit_on, "Skip long media").changed() {
+                        self.config.formats.media.max_minutes =
+                            limit_on.then_some(DEFAULT_MEDIA_MAX_MINUTES);
+                        self.config.formats.media.max_hours = None;
+                        changed = true;
+                    }
+                });
+                if let Some(mut minutes) = self.config.formats.media_max_minutes() {
+                    Row::new("Maximum duration").show(ui, |ui, named| {
+                        widgets::small(ui, "min");
+                        let response = ui
+                            .add(
+                                egui::DragValue::new(&mut minutes)
+                                    .range(1.0..=1440.0)
+                                    .speed(1.0)
+                                    .custom_formatter(|m, _| {
+                                        if m.fract() == 0.0 {
+                                            format!("{m:.0}")
+                                        } else {
+                                            format!("{m:.1}")
+                                        }
+                                    }),
+                            )
+                            // DragValue's resize-arrow cursor reads as a splitter here.
+                            .on_hover_cursor(egui::CursorIcon::Text);
+                        let response = named(response);
+                        if response.changed() {
+                            self.config.formats.media.max_minutes = Some(minutes);
                             self.config.formats.media.max_hours = None;
-                            changed = true;
+                            self.idle_dirty = true;
                         }
                     });
-                if let Some(mut minutes) = self.config.formats.media_max_minutes() {
-                    Row::new("Maximum duration")
-                        .help("Audio and video files longer than this are not indexed.")
-                        .show(ui, |ui, named| {
-                            widgets::small(ui, "min");
-                            let response = ui
-                                .add(
-                                    egui::DragValue::new(&mut minutes)
-                                        .range(1.0..=1440.0)
-                                        .speed(1.0)
-                                        .custom_formatter(|m, _| {
-                                            if m.fract() == 0.0 {
-                                                format!("{m:.0}")
-                                            } else {
-                                                format!("{m:.1}")
-                                            }
-                                        }),
-                                )
-                                // DragValue's resize-arrow cursor reads as a splitter here.
-                                .on_hover_cursor(egui::CursorIcon::Text);
-                            let response = named(response);
-                            if response.changed() {
-                                self.config.formats.media.max_minutes = Some(minutes);
-                                self.config.formats.media.max_hours = None;
-                                self.idle_dirty = true;
-                            }
-                        });
                 }
             }
             if let Some(s) = s
@@ -308,7 +306,7 @@ impl SettingsWindow {
                 let n = s.sessions_unread;
                 Row::new("Unreadable")
                     .help(&format!(
-                        "{n} {} could not be read (newer vinoWhisper format or damaged file).",
+                        "{n} {} unreadable (newer format or damaged).",
                         if n == 1 { "session" } else { "sessions" }
                     ))
                     .tone(Tone::Error)
@@ -329,7 +327,7 @@ impl SettingsWindow {
                 &AppPicker {
                     label: "Editor",
                     help: "Opens text results at the matching line.",
-                    command_help: "Include {file} and {line} placeholders (run directly without a shell).",
+                    command_help: "Use {file} and {line} placeholders.",
                     hint: "foot -e nvim +{line} {file}",
                     apps: &editors,
                 },
@@ -341,8 +339,8 @@ impl SettingsWindow {
                 ui,
                 &AppPicker {
                     label: "Player",
-                    help: "Plays audio and video from the matching timestamp (mpv, VLC, or Celluloid).",
-                    command_help: "Include {file} and {seconds} placeholders (run directly without a shell).",
+                    help: "Plays media from the matching timestamp.",
+                    command_help: "Use {file} and {seconds} placeholders.",
                     hint: "mpv --start={seconds} {file}",
                     apps: &players,
                 },
@@ -353,7 +351,6 @@ impl SettingsWindow {
         });
 
         widgets::group_label(ui, "Match threshold");
-        widgets::group_help(ui, "Higher values return fewer, stricter matches.");
         widgets::group(ui, |ui| {
             let text = self.config.formats.text.min_score;
             if let Some(v) = score_row(ui, "Text", text, DEFAULT_TEXT_MIN_SCORE, 0.45..=0.85) {

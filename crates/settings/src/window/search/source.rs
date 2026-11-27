@@ -255,9 +255,7 @@ impl Runner {
                     .to_owned()
             }
             zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("UnknownMethod") => {
-                "The running search service is older than this window. Restart the service to \
-                 search here."
-                    .to_owned()
+                "Restart the search service to match this version.".to_owned()
             }
             zbus::Error::MethodError(_, Some(message), _) => message,
             other => {

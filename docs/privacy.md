@@ -15,9 +15,10 @@ Index encryption is optional and disabled by default ([#4](https://github.com/ka
 
 - **Full-database encryption:** Uses SQLCipher (AES-256) across the entire database, protecting extracted text, embeddings, filenames, and the FTS5 word index.
 - **In-place conversion:** Turning encryption on or off converts the existing database in place without re-indexing, and search behavior remains unchanged.
-- **TPM sealing (`systemd-creds`):** On systems with systemd 256+, a random key is sealed via `systemd-creds` to your machine's TPM and user ID. Without a TPM, encryption is refused unless you explicitly allow systemd's host key (`allow_host_key = true`), which `root` can read. If a sealed key can no longer be unsealed (for example, after clearing the TPM or replacing the motherboard), the index is rebuilt from your files rather than left readable.
+- **TPM sealing (`systemd-creds`):** On systems with systemd 256+, a random key is sealed via `systemd-creds` to your machine's TPM and user ID. Without a TPM, encryption is refused unless you explicitly allow systemd's host key (`allow_host_key = true`, **Host-key fallback** in Settings), which `root` can read (this protects backups and copies of your home folder, but not a removed system disk). If a sealed key can no longer be unsealed (for example, after clearing the TPM or replacing the motherboard), the index is rebuilt from your files rather than left readable.
 - **Flatpak support:** The Flatpak seals and unseals keys using the host's `systemd-creds` over `flatpak-spawn --host`, piping the key directly to `systemd-creds` so it binds to the same TPM and user as a native install. If the host cannot be reached, the encrypted index is preserved while waiting and never silently migrated to the keyring.
 - **No silent downgrade between backends:** Once an index is sealed with `systemd-creds`, it is never migrated to the keyring; an index is always unsealed with the same mechanism that sealed it.
+- **Free disk space and swap:** Previously unencrypted data may remain in free disk space until overwritten. Enable encryption before initial indexing, or use full-disk encryption to protect free space and swap as well.
 
 ### Desktop keyring fallback (without `systemd-creds`)
 

@@ -146,7 +146,7 @@ impl SettingsWindow {
                         widgets::small(ui, note);
                     }
                     if !a.folders.is_empty() {
-                        widgets::small(ui, "Slowest subfolders to index (exclude to skip):");
+                        widgets::small(ui, "Slowest subfolders:");
                         for f in &a.folders {
                             let entry = tilde(Path::new(&f.path));
                             let excluded = self.config.exclude.contains(&entry);

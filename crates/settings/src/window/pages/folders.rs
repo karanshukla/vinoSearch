@@ -31,7 +31,7 @@ impl SettingsWindow {
     pub(in crate::window) fn included(&mut self, ui: &mut egui::Ui, reachable: Option<&Status>) {
         let p = theme::palette(ui.ctx());
         widgets::group_label(ui, "Included");
-        widgets::group_help(ui, "These folders are indexed and watched for changes.");
+        widgets::group_help(ui, "Indexed and watched for changes.");
         let mut roots = reachable.map(|s| s.roots.clone()).unwrap_or_default();
         self.forgetting.retain(|r| roots.contains(r));
         roots.retain(|r| !self.forgetting.contains(r));
@@ -134,16 +134,7 @@ impl SettingsWindow {
     pub(in crate::window) fn excluded(&mut self, ui: &mut egui::Ui) {
         widgets::group_label(ui, "Excluded");
         widgets::group_help(ui, "Skipped even when inside an included folder.");
-        if let Some(why) = &self.config_broken {
-            widgets::banner(
-                ui,
-                Tone::Error,
-                &format!(
-                    "Could not parse {} ({why}). Fix the file before changing settings here.",
-                    self.config_path.display()
-                ),
-                |_| {},
-            );
+        if self.config_broken_banner(ui) {
             return;
         }
         let mut remove = None;
@@ -191,8 +182,8 @@ impl SettingsWindow {
         widgets::group_section(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let (button, hint) = match target {
-                    Target::Root => ("Add folder…", "or enter a path, e.g. ~/Documents"),
-                    Target::Exclude => ("Exclude folder…", "or enter a path, e.g. ~/Downloads/tax"),
+                    Target::Root => ("Add folder…", "Path, e.g. ~/Documents"),
+                    Target::Exclude => ("Exclude folder…", "Path, e.g. ~/Downloads/tax"),
                 };
                 if ui
                     .add_enabled(!self.picking, Button::tonal(button).icon(Icon::Plus))
