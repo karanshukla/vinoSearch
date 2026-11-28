@@ -152,8 +152,6 @@ impl SettingsWindow {
                             let excluded = self.config.exclude.contains(&entry);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                icons::icon(ui, Icon::Folder, 16.0, p.muted);
-                                widgets::mono(ui, &entry);
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let can = !excluded && self.config_broken.is_none();
                                     let label = if excluded { "Excluded" } else { "Exclude" };
@@ -165,7 +163,18 @@ impl SettingsWindow {
                                     {
                                         exclude = Some(PathBuf::from(&f.path));
                                     }
-                                    widgets::small(ui, &f.summary);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&f.summary).size(12.5).color(p.muted),
+                                        )
+                                        .extend(),
+                                    );
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        let clip = ui.max_rect().intersect(ui.clip_rect());
+                                        ui.set_clip_rect(clip);
+                                        icons::icon(ui, Icon::Folder, 16.0, p.muted);
+                                        widgets::mono(ui, &entry).on_hover_text(&entry);
+                                    });
                                 });
                             });
                         }
